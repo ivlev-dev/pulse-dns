@@ -10,6 +10,12 @@ pub(crate) fn read_u16(data: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_le_bytes(bytes))
 }
 
+pub(crate) fn read_u16_be(data: &[u8], off: usize) -> Option<u16> {
+    let (_, tail) = data.split_at_checked(off)?;
+    let bytes: [u8; 2] = tail.get(..2)?.try_into().ok()?;
+    Some(u16::from_be_bytes(bytes))
+}
+
 pub(crate) fn read_u32(data: &[u8], off: usize) -> Option<u32> {
     let (_, tail) = data.split_at_checked(off)?;
     let bytes: [u8; 4] = tail.get(..4)?.try_into().ok()?;

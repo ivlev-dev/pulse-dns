@@ -1,13 +1,20 @@
-//! Прототип формата файла зон pulse (v1), фаза 1.
+//! Прототип формата файла зон pulse (v1), фазы 1–2.
 //!
-//! Реализовано: константы формата, CRC-32C, superblock, meta-страницы, pager
+//! Фаза 1: константы формата, CRC-32C, superblock, meta-страницы, pager
 //! (создание/открытие), lock-файл writer'а, таблица читателей с двухфазным
 //! пином, восстановление активной meta (max-valid, torn-диагностика,
 //! `Memory`-фолбэк/read-only), липкий режим durability, правило
 //! переиспользования страниц и ленивые проверки заголовка страницы.
 //!
-//! Не реализовано (следующие фазы): B+tree, каталог зон, overflow-цепочки,
-//! freelist, коммит правок и `fsck`.
+//! Фаза 2: RLE-ключи и канонический компаратор ([`key`]), узлы B+tree с
+//! фронт-кодированием и валидацией ([`node`]), overflow-цепочки RDATA
+//! ([`overflow`]), B+tree зоны с `T_NODE`/ENT-материализацией и абстракция
+//! страничного I/O ([`tree`]). Горячий путь чтения — [`cache::PageCache`]:
+//! страница валидируется один раз на версию, далее поиск идёт по zero-copy
+//! [`node::NodeRef`] без аллокаций. Каталог зон в памяти — [`zone_index`].
+//!
+//! Не реализовано (следующие фазы): публикация корней/коммит, freelist,
+//! per-zone metadata и `fsck`.
 //!
 //! # Пример
 //!
@@ -39,18 +46,25 @@
     )
 )]
 
+pub mod cache;
 pub mod checksum;
 pub mod consts;
 mod errors;
+mod hash;
+pub mod key;
 mod lock;
 mod map;
 pub mod meta;
+pub mod node;
+pub mod overflow;
 mod page;
 mod pager;
 pub mod readers;
 mod recovery;
 pub mod superblock;
+pub mod tree;
 mod wire;
+pub mod zone_index;
 mod zonefile;
 
 pub use errors::{CorruptDetail, CorruptKind, InvariantId, Version, ZoneFileError};

@@ -15,9 +15,18 @@ rustix = { version = "1", features = ["fs", "process", "time"] }
 thiserror = "2"
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1"
 static_assertions = "1"
 tempfile = "3"
+
+[[bench]]
+name = "tree"
+harness = false
+
+[[bench]]
+name = "perf"
+harness = false
 
 [lints]
 workspace = true

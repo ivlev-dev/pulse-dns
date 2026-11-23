@@ -227,6 +227,19 @@ pub enum ZoneFileError {
     #[error("name too long")]
     NameTooLong,
 
+    /// Имя не принадлежит зоне (не является apex и не лежит под ним).
+    #[error("name is outside the zone apex")]
+    NameOutsideZone,
+
+    /// TTL превышает `2^31−1` на пути записи.
+    #[error("ttl {ttl} exceeds maximum {max}")]
+    TtlOutOfRange {
+        /// Переданный TTL.
+        ttl: u32,
+        /// Максимально допустимый TTL.
+        max: u32,
+    },
+
     /// Метка слишком длинная.
     #[error("label too long")]
     LabelTooLong,
