@@ -1,0 +1,19 @@
+[package]
+name = "pulse-dns"
+description = "Shared kernel pulse-dns: DNS wire format, domain names and RR types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+hex = "0.4"
+proptest = "1"
+
+[lints]
+workspace = true
