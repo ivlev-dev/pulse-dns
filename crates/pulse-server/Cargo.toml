@@ -1,0 +1,24 @@
+[package]
+name = "pulse-server"
+description = "Authoritative query engine for pulse-dns: zone lookup semantics and DNS response assembly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pulse-dns = { path = "../pulse-dns" }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+
+[features]
+default = ["testkit"]
+# In-memory `ZoneView` implementation used by tests and embedders without a zone store.
+testkit = []
+
+[lints]
+workspace = true
