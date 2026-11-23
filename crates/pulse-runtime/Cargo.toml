@@ -1,0 +1,27 @@
+[package]
+name = "pulse-runtime"
+description = "Thread-per-core UDP runtime for pulse-dns: io_uring (multishot + provided buffers) with optional epoll fallback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+io-uring = "0.7.16"
+libc = "0.2"
+rustix = { version = "1.1", features = ["event", "net", "std", "thread"] }
+thiserror = "2"
+
+[features]
+default = []
+# Compiles the epoll/recvmmsg/sendmmsg backend (see `docs/spec/io-uring-runtime.md` §12).
+epoll-fallback = []
+
+[[bin]]
+name = "pulse-udp-bench"
+path = "src/bin/pulse-udp-bench.rs"
+
+[lints]
+workspace = true

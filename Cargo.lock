@@ -559,6 +559,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulse-server"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "pulse-dns",
+ "thiserror",
+]
+
+[[package]]
 name = "pulse-zonefile"
 version = "0.1.0"
 dependencies = [
