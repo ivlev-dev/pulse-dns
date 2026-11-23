@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.idea/
+.vscode/
+*.profraw
+fuzz/target
+fuzz/corpus
+/data
+*.mmap
+*.zonefile.bin

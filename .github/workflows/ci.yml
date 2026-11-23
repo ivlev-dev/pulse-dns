@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: |
+          if cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -q '"workspace_members":\[\]'; then
+            echo "Workspace is empty; skipping cargo fmt"
+          else
+            cargo fmt --all --check
+          fi
+      - name: Clippy
+        run: |
+          if cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -q '"workspace_members":\[\]'; then
+            echo "Workspace is empty; skipping cargo clippy"
+          else
+            cargo clippy --workspace --all-targets -- -D warnings
+          fi
+      - name: Tests
+        run: |
+          if cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -q '"workspace_members":\[\]'; then
+            echo "Workspace is empty; skipping cargo test"
+          else
+            cargo test --workspace
+          fi
+      - name: Docs
+        run: |
+          if cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -q '"workspace_members":\[\]'; then
+            echo "Workspace is empty; skipping cargo doc"
+          else
+            cargo doc --workspace --no-deps
+          fi
