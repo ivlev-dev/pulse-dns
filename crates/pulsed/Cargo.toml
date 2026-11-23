@@ -1,0 +1,32 @@
+[package]
+name = "pulsed"
+description = "Authoritative DNS server binary: config, zone loading, UDP/TCP transports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pulsed"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pulsed"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
+hex = "0.4"
+pulse-dns = { path = "../pulse-dns" }
+pulse-runtime = { path = "../pulse-runtime" }
+pulse-server = { path = "../pulse-server", features = ["testkit"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+thiserror = "2"
+
+[lints]
+workspace = true
