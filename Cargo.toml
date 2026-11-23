@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/pulse-zonefile"]
+members = [
+    "crates/pulse-dns",
+    "crates/pulse-runtime",
+    "crates/pulse-server",
+    "crates/pulse-zonefile",
+    "crates/pulse-api",
+    "crates/pulsed",
+]
 resolver = "3"
 
 [workspace.package]

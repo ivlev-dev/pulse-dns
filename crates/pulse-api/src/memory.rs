@@ -1,0 +1,1098 @@
+//! In-memory реализация [`ZoneAdmin`] для тестов и `pulsed`.
+//!
+//! Модель конкурентности: каталог зон защищён `RwLock`, каждая зона — своим
+//! `Mutex` (аренда). Мутации одной зоны сериализуются, разные зоны пишутся
+//! параллельно. Проверка `If-Match` выполняется внутри аренды, поэтому
+//! конкурентные записи с одним ETag дают ровно одну победу.
+//!
+//! Порядок взятия блокировок всегда «каталог → зона»; обратный порядок
+//! запрещён (иначе возможен deadlock с удалением зоны).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
+
+use pulse_dns::{Name, Rclass, Rdata, Rrset, RrsetError, Rtype, Serial, Ttl};
+
+use crate::base64url;
+use crate::error::{AdminError, InvariantViolation};
+use crate::etag::{normalize_tag, rrset_etag, zone_etag};
+use crate::port::{
+    Denial, ListRrsets, ListZones, Precondition, Preconditions, RrsetInput, RrsetPage, RrsetPatch,
+    RrsetPatchOutcome, RrsetView, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneId, ZoneKind,
+    ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, ZoneView,
+};
+use crate::rdata_text::is_managed_type;
+
+type RrsetKey = (String, u16);
+
+struct RrsetRecord {
+    rrset: Rrset,
+    etag: String,
+    updated_at: std::time::SystemTime,
+}
+
+struct ZoneData {
+    id: ZoneId,
+    origin: Name,
+    kind: ZoneKind,
+    serial: Serial,
+    version: u64,
+    txn: u64,
+    default_ttl: Ttl,
+    denial: Denial,
+    rrsets: BTreeMap<RrsetKey, RrsetRecord>,
+    created_at: std::time::SystemTime,
+    updated_at: std::time::SystemTime,
+}
+
+impl ZoneData {
+    fn etag(&self) -> String {
+        zone_etag(self.id.as_u32(), self.version, self.txn)
+    }
+
+    fn view(&self) -> ZoneView {
+        ZoneView {
+            id: self.id,
+            origin: self.origin.clone(),
+            kind: self.kind,
+            serial: self.serial,
+            version: self.version,
+            txn: self.txn,
+            default_ttl: self.default_ttl,
+            denial: self.denial,
+            rrset_count: u32::try_from(self.rrsets.len()).unwrap_or(u32::MAX),
+            etag: self.etag(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+
+    fn settings_view(&self) -> ZoneSettingsView {
+        ZoneSettingsView {
+            zone: self.origin.clone(),
+            settings: ZoneSettings {
+                default_ttl: self.default_ttl,
+                denial: self.denial,
+            },
+            version: self.version,
+            etag: self.etag(),
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// In-memory store зон.
+pub struct InMemoryZoneAdmin {
+    catalog: RwLock<BTreeMap<String, Arc<Mutex<ZoneData>>>>,
+    next_id: AtomicU32,
+    next_txn: AtomicU64,
+    ready: AtomicBool,
+}
+
+impl InMemoryZoneAdmin {
+    /// Создаёт пустой store.
+    pub fn new() -> Self {
+        Self {
+            catalog: RwLock::new(BTreeMap::new()),
+            next_id: AtomicU32::new(1),
+            next_txn: AtomicU64::new(1),
+            ready: AtomicBool::new(true),
+        }
+    }
+
+    /// Помечает store как готовый/неготовый (для `/readyz`).
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Release);
+    }
+
+    fn next_txn(&self) -> u64 {
+        self.next_txn.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn zone_key(origin: &Name) -> String {
+        origin.to_string()
+    }
+
+    fn rrset_key(owner: &Name, rr_type: Rtype) -> RrsetKey {
+        (owner.to_string(), rr_type.as_u16())
+    }
+
+    fn zone_handle<'a>(
+        &'a self,
+        origin: &Name,
+    ) -> Result<
+        (
+            RwLockReadGuard<'a, BTreeMap<String, Arc<Mutex<ZoneData>>>>,
+            Arc<Mutex<ZoneData>>,
+        ),
+        AdminError,
+    > {
+        let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
+        let key = Self::zone_key(origin);
+        let zone = catalog
+            .get(&key)
+            .cloned()
+            .ok_or_else(AdminError::zone_not_found)?;
+        Ok((catalog, zone))
+    }
+
+    fn replace_zone(
+        &self,
+        zone: &mut ZoneData,
+        meta: &ZoneMetaInput,
+        preconditions: &Preconditions,
+    ) -> Result<ZoneView, AdminError> {
+        check_existing(preconditions, &zone.etag(), zone.version)?;
+        if !meta.kind.is_writable() && !zone.rrsets.is_empty() {
+            return Err(AdminError::invariant(
+                "/kind",
+                "zone-not-empty",
+                "zone must be empty before changing kind",
+            ));
+        }
+        zone.kind = meta.kind;
+        zone.default_ttl = meta.default_ttl;
+        zone.denial = meta.denial;
+        zone.version = zone.version.saturating_add(1);
+        zone.txn = self.next_txn();
+        zone.updated_at = std::time::SystemTime::now();
+        Ok(zone.view())
+    }
+
+    fn check_writable(&self, zone: &ZoneData) -> Result<(), AdminError> {
+        if zone.kind.is_writable() {
+            Ok(())
+        } else {
+            Err(AdminError::Conflict(crate::error::Conflict::ZoneReadOnly))
+        }
+    }
+
+    fn validate_type(
+        &self,
+        zone: &ZoneData,
+        owner: &Name,
+        rr_type: Rtype,
+    ) -> Result<(), AdminError> {
+        if !owner.is_subdomain_of(&zone.origin) {
+            return Err(AdminError::invariant(
+                "/owner",
+                "owner-out-of-zone",
+                "record owner must be inside the zone",
+            ));
+        }
+        if rr_type == Rtype::SOA {
+            if owner == &zone.origin {
+                return Err(AdminError::invariant(
+                    "/type",
+                    "serial-managed",
+                    "SOA is managed by the serial/commit path and cannot be edited via the RRset API",
+                ));
+            }
+            return Err(AdminError::invariant(
+                "/type",
+                "soa-apex-only",
+                "SOA is allowed only at the zone apex",
+            ));
+        }
+        if is_managed_type(rr_type) {
+            return Err(AdminError::invariant(
+                "/type",
+                "managed-by-signer",
+                "DNSSEC records are managed by the signer",
+            ));
+        }
+        if matches!(
+            rr_type,
+            Rtype::OPT | Rtype::AXFR | Rtype::IXFR | Rtype::ANY | Rtype::TKEY | Rtype::TSIG
+        ) {
+            return Err(AdminError::invariant(
+                "/type",
+                "invalid-type",
+                "this record type cannot be stored in a zone",
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_owner_conflicts(
+        &self,
+        zone: &ZoneData,
+        owner: &Name,
+        rr_type: Rtype,
+    ) -> Result<(), AdminError> {
+        let owner_text = owner.to_string();
+        let has_cname = zone
+            .rrsets
+            .iter()
+            .any(|((name, kind), _)| name == &owner_text && *kind == Rtype::CNAME.as_u16());
+        let has_other = zone.rrsets.iter().any(|((name, kind), _)| {
+            name == &owner_text && *kind != rr_type.as_u16() && *kind != Rtype::CNAME.as_u16()
+        });
+        if rr_type == Rtype::CNAME {
+            if owner == &zone.origin {
+                return Err(AdminError::invariant(
+                    "/owner",
+                    "cname-conflict",
+                    "CNAME is not allowed at the zone apex",
+                ));
+            }
+            if has_other {
+                return Err(AdminError::invariant(
+                    "/owner",
+                    "cname-conflict",
+                    "CNAME cannot coexist with other types at the same owner",
+                ));
+            }
+        }
+        if rr_type == Rtype::DNAME {
+            if owner == &zone.origin {
+                return Err(AdminError::invariant(
+                    "/owner",
+                    "dname-conflict",
+                    "DNAME is not allowed at the zone apex",
+                ));
+            }
+            if has_cname {
+                return Err(AdminError::invariant(
+                    "/owner",
+                    "dname-conflict",
+                    "DNAME cannot coexist with CNAME at the same owner",
+                ));
+            }
+        }
+        if has_cname && rr_type != Rtype::CNAME {
+            return Err(AdminError::invariant(
+                "/owner",
+                "cname-conflict",
+                "owner with CNAME cannot have other types",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for InMemoryZoneAdmin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn lock_zone(zone: &Mutex<ZoneData>) -> MutexGuard<'_, ZoneData> {
+    zone.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn tags_equal(left: &str, right: &str) -> bool {
+    match (normalize_tag(left), normalize_tag(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn condition_matches(condition: &Precondition, current_etag: &str) -> bool {
+    match condition {
+        Precondition::Any => true,
+        Precondition::Tag(tag) => tags_equal(tag, current_etag),
+        Precondition::Tags(tags) => tags.iter().any(|tag| tags_equal(tag, current_etag)),
+    }
+}
+
+fn precondition_failed(etag: &str, version: u64) -> AdminError {
+    AdminError::PreconditionFailed {
+        current_etag: Some(etag.to_owned()),
+        current_version: Some(version),
+    }
+}
+
+fn check_existing(
+    preconditions: &Preconditions,
+    current_etag: &str,
+    current_version: u64,
+) -> Result<(), AdminError> {
+    if let Some(condition) = &preconditions.if_none_match {
+        if condition_matches(condition, current_etag) {
+            return Err(precondition_failed(current_etag, current_version));
+        }
+    }
+    match &preconditions.if_match {
+        Some(condition) => {
+            if condition_matches(condition, current_etag) {
+                Ok(())
+            } else {
+                Err(precondition_failed(current_etag, current_version))
+            }
+        }
+        None => Err(AdminError::PreconditionRequired),
+    }
+}
+
+fn check_create(preconditions: &Preconditions) -> Result<(), AdminError> {
+    if preconditions.if_match.is_some() {
+        return Err(AdminError::PreconditionFailed {
+            current_etag: None,
+            current_version: None,
+        });
+    }
+    Ok(())
+}
+
+fn map_rrset_error(error: RrsetError) -> AdminError {
+    match error {
+        RrsetError::Empty => {
+            AdminError::invariant("/records", "empty-rrset", "rrset must not be empty")
+        }
+        RrsetError::TtlMismatch { .. } => AdminError::invariant(
+            "/ttl",
+            "ttl-mismatch",
+            "all records in an rrset must share one ttl",
+        ),
+        RrsetError::OwnerMismatch { .. } | RrsetError::Owner(_) => {
+            AdminError::invariant("/owner", "owner-invalid", "invalid record owner")
+        }
+        RrsetError::TypeMismatch { .. } | RrsetError::RdataTypeMismatch { .. } => {
+            AdminError::invariant(
+                "/records",
+                "rdata-type-mismatch",
+                "record data does not match the rrset type",
+            )
+        }
+        RrsetError::ClassMismatch { .. } | RrsetError::UnsupportedClass { .. } => {
+            AdminError::invariant("/class", "unsupported-class", "only class IN is supported")
+        }
+        RrsetError::TooManyRecords { .. } => AdminError::invariant(
+            "/records",
+            "too-many-records",
+            "rrset exceeds the record limit",
+        ),
+        RrsetError::Rdata(_) | RrsetError::RdataTooLong { .. } => {
+            AdminError::invariant("/records", "invalid-rdata", "invalid record data")
+        }
+    }
+}
+
+fn rrset_view(zone: &ZoneData, record: &RrsetRecord) -> RrsetView {
+    RrsetView {
+        zone: zone.origin.clone(),
+        owner: record.rrset.owner().clone(),
+        rr_type: record.rrset.rr_type(),
+        ttl: record.rrset.ttl(),
+        rdata: record.rrset.rdatas().iter().cloned().collect(),
+        etag: record.etag.clone(),
+        updated_at: record.updated_at,
+    }
+}
+
+impl ZoneAdmin for InMemoryZoneAdmin {
+    fn ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    fn list_zones(&self, query: &ListZones, allow: &dyn ZoneAllow) -> Result<ZonePage, AdminError> {
+        let limit = if query.limit == 0 {
+            50
+        } else {
+            query.limit.min(500)
+        };
+        let cursor = match query.cursor.as_deref() {
+            Some(cursor) => Some(decode_zone_cursor(cursor)?),
+            None => None,
+        };
+        let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
+        let mut zones: Vec<(ZoneId, Arc<Mutex<ZoneData>>)> = catalog
+            .values()
+            .map(|zone| {
+                let data = lock_zone(zone);
+                (data.id, Arc::clone(zone))
+            })
+            .collect();
+        zones.sort_by_key(|(id, _)| *id);
+        let mut items = Vec::new();
+        let mut has_more = false;
+        for (id, zone) in zones {
+            if cursor.is_some_and(|cursor| id.as_u32() <= cursor) {
+                continue;
+            }
+            let data = lock_zone(&zone);
+            if !allow.allows(&data.origin) {
+                continue;
+            }
+            if query.kind.is_some_and(|kind| kind != data.kind) {
+                continue;
+            }
+            if items.len() >= limit as usize {
+                has_more = true;
+                break;
+            }
+            items.push(data.view());
+        }
+        let next_cursor = if has_more {
+            items.last().map(|zone| encode_zone_cursor(zone.id))
+        } else {
+            None
+        };
+        Ok(ZonePage {
+            items,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    fn get_zone(&self, origin: &Name) -> Result<ZoneView, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let data = lock_zone(&zone);
+        Ok(data.view())
+    }
+
+    fn put_zone(
+        &self,
+        origin: &Name,
+        meta: &ZoneMetaInput,
+        preconditions: &Preconditions,
+    ) -> Result<WriteOutcome<ZoneView>, AdminError> {
+        if origin == &Name::root() || origin.labels().any(|label| label == b"*") {
+            return Err(AdminError::invariant(
+                "/origin",
+                "invalid-origin",
+                "zone origin must be a non-root name without wildcards",
+            ));
+        }
+        let key = Self::zone_key(origin);
+        {
+            let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
+            if let Some(zone) = catalog.get(&key) {
+                let mut data = lock_zone(zone);
+                let view = self.replace_zone(&mut data, meta, preconditions)?;
+                return Ok(WriteOutcome::Updated(view));
+            }
+        }
+        check_create(preconditions)?;
+        let mut catalog = self.catalog.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(zone) = catalog.get(&key) {
+            let mut data = lock_zone(zone);
+            let view = self.replace_zone(&mut data, meta, preconditions)?;
+            return Ok(WriteOutcome::Updated(view));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let txn = self.next_txn();
+        let now = std::time::SystemTime::now();
+        let data = ZoneData {
+            id: ZoneId::new(id),
+            origin: origin.clone(),
+            kind: meta.kind,
+            serial: Serial::new(1),
+            version: 1,
+            txn,
+            default_ttl: meta.default_ttl,
+            denial: meta.denial,
+            rrsets: BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let view = data.view();
+        catalog.insert(key, Arc::new(Mutex::new(data)));
+        Ok(WriteOutcome::Created(view))
+    }
+
+    fn delete_zone(&self, origin: &Name, preconditions: &Preconditions) -> Result<(), AdminError> {
+        let key = Self::zone_key(origin);
+        let mut catalog = self.catalog.write().unwrap_or_else(PoisonError::into_inner);
+        let zone = catalog
+            .get(&key)
+            .cloned()
+            .ok_or_else(AdminError::zone_not_found)?;
+        {
+            let data = lock_zone(&zone);
+            check_existing(preconditions, &data.etag(), data.version)?;
+        }
+        catalog.remove(&key);
+        Ok(())
+    }
+
+    fn list_rrsets(&self, origin: &Name, query: &ListRrsets) -> Result<RrsetPage, AdminError> {
+        let limit = if query.limit == 0 {
+            50
+        } else {
+            query.limit.min(500)
+        };
+        let cursor = match query.cursor.as_deref() {
+            Some(cursor) => Some(decode_rrset_cursor(cursor)?),
+            None => None,
+        };
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let data = lock_zone(&zone);
+        let mut items = Vec::new();
+        let mut has_more = false;
+        for (key, record) in &data.rrsets {
+            let owner = record.rrset.owner();
+            if query.owner.as_ref().is_some_and(|wanted| wanted != owner) {
+                continue;
+            }
+            if query
+                .owner_suffix
+                .as_ref()
+                .is_some_and(|suffix| !owner.is_subdomain_of(suffix))
+            {
+                continue;
+            }
+            if !query.types.is_empty() && !query.types.contains(&record.rrset.rr_type()) {
+                continue;
+            }
+            if let Some((cursor_owner, cursor_type)) = &cursor {
+                let key_owner = key.0.as_str();
+                if key_owner < cursor_owner.as_str()
+                    || (key_owner == cursor_owner.as_str() && key.1 <= *cursor_type)
+                {
+                    continue;
+                }
+            }
+            if items.len() >= limit as usize {
+                has_more = true;
+                break;
+            }
+            items.push(rrset_view(&data, record));
+        }
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(|rrset| encode_rrset_cursor(&rrset.owner, rrset.rr_type))
+        } else {
+            None
+        };
+        Ok(RrsetPage {
+            items,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    fn get_rrset(
+        &self,
+        origin: &Name,
+        owner: &Name,
+        rr_type: Rtype,
+    ) -> Result<RrsetView, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let data = lock_zone(&zone);
+        let key = Self::rrset_key(owner, rr_type);
+        let record = data
+            .rrsets
+            .get(&key)
+            .ok_or_else(AdminError::rrset_not_found)?;
+        Ok(rrset_view(&data, record))
+    }
+
+    fn put_rrset(
+        &self,
+        origin: &Name,
+        owner: &Name,
+        rr_type: Rtype,
+        input: &RrsetInput,
+        preconditions: &Preconditions,
+    ) -> Result<WriteOutcome<RrsetView>, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let mut data = lock_zone(&zone);
+        self.check_writable(&data)?;
+        self.validate_type(&data, owner, rr_type)?;
+        self.check_owner_conflicts(&data, owner, rr_type)?;
+        let rrset = Rrset::new(
+            owner.clone(),
+            rr_type,
+            Rclass::IN,
+            input.ttl,
+            input.rdata.iter().cloned(),
+        )
+        .map_err(map_rrset_error)?;
+        let key = Self::rrset_key(owner, rr_type);
+        let existed = data.rrsets.contains_key(&key);
+        if let Some(current) = data.rrsets.get(&key) {
+            check_existing(preconditions, &current.etag, data.version)?;
+        } else {
+            check_create(preconditions)?;
+        }
+        let now = std::time::SystemTime::now();
+        let etag = rrset_etag(&rrset);
+        data.rrsets.insert(
+            key,
+            RrsetRecord {
+                rrset,
+                etag,
+                updated_at: now,
+            },
+        );
+        data.serial = data.serial.succ();
+        data.version = data.version.saturating_add(1);
+        data.txn = self.next_txn();
+        data.updated_at = now;
+        let record = data
+            .rrsets
+            .get(&Self::rrset_key(owner, rr_type))
+            .ok_or(AdminError::Internal)?;
+        let view = rrset_view(&data, record);
+        if existed {
+            Ok(WriteOutcome::Updated(view))
+        } else {
+            Ok(WriteOutcome::Created(view))
+        }
+    }
+
+    fn patch_rrset(
+        &self,
+        origin: &Name,
+        owner: &Name,
+        rr_type: Rtype,
+        patch: &RrsetPatch,
+        preconditions: &Preconditions,
+    ) -> Result<RrsetPatchOutcome, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let mut data = lock_zone(&zone);
+        self.check_writable(&data)?;
+        let key = Self::rrset_key(owner, rr_type);
+        let current = data
+            .rrsets
+            .get(&key)
+            .ok_or_else(AdminError::rrset_not_found)?;
+        check_existing(preconditions, &current.etag, data.version)?;
+        let ttl = patch.ttl.unwrap_or(current.rrset.ttl());
+        let current_set: BTreeSet<Rdata> = current.rrset.rdatas().iter().cloned().collect();
+        let remove_set: BTreeSet<Rdata> = patch.remove.iter().cloned().collect();
+        let add_set: BTreeSet<Rdata> = patch.add.iter().cloned().collect();
+        let mut next_set = current_set.clone();
+        for record in &remove_set {
+            next_set.remove(record);
+        }
+        let removed = current_set.len().saturating_sub(
+            current_set
+                .iter()
+                .filter(|record| !remove_set.contains(*record))
+                .count(),
+        );
+        let added = add_set
+            .iter()
+            .filter(|record| !current_set.contains(*record))
+            .count();
+        for record in &add_set {
+            next_set.insert(record.clone());
+        }
+        let now = std::time::SystemTime::now();
+        if next_set.is_empty() {
+            data.rrsets.remove(&key);
+            data.serial = data.serial.succ();
+            data.version = data.version.saturating_add(1);
+            data.txn = self.next_txn();
+            data.updated_at = now;
+            return Ok(RrsetPatchOutcome::Deleted {
+                removed: u32::try_from(removed).unwrap_or(u32::MAX),
+            });
+        }
+        let rrset = Rrset::new(owner.clone(), rr_type, Rclass::IN, ttl, next_set)
+            .map_err(map_rrset_error)?;
+        let etag = rrset_etag(&rrset);
+        data.rrsets.insert(
+            key,
+            RrsetRecord {
+                rrset,
+                etag,
+                updated_at: now,
+            },
+        );
+        data.serial = data.serial.succ();
+        data.version = data.version.saturating_add(1);
+        data.txn = self.next_txn();
+        data.updated_at = now;
+        let record = data
+            .rrsets
+            .get(&Self::rrset_key(owner, rr_type))
+            .ok_or(AdminError::Internal)?;
+        Ok(RrsetPatchOutcome::Updated {
+            rrset: rrset_view(&data, record),
+            added: u32::try_from(added).unwrap_or(u32::MAX),
+            removed: u32::try_from(removed).unwrap_or(u32::MAX),
+        })
+    }
+
+    fn delete_rrset(
+        &self,
+        origin: &Name,
+        owner: &Name,
+        rr_type: Rtype,
+        preconditions: &Preconditions,
+    ) -> Result<(), AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let mut data = lock_zone(&zone);
+        self.check_writable(&data)?;
+        let key = Self::rrset_key(owner, rr_type);
+        let current = data
+            .rrsets
+            .get(&key)
+            .ok_or_else(AdminError::rrset_not_found)?;
+        check_existing(preconditions, &current.etag, data.version)?;
+        data.rrsets.remove(&key);
+        data.serial = data.serial.succ();
+        data.version = data.version.saturating_add(1);
+        data.txn = self.next_txn();
+        data.updated_at = std::time::SystemTime::now();
+        Ok(())
+    }
+
+    fn get_settings(&self, origin: &Name) -> Result<ZoneSettingsView, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let data = lock_zone(&zone);
+        Ok(data.settings_view())
+    }
+
+    fn patch_settings(
+        &self,
+        origin: &Name,
+        patch: &ZoneSettingsPatch,
+        preconditions: &Preconditions,
+    ) -> Result<ZoneSettingsView, AdminError> {
+        if patch.is_empty() {
+            return Err(AdminError::InvariantViolation(InvariantViolation::single(
+                "/",
+                "validation-failed",
+                "at least one setting must be provided",
+            )));
+        }
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let mut data = lock_zone(&zone);
+        check_existing(preconditions, &data.etag(), data.version)?;
+        if let Some(default_ttl) = patch.default_ttl {
+            data.default_ttl = default_ttl;
+        }
+        if let Some(denial) = patch.denial {
+            data.denial = denial;
+        }
+        data.version = data.version.saturating_add(1);
+        data.txn = self.next_txn();
+        data.updated_at = std::time::SystemTime::now();
+        Ok(data.settings_view())
+    }
+}
+
+fn encode_zone_cursor(id: ZoneId) -> String {
+    base64url::encode(id.as_u32().to_string().as_bytes())
+}
+
+fn decode_zone_cursor(cursor: &str) -> Result<u32, AdminError> {
+    let bytes = base64url::decode(cursor).ok_or(AdminError::InvalidCursor)?;
+    let text = String::from_utf8(bytes).map_err(|_| AdminError::InvalidCursor)?;
+    text.parse::<u32>().map_err(|_| AdminError::InvalidCursor)
+}
+
+fn encode_rrset_cursor(owner: &Name, rr_type: Rtype) -> String {
+    let payload = format!("{}\u{0}{}", owner, rr_type.as_u16());
+    base64url::encode(payload.as_bytes())
+}
+
+fn decode_rrset_cursor(cursor: &str) -> Result<(String, u16), AdminError> {
+    let bytes = base64url::decode(cursor).ok_or(AdminError::InvalidCursor)?;
+    let text = String::from_utf8(bytes).map_err(|_| AdminError::InvalidCursor)?;
+    let (owner, rr_type) = text.split_once('\u{0}').ok_or(AdminError::InvalidCursor)?;
+    let rr_type = rr_type
+        .parse::<u16>()
+        .map_err(|_| AdminError::InvalidCursor)?;
+    Ok((owner.to_owned(), rr_type))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use pulse_dns::{Name, Rdata, Rtype, Ttl};
+
+    use super::*;
+    use crate::port::AllowAll;
+
+    fn origin() -> Name {
+        Name::parse("example.com.").unwrap()
+    }
+
+    fn meta() -> ZoneMetaInput {
+        ZoneMetaInput {
+            kind: ZoneKind::Primary,
+            default_ttl: Ttl::new(3600).unwrap(),
+            denial: Denial::Nsec,
+        }
+    }
+
+    fn store_with_zone() -> (InMemoryZoneAdmin, String) {
+        let store = InMemoryZoneAdmin::new();
+        let created = store
+            .put_zone(&origin(), &meta(), &Preconditions::none())
+            .unwrap();
+        let etag = created.value().etag.clone();
+        (store, etag)
+    }
+
+    fn a_record(address: &str) -> Rdata {
+        Rdata::A(address.parse().unwrap())
+    }
+
+    #[test]
+    fn zone_lifecycle() {
+        let (store, etag) = store_with_zone();
+        assert!(store.get_zone(&origin()).is_ok());
+        assert!(matches!(
+            store.put_zone(&origin(), &meta(), &Preconditions::none()),
+            Err(AdminError::PreconditionRequired)
+        ));
+        let replaced = store
+            .put_zone(&origin(), &meta(), &Preconditions::if_match(&etag))
+            .unwrap();
+        assert!(!replaced.is_created());
+        let new_etag = replaced.value().etag.clone();
+        store
+            .delete_zone(&origin(), &Preconditions::if_match(&new_etag))
+            .unwrap();
+        assert!(matches!(
+            store.get_zone(&origin()),
+            Err(AdminError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn rrset_crud_and_patch() {
+        let (store, zone_etag) = store_with_zone();
+        let owner = Name::parse("www.example.com.").unwrap();
+        let input = RrsetInput {
+            ttl: Ttl::new(300).unwrap(),
+            rdata: vec![a_record("192.0.2.10")],
+        };
+        let created = store
+            .put_rrset(&origin(), &owner, Rtype::A, &input, &Preconditions::none())
+            .unwrap();
+        let etag = created.value().etag.clone();
+        let updated = store
+            .put_rrset(
+                &origin(),
+                &owner,
+                Rtype::A,
+                &RrsetInput {
+                    ttl: Ttl::new(300).unwrap(),
+                    rdata: vec![a_record("192.0.2.10"), a_record("192.0.2.11")],
+                },
+                &Preconditions::if_match(&etag),
+            )
+            .unwrap();
+        assert_eq!(updated.value().rdata.len(), 2);
+        let etag = updated.value().etag.clone();
+        let patched = store
+            .patch_rrset(
+                &origin(),
+                &owner,
+                Rtype::A,
+                &RrsetPatch {
+                    ttl: Some(Ttl::new(600).unwrap()),
+                    add: vec![a_record("192.0.2.12")],
+                    remove: vec![a_record("192.0.2.10")],
+                },
+                &Preconditions::if_match(&etag),
+            )
+            .unwrap();
+        let RrsetPatchOutcome::Updated {
+            rrset,
+            added,
+            removed,
+        } = patched
+        else {
+            panic!("expected updated");
+        };
+        assert_eq!(added, 1);
+        assert_eq!(removed, 1);
+        assert_eq!(rrset.ttl, Ttl::new(600).unwrap());
+        assert_eq!(rrset.rdata.len(), 2);
+        let etag = rrset.etag.clone();
+        let outcome = store
+            .patch_rrset(
+                &origin(),
+                &owner,
+                Rtype::A,
+                &RrsetPatch {
+                    ttl: None,
+                    add: Vec::new(),
+                    remove: rrset.rdata.clone(),
+                },
+                &Preconditions::if_match(&etag),
+            )
+            .unwrap();
+        assert!(matches!(outcome, RrsetPatchOutcome::Deleted { removed: 2 }));
+        assert!(matches!(
+            store.get_rrset(&origin(), &owner, Rtype::A),
+            Err(AdminError::NotFound(_))
+        ));
+        let _ = zone_etag;
+    }
+
+    #[test]
+    fn conditional_write_is_atomic() {
+        let (store, _) = store_with_zone();
+        let owner = Name::parse("www.example.com.").unwrap();
+        let input = RrsetInput {
+            ttl: Ttl::new(300).unwrap(),
+            rdata: vec![a_record("192.0.2.10")],
+        };
+        let created = store
+            .put_rrset(&origin(), &owner, Rtype::A, &input, &Preconditions::none())
+            .unwrap();
+        let etag = created.value().etag.clone();
+        let store = Arc::new(store);
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for address in ["192.0.2.20", "192.0.2.21"] {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let etag = etag.clone();
+            let owner = owner.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.put_rrset(
+                    &origin(),
+                    &owner,
+                    Rtype::A,
+                    &RrsetInput {
+                        ttl: Ttl::new(300).unwrap(),
+                        rdata: vec![a_record(address)],
+                    },
+                    &Preconditions::if_match(&etag),
+                )
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let ok = results.iter().filter(|result| result.is_ok()).count();
+        let failed = results
+            .iter()
+            .filter(|result| matches!(result, Err(AdminError::PreconditionFailed { .. })))
+            .count();
+        assert_eq!((ok, failed), (1, 1));
+    }
+
+    #[test]
+    fn pagination_and_allowlist() {
+        let store = InMemoryZoneAdmin::new();
+        for name in ["a.example.", "b.example.", "c.example."] {
+            store
+                .put_zone(&Name::parse(name).unwrap(), &meta(), &Preconditions::none())
+                .unwrap();
+        }
+        let scope = crate::auth::ZoneScope::parse(&["*.example.".to_owned()]).unwrap();
+        let first = store
+            .list_zones(
+                &ListZones {
+                    limit: 2,
+                    cursor: None,
+                    kind: None,
+                },
+                &scope,
+            )
+            .unwrap();
+        assert_eq!(first.items.len(), 2);
+        assert!(first.has_more);
+        let second = store
+            .list_zones(
+                &ListZones {
+                    limit: 2,
+                    cursor: first.next_cursor.clone(),
+                    kind: None,
+                },
+                &scope,
+            )
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert!(!second.has_more);
+        let all = store
+            .list_zones(
+                &ListZones {
+                    limit: 10,
+                    cursor: None,
+                    kind: None,
+                },
+                &AllowAll,
+            )
+            .unwrap();
+        assert_eq!(all.items.len(), 3);
+    }
+
+    #[test]
+    fn cname_conflict_rejected() {
+        let (store, _) = store_with_zone();
+        let owner = Name::parse("alias.example.com.").unwrap();
+        let cname = RrsetInput {
+            ttl: Ttl::new(300).unwrap(),
+            rdata: vec![Rdata::Cname(Name::parse("target.example.com.").unwrap())],
+        };
+        store
+            .put_rrset(
+                &origin(),
+                &owner,
+                Rtype::CNAME,
+                &cname,
+                &Preconditions::none(),
+            )
+            .unwrap();
+        let error = store
+            .put_rrset(
+                &origin(),
+                &owner,
+                Rtype::A,
+                &RrsetInput {
+                    ttl: Ttl::new(300).unwrap(),
+                    rdata: vec![a_record("192.0.2.1")],
+                },
+                &Preconditions::none(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, AdminError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn delete_last_removes_rrset_and_etag_isolated() {
+        let (store, _) = store_with_zone();
+        let first = Name::parse("a.example.com.").unwrap();
+        let second = Name::parse("b.example.com.").unwrap();
+        let input = |address: &str| RrsetInput {
+            ttl: Ttl::new(300).unwrap(),
+            rdata: vec![a_record(address)],
+        };
+        store
+            .put_rrset(
+                &origin(),
+                &first,
+                Rtype::A,
+                &input("192.0.2.1"),
+                &Preconditions::none(),
+            )
+            .unwrap();
+        let second_view = store
+            .put_rrset(
+                &origin(),
+                &second,
+                Rtype::A,
+                &input("192.0.2.2"),
+                &Preconditions::none(),
+            )
+            .unwrap();
+        let second_etag = second_view.value().etag.clone();
+        assert_eq!(
+            store.get_rrset(&origin(), &second, Rtype::A).unwrap().etag,
+            second_etag
+        );
+        store
+            .put_rrset(
+                &origin(),
+                &first,
+                Rtype::A,
+                &input("192.0.2.3"),
+                &Preconditions::if_match(
+                    &store.get_rrset(&origin(), &first, Rtype::A).unwrap().etag,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_rrset(&origin(), &second, Rtype::A).unwrap().etag,
+            second_etag
+        );
+    }
+}
