@@ -135,6 +135,19 @@ impl TlsConfig {
         Self::from_pem(cert_pem, key_pem, &[b"doq"])
     }
 
+    /// Конфигурация для DoH/HTTP/3 (ALPN `h3`, RFC 9114/8484).
+    ///
+    /// QUIC требует TLS 1.3; ранние данные (0-RTT) не включаются.
+    /// Для quinn используйте [`TlsConfig::quic_server_config`].
+    ///
+    /// # Errors
+    ///
+    /// См. [`TlsConfig::from_pem`].
+    #[cfg(feature = "http3")]
+    pub fn for_doh3(cert_pem: &[u8], key_pem: &[u8]) -> Result<Self, Error> {
+        Self::from_pem(cert_pem, key_pem, &[b"h3"])
+    }
+
     /// Собирает QUIC-конфигурацию quinn из текущей rustls-пары и ALPN.
     ///
     /// 0-RTT не включается: `max_early_data_size` равен нулю. Транспортные
@@ -145,7 +158,7 @@ impl TlsConfig {
     ///
     /// [`Error::Quic`], если rustls-конфигурация несовместима с QUIC
     /// (например, отключён TLS 1.3 или нет TLS 1.3 cipher suite).
-    #[cfg(feature = "doq")]
+    #[cfg(any(feature = "doq", feature = "http3"))]
     pub fn quic_server_config(
         &self,
         transport: Arc<quinn::TransportConfig>,

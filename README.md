@@ -9,9 +9,10 @@
 параллельная запись v2 является основной), а
 также резолвер (`pulseresolved`) с
 forward/iterative-резолюцией, кешем, blocklist, overrides и DNSSEC-валидацией.
-Это не полный продукт из ТЗ (нет DoQ, полного RRL авторитетного сервера и
-т.д.). DoT, DoH (HTTP/1.1) и DNSCrypt v2 (авторитетный сервер) реализованы;
-резолвер умеет ходить в upstream по UDP, TCP, DoT и DoH/1.1.
+Это не полный продукт из ТЗ (нет полного RRL авторитетного сервера и
+т.д.). DoT, DoH (HTTP/1.1, HTTP/2 и HTTP/3), DoQ и DNSCrypt v2 (авторитетный
+сервер) реализованы; резолвер умеет ходить в upstream по UDP, TCP, DoT и
+DoH/1.1.
 
 ## Возможности
 
@@ -47,13 +48,14 @@ forward/iterative-резолюцией, кешем, blocklist, overrides и DNSS
   SOA-refresh, expire → SERVFAIL), DNSSEC-подпись в zonefile (NSEC или
   NSEC3), Dockerfile.
 - Защищённые транспорты `pulsed`: DoT (`dot_listen`, RFC 7858), DoH/1.1
-  (`doh_listen`, RFC 8484, ALPN `http/1.1`, только HTTP/1.1) и DNSCrypt v2 по
-  UDP (`dnscrypt_listen`) и TCP (`dnscrypt_tcp_listen`, 2-байтовый
-  length-prefix, несколько запросов на соединение), общий путь
-  `decode → QueryEngine (mmap) → encode`, TLS hot-reload по
-  `SIGHUP`/`tls_reload_secs`, IP/CIDR ACL и лимиты,
-  `pulsed dnscrypt-gencert` (ключи 0600, каталог 0700, TXT-записи), метрики
-  `dot_*`/`doh_*`/`dnscrypt_*`/`dnscrypt_tcp_*` в `/metrics`.
+  (`doh_listen`), DoH/2 (`doh_h2_listen`), DoH/3 (`doh3_listen`, RFC 9114,
+  ALPN `h3`, QUIC/TLS 1.3) и DNSCrypt v2 по UDP (`dnscrypt_listen`) и TCP
+  (`dnscrypt_tcp_listen`, 2-байтовый length-prefix, несколько запросов на
+  соединение), общий путь `decode → QueryEngine (mmap) → encode`, TLS
+  hot-reload по `SIGHUP`/`tls_reload_secs` (DoH/3 — новый `endpoint config`),
+  IP/CIDR ACL и лимиты, `pulsed dnscrypt-gencert` (ключи 0600, каталог 0700,
+  TXT-записи), метрики `dot_*`/`doh_*`/`doh_http2_*`/`doh_http3_*`/`doq_*`/
+  `dnscrypt_*` в `/metrics`.
 - Бинарник `pulseresolved`: forward/iterative-резолюция через `pulse-resolver`,
   UDP на `pulse-runtime` (N worker) и TCP с length-prefix, EDNS/TC, REFUSED
   для AXFR/IXFR, кеш, blocklist + overrides, DNSSEC-валидация (AD/SERVFAIL),
@@ -82,14 +84,14 @@ forward/iterative-резолюцией, кешем, blocklist, overrides и DNSS
 **Не реализовано (см. `STATUS.md`):** межпроцессная параллельная запись
 (N процессов; в v2.0 — один процесс-писатель, `LOCK_EX`); WAL/journal для
 внутренних write-through путей (import/secondary/DNSSEC; REST-мутации
-журналируются); DoQ; NSEC3 для secondary-зон; HTTP/2/3 для DoH (только
-HTTP/1.1); 0x20 echo; TLS для REST API, control-plane резолвера и метрик
-(только loopback); DNS Cookies и
+журналируются); NSEC3 для secondary-зон; 0x20 echo; TLS для REST API,
+control-plane резолвера и метрик (только loopback); DNS Cookies и
 RRL авторитетного сервера (`pulsed`; у резолвера RRL есть); REST —
 MVP-подмножество спецификации; loom в CI. NSEC3 Opt-Out, автоматическая
 ротация ключей (`pulsed`) и RFC 5011 в резолвере реализованы. У резолвера нет
 DoQ и HTTP/2/3 для DoH-апстримов; upstream DoH — HTTP/1.1 с пулом
-keep-alive соединений (по умолчанию 4).
+keep-alive соединений (по умолчанию 4). HTTP/3 используется только для DoH:
+WebTransport, server push, datagrams и 0-RTT выключены.
 
 ## Архитектура
 
@@ -102,11 +104,11 @@ keep-alive соединений (по умолчанию 4).
 | `pulse-zonefile` | Бинарный mmap-формат зон: reader, writer/commit, fsck, compact |
 | `pulse-runtime` | io_uring UDP-рантайм + epoll-фолбэк |
 | `pulse-server` | Авторитетный движок запросов |
-| `pulse-tls` | DNS over TLS (RFC 7858) и DNS over HTTPS/1.1 (RFC 8484): серверы и клиенты для upstream |
+| `pulse-tls` | DNS over TLS (RFC 7858), DoH/1.1 (RFC 8484), DoH/2 (`http2`), DoH/3 (`http3`, RFC 9114) и DoQ (`doq`): серверы и клиенты для upstream |
 | `pulse-dnscrypt` | DNSCrypt v2: сертификаты, сервер, клиент |
 | `pulse-api` | REST API управления зонами |
 | `pulse-resolver` | Кеширующий резолвер: forward/iterative, кеш, blocklist, overrides, DNSSEC |
-| `pulsed` | Бинарник сервера (UDP+TCP+DoT+DoH+DNSCrypt+REST) |
+| `pulsed` | Бинарник сервера (UDP+TCP+DoT+DoH/1.1-2-3+DoQ+DNSCrypt+REST) |
 | `pulseresolved` | Бинарник резолвера (UDP+TCP+DoT+DoH/1.1+DoH/2+DoQ+DNSCrypt+метрики+control-plane API) |
 
 Спецификации и решения: `docs/adr/`, `docs/spec/`, `docs/api/rest-v1.md`,
@@ -173,6 +175,13 @@ kdig @127.0.0.1 -p 8853 +tls +tls-ca=/tmp/pulsed-tls/cert.pem \
   +tls-hostname=localhost www.example.com. A
 kdig @127.0.0.1 -p 8443 +https +tls-ca=/tmp/pulsed-tls/cert.pem \
   +tls-hostname=localhost www.example.com. A
+kdig @127.0.0.1 -p 8444 +https +tls-ca=/tmp/pulsed-tls/cert.pem \
+  +tls-hostname=localhost www.example.com. A       # DoH/2 (ALPN h2)
+# DoH/3 (ALPN h3, QUIC): curl должен быть собран с HTTP/3
+curl --http3-only --cacert /tmp/pulsed-tls/cert.pem \
+  https://localhost:8445/healthz
+kdig @127.0.0.1 -p 8854 +quic +tls-ca=/tmp/pulsed-tls/cert.pem \
+  +tls-hostname=localhost www.example.com. A       # DoQ
 # DNSCrypt: клиент pulse-dnscrypt/dnscrypt-proxy, сертификат из
 # /tmp/pulsed-tls/dnscrypt-cert.json, TXT — /tmp/pulsed-tls/dnscrypt-cert.txt
 ```
@@ -374,9 +383,10 @@ cargo deny check
   `pulsed fsck --data <file> [--repair]` проверяет граф/пулы/утечки и
   изолирует повреждённые зоны; `map_size` задаётся при создании (по умолчанию
   4 GiB); до 4096 зон, страницы 4096 байт.
-- DoT/DoH работают синхронно (поток на соединение), DoH — только HTTP/1.1;
-  DNSCrypt UDP усекает большие ответы с `TC`, DNSCrypt TCP отдаёт их без
-  усечения; DNSCrypt TXT-запись публикуется вручную.
+- DoT/DoH/1.1 работают синхронно (поток на соединение), DoH/2 — h2, DoH/3 и
+  DoQ — QUIC (quinn); DoH/3 только серверный, без WebTransport/server push/
+  datagrams и 0-RTT; DNSCrypt UDP усекает большие ответы с `TC`, DNSCrypt TCP
+  отдаёт их без усечения; DNSCrypt TXT-запись публикуется вручную.
 - REST — MVP-подмножество спецификации; API доступен только на loopback (без TLS).
 - DNSSEC: NSEC и NSEC3 (SHA-1, Opt-Out включается `nsec3_opt_out`),
   автоматическая ротация KSK/ZSK по RFC 7583 (`rotation`: pre-publish →

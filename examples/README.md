@@ -263,9 +263,10 @@ curl -sS -X POST -H "Authorization: Bearer $PULSED_API_TOKEN" \
 ## Защищённые транспорты: DoT, DoH/1.1 и DNSCrypt
 
 `pulsed` умеет одновременно обслуживать UDP/TCP, DNS-over-TLS (RFC 7858),
-DNS-over-HTTPS/1.1 (RFC 8484) и DNSCrypt v2 по UDP и TCP. Все они используют
-один и тот же путь ответа: `decode → QueryEngine (mmap snapshot) → encode`,
-поэтому данные из `--data` и REST-правки видны сразу на всех транспортах.
+DNS-over-HTTPS/1.1-2-3 (RFC 8484 + RFC 9113/9114), DNS-over-QUIC (RFC 9250)
+и DNSCrypt v2 по UDP и TCP. Все они используют один и тот же путь ответа:
+`decode → QueryEngine (mmap snapshot) → encode`, поэтому данные из `--data` и
+REST-правки видны сразу на всех транспортах.
 
 Пример конфигурации — `examples/transports.toml` (JSON-эквивалент —
 `examples/transports.json`):
@@ -277,6 +278,7 @@ zonefile = "/tmp/pulse-dns.zonefile"
 dot_listen = "127.0.0.1:8853"
 doh_listen = "127.0.0.1:8443"
 doh_h2_listen = "127.0.0.1:8444"
+doh3_listen = "127.0.0.1:8445"
 doq_listen = "127.0.0.1:8854"
 tls_cert = "/tmp/pulsed-tls/cert.pem"
 tls_key = "/tmp/pulsed-tls/key.pem"
@@ -290,7 +292,8 @@ dnscrypt_cert = "/tmp/pulsed-tls/dnscrypt-cert.json"
 dnscrypt_provider_name = "2.dnscrypt-cert.example.com."
 ```
 
-`dot_listen`/`doh_listen` требуют **оба** `tls_cert` и `tls_key`; при
+`dot_listen`/`doh_listen`/`doh_h2_listen`/`doh3_listen`/`doq_listen` требуют
+**оба** `tls_cert` и `tls_key`; при
 `dnscrypt_listen`/`dnscrypt_tcp_listen` обязательны `dnscrypt_provider_key`,
 `dnscrypt_resolver_key` и `dnscrypt_cert`. Приватные ключи должны иметь режим
 `0600` (иначе запуск завершается ошибкой), секреты не попадают в логи и
@@ -319,8 +322,9 @@ chmod 600 /tmp/pulsed-tls/key.pem
 
 Сертификат перечитывается для **новых** соединений по `SIGHUP` или каждые
 `tls_reload_secs` секунд; уже открытые TLS-сессии продолжают работать со старой
-парой. ALPN: `dot` для DoT и `http/1.1` для DoH (HTTP/2 и HTTP/3 не
-поддерживаются: preface HTTP/2 получает `505`).
+парой. ALPN: `dot` для DoT, `http/1.1` для DoH/1.1, `h2` для DoH/2, `h3` для
+DoH/3, `doq` для DoQ. DoH/3 и DoQ применяют новый сертификат к новым
+QUIC-соединениям через `endpoint.set_server_config`; 0-RTT выключен.
 
 ```bash
 kill -HUP "$(pgrep pulsed)"   # перечитать cert.pem/key.pem
@@ -333,10 +337,17 @@ kdig @127.0.0.1 -p 8853 +tls +tls-ca=/tmp/pulsed-tls/cert.pem \
   +tls-hostname=localhost www.example.com. A
 kdig @127.0.0.1 -p 8443 +https +tls-ca=/tmp/pulsed-tls/cert.pem \
   +tls-hostname=localhost www.example.com. A
+kdig @127.0.0.1 -p 8444 +https +tls-ca=/tmp/pulsed-tls/cert.pem \
+  +tls-hostname=localhost www.example.com. A       # DoH/2
+kdig @127.0.0.1 -p 8854 +quic +tls-ca=/tmp/pulsed-tls/cert.pem \
+  +tls-hostname=localhost www.example.com. A       # DoQ
+# DoH/3: нужен клиент с HTTP/3 (например, curl --http3-only)
+curl -sS --http3-only --cacert /tmp/pulsed-tls/cert.pem \
+  https://localhost:8445/healthz
 ```
 
-DoH также можно проверить `curl` (только HTTP/1.1, POST
-`application/dns-message`):
+DoH/1.1 также можно проверить `curl` (POST `application/dns-message`):
+DoH/3 проверяется тем же запросом с `--http3-only` на порту `doh3_listen`.
 
 ```bash
 # 33-байтовый запрос A www.example.com. (ID 0x1234)
@@ -350,7 +361,9 @@ curl -sS --http1.1 --cacert /tmp/pulsed-tls/cert.pem \
 ```
 
 ACL `tls_allow_from` (IP/CIDR) и лимиты `dot_max_connections`/
-`doh_max_connections` действуют только на настроенных адресах.
+`doh_max_connections`/`doh3_max_connections` действуют только на настроенных
+адресах; у DoH/3 также есть `doh3_max_concurrent_requests` (на соединение) и
+`doh3_idle_timeout_ms`.
 
 ### DNSCrypt: ключи, сертификат и TXT
 
@@ -394,7 +407,8 @@ curl -sS -H "Authorization: Bearer $PULSED_API_TOKEN" \
 
 Префиксы: `dot_*` (connections, handshakes, queries, responses, bytes,
 errors), `doh_*` (то же + `doh_http_requests_total`/`doh_http_errors_total`),
-`dnscrypt_*` (packets, queries, responses, errors, dropped),
+`doh_http2_*`, `doh_http3_*`, `doq_*`, `dnscrypt_*` (packets, queries,
+responses, errors, dropped),
 `pulsed_tls_reload_total`/`pulsed_tls_reload_errors_total`.
 
 ## Primary + secondary (AXFR/IXFR, TSIG, NOTIFY)

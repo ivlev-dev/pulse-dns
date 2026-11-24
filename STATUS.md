@@ -41,9 +41,9 @@
 | `pulse-server` | авторитетный движок: NXDOMAIN/NODATA/ENT, wildcard/closest encloser, CNAME/DNAME, делегация/glue/DS, EDNS/BADVERS, TC, ANY по RFC 8482, детерминированный additional |
 | `pulse-resolver` | library: forward/iterative, кеш + negative caching, blocklist/allowlist/overrides, DNSSEC AD/BOGUS→SERVFAIL, UDP/TCP + upstream DoT/DoH с failover/cooldown, пул keep-alive соединений (`pool_size`, default 4, in-flight лимит, reconnect backoff), смешанные upstream |
 | `pulseresolved` | binary резолвер: TOML-конфиг (JSON — совместимость), UDP/TCP, серверные DoT/DoH/1.1/DoH/2/DoQ/DNSCrypt v2 (UDP+TCP), ACL клиентов (default loopback, отдельный `tls_allow_from`), per-source rate limit, полный RRL (`noerror`/`nxdomain`/`referral`/`error`, per-source + per-name, slip, refused/drop/truncate; только UDP), пул DoT/DoH, смешанные upstream (UDP/TCP/DoT/DoH), кеш, blocklist, overrides, DNSSEC, SIGHUP (blocklist + TLS-пара), `/metrics` по транспортам, `/healthz`, control-plane REST API (`control_listen`, bearer-token, cache/blocklist/upstreams/trust-anchors/RRL/config, RFC 9457 problem+json, `X-Request-Id`, rate limit на токен, graceful shutdown) |
-| `pulse-tls` | DoT (RFC 7858), DoH/1.1 (RFC 8484), DoH/2 (`http2`) и DoQ (`doq`) на rustls/quinn: серверы и клиенты (webpki-roots/CA, ALPN, keep-alive) |
+| `pulse-tls` | DoT (RFC 7858), DoH/1.1 (RFC 8484), DoH/2 (`http2`), DoH/3 (`http3`, RFC 9114) и DoQ (`doq`) на rustls/quinn/h3: серверы и клиенты (webpki-roots/CA, ALPN, keep-alive) |
 | `pulse-api` | REST MVP: health/ready/metrics/OpenAPI, zones CRUD, RRset CRUD/PATCH, settings, bearer-auth + scopes + per-zone allowlist, ETag/If-Match, RFC 9457 problem+json, Idempotency-Key, пагинация, лимиты; write-ahead journal (outbox) мутаций: CRC/seq, fsync, crash-recovery, compaction, `journal_*` метрики |
-| `pulsed` | binary: TOML-конфиг (JSON — совместимость) с CLI-overrides, UDP+TCP+DoT+DoH (HTTP/1.1)+DNSCrypt v2 (UDP/TCP)+REST, зоны только в `pulse-zonefile` v2 (`--data`), DNS отвечает из mmap, импорт `.zone`, `convert` v1→v2, per-zone/group commit, AXFR/IXFR-out, NOTIFY, secondary-зоны, DNSSEC-подпись NSEC/NSEC3, journal REST-мутаций с recovery на старте (`journal = true` по умолчанию), graceful shutdown, Dockerfile |
+| `pulsed` | binary: TOML-конфиг (JSON — совместимость) с CLI-overrides, UDP+TCP+DoT+DoH/1.1+DoH/2+DoH/3+DoQ+DNSCrypt v2 (UDP/TCP)+REST, зоны только в `pulse-zonefile` v2 (`--data`), DNS отвечает из mmap, импорт `.zone`, `convert` v1→v2, per-zone/group commit, AXFR/IXFR-out, NOTIFY, secondary-зоны, DNSSEC-подпись NSEC/NSEC3, journal REST-мутаций с recovery на старте (`journal = true` по умолчанию), graceful shutdown, Dockerfile |
 
 ## Проверено руками
 
@@ -61,14 +61,15 @@
   `/keys` отдаёт стадии ключей; RFC 5011 add/revoke hold-down, откат
   кандидатов и `0600`-состояние; secondary AXFR-in → ответы из mmap → рестарт.
 - Защищённые транспорты: реальные клиенты получают A-ответ по DoT, DoH POST/GET
-  и DNSCrypt UDP/TCP; транспорты работают параллельно на разных портах;
-  неверный provider-ключ и испорченный сертификат отклоняются; большие ответы
-  DoT/DoH/DNSCrypt TCP не усекаются, DNSCrypt UDP отдаёт `TC`; TLS hot-reload
-  меняет сертификат для новых соединений; graceful shutdown закрывает порты;
+  (HTTP/1.1, HTTP/2 и HTTP/3), DoQ и DNSCrypt UDP/TCP; транспорты работают
+  параллельно на разных портах; неверный provider-ключ и испорченный
+  сертификат отклоняются; большие ответы DoT/DoH/DoQ не усекаются, DNSCrypt
+  UDP отдаёт `TC`; TLS hot-reload меняет сертификат для новых соединений
+  (DoH/3 — новый QUIC `endpoint config`); graceful shutdown закрывает порты;
   DNSCrypt TCP держит несколько запросов на соединении и idle timeout;
   `dnscrypt-gencert` создаёт файлы 0600/0700, не печатает секреты и не
   перезаписывает их без `--force`; `/metrics` содержит `dot_*`/`doh_*`/
-  `dnscrypt_*`/`dnscrypt_tcp_*`.
+  `doh_http3_*`/`doq_*`/`dnscrypt_*`/`dnscrypt_tcp_*`.
 - REST-сценарий: PUT зоны → SOA/NS/A → UDP отвечает → PATCH → ответ меняется →
   DELETE → NODATA/REFUSED.
 - Резолвер (`pulseresolved`) защищённые транспорты: реальные клиенты получают
@@ -138,8 +139,10 @@
 - DNSSEC: NSEC3 для secondary-зон не генерируется; ротация ключей и RFC 5011
   реализованы (см. «Готово»), но для secondary-зон ключи не ротируются
   автоматически.
-- DoH/3 не реализован; DoH/2 и DoQ доступны в `pulse-tls`, `pulsed`
-  (`doh_h2_listen`/`doq_listen`) и `pulseresolved` (`doh2_listen`/`doq_listen`).
+- DoH/3 реализован для `pulse-tls`/`pulsed` (`doh3_listen`, feature `http3`);
+  у `pulseresolved` серверный DoH/3 и upstream HTTP/3 пока не включены
+  (`doh2_listen`/`doq_listen` есть). HTTP/3 только для DoH: WebTransport,
+  server push, datagrams и 0-RTT выключены.
 - Резолвер: upstream DoH только HTTP/1.1; пул keep-alive соединений
   DoT/DoH (`upstream_pool.pool_size`, по умолчанию 4) с cooldown/backoff и
   лимитом in-flight; RRL резолвера по классам ответов есть (`rrl`, slip),

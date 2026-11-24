@@ -9,6 +9,7 @@
   "dot_listen": "127.0.0.1:8853",
   "doh_listen": "127.0.0.1:8443",
   "doh_h2_listen": "127.0.0.1:8444",
+  "doh3_listen": "127.0.0.1:8445",
   "doq_listen": "127.0.0.1:8854",
   "tls_cert": "/tmp/pulsed-tls/cert.pem",
   "tls_key": "/tmp/pulsed-tls/key.pem",

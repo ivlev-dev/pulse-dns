@@ -1,4 +1,4 @@
-//! Запуск и остановка DNS-транспортов (UDP/TCP/DoT/DoH/DNSCrypt) и
+//! Запуск и остановка DNS-транспортов (UDP/TCP/DoT/DoH/DoQ/DNSCrypt) и
 //! встроенного REST API.
 
 use std::fmt;
@@ -184,6 +184,7 @@ impl Server {
             dot: config.dot_listen.is_some(),
             doh: config.doh_listen.is_some(),
             doh_h2: config.doh_h2_listen.is_some(),
+            doh3: config.doh3_listen.is_some(),
             doq: config.doq_listen.is_some(),
             dnscrypt: config.dnscrypt_listen.is_some(),
             dnscrypt_tcp: config.dnscrypt_tcp_listen.is_some(),
@@ -310,6 +311,12 @@ impl Server {
         self.tls.as_ref().and_then(TlsTransports::doh_h2_addr)
     }
 
+    /// Фактический DoH/HTTP/3-адрес (полезен при `port = 0`).
+    #[must_use]
+    pub fn doh3_addr(&self) -> Option<SocketAddr> {
+        self.tls.as_ref().and_then(TlsTransports::doh3_addr)
+    }
+
     /// Фактический DoQ-адрес (полезен при `port = 0`).
     #[must_use]
     pub fn doq_addr(&self) -> Option<SocketAddr> {
@@ -346,6 +353,12 @@ impl Server {
     #[must_use]
     pub fn doh_h2_stats(&self) -> Option<pulse_tls::StatsSnapshot> {
         self.tls.as_ref().and_then(TlsTransports::doh_h2_stats)
+    }
+
+    /// Снимок счётчиков DoH/HTTP/3, если транспорт запущен.
+    #[must_use]
+    pub fn doh3_stats(&self) -> Option<pulse_tls::StatsSnapshot> {
+        self.tls.as_ref().and_then(TlsTransports::doh3_stats)
     }
 
     /// Снимок счётчиков DoQ, если транспорт запущен.

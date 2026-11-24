@@ -39,6 +39,7 @@ pub(crate) fn run() -> ExitCode {
         dot_listen: matches.get_one::<SocketAddr>("dot-listen").copied(),
         doh_listen: matches.get_one::<SocketAddr>("doh-listen").copied(),
         doh_h2_listen: matches.get_one::<SocketAddr>("doh-h2-listen").copied(),
+        doh3_listen: matches.get_one::<SocketAddr>("doh3-listen").copied(),
         doq_listen: matches.get_one::<SocketAddr>("doq-listen").copied(),
         tls_cert: matches.get_one::<PathBuf>("tls-cert").cloned(),
         tls_key: matches.get_one::<PathBuf>("tls-key").cloned(),
@@ -116,13 +117,14 @@ pub(crate) fn run() -> ExitCode {
     logging::info(
         "startup",
         &format!(
-            "pulsed {} listening: udp={:?} tcp={:?} dot={:?} doh={:?} doh_h2={:?} doq={:?} dnscrypt={:?} api={:?} workers={:?} backend={:?}",
+            "pulsed {} listening: udp={:?} tcp={:?} dot={:?} doh={:?} doh_h2={:?} doh3={:?} doq={:?} dnscrypt={:?} api={:?} workers={:?} backend={:?}",
             env!("CARGO_PKG_VERSION"),
             server.udp_addr(),
             server.tcp_addr(),
             server.dot_addr(),
             server.doh_addr(),
             server.doh_h2_addr(),
+            server.doh3_addr(),
             server.doq_addr(),
             server.dnscrypt_addr(),
             server.api_addr(),
@@ -153,6 +155,15 @@ pub(crate) fn run() -> ExitCode {
             "doh_h2",
             &format!(
                 "DoH enabled (HTTP/2, ALPN h2): connections={} active={}",
+                stats.connections, stats.active_connections
+            ),
+        );
+    }
+    if let Some(stats) = server.doh3_stats() {
+        logging::info(
+            "doh3",
+            &format!(
+                "DoH enabled (HTTP/3, ALPN h3, QUIC/TLS 1.3): connections={} active={}",
                 stats.connections, stats.active_connections
             ),
         );
@@ -223,6 +234,7 @@ pub(crate) fn run() -> ExitCode {
     let dot_snapshot = server.dot_stats();
     let doh_snapshot = server.doh_stats();
     let doh_h2_snapshot = server.doh_h2_stats();
+    let doh3_snapshot = server.doh3_stats();
     let doq_snapshot = server.doq_stats();
     let dnscrypt_snapshot = server.dnscrypt_stats();
     let shutdown_result = server.shutdown();
@@ -310,6 +322,20 @@ pub(crate) fn run() -> ExitCode {
             ),
         );
     }
+    if let Some(doh3) = doh3_snapshot {
+        logging::info(
+            "doh3_stats",
+            &format!(
+                "connections={} handshakes={} http_requests={} queries={} responses={} errors={}",
+                doh3.connections,
+                doh3.handshakes,
+                doh3.http_requests,
+                doh3.queries,
+                doh3.responses,
+                doh3.errors
+            ),
+        );
+    }
     if let Some(doq) = doq_snapshot {
         logging::info(
             "doq_stats",
@@ -346,6 +372,7 @@ fn reload_tls(server: &Server, source: &str) {
     if server.dot_addr().is_none()
         && server.doh_addr().is_none()
         && server.doh_h2_addr().is_none()
+        && server.doh3_addr().is_none()
         && server.doq_addr().is_none()
     {
         logging::warn(
@@ -795,7 +822,7 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
 fn command() -> Command {
     Command::new("pulsed")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("Authoritative DNS server: UDP/TCP, DoT, DoH/1.1, DNSCrypt, pulse-zonefile")
+        .about("Authoritative DNS server: UDP/TCP, DoT, DoH/1.1-2-3, DoQ, DNSCrypt, pulse-zonefile")
         .arg(
             Arg::new("config")
                 .long("config")
@@ -838,6 +865,13 @@ fn command() -> Command {
                 .value_name("ADDR")
                 .value_parser(value_parser!(SocketAddr))
                 .help("Enable DNS-over-HTTPS/2 (RFC 8484 + 9113), e.g. 0.0.0.0:443"),
+        )
+        .arg(
+            Arg::new("doh3-listen")
+                .long("doh3-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNS-over-HTTPS/3 over QUIC (RFC 8484 + 9114), e.g. 0.0.0.0:443"),
         )
         .arg(
             Arg::new("doq-listen")

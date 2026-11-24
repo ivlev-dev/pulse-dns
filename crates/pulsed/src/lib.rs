@@ -3,7 +3,7 @@
 //! Крейт является **composition root** для авторитетного процесса: читает
 //! TOML-настройки сервера (JSON — legacy), открывает `pulse-zonefile` (`--data`) как
 //! единственный источник истины зон, поднимает UDP (`pulse-runtime`,
-//! io_uring), TCP (std), DoT/DoH/1.1/DoH/2/DoQ (`pulse-tls`), DNSCrypt v2
+//! io_uring), TCP (std), DoT/DoH/1.1/DoH/2/DoH/3/DoQ (`pulse-tls`), DNSCrypt v2
 //! по UDP/TCP (`pulse-dnscrypt`) и опциональный REST API (`pulse-api`) и
 //! обслуживает `SIGTERM`/`SIGINT`/`SIGHUP`.
 //!
@@ -29,7 +29,7 @@
 //! - `dnssec` — загрузка ключей и DNSSEC-подпись зон в zonefile.
 //! - [`rotation`] — RFC 7583 ротация KSK/ZSK с персистентным состоянием.
 //! - `transfer` — AXFR/IXFR-out из zonefile, TSIG/ACL, IXFR-история и NOTIFY.
-//! - `tls` — DoT/DoH/1.1/DoH/2/DoQ-серверы и hot-reload сертификата.
+//! - `tls` — DoT/DoH/1.1/DoH/2/DoH/3/DoQ-серверы и hot-reload сертификата.
 //! - `dnscrypt` — DNSCrypt UDP, загрузка ключей и `dnscrypt-gencert`.
 //! - [`server`] — запуск и остановка DNS/API.
 //! - [`stats`] — атомарные счётчики без блокировок на горячем пути.

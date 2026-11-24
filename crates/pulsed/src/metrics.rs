@@ -20,6 +20,8 @@ pub(crate) struct EnabledTransports {
     pub doh: bool,
     /// DoH/HTTP/2.
     pub doh_h2: bool,
+    /// DoH/HTTP/3.
+    pub doh3: bool,
     /// DoQ.
     pub doq: bool,
     /// DNSCrypt UDP.
@@ -35,12 +37,14 @@ pub(crate) struct TransportMetrics {
     dot_enabled: bool,
     doh_enabled: bool,
     doh_h2_enabled: bool,
+    doh3_enabled: bool,
     doq_enabled: bool,
     dnscrypt_enabled: bool,
     dnscrypt_tcp_enabled: bool,
     dot: Arc<Stats>,
     doh: Arc<Stats>,
     doh_h2: Arc<Stats>,
+    doh3: Arc<Stats>,
     doq: Arc<Stats>,
     dnscrypt_packets: AtomicU64,
     dnscrypt_queries: AtomicU64,
@@ -64,12 +68,14 @@ impl TransportMetrics {
             dot_enabled: enabled.dot,
             doh_enabled: enabled.doh,
             doh_h2_enabled: enabled.doh_h2,
+            doh3_enabled: enabled.doh3,
             doq_enabled: enabled.doq,
             dnscrypt_enabled: enabled.dnscrypt,
             dnscrypt_tcp_enabled: enabled.dnscrypt_tcp,
             dot: Arc::new(Stats::new()),
             doh: Arc::new(Stats::new()),
             doh_h2: Arc::new(Stats::new()),
+            doh3: Arc::new(Stats::new()),
             doq: Arc::new(Stats::new()),
             ..Self::default()
         }
@@ -88,6 +94,10 @@ impl TransportMetrics {
     /// Счётчики DoH/HTTP/2 (для `Doh2Server`).
     pub(crate) fn doh_h2_stats(&self) -> Arc<Stats> {
         Arc::clone(&self.doh_h2)
+    }
+
+    pub(crate) fn doh3_stats(&self) -> Arc<Stats> {
+        Arc::clone(&self.doh3)
     }
 
     /// Счётчики DoQ (для `DoqServer`).
@@ -150,6 +160,7 @@ impl TransportMetrics {
     }
 
     /// Рендерит метрики в формате Prometheus.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn render(&self) -> String {
         let mut out = String::new();
         if self.dot_enabled {
@@ -161,10 +172,18 @@ impl TransportMetrics {
         if self.doh_h2_enabled {
             append_tls("doh_http2", &self.doh_h2.snapshot(), &mut out);
         }
+        if self.doh3_enabled {
+            append_tls("doh_http3", &self.doh3.snapshot(), &mut out);
+        }
         if self.doq_enabled {
             append_tls("doq", &self.doq.snapshot(), &mut out);
         }
-        if self.dot_enabled || self.doh_enabled || self.doh_h2_enabled || self.doq_enabled {
+        if self.dot_enabled
+            || self.doh_enabled
+            || self.doh_h2_enabled
+            || self.doh3_enabled
+            || self.doq_enabled
+        {
             let _ = write!(
                 out,
                 "# HELP pulsed_tls_reload_total Successful TLS reloads.\n\
@@ -347,6 +366,7 @@ mod tests {
             dot: true,
             doh: false,
             doh_h2: true,
+            doh3: true,
             doq: true,
             dnscrypt: true,
             dnscrypt_tcp: true,
@@ -362,6 +382,7 @@ mod tests {
         assert!(text.contains("dot_queries_total 0"));
         assert!(!text.contains("\ndoh_queries_total"));
         assert!(text.contains("doh_http2_queries_total 0"));
+        assert!(text.contains("doh_http3_queries_total 0"));
         assert!(text.contains("doq_queries_total 0"));
         assert!(text.contains("dnscrypt_packets_total 1"));
         assert!(text.contains("dnscrypt_responses_total 1"));

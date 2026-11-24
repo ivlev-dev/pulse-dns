@@ -98,8 +98,8 @@ pub enum Error {
     /// Сервис уже остановлен.
     #[error("server is shut down")]
     Shutdown,
-    /// Ошибка QUIC/DoQ.
-    #[cfg(feature = "doq")]
+    /// Ошибка QUIC/DoQ/DoH3.
+    #[cfg(any(feature = "doq", feature = "http3"))]
     #[error("QUIC error: {0}")]
     Quic(String),
 }

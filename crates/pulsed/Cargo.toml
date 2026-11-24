@@ -27,7 +27,7 @@ pulse-dnssec = { path = "../pulse-dnssec" }
 pulse-master = { path = "../pulse-master" }
 pulse-runtime = { path = "../pulse-runtime" }
 pulse-server = { path = "../pulse-server", features = ["testkit"] }
-pulse-tls = { path = "../pulse-tls", features = ["http2", "doq"] }
+pulse-tls = { path = "../pulse-tls", features = ["http2", "http3", "doq"] }
 pulse-transfer = { path = "../pulse-transfer" }
 pulse-zonefile = { path = "../pulse-zonefile" }
 serde = { version = "1", features = ["derive"] }
@@ -40,6 +40,8 @@ toml = "0.8"
 [dev-dependencies]
 bytes = "1"
 h2 = "0.4"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 http = "1"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }

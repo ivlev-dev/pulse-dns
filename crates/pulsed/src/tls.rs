@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use pulse_server::Transport;
 use pulse_tls::{
-    Acl, DnsHandler, Doh2Config, Doh2Server, DohConfig, DohServer, DoqConfig, DoqServer, DotConfig,
-    DotServer, Stats as TlsStats, TlsConfig,
+    Acl, DnsHandler, Doh2Config, Doh2Server, Doh3Config, Doh3Server, DohConfig, DohServer,
+    DoqConfig, DoqServer, DotConfig, DotServer, Stats as TlsStats, TlsConfig,
 };
 use thiserror::Error;
 
@@ -65,6 +65,15 @@ pub enum TlsError {
         #[source]
         source: pulse_tls::Error,
     },
+    /// Не удалось запустить DoH/HTTP/3.
+    #[error("cannot start DoH/HTTP/3 listener {addr}: {source}")]
+    Doh3Start {
+        /// Запрошенный адрес.
+        addr: SocketAddr,
+        /// Причина.
+        #[source]
+        source: pulse_tls::Error,
+    },
     /// Остановка DoT завершилась ошибкой.
     #[error("DoT shutdown failed: {0}")]
     DotShutdown(#[source] pulse_tls::Error),
@@ -77,6 +86,9 @@ pub enum TlsError {
     /// Остановка DoQ завершилась ошибкой.
     #[error("DoQ shutdown failed: {0}")]
     DoqShutdown(#[source] pulse_tls::Error),
+    /// Остановка DoH/HTTP/3 завершилась ошибкой.
+    #[error("DoH/HTTP/3 shutdown failed: {0}")]
+    Doh3Shutdown(#[source] pulse_tls::Error),
     /// Не удалось перечитать сертификат.
     #[error("cannot reload TLS certificate: {0}")]
     Reload(#[source] pulse_tls::Error),
@@ -87,10 +99,12 @@ pub(crate) struct TlsTransports {
     dot: Option<DotServer>,
     doh: Option<DohServer>,
     doh_h2: Option<Doh2Server>,
+    doh3: Option<Doh3Server>,
     doq: Option<DoqServer>,
     dot_counts: Arc<TlsStats>,
     doh_counts: Arc<TlsStats>,
     doh_h2_counts: Arc<TlsStats>,
+    doh3_counts: Arc<TlsStats>,
     doq_counts: Arc<TlsStats>,
     metrics: Arc<TransportMetrics>,
 }
@@ -101,6 +115,7 @@ impl TlsTransports {
     /// # Errors
     ///
     /// [`TlsError`] при ошибке чтения сертификата, ACL или bind.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn start(
         config: &Config,
         admin: Arc<SharedZoneAdmin>,
@@ -110,6 +125,7 @@ impl TlsTransports {
         if config.dot_listen.is_none()
             && config.doh_listen.is_none()
             && config.doh_h2_listen.is_none()
+            && config.doh3_listen.is_none()
             && config.doq_listen.is_none()
         {
             return Ok(None);
@@ -175,6 +191,22 @@ impl TlsTransports {
             }
             None => None,
         };
+        let doh3 = match config.doh3_listen {
+            Some(addr) => {
+                let tls = doh3_tls_config(cert_path, key_path)?;
+                let mut h3_config = Doh3Config::new(addr, tls);
+                h3_config.max_connections = config.doh3_max_connections;
+                h3_config.max_concurrent_requests = config.doh3_max_concurrent_requests;
+                h3_config.idle_timeout = Duration::from_millis(config.doh3_idle_timeout_ms);
+                h3_config.acl.clone_from(&acl);
+                h3_config.cache_control = true;
+                Some(
+                    Doh3Server::bind_shared(h3_config, Arc::clone(&handler), metrics.doh3_stats())
+                        .map_err(|source| TlsError::Doh3Start { addr, source })?,
+                )
+            }
+            None => None,
+        };
         let doq = match config.doq_listen {
             Some(addr) => {
                 let tls = doq_tls_config(cert_path, key_path)?;
@@ -195,10 +227,12 @@ impl TlsTransports {
             dot,
             doh,
             doh_h2,
+            doh3,
             doq,
             dot_counts: metrics.dot_stats(),
             doh_counts: metrics.doh_stats(),
             doh_h2_counts: metrics.doh_h2_stats(),
+            doh3_counts: metrics.doh3_stats(),
             doq_counts: metrics.doq_stats(),
             metrics,
         }))
@@ -219,6 +253,11 @@ impl TlsTransports {
         self.doh_h2.as_ref().map(Doh2Server::local_addr)
     }
 
+    /// Фактический DoH/HTTP/3-адрес.
+    pub(crate) fn doh3_addr(&self) -> Option<SocketAddr> {
+        self.doh3.as_ref().map(Doh3Server::local_addr)
+    }
+
     /// Фактический DoQ-адрес.
     pub(crate) fn doq_addr(&self) -> Option<SocketAddr> {
         self.doq.as_ref().map(DoqServer::local_addr)
@@ -237,6 +276,11 @@ impl TlsTransports {
     /// Снимок счётчиков DoH/HTTP/2, если транспорт запущен.
     pub(crate) fn doh_h2_stats(&self) -> Option<pulse_tls::StatsSnapshot> {
         self.doh_h2.as_ref().map(|_| self.doh_h2_counts.snapshot())
+    }
+
+    /// Снимок счётчиков DoH/HTTP/3, если транспорт запущен.
+    pub(crate) fn doh3_stats(&self) -> Option<pulse_tls::StatsSnapshot> {
+        self.doh3.as_ref().map(|_| self.doh3_counts.snapshot())
     }
 
     /// Снимок счётчиков DoQ, если транспорт запущен.
@@ -266,6 +310,11 @@ impl TlsTransports {
         }
         if let Some(doh_h2) = &self.doh_h2
             && let Err(error) = doh_h2.reload_from_files()
+        {
+            first_error.get_or_insert(error);
+        }
+        if let Some(doh3) = &self.doh3
+            && let Err(error) = doh3.reload_from_files()
         {
             first_error.get_or_insert(error);
         }
@@ -305,6 +354,11 @@ impl TlsTransports {
         {
             first_error.get_or_insert(TlsError::Doh2Shutdown(error));
         }
+        if let Some(mut doh3) = self.doh3.take()
+            && let Err(error) = doh3.shutdown()
+        {
+            first_error.get_or_insert(TlsError::Doh3Shutdown(error));
+        }
         if let Some(mut doq) = self.doq.take()
             && let Err(error) = doq.shutdown()
         {
@@ -327,6 +381,11 @@ fn doh_tls_config(cert: &Path, key: &Path) -> Result<TlsConfig, TlsError> {
 fn doh2_tls_config(cert: &Path, key: &Path) -> Result<TlsConfig, TlsError> {
     TlsConfig::from_pem_files(cert, key, &[b"h2"])
         .map_err(|error| TlsError::Config(format!("DoH/HTTP/2 certificate: {error}")))
+}
+
+fn doh3_tls_config(cert: &Path, key: &Path) -> Result<TlsConfig, TlsError> {
+    TlsConfig::from_pem_files(cert, key, &[b"h3"])
+        .map_err(|error| TlsError::Config(format!("DoH/HTTP/3 certificate: {error}")))
 }
 
 fn doq_tls_config(cert: &Path, key: &Path) -> Result<TlsConfig, TlsError> {

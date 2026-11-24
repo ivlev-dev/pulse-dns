@@ -588,19 +588,23 @@ pub struct Config {
     /// Адрес DNS-over-HTTPS/2 (RFC 8484 + RFC 9113); `null` отключает DoH h2.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doh_h2_listen: Option<SocketAddr>,
+    /// Адрес DNS-over-HTTPS/3 (RFC 8484 + RFC 9114) поверх QUIC; `null`
+    /// отключает DoH h3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doh3_listen: Option<SocketAddr>,
     /// Адрес DNS-over-QUIC (RFC 9250); `null` отключает DoQ.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doq_listen: Option<SocketAddr>,
-    /// PEM-сертификат (цепочка) для DoT/DoH.
+    /// PEM-сертификат (цепочка) для DoT/DoH/DoQ.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_cert: Option<PathBuf>,
-    /// PEM-закрытый ключ для DoT/DoH (права 0600).
+    /// PEM-закрытый ключ для DoT/DoH/DoQ (права 0600).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_key: Option<PathBuf>,
     /// Перечитывать TLS-сертификат каждые N секунд; `null` — только SIGHUP.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_reload_secs: Option<u64>,
-    /// IP/CIDR allowlist для DoT/DoH; пусто — разрешены все адреса.
+    /// IP/CIDR allowlist для DoT/DoH/DoQ/DoH3; пусто — разрешены все адреса.
     pub tls_allow_from: Vec<String>,
     /// Максимум одновременных DoT-соединений.
     pub dot_max_connections: usize,
@@ -610,6 +614,12 @@ pub struct Config {
     pub doh_h2_max_connections: usize,
     /// Максимум одновременных HTTP/2 stream'ов на соединение.
     pub doh_h2_max_streams: u32,
+    /// Максимум одновременных DoH/HTTP/3-соединений.
+    pub doh3_max_connections: usize,
+    /// Максимум одновременных HTTP/3-запросов на соединение.
+    pub doh3_max_concurrent_requests: u32,
+    /// Idle timeout DoH/HTTP/3-соединения в миллисекундах.
+    pub doh3_idle_timeout_ms: u64,
     /// Максимум одновременных DoQ-соединений.
     pub doq_max_connections: usize,
     /// Максимум одновременных двунаправленных stream'ов DoQ на соединение.
@@ -704,6 +714,7 @@ impl Default for Config {
             dot_listen: None,
             doh_listen: None,
             doh_h2_listen: None,
+            doh3_listen: None,
             doq_listen: None,
             tls_cert: None,
             tls_key: None,
@@ -713,6 +724,9 @@ impl Default for Config {
             doh_max_connections: 1024,
             doh_h2_max_connections: 1024,
             doh_h2_max_streams: 100,
+            doh3_max_connections: 1024,
+            doh3_max_concurrent_requests: 100,
+            doh3_idle_timeout_ms: 30_000,
             doq_max_connections: 1024,
             doq_max_streams: 100,
             doq_idle_timeout_ms: 30_000,
@@ -861,13 +875,14 @@ impl Config {
             && self.dot_listen.is_none()
             && self.doh_listen.is_none()
             && self.doh_h2_listen.is_none()
+            && self.doh3_listen.is_none()
             && self.doq_listen.is_none()
             && self.dnscrypt_listen.is_none()
             && self.dnscrypt_tcp_listen.is_none()
         {
             return Err(ConfigError::Invalid(
                 "at least one of listen_udp/listen_tcp/dot_listen/doh_listen/\
-                 doh_h2_listen/doq_listen/dnscrypt_listen/dnscrypt_tcp_listen must be set"
+                 doh_h2_listen/doh3_listen/doq_listen/dnscrypt_listen/dnscrypt_tcp_listen must be set"
                     .to_owned(),
             ));
         }
@@ -1045,20 +1060,23 @@ impl Config {
         Ok(())
     }
 
-    /// Проверяет параметры DoT/DoH.
+    /// Проверяет параметры DoT/DoH/DoQ.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::Invalid`], если включён DoT/DoH без TLS-пары, лимиты
-    /// выходят за допустимые пределы или ACL содержит некорректный CIDR.
+    /// [`ConfigError::Invalid`], если включён защищённый транспорт без
+    /// TLS-пары, лимиты выходят за допустимые пределы или ACL содержит
+    /// некорректный CIDR.
+    #[allow(clippy::too_many_lines)]
     pub fn validate_tls(&self) -> Result<(), ConfigError> {
         let enabled = self.dot_listen.is_some()
             || self.doh_listen.is_some()
             || self.doh_h2_listen.is_some()
+            || self.doh3_listen.is_some()
             || self.doq_listen.is_some();
         if enabled && (self.tls_cert.is_none() || self.tls_key.is_none()) {
             return Err(ConfigError::Invalid(
-                "dot_listen/doh_listen/doh_h2_listen/doq_listen require both tls_cert and tls_key"
+                "dot_listen/doh_listen/doh_h2_listen/doh3_listen/doq_listen require both tls_cert and tls_key"
                     .to_owned(),
             ));
         }
@@ -1105,6 +1123,24 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "doh_h2_max_streams must be in 1..=1000, got {}",
                 self.doh_h2_max_streams
+            )));
+        }
+        if !(1..=65_535).contains(&self.doh3_max_connections) {
+            return Err(ConfigError::Invalid(format!(
+                "doh3_max_connections must be in 1..=65535, got {}",
+                self.doh3_max_connections
+            )));
+        }
+        if !(1..=1000).contains(&self.doh3_max_concurrent_requests) {
+            return Err(ConfigError::Invalid(format!(
+                "doh3_max_concurrent_requests must be in 1..=1000, got {}",
+                self.doh3_max_concurrent_requests
+            )));
+        }
+        if !(100..=600_000).contains(&self.doh3_idle_timeout_ms) {
+            return Err(ConfigError::Invalid(format!(
+                "doh3_idle_timeout_ms must be in 100..=600000, got {}",
+                self.doh3_idle_timeout_ms
             )));
         }
         if !(1..=65_535).contains(&self.doq_max_connections) {
@@ -1324,6 +1360,9 @@ impl Config {
         if let Some(addr) = overrides.doh_h2_listen {
             self.doh_h2_listen = Some(addr);
         }
+        if let Some(addr) = overrides.doh3_listen {
+            self.doh3_listen = Some(addr);
+        }
         if let Some(addr) = overrides.doq_listen {
             self.doq_listen = Some(addr);
         }
@@ -1391,6 +1430,8 @@ pub struct Overrides {
     pub doh_listen: Option<SocketAddr>,
     /// Новый адрес DoH/HTTP/2.
     pub doh_h2_listen: Option<SocketAddr>,
+    /// Новый адрес DoH/HTTP/3.
+    pub doh3_listen: Option<SocketAddr>,
     /// Новый адрес DoQ.
     pub doq_listen: Option<SocketAddr>,
     /// Новый PEM-сертификат DoT/DoH.
@@ -1519,6 +1560,7 @@ mod tests {
             dot_listen: None,
             doh_listen: None,
             doh_h2_listen: None,
+            doh3_listen: None,
             doq_listen: None,
             tls_cert: None,
             tls_key: None,
@@ -1654,6 +1696,7 @@ mod tests {
             listen_udp: None,
             listen_tcp: None,
             doh_h2_listen: Some("127.0.0.1:8443".parse().unwrap()),
+            doh3_listen: Some("127.0.0.1:8445".parse().unwrap()),
             doq_listen: Some("127.0.0.1:8853".parse().unwrap()),
             ..Config::default()
         };
@@ -1670,6 +1713,15 @@ mod tests {
         config.doh_h2_max_streams = 0;
         assert!(config.validate().is_err());
         config.doh_h2_max_streams = 100;
+        config.doh3_max_connections = 0;
+        assert!(config.validate().is_err());
+        config.doh3_max_connections = 1024;
+        config.doh3_max_concurrent_requests = 1001;
+        assert!(config.validate().is_err());
+        config.doh3_max_concurrent_requests = 100;
+        config.doh3_idle_timeout_ms = 10;
+        assert!(config.validate().is_err());
+        config.doh3_idle_timeout_ms = 30_000;
         config.doq_max_streams = 1001;
         assert!(config.validate().is_err());
         config.doq_max_streams = 100;
@@ -1686,13 +1738,16 @@ mod tests {
     fn h2_and_doq_overrides_apply() {
         let mut config = Config::default();
         let h2: SocketAddr = "127.0.0.1:9443".parse().unwrap();
+        let h3: SocketAddr = "127.0.0.1:9445".parse().unwrap();
         let doq: SocketAddr = "127.0.0.1:9853".parse().unwrap();
         config.apply_overrides(&Overrides {
             doh_h2_listen: Some(h2),
+            doh3_listen: Some(h3),
             doq_listen: Some(doq),
             ..Overrides::default()
         });
         assert_eq!(config.doh_h2_listen, Some(h2));
+        assert_eq!(config.doh3_listen, Some(h3));
         assert_eq!(config.doq_listen, Some(doq));
     }
 
@@ -2123,6 +2178,7 @@ tick_secs = 300
             dot_listen: Some("127.0.0.2:8853".parse().expect("addr")),
             doh_listen: Some("127.0.0.2:8443".parse().expect("addr")),
             doh_h2_listen: Some("127.0.0.2:8444".parse().expect("addr")),
+            doh3_listen: Some("127.0.0.2:8445".parse().expect("addr")),
             doq_listen: Some("127.0.0.2:8854".parse().expect("addr")),
             tls_cert: Some(PathBuf::from("cli-cert.pem")),
             tls_key: Some(PathBuf::from("cli-key.pem")),
