@@ -1,0 +1,26 @@
+# Secondary: AXFR/IXFR-in с primary, обновление по NOTIFY.
+# Эквивалент examples/pair-secondary.json.
+listen_udp = "127.0.0.1:5354"
+listen_tcp = "127.0.0.1:5354"
+workers = 2
+zonefile = "./secondary.pulse"
+durability = "flush"
+
+[[tsig_keys]]
+name = "xfr-key.example.com."
+algorithm = "hmac-sha256"
+secret = "c2VjcmV0LW11c3QtYmUtcmVwbGFjZWQ="
+
+[[secondary_zones]]
+origin = "example.com."
+masters = ["127.0.0.1:5353"]
+tsig_key = "xfr-key.example.com."
+refresh = 60
+retry = 10
+expire = 604800
+allow_notify_from = ["127.0.0.1", "::1"]
+bootstrap = true
+
+[transfer]
+require_tsig = true
+allow_from = ["127.0.0.1", "::1"]

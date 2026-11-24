@@ -1,32 +1,35 @@
 //! `pulsed` — авторитетный DNS-сервер (MVP).
 //!
 //! Крейт является **composition root** для авторитетного процесса: читает
-//! JSON-настройки сервера, открывает `pulse-zonefile` (`--data`) как
+//! TOML-настройки сервера (JSON — legacy), открывает `pulse-zonefile` (`--data`) как
 //! единственный источник истины зон, поднимает UDP (`pulse-runtime`,
-//! io_uring), TCP (std), DoT/DoH (`pulse-tls`), DNSCrypt v2 по UDP/TCP
-//! (`pulse-dnscrypt`) и опциональный REST API (`pulse-api`) и обслуживает
-//! `SIGTERM`/`SIGINT`/`SIGHUP`.
+//! io_uring), TCP (std), DoT/DoH/1.1/DoH/2/DoQ (`pulse-tls`), DNSCrypt v2
+//! по UDP/TCP (`pulse-dnscrypt`) и опциональный REST API (`pulse-api`) и
+//! обслуживает `SIGTERM`/`SIGINT`/`SIGHUP`.
 //!
 //! DNS-ответы читаются из mmap v2 (`ParallelStore`/`ZoneReader`): на каждый
 //! запрос берётся стабильный пин зоны и выполняется точечный поиск RRset, без
 //! материализации зоны. REST-мутации открывают per-zone writer (lease), пишут
 //! COW-страницы и коммитят (`--commit-mode per-zone|group`); разные зоны
-//! коммитятся параллельно. Без `--data` сервер поднимается без зон и отвечает
-//! `REFUSED`.
+//! коммитятся параллельно. Перед применением REST-мутации пишется
+//! write-ahead журнал (`<data>.journal`, см. `docs/ops/journal.md`), а `2xx`
+//! отдаётся после `committed`; незавершённые intents повторяются на старте.
+//! Без `--data` сервер поднимается без зон и отвечает `REFUSED`.
 //!
 //! Master-файлы импортируются отдельной командой `pulsed import --data ...`;
 //! legacy v1-файл конвертируется `pulsed convert --from <v1> --to <v2>`;
-//! в рантайме `.zone` не читаются, JSON-поля `zones`/`zones_files` отвергаются
+//! в рантайме `.zone` не читаются, поля `zones`/`zones_files` отвергаются
 //! с инструкцией миграции.
 //!
 //! # Состав
 //!
-//! - [`config`] — JSON-настройки сервера и CLI-overrides.
+//! - [`config`] — TOML-настройки сервера (JSON — совместимость) и CLI-overrides.
 //! - `zonefile` — `ZoneView` поверх mmap и адаптер записи в `pulse-zonefile`.
 //! - `master` — импорт RFC 1035 master-файлов (`pulsed import`).
 //! - `dnssec` — загрузка ключей и DNSSEC-подпись зон в zonefile.
+//! - [`rotation`] — RFC 7583 ротация KSK/ZSK с персистентным состоянием.
 //! - `transfer` — AXFR/IXFR-out из zonefile, TSIG/ACL, IXFR-история и NOTIFY.
-//! - `tls` — DoT/DoH-серверы и hot-reload сертификата.
+//! - `tls` — DoT/DoH/1.1/DoH/2/DoQ-серверы и hot-reload сертификата.
 //! - `dnscrypt` — DNSCrypt UDP, загрузка ключей и `dnscrypt-gencert`.
 //! - [`server`] — запуск и остановка DNS/API.
 //! - [`stats`] — атомарные счётчики без блокировок на горячем пути.
@@ -38,7 +41,7 @@
 //! use pulsed::server::Server;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = Config::load("examples/pulsed.json")?;
+//! let config = Config::from_path("examples/pulsed.toml")?;
 //! let mut server = Server::start(&config)?;
 //! println!("udp={:?} tcp={:?}", server.udp_addr(), server.tcp_addr());
 //! server.shutdown()?;
@@ -71,6 +74,7 @@ mod udp;
 mod zonefile;
 
 pub mod config;
+pub mod rotation;
 pub mod server;
 pub mod stats;
 

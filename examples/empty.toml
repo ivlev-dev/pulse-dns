@@ -1,0 +1,6 @@
+# Минимальный конфиг: только транспорты, zonefile задаётся через --data.
+# Эквивалент examples/empty.json.
+listen_udp = "127.0.0.1:5353"
+listen_tcp = "127.0.0.1:5353"
+workers = 2
+log_level = "info"

@@ -3,7 +3,7 @@
 mod common;
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +22,9 @@ const TOKEN: &str = "pd_live_secondary_0123456789abcdef";
 const KEY_NAME: &str = "xfr-key.test.";
 const SECRET: &str = "secret";
 const ORIGIN: &str = "example.com.";
+
+/// Сколько раз целиком перезапускать пару primary+secondary при гонке за порт.
+const START_ATTEMPTS: u32 = 5;
 
 fn now() -> u64 {
     SystemTime::now()
@@ -84,7 +87,11 @@ fn transfer_settings(timeout_ms: u64, notify: Vec<SocketAddr>) -> TransferSettin
     }
 }
 
-fn primary_config(records: Vec<String>, notify: Vec<SocketAddr>) -> (common::TempZone, Config) {
+fn primary_config(
+    records: Vec<String>,
+    notify: Vec<SocketAddr>,
+    listen_tcp: SocketAddr,
+) -> (common::TempZone, Config) {
     let mut text = String::from("$ORIGIN example.com.\n$TTL 3600\n");
     for line in records {
         text.push_str(&line);
@@ -93,6 +100,7 @@ fn primary_config(records: Vec<String>, notify: Vec<SocketAddr>) -> (common::Tem
     let (_dir, path) = common::write_text("secondary-primary", "zone", &text);
     let zone = common::TempZone::with_import("secondary-primary", ORIGIN, &path);
     let mut config = common::base_config(zone.path());
+    config.listen_tcp = Some(listen_tcp);
     config.tcp = TcpConfig {
         idle_timeout_ms: 2000,
         ..TcpConfig::default()
@@ -104,13 +112,17 @@ fn primary_config(records: Vec<String>, notify: Vec<SocketAddr>) -> (common::Tem
 
 fn secondary_config(
     master: SocketAddr,
-    udp: SocketAddr,
     zonefile: Option<PathBuf>,
     secret: &str,
     expire: u32,
+    refresh: u32,
+    bootstrap: bool,
 ) -> Config {
     Config {
-        listen_udp: Some(udp),
+        // Порт 0: фактический адрес сообщает сам сервер. Резервировать UDP-порт
+        // снаружи нельзя — `pulse-runtime` использует `SO_REUSEPORT`, и
+        // «свободный» порт может молча достаться двум серверам сразу.
+        listen_udp: Some("127.0.0.1:0".parse().expect("udp")),
         listen_tcp: Some("127.0.0.1:0".parse().expect("tcp")),
         workers: 1,
         tcp: TcpConfig {
@@ -125,11 +137,11 @@ fn secondary_config(
             origin: ORIGIN.to_owned(),
             masters: vec![master],
             tsig_key: Some(KEY_NAME.to_owned()),
-            refresh: Some(1),
+            refresh: Some(refresh),
             retry: Some(1),
             expire: Some(expire),
             allow_notify_from: vec!["127.0.0.1".parse().expect("ip")],
-            bootstrap: true,
+            bootstrap,
         }],
         transfer: TransferSettings {
             timeout_ms: 500,
@@ -148,83 +160,185 @@ fn api_options() -> ApiOptions {
     }
 }
 
-fn free_udp_addr() -> SocketAddr {
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("free port");
-    socket.local_addr().expect("addr")
+fn start_optional_api(config: &Config, with_api: bool) -> Result<Server, String> {
+    let started = if with_api {
+        Server::start_with_api(config, Some(api_options()))
+    } else {
+        Server::start(config)
+    };
+    started.map_err(|error| error.to_string())
 }
 
-fn recv_from(socket: &UdpSocket, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-    loop {
-        match socket.recv_from(buffer) {
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            result => return result,
+/// Описание пары primary+secondary для [`start_pair`].
+///
+/// Флаги независимы: это набор сценариев e2e, а не состояние автомата.
+#[allow(clippy::struct_excessive_bools)]
+struct PairSpec {
+    records: Vec<String>,
+    zone: Option<PathBuf>,
+    secret: &'static str,
+    expire: u32,
+    refresh: u32,
+    bootstrap: bool,
+    primary_api: bool,
+    secondary_api: bool,
+    /// Передавать ли адрес secondary в `notify` primary (тогда secondary
+    /// стартует первым, чтобы его UDP-порт был известен до старта primary).
+    notify: bool,
+}
+
+/// Поднятая пара серверов; zone primary живёт столько же, сколько пара.
+struct Pair {
+    _primary_zone: common::TempZone,
+    primary: Server,
+    secondary: Server,
+}
+
+/// Поднимает primary и secondary, не угадывая UDP-порт secondary.
+///
+/// При `notify` secondary слушает UDP на `port = 0` → фактический адрес берётся
+/// у сервера → он же уходит в `notify` primary. Иначе primary стартует первым.
+/// Единственный «зарезервированный» адрес — TCP primary: там bind эксклюзивен,
+/// поэтому редкая гонка видна как ошибка старта и снимается повтором всей пары.
+fn start_pair(spec: &PairSpec) -> Pair {
+    let mut last_error = String::new();
+    for _ in 0..START_ATTEMPTS {
+        let primary_addr = common::reserved_tcp_addr();
+        if spec.notify {
+            let secondary_cfg = secondary_config(
+                primary_addr,
+                spec.zone.clone(),
+                spec.secret,
+                spec.expire,
+                spec.refresh,
+                spec.bootstrap,
+            );
+            let secondary = match start_optional_api(&secondary_cfg, spec.secondary_api) {
+                Ok(server) => server,
+                Err(error) => {
+                    last_error = error;
+                    continue;
+                }
+            };
+            let secondary_udp = secondary.udp_addr().expect("secondary UDP address");
+            let (primary_zone, primary_cfg) =
+                primary_config(spec.records.clone(), vec![secondary_udp], primary_addr);
+            match start_optional_api(&primary_cfg, spec.primary_api) {
+                Ok(primary) => {
+                    return Pair {
+                        _primary_zone: primary_zone,
+                        primary,
+                        secondary,
+                    };
+                }
+                Err(error) => {
+                    last_error = error;
+                    drop(secondary);
+                }
+            }
+        } else {
+            let (primary_zone, primary_cfg) =
+                primary_config(spec.records.clone(), Vec::new(), primary_addr);
+            let primary = match start_optional_api(&primary_cfg, spec.primary_api) {
+                Ok(server) => server,
+                Err(error) => {
+                    last_error = error;
+                    continue;
+                }
+            };
+            let secondary_cfg = secondary_config(
+                primary_addr,
+                spec.zone.clone(),
+                spec.secret,
+                spec.expire,
+                spec.refresh,
+                spec.bootstrap,
+            );
+            match start_optional_api(&secondary_cfg, spec.secondary_api) {
+                Ok(secondary) => {
+                    return Pair {
+                        _primary_zone: primary_zone,
+                        primary,
+                        secondary,
+                    };
+                }
+                Err(error) => {
+                    last_error = error;
+                    drop(primary);
+                }
+            }
         }
     }
+    panic!("cannot start primary/secondary pair in {START_ATTEMPTS} attempts: {last_error}");
 }
 
-fn dns_query(server: &Server, qname: &str, qtype: Rtype) -> Message {
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("client");
-    socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("timeout");
+fn try_dns_query(server: &Server, qname: &str, qtype: Rtype) -> io::Result<Message> {
+    let address = server
+        .udp_addr()
+        .ok_or_else(|| io::Error::other("server has no UDP address"))?;
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    socket.set_read_timeout(Some(common::SOCKET_TIMEOUT))?;
     let query = Message::query(0x4242, Question::new(name(qname), qtype, Rclass::IN))
         .encode(&EncodeOptions::compressed())
-        .expect("encode");
-    socket
-        .send_to(&query, server.udp_addr().expect("udp"))
-        .expect("send");
+        .map_err(|error| io::Error::other(format!("encode: {error:?}")))?;
+    common::udp_send_to(&socket, &query, address)?;
     let mut buffer = [0_u8; 4096];
-    let (length, _) = recv_from(&socket, &mut buffer).expect("recv");
-    Message::decode(
-        buffer.get(..length).expect("length"),
-        &DecodeLimits::default(),
+    let (length, _) = common::udp_recv_from(&socket, &mut buffer)?;
+    let bytes = buffer
+        .get(..length)
+        .ok_or_else(|| io::Error::other("response length out of range"))?;
+    Message::decode(bytes, &DecodeLimits::default())
+        .map_err(|error| io::Error::other(format!("decode: {error:?}")))
+}
+
+/// Запрос с диагностикой: таймаут/ошибка сети — паника с адресом и ошибкой.
+fn dns_query(server: &Server, qname: &str, qtype: Rtype) -> Message {
+    try_dns_query(server, qname, qtype).unwrap_or_else(|error| {
+        panic!(
+            "DNS query {qname} {qtype:?} failed: {error}; {}",
+            server_context(server)
+        )
+    })
+}
+
+/// Диагностика secondary-зоны для сообщений об ошибках.
+fn server_context(server: &Server) -> String {
+    format!(
+        "secondary_last_error={:?}, stats={:?}",
+        server.secondary_last_error(&name(ORIGIN)),
+        server.stats()
     )
-    .expect("decode")
 }
 
 fn wait_for_serial(server: &Server, expected: u32, total: Duration) -> bool {
-    let deadline = Instant::now() + total;
-    while Instant::now() < deadline {
-        let response = dns_query(server, ORIGIN, Rtype::SOA);
-        if response.rcode() == Rcode::NOERROR
-            && response
-                .answers()
-                .iter()
-                .any(|record| record.rr_type() == Rtype::SOA && serial(record) == expected)
-        {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
+    common::wait_until(total, || {
+        try_dns_query(server, ORIGIN, Rtype::SOA).is_ok_and(|response| {
+            response.rcode() == Rcode::NOERROR
+                && response
+                    .answers()
+                    .iter()
+                    .any(|record| record.rr_type() == Rtype::SOA && serial(record) == expected)
+        })
+    })
 }
 
 fn wait_for_a(server: &Server, expected: &str, total: Duration) -> bool {
-    let deadline = Instant::now() + total;
-    while Instant::now() < deadline {
-        let response = dns_query(server, "www.example.com.", Rtype::A);
-        if response.rcode() == Rcode::NOERROR
-            && response
-                .answers()
-                .iter()
-                .any(|record| record.rdata() == &Rdata::A(expected.parse().expect("ipv4")))
-        {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
+    let expected = expected.parse().expect("ipv4");
+    common::wait_until(total, || {
+        try_dns_query(server, "www.example.com.", Rtype::A).is_ok_and(|response| {
+            response.rcode() == Rcode::NOERROR
+                && response
+                    .answers()
+                    .iter()
+                    .any(|record| record.rdata() == &Rdata::A(expected))
+        })
+    })
 }
 
 fn wait_for_rcode(server: &Server, rcode: Rcode, total: Duration) -> bool {
-    let deadline = Instant::now() + total;
-    while Instant::now() < deadline {
-        if dns_query(server, ORIGIN, Rtype::SOA).rcode() == rcode {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
+    common::wait_until(total, || {
+        try_dns_query(server, ORIGIN, Rtype::SOA).is_ok_and(|response| response.rcode() == rcode)
+    })
 }
 
 fn serial(record: &Record) -> u32 {
@@ -351,28 +465,30 @@ impl Drop for TempDir {
 fn primary_to_secondary_bootstrap_update_ixfr_and_reopen() {
     let dir = TempDir::new("full");
     let data = dir.path().join("secondary.pulse");
-    let secondary_udp = free_udp_addr();
-    let (_primary_zone, primary_cfg) =
-        primary_config(zone_config(1, "192.0.2.10"), vec![secondary_udp]);
-    let mut primary = Server::start_with_api(&primary_cfg, Some(api_options())).expect("primary");
-    let primary_tcp = primary.tcp_addr().expect("primary tcp");
-    let primary_api = primary.api_addr().expect("primary api");
+    let pair = start_pair(&PairSpec {
+        records: zone_config(1, "192.0.2.10"),
+        zone: Some(data.clone()),
+        secret: "c2VjcmV0",
+        expire: 60,
+        refresh: 1,
+        bootstrap: true,
+        primary_api: true,
+        secondary_api: true,
+        notify: true,
+    });
+    let primary_tcp = pair.primary.tcp_addr().expect("primary tcp");
+    let primary_api = pair.primary.api_addr().expect("primary api");
 
-    let secondary_config = secondary_config(
-        primary_tcp,
-        secondary_udp,
-        Some(data.clone()),
-        "c2VjcmV0",
-        60,
-    );
-    let mut secondary =
-        Server::start_with_api(&secondary_config, Some(api_options())).expect("secondary");
     assert!(
-        wait_for_serial(&secondary, 1, Duration::from_secs(10)),
-        "secondary did not bootstrap: {:?}",
-        secondary.secondary_last_error(&name(ORIGIN))
+        wait_for_serial(&pair.secondary, 1, common::E2E_DEADLINE),
+        "secondary did not bootstrap: {}",
+        server_context(&pair.secondary)
     );
-    assert!(wait_for_a(&secondary, "192.0.2.10", Duration::from_secs(2)));
+    assert!(
+        wait_for_a(&pair.secondary, "192.0.2.10", common::E2E_DEADLINE),
+        "secondary has no www A after bootstrap: {}",
+        server_context(&pair.secondary)
+    );
 
     // Три изменения primary: serial 2, 3, 4 и три IXFR-дельты.
     for address in ["192.0.2.21", "192.0.2.22", "192.0.2.23"] {
@@ -391,14 +507,18 @@ fn primary_to_secondary_bootstrap_update_ixfr_and_reopen() {
     assert_eq!(deltas.len(), 3);
 
     assert!(
-        wait_for_serial(&secondary, 4, Duration::from_secs(10)),
-        "secondary did not update serial: {:?}",
-        secondary.secondary_last_error(&name(ORIGIN))
+        wait_for_serial(&pair.secondary, 4, common::E2E_DEADLINE),
+        "secondary did not update serial: {}",
+        server_context(&pair.secondary)
     );
-    assert!(wait_for_a(&secondary, "192.0.2.23", Duration::from_secs(5)));
+    assert!(
+        wait_for_a(&pair.secondary, "192.0.2.23", common::E2E_DEADLINE),
+        "secondary did not apply the last IXFR delta: {}",
+        server_context(&pair.secondary)
+    );
 
     // Secondary read-only для RRset API.
-    let api = secondary.api_addr().expect("secondary api");
+    let api = pair.secondary.api_addr().expect("secondary api");
     let (status, _) = put(
         api,
         "/api/v1/zones/example.com./records/www.example.com./A",
@@ -407,112 +527,128 @@ fn primary_to_secondary_bootstrap_update_ixfr_and_reopen() {
     );
     assert_eq!(status, 409);
 
+    let Pair {
+        _primary_zone,
+        mut primary,
+        mut secondary,
+    } = pair;
     secondary.shutdown().expect("secondary shutdown");
     drop(secondary);
     primary.shutdown().expect("primary shutdown");
     drop(primary);
 
     // Рестарт secondary без master: данные должны прийти из zonefile.
+    let config = secondary_config(primary_tcp, Some(data.clone()), "c2VjcmV0", 60, 1, true);
     let mut secondary =
-        Server::start_with_api(&secondary_config, Some(api_options())).expect("secondary reopen");
+        Server::start_with_api(&config, Some(api_options())).expect("secondary reopen");
     assert!(
-        wait_for_serial(&secondary, 4, Duration::from_secs(5)),
-        "secondary did not load from zonefile"
+        wait_for_serial(&secondary, 4, common::E2E_DEADLINE),
+        "secondary did not load from zonefile: {}",
+        server_context(&secondary)
     );
-    assert!(wait_for_a(&secondary, "192.0.2.23", Duration::from_secs(2)));
+    assert!(
+        wait_for_a(&secondary, "192.0.2.23", common::E2E_DEADLINE),
+        "secondary lost www A after reopen: {}",
+        server_context(&secondary)
+    );
     secondary.shutdown().expect("secondary shutdown");
 }
 
 #[test]
 fn secondary_retries_and_expires_when_master_is_down() {
-    let secondary_udp = free_udp_addr();
-    let (_primary_zone, primary_cfg) =
-        primary_config(zone_config(1, "192.0.2.10"), vec![secondary_udp]);
-    let mut primary = Server::start(&primary_cfg).expect("primary");
-    let primary_tcp = primary.tcp_addr().expect("primary tcp");
     let secondary_zone = common::TempZone::empty("secondary-expire");
-    let mut secondary = Server::start(&secondary_config(
-        primary_tcp,
-        secondary_udp,
-        Some(secondary_zone.path().to_path_buf()),
-        "c2VjcmV0",
-        1,
-    ))
-    .expect("secondary");
-    assert!(wait_for_serial(&secondary, 1, Duration::from_secs(10)));
-
-    primary.shutdown().expect("primary shutdown");
+    let mut pair = start_pair(&PairSpec {
+        records: zone_config(1, "192.0.2.10"),
+        zone: Some(secondary_zone.path().to_path_buf()),
+        secret: "c2VjcmV0",
+        expire: 1,
+        refresh: 1,
+        bootstrap: true,
+        primary_api: false,
+        secondary_api: false,
+        notify: false,
+    });
     assert!(
-        wait_for_rcode(&secondary, Rcode::SERVFAIL, Duration::from_secs(15)),
-        "secondary did not expire: {:?}",
-        secondary.secondary_last_error(&name(ORIGIN))
+        wait_for_serial(&pair.secondary, 1, common::E2E_DEADLINE),
+        "secondary did not bootstrap: {}",
+        server_context(&pair.secondary)
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && secondary.secondary_last_error(&name(ORIGIN)).is_none() {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(secondary.secondary_last_error(&name(ORIGIN)).is_some());
-    secondary.shutdown().expect("secondary shutdown");
+
+    pair.primary.shutdown().expect("primary shutdown");
+    assert!(
+        wait_for_rcode(&pair.secondary, Rcode::SERVFAIL, common::E2E_DEADLINE),
+        "secondary did not expire: {}",
+        server_context(&pair.secondary)
+    );
+    assert!(
+        common::wait_until(common::SOCKET_TIMEOUT, || pair
+            .secondary
+            .secondary_last_error(&name(ORIGIN))
+            .is_some()),
+        "expired secondary must record the last refresh error: {}",
+        server_context(&pair.secondary)
+    );
+    pair.secondary.shutdown().expect("secondary shutdown");
 }
 
 #[test]
 fn secondary_rejects_wrong_tsig() {
-    let secondary_udp = free_udp_addr();
-    let (_primary_zone, primary_cfg) = primary_config(zone_config(1, "192.0.2.10"), Vec::new());
-    let mut primary = Server::start(&primary_cfg).expect("primary");
-    let primary_tcp = primary.tcp_addr().expect("primary tcp");
     let secondary_zone = common::TempZone::empty("secondary-badtsig");
-    let mut secondary = Server::start(&secondary_config(
-        primary_tcp,
-        secondary_udp,
-        Some(secondary_zone.path().to_path_buf()),
-        "d3Jvbmc=",
-        60,
-    ))
-    .expect("secondary");
+    let mut pair = start_pair(&PairSpec {
+        records: zone_config(1, "192.0.2.10"),
+        zone: Some(secondary_zone.path().to_path_buf()),
+        secret: "d3Jvbmc=",
+        expire: 60,
+        refresh: 1,
+        bootstrap: true,
+        primary_api: false,
+        secondary_api: false,
+        notify: false,
+    });
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && secondary.secondary_last_error(&name(ORIGIN)).is_none() {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let error = secondary
-        .secondary_last_error(&name(ORIGIN))
-        .expect("TSIG error must be recorded");
+    // Ошибка должна быть именно TSIG/NOTAUTH: «connection refused» не считается.
     assert!(
-        error.contains("NOTAUTH") || error.contains("TSIG") || error.contains("BADSIG"),
-        "unexpected error: {error}"
+        common::wait_until(common::E2E_DEADLINE, || pair
+            .secondary
+            .secondary_last_error(&name(ORIGIN))
+            .is_some_and(|error| tsig_error(&error))),
+        "TSIG error must be recorded: {}",
+        server_context(&pair.secondary)
     );
-    let response = dns_query(&secondary, ORIGIN, Rtype::SOA);
+    let response = dns_query(&pair.secondary, ORIGIN, Rtype::SOA);
     assert_eq!(response.rcode(), Rcode::REFUSED);
 
-    secondary.shutdown().expect("secondary shutdown");
-    primary.shutdown().expect("primary shutdown");
+    pair.secondary.shutdown().expect("secondary shutdown");
+    pair.primary.shutdown().expect("primary shutdown");
+}
+
+fn tsig_error(error: &str) -> bool {
+    error.contains("NOTAUTH") || error.contains("TSIG") || error.contains("BADSIG")
 }
 
 #[test]
 fn bootstrap_false_waits_for_notify() {
-    let secondary_udp = free_udp_addr();
-    let (_primary_zone, primary_cfg) =
-        primary_config(zone_config(1, "192.0.2.10"), vec![secondary_udp]);
-    let mut primary = Server::start_with_api(&primary_cfg, Some(api_options())).expect("primary");
-    let primary_tcp = primary.tcp_addr().expect("primary tcp");
-    let primary_api = primary.api_addr().expect("primary api");
     let secondary_zone = common::TempZone::empty("secondary-notify");
-    let mut config = secondary_config(
-        primary_tcp,
-        secondary_udp,
-        Some(secondary_zone.path().to_path_buf()),
-        "c2VjcmV0",
-        60,
-    );
-    config.secondary_zones[0].bootstrap = false;
-    let mut secondary = Server::start(&config).expect("secondary");
+    let mut pair = start_pair(&PairSpec {
+        records: zone_config(1, "192.0.2.10"),
+        zone: Some(secondary_zone.path().to_path_buf()),
+        secret: "c2VjcmV0",
+        expire: 60,
+        // refresh заметно больше дедлайна: тест доказывает именно NOTIFY, а не
+        // регулярный опрос master'а.
+        refresh: 600,
+        bootstrap: false,
+        primary_api: true,
+        secondary_api: false,
+        notify: true,
+    });
+    let primary_api = pair.primary.api_addr().expect("primary api");
 
     // Без bootstrap зоны нет: REFUSED.
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         assert_ne!(
-            dns_query(&secondary, ORIGIN, Rtype::SOA).rcode(),
+            dns_query(&pair.secondary, ORIGIN, Rtype::SOA).rcode(),
             Rcode::NOERROR
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -525,12 +661,16 @@ fn bootstrap_false_waits_for_notify() {
         String::from_utf8_lossy(&body)
     );
     assert!(
-        wait_for_serial(&secondary, 2, Duration::from_secs(10)),
-        "secondary did not bootstrap on NOTIFY: {:?}",
-        secondary.secondary_last_error(&name(ORIGIN))
+        wait_for_serial(&pair.secondary, 2, common::E2E_DEADLINE),
+        "secondary did not bootstrap on NOTIFY (refresh=600s, so only NOTIFY could wake it): {}",
+        server_context(&pair.secondary)
     );
-    assert!(wait_for_a(&secondary, "192.0.2.11", Duration::from_secs(5)));
+    assert!(
+        wait_for_a(&pair.secondary, "192.0.2.11", common::E2E_DEADLINE),
+        "secondary did not apply NOTIFY-triggered transfer: {}",
+        server_context(&pair.secondary)
+    );
 
-    secondary.shutdown().expect("secondary shutdown");
-    primary.shutdown().expect("primary shutdown");
+    pair.secondary.shutdown().expect("secondary shutdown");
+    pair.primary.shutdown().expect("primary shutdown");
 }

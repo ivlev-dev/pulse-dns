@@ -10,16 +10,38 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pulse_tls::Stats;
 
+/// Какие защищённые транспорты включены.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)] // независимые флаги транспортов
+pub(crate) struct EnabledTransports {
+    /// DoT.
+    pub dot: bool,
+    /// DoH/HTTP/1.1.
+    pub doh: bool,
+    /// DoH/HTTP/2.
+    pub doh_h2: bool,
+    /// DoQ.
+    pub doq: bool,
+    /// DNSCrypt UDP.
+    pub dnscrypt: bool,
+    /// DNSCrypt TCP.
+    pub dnscrypt_tcp: bool,
+}
+
 /// Общие счётчики защищённых транспортов.
 #[derive(Debug, Default)]
 #[allow(clippy::struct_excessive_bools)] // независимые флаги транспортов
 pub(crate) struct TransportMetrics {
     dot_enabled: bool,
     doh_enabled: bool,
+    doh_h2_enabled: bool,
+    doq_enabled: bool,
     dnscrypt_enabled: bool,
     dnscrypt_tcp_enabled: bool,
     dot: Arc<Stats>,
     doh: Arc<Stats>,
+    doh_h2: Arc<Stats>,
+    doq: Arc<Stats>,
     dnscrypt_packets: AtomicU64,
     dnscrypt_queries: AtomicU64,
     dnscrypt_responses: AtomicU64,
@@ -37,21 +59,18 @@ pub(crate) struct TransportMetrics {
 
 impl TransportMetrics {
     /// Создаёт набор счётчиков для включённых транспортов.
-    #[allow(clippy::similar_names)]
-    #[allow(clippy::fn_params_excessive_bools)] // флаги транспортов независимы
-    pub(crate) fn new(
-        enable_dot: bool,
-        enable_doh: bool,
-        enable_dnscrypt: bool,
-        enable_dnscrypt_tcp: bool,
-    ) -> Self {
+    pub(crate) fn new(enabled: EnabledTransports) -> Self {
         Self {
-            dot_enabled: enable_dot,
-            doh_enabled: enable_doh,
-            dnscrypt_enabled: enable_dnscrypt,
-            dnscrypt_tcp_enabled: enable_dnscrypt_tcp,
+            dot_enabled: enabled.dot,
+            doh_enabled: enabled.doh,
+            doh_h2_enabled: enabled.doh_h2,
+            doq_enabled: enabled.doq,
+            dnscrypt_enabled: enabled.dnscrypt,
+            dnscrypt_tcp_enabled: enabled.dnscrypt_tcp,
             dot: Arc::new(Stats::new()),
             doh: Arc::new(Stats::new()),
+            doh_h2: Arc::new(Stats::new()),
+            doq: Arc::new(Stats::new()),
             ..Self::default()
         }
     }
@@ -64,6 +83,16 @@ impl TransportMetrics {
     /// Счётчики DoH (для `DohServer`).
     pub(crate) fn doh_stats(&self) -> Arc<Stats> {
         Arc::clone(&self.doh)
+    }
+
+    /// Счётчики DoH/HTTP/2 (для `Doh2Server`).
+    pub(crate) fn doh_h2_stats(&self) -> Arc<Stats> {
+        Arc::clone(&self.doh_h2)
+    }
+
+    /// Счётчики DoQ (для `DoqServer`).
+    pub(crate) fn doq_stats(&self) -> Arc<Stats> {
+        Arc::clone(&self.doq)
     }
 
     pub(crate) fn dnscrypt_packet(&self) {
@@ -129,7 +158,13 @@ impl TransportMetrics {
         if self.doh_enabled {
             append_tls("doh", &self.doh.snapshot(), &mut out);
         }
-        if self.dot_enabled || self.doh_enabled {
+        if self.doh_h2_enabled {
+            append_tls("doh_http2", &self.doh_h2.snapshot(), &mut out);
+        }
+        if self.doq_enabled {
+            append_tls("doq", &self.doq.snapshot(), &mut out);
+        }
+        if self.dot_enabled || self.doh_enabled || self.doh_h2_enabled || self.doq_enabled {
             let _ = write!(
                 out,
                 "# HELP pulsed_tls_reload_total Successful TLS reloads.\n\
@@ -279,16 +314,16 @@ fn append_tls(prefix: &str, stats: &pulse_tls::StatsSnapshot, out: &mut String) 
         "Protocol and handler errors.",
         stats.errors,
     );
-    if prefix == "doh" {
+    if prefix.starts_with("doh") {
         append_counter(
             out,
-            "doh_http_requests_total",
+            &format!("{prefix}_http_requests_total"),
             "HTTP requests served.",
             stats.http_requests,
         );
         append_counter(
             out,
-            "doh_http_errors_total",
+            &format!("{prefix}_http_errors_total"),
             "HTTP 4xx/5xx responses.",
             stats.http_errors,
         );
@@ -308,7 +343,14 @@ mod tests {
 
     #[test]
     fn renders_enabled_transports_only() {
-        let metrics = TransportMetrics::new(true, false, true, true);
+        let metrics = TransportMetrics::new(EnabledTransports {
+            dot: true,
+            doh: false,
+            doh_h2: true,
+            doq: true,
+            dnscrypt: true,
+            dnscrypt_tcp: true,
+        });
         metrics.dnscrypt_packet();
         metrics.dnscrypt_query();
         metrics.dnscrypt_response();
@@ -318,7 +360,9 @@ mod tests {
         metrics.tls_reload();
         let text = metrics.render();
         assert!(text.contains("dot_queries_total 0"));
-        assert!(!text.contains("doh_queries_total"));
+        assert!(!text.contains("\ndoh_queries_total"));
+        assert!(text.contains("doh_http2_queries_total 0"));
+        assert!(text.contains("doq_queries_total 0"));
         assert!(text.contains("dnscrypt_packets_total 1"));
         assert!(text.contains("dnscrypt_responses_total 1"));
         assert!(text.contains("dnscrypt_tcp_connections_total 1"));

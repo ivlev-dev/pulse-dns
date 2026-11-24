@@ -416,7 +416,33 @@ pub struct ZoneFileMetrics {
     pub v2_pins: u64,
 }
 
+/// Состояние одного ключа ротации (RFC 7583) для `/keys`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRotationKeyView {
+    /// Key tag.
+    pub key_tag: u16,
+    /// Роль (`ksk`/`zsk`).
+    pub role: String,
+    /// Стадия (`pre_publish`, `double_sign`, `active`, `retired`).
+    pub state: String,
+    /// Время создания (UNIX).
+    pub created_at: u32,
+    /// Ближайший переход (UNIX), если есть.
+    pub next_transition: Option<u32>,
+}
+
+/// Снимок ротации ключей зоны.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRotationView {
+    /// Ключи в детерминированном порядке.
+    pub keys: Vec<KeyRotationKeyView>,
+    /// Ближайшее событие ротации.
+    pub next_event_at: Option<u32>,
+}
+
 /// Порт администрирования зон.
+///
+/// Реализации синхронные и `Send + Sync`.
 pub trait ZoneAdmin: Send + Sync + 'static {
     /// Готов ли store обслуживать запросы.
     fn ready(&self) -> bool;
@@ -502,5 +528,13 @@ pub trait ZoneAdmin: Send + Sync + 'static {
     fn sign_zone(&self, origin: &Name) -> Result<ZoneView, AdminError> {
         let _ = origin;
         Err(AdminError::Internal)
+    }
+
+    /// Состояние автоматической ротации ключей, если она настроена.
+    ///
+    /// In-memory store и зоны со статическими ключами возвращают `Ok(None)`.
+    fn key_rotation(&self, origin: &Name) -> Result<Option<KeyRotationView>, AdminError> {
+        let _ = origin;
+        Ok(None)
     }
 }

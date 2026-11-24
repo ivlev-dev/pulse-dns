@@ -4,18 +4,22 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use pulse_api::auth::TokenConfig;
 use pulse_api::config::ApiConfig;
-use pulse_api::server::{ApiServerError, RunningServer, serve_with_metrics};
+use pulse_api::journal::{Journal, JournalConfig, JournalError};
+use pulse_api::server::{ApiServerError, RunningServer, serve_with_journal};
 use pulse_server::StatsSnapshot as QueryStatsSnapshot;
 use thiserror::Error;
 
 use crate::config::{Config, ConfigError};
 use crate::dnscrypt::{DnscryptError, DnscryptService, DnscryptTcpService};
 use crate::dnssec::{self, DnssecError};
-use crate::metrics::TransportMetrics;
+use crate::metrics::{EnabledTransports, TransportMetrics};
 use crate::secondary::SecondaryScheduler;
 use crate::stats::{Stats, StatsSnapshot};
 use crate::store::{self, SharedZoneAdmin};
@@ -61,6 +65,7 @@ pub struct Server {
     dnscrypt_tcp: Option<DnscryptTcpService>,
     api: Option<RunningServer>,
     secondary: Option<SecondaryScheduler>,
+    rotation: Option<RotationScheduler>,
 }
 
 impl Server {
@@ -131,6 +136,34 @@ impl Server {
         let admin = Arc::new(SharedZoneAdmin::new(store, dnssec, config, notify).map_err(
             |error| ServerError::Store(format!("cannot build initial DNS snapshot: {error}")),
         )?);
+        let journal = match config.journal_file() {
+            Some(path) => Some(Arc::new(
+                Journal::open(JournalConfig {
+                    path: path.clone(),
+                    max_bytes: config.journal_max_bytes,
+                    fsync: config.journal_fsync,
+                    retain_resolved: pulse_api::journal::DEFAULT_RETAIN_RESOLVED,
+                })
+                .map_err(ServerError::Journal)?,
+            )),
+            None => None,
+        };
+        if let Some(journal) = &journal {
+            let report = journal.recover(&*admin).map_err(ServerError::Journal)?;
+            if report.pending > 0 {
+                crate::logging::info(
+                    "journal",
+                    &format!(
+                        "journal recovery: pending={} replayed={} skipped={} aborted={} truncated_bytes={}",
+                        report.pending,
+                        report.replayed,
+                        report.skipped,
+                        report.aborted,
+                        report.truncated_bytes
+                    ),
+                );
+            }
+        }
         let secondary = if admin.has_secondary_zones() {
             Some(
                 SecondaryScheduler::start(Arc::downgrade(&admin))
@@ -139,13 +172,22 @@ impl Server {
         } else {
             None
         };
+        let rotation = match admin.rotation_tick() {
+            Some(interval) => Some(
+                RotationScheduler::start(Arc::downgrade(&admin), interval)
+                    .map_err(ServerError::Rotation)?,
+            ),
+            None => None,
+        };
         let stats = Arc::new(Stats::new());
-        let metrics = Arc::new(TransportMetrics::new(
-            config.dot_listen.is_some(),
-            config.doh_listen.is_some(),
-            config.dnscrypt_listen.is_some(),
-            config.dnscrypt_tcp_listen.is_some(),
-        ));
+        let metrics = Arc::new(TransportMetrics::new(EnabledTransports {
+            dot: config.dot_listen.is_some(),
+            doh: config.doh_listen.is_some(),
+            doh_h2: config.doh_h2_listen.is_some(),
+            doq: config.doq_listen.is_some(),
+            dnscrypt: config.dnscrypt_listen.is_some(),
+            dnscrypt_tcp: config.dnscrypt_tcp_listen.is_some(),
+        }));
         let tls = TlsTransports::start(
             config,
             Arc::clone(&admin),
@@ -213,10 +255,11 @@ impl Server {
                     let metrics = Arc::clone(&metrics);
                     Arc::new(move || metrics.render())
                 };
-                Some(serve_with_metrics(
+                Some(serve_with_journal(
                     api_config,
                     Arc::clone(&admin),
                     Some(metric_source),
+                    journal.clone(),
                 )?)
             }
             None => None,
@@ -233,6 +276,7 @@ impl Server {
             dnscrypt_tcp,
             api,
             secondary,
+            rotation,
         })
     }
 
@@ -260,6 +304,18 @@ impl Server {
         self.tls.as_ref().and_then(TlsTransports::doh_addr)
     }
 
+    /// Фактический DoH/HTTP/2-адрес (полезен при `port = 0`).
+    #[must_use]
+    pub fn doh_h2_addr(&self) -> Option<SocketAddr> {
+        self.tls.as_ref().and_then(TlsTransports::doh_h2_addr)
+    }
+
+    /// Фактический DoQ-адрес (полезен при `port = 0`).
+    #[must_use]
+    pub fn doq_addr(&self) -> Option<SocketAddr> {
+        self.tls.as_ref().and_then(TlsTransports::doq_addr)
+    }
+
     /// Фактический DNSCrypt-адрес (полезен при `port = 0`).
     #[must_use]
     pub fn dnscrypt_addr(&self) -> Option<SocketAddr> {
@@ -284,6 +340,18 @@ impl Server {
     #[must_use]
     pub fn doh_stats(&self) -> Option<pulse_tls::StatsSnapshot> {
         self.tls.as_ref().and_then(TlsTransports::doh_stats)
+    }
+
+    /// Снимок счётчиков DoH/HTTP/2, если транспорт запущен.
+    #[must_use]
+    pub fn doh_h2_stats(&self) -> Option<pulse_tls::StatsSnapshot> {
+        self.tls.as_ref().and_then(TlsTransports::doh_h2_stats)
+    }
+
+    /// Снимок счётчиков DoQ, если транспорт запущен.
+    #[must_use]
+    pub fn doq_stats(&self) -> Option<pulse_tls::StatsSnapshot> {
+        self.tls.as_ref().and_then(TlsTransports::doq_stats)
     }
 
     /// Снимок счётчиков DNSCrypt UDP, если DNSCrypt запущен.
@@ -418,6 +486,9 @@ impl Server {
         if let Some(secondary) = self.secondary.take() {
             secondary.shutdown();
         }
+        if let Some(rotation) = self.rotation.take() {
+            rotation.shutdown();
+        }
         let mut first_error = None;
         if let Some(mut tls) = self.tls.take()
             && let Err(error) = tls.shutdown()
@@ -456,6 +527,63 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+/// Фоновый планировщик ротации ключей.
+///
+/// Продвигает состояние по возрасту ключей и переподписывает зоны, у которых
+/// произошёл переход. Если администратор уже выгружен, поток завершается.
+struct RotationScheduler {
+    stop: Arc<AtomicBool>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl RotationScheduler {
+    fn start(admin: Weak<SharedZoneAdmin>, interval: Duration) -> io::Result<Self> {
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&shutdown_flag);
+        let handle = thread::Builder::new()
+            .name("pulse-rotation".to_owned())
+            .spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    if let Some(admin) = admin.upgrade() {
+                        admin.advance_rotations();
+                    } else {
+                        break;
+                    }
+                    // Просыпаемся чаще интервала, чтобы shutdown не ждал tick.
+                    let mut remaining = interval;
+                    let step = Duration::from_millis(100);
+                    while remaining > Duration::ZERO && !worker_stop.load(Ordering::Acquire) {
+                        let sleep = remaining.min(step);
+                        thread::sleep(sleep);
+                        remaining = remaining.saturating_sub(sleep);
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop: shutdown_flag,
+            handle: Mutex::new(Some(handle)),
+        })
+    }
+
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for RotationScheduler {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -498,7 +626,13 @@ pub enum ServerError {
     /// Не удалось запустить фоновый secondary-планировщик.
     #[error("cannot start secondary scheduler: {0}")]
     Secondary(#[source] io::Error),
+    /// Не удалось запустить фоновый планировщик ротации.
+    #[error("cannot start key rotation scheduler: {0}")]
+    Rotation(#[source] io::Error),
     /// Ошибка встроенного API.
     #[error(transparent)]
     Api(#[from] ApiServerError),
+    /// Ошибка write-ahead журнала или его recovery.
+    #[error("journal error: {0}")]
+    Journal(#[from] JournalError),
 }

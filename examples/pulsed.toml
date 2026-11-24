@@ -1,0 +1,16 @@
+# Сервер pulsed: UDP/TCP и persistence в pulse-zonefile.
+# Эквивалент examples/pulsed.json (JSON поддерживается для совместимости).
+listen_udp = "127.0.0.1:5353"
+listen_tcp = "127.0.0.1:5353"
+workers = 2
+log_level = "info"
+zonefile = "/tmp/pulse-dns.zonefile"
+durability = "flush"
+map_size = 268435456
+
+# Write-ahead journal REST-мутаций (outbox). Включён по умолчанию; путь по
+# умолчанию — "<zonefile>.journal". См. docs/ops/journal.md.
+journal = true
+# journal_path = "/tmp/pulse-dns.zonefile.journal"
+journal_max_bytes = 8388608
+journal_fsync = true

@@ -1,0 +1,9 @@
+# Запуск с persistence: все зоны живут в zonefile.
+# Эквивалент examples/persistent.json.
+listen_udp = "127.0.0.1:5353"
+listen_tcp = "127.0.0.1:5353"
+workers = 2
+log_level = "info"
+zonefile = "/tmp/pulse-dns.zonefile"
+durability = "flush"
+map_size = 268435456

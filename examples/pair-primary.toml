@@ -1,0 +1,20 @@
+# Primary: AXFR/IXFR-out с TSIG и NOTIFY на secondary.
+# Эквивалент examples/pair-primary.json.
+listen_udp = "127.0.0.1:5353"
+listen_tcp = "127.0.0.1:5353"
+workers = 2
+zonefile = "./primary.pulse"
+durability = "flush"
+map_size = 268435456
+
+[[tsig_keys]]
+name = "xfr-key.example.com."
+algorithm = "hmac-sha256"
+secret = "c2VjcmV0LW11c3QtYmUtcmVwbGFjZWQ="
+
+[transfer]
+require_tsig = true
+allow_from = ["127.0.0.1", "::1"]
+allow_zones = ["example.com."]
+notify = ["127.0.0.1:5354"]
+notify_tsig_key = "xfr-key.example.com."

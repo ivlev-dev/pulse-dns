@@ -32,12 +32,14 @@ pub(crate) fn run() -> ExitCode {
     let config_path = matches
         .get_one::<PathBuf>("config")
         .cloned()
-        .unwrap_or_else(|| PathBuf::from("pulsed.json"));
+        .unwrap_or_else(|| PathBuf::from("examples/pulsed.toml"));
     let overrides = Overrides {
         listen_udp: matches.get_one::<SocketAddr>("listen-udp").copied(),
         listen_tcp: matches.get_one::<SocketAddr>("listen-tcp").copied(),
         dot_listen: matches.get_one::<SocketAddr>("dot-listen").copied(),
         doh_listen: matches.get_one::<SocketAddr>("doh-listen").copied(),
+        doh_h2_listen: matches.get_one::<SocketAddr>("doh-h2-listen").copied(),
+        doq_listen: matches.get_one::<SocketAddr>("doq-listen").copied(),
         tls_cert: matches.get_one::<PathBuf>("tls-cert").cloned(),
         tls_key: matches.get_one::<PathBuf>("tls-key").cloned(),
         tls_reload_secs: matches.get_one::<u64>("tls-reload-secs").copied(),
@@ -61,7 +63,7 @@ pub(crate) fn run() -> ExitCode {
         map_size: matches.get_one::<u64>("map-size").copied(),
     };
 
-    let mut config = match Config::load(&config_path) {
+    let mut config = match Config::from_path(&config_path) {
         Ok(config) => config,
         Err(error) => {
             logging::error("config", &error.to_string());
@@ -97,7 +99,7 @@ pub(crate) fn run() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let api = match api_options(&matches) {
+    let api = match api_options(&matches, &config) {
         Ok(api) => api,
         Err(error) => {
             logging::error("api", &error);
@@ -114,12 +116,14 @@ pub(crate) fn run() -> ExitCode {
     logging::info(
         "startup",
         &format!(
-            "pulsed {} listening: udp={:?} tcp={:?} dot={:?} doh={:?} dnscrypt={:?} api={:?} workers={:?} backend={:?}",
+            "pulsed {} listening: udp={:?} tcp={:?} dot={:?} doh={:?} doh_h2={:?} doq={:?} dnscrypt={:?} api={:?} workers={:?} backend={:?}",
             env!("CARGO_PKG_VERSION"),
             server.udp_addr(),
             server.tcp_addr(),
             server.dot_addr(),
             server.doh_addr(),
+            server.doh_h2_addr(),
+            server.doq_addr(),
             server.dnscrypt_addr(),
             server.api_addr(),
             server.udp_workers(),
@@ -139,7 +143,25 @@ pub(crate) fn run() -> ExitCode {
         logging::info(
             "doh",
             &format!(
-                "DoH enabled (HTTP/1.1 only, ALPN http/1.1): connections={} active={}",
+                "DoH enabled (HTTP/1.1, ALPN http/1.1): connections={} active={}",
+                stats.connections, stats.active_connections
+            ),
+        );
+    }
+    if let Some(stats) = server.doh_h2_stats() {
+        logging::info(
+            "doh_h2",
+            &format!(
+                "DoH enabled (HTTP/2, ALPN h2): connections={} active={}",
+                stats.connections, stats.active_connections
+            ),
+        );
+    }
+    if let Some(stats) = server.doq_stats() {
+        logging::info(
+            "doq",
+            &format!(
+                "DoQ enabled (ALPN doq, RFC 9250): connections={} active={}",
                 stats.connections, stats.active_connections
             ),
         );
@@ -200,6 +222,8 @@ pub(crate) fn run() -> ExitCode {
     let udp_stats = server.udp_stats();
     let dot_snapshot = server.dot_stats();
     let doh_snapshot = server.doh_stats();
+    let doh_h2_snapshot = server.doh_h2_stats();
+    let doq_snapshot = server.doq_stats();
     let dnscrypt_snapshot = server.dnscrypt_stats();
     let shutdown_result = server.shutdown();
     let stats = server.stats();
@@ -272,6 +296,29 @@ pub(crate) fn run() -> ExitCode {
             ),
         );
     }
+    if let Some(doh_h2) = doh_h2_snapshot {
+        logging::info(
+            "doh_h2_stats",
+            &format!(
+                "connections={} handshakes={} http_requests={} queries={} responses={} errors={}",
+                doh_h2.connections,
+                doh_h2.handshakes,
+                doh_h2.http_requests,
+                doh_h2.queries,
+                doh_h2.responses,
+                doh_h2.errors
+            ),
+        );
+    }
+    if let Some(doq) = doq_snapshot {
+        logging::info(
+            "doq_stats",
+            &format!(
+                "connections={} handshakes={} queries={} responses={} errors={}",
+                doq.connections, doq.handshakes, doq.queries, doq.responses, doq.errors
+            ),
+        );
+    }
     if let Some(dnscrypt) = dnscrypt_snapshot {
         logging::info(
             "dnscrypt_stats",
@@ -296,7 +343,11 @@ pub(crate) fn run() -> ExitCode {
 }
 
 fn reload_tls(server: &Server, source: &str) {
-    if server.dot_addr().is_none() && server.doh_addr().is_none() {
+    if server.dot_addr().is_none()
+        && server.doh_addr().is_none()
+        && server.doh_h2_addr().is_none()
+        && server.doq_addr().is_none()
+    {
         logging::warn(
             "tls",
             &format!("{source}: TLS is not configured; reload skipped"),
@@ -665,15 +716,21 @@ fn tsig_keys(matches: &ArgMatches) -> Result<Vec<(String, String, String)>, Stri
     Ok(keys)
 }
 
-fn api_options(matches: &ArgMatches) -> Result<Option<ApiOptions>, String> {
-    let listen = matches.get_one::<SocketAddr>("api-listen").copied();
+fn api_options(matches: &ArgMatches, config: &Config) -> Result<Option<ApiOptions>, String> {
+    let listen = matches
+        .get_one::<SocketAddr>("api-listen")
+        .copied()
+        .or(config.api_listen);
+    // Приоритет: CLI → PULSED_API_TOKEN → конфигурация. Env предпочтительнее
+    // файла, чтобы секрет можно было не хранить на диске.
     let token = matches
         .get_one::<String>("api-token")
         .cloned()
         .or_else(|| std::env::var("PULSED_API_TOKEN").ok())
+        .or_else(|| config.api_token.clone())
         .map(|token| token.trim().to_owned())
         .filter(|token| !token.is_empty());
-    let scopes: Vec<String> = matches
+    let cli_scopes: Vec<String> = matches
         .get_many::<String>("api-scope")
         .map(|values| {
             values
@@ -682,6 +739,16 @@ fn api_options(matches: &ArgMatches) -> Result<Option<ApiOptions>, String> {
                 .collect()
         })
         .unwrap_or_default();
+    let scopes = if cli_scopes.is_empty() {
+        config
+            .api_scope
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect()
+    } else {
+        cli_scopes
+    };
     match (listen, token) {
         (Some(listen), Some(token)) => Ok(Some(ApiOptions {
             listen,
@@ -705,9 +772,10 @@ fn api_options(matches: &ArgMatches) -> Result<Option<ApiOptions>, String> {
 
 fn server_exit_code(error: &ServerError) -> ExitCode {
     match error {
-        ServerError::Config(_) | ServerError::Store(_) | ServerError::Dnssec(_) => {
-            ExitCode::from(2)
-        }
+        ServerError::Config(_)
+        | ServerError::Store(_)
+        | ServerError::Dnssec(_)
+        | ServerError::Journal(_) => ExitCode::from(2),
         ServerError::Api(error) => match error {
             ApiServerError::Config(_) => ExitCode::from(2),
             _ => ExitCode::from(1),
@@ -717,6 +785,7 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
         | ServerError::Udp(_)
         | ServerError::Notify(_)
         | ServerError::Secondary(_)
+        | ServerError::Rotation(_)
         | ServerError::Tls(_)
         | ServerError::Dnscrypt(_) => ExitCode::from(1),
     }
@@ -731,9 +800,9 @@ fn command() -> Command {
             Arg::new("config")
                 .long("config")
                 .value_name("PATH")
-                .default_value("pulsed.json")
+                .default_value("examples/pulsed.toml")
                 .value_parser(value_parser!(PathBuf))
-                .help("Path to the JSON configuration file"),
+                .help("Path to the TOML (or legacy JSON) configuration file"),
         )
         .arg(
             Arg::new("listen-udp")
@@ -762,6 +831,20 @@ fn command() -> Command {
                 .value_name("ADDR")
                 .value_parser(value_parser!(SocketAddr))
                 .help("Enable DNS-over-HTTPS/1.1 (RFC 8484), e.g. 0.0.0.0:443"),
+        )
+        .arg(
+            Arg::new("doh-h2-listen")
+                .long("doh-h2-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNS-over-HTTPS/2 (RFC 8484 + 9113), e.g. 0.0.0.0:443"),
+        )
+        .arg(
+            Arg::new("doq-listen")
+                .long("doq-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNS-over-QUIC (RFC 9250), e.g. 0.0.0.0:853"),
         )
         .arg(
             Arg::new("tls-cert")
@@ -1069,6 +1152,67 @@ mod tests {
         command()
             .try_get_matches_from(std::iter::once("pulsed").chain(args.iter().copied()))
             .expect("arguments parse")
+    }
+
+    #[test]
+    fn cli_default_config_is_toml_example() {
+        let arguments = matches(&[]);
+        assert_eq!(
+            arguments.get_one::<PathBuf>("config"),
+            Some(&PathBuf::from("examples/pulsed.toml"))
+        );
+    }
+
+    #[test]
+    fn api_settings_merge_config_and_cli_overrides() {
+        let config = Config {
+            api_listen: Some("127.0.0.1:8080".parse().expect("addr")),
+            api_token: Some("file-token".to_owned()),
+            api_scope: vec!["example.com.".to_owned()],
+            ..Config::default()
+        };
+        let from_config = api_options(&matches(&[]), &config)
+            .expect("config api")
+            .expect("enabled");
+        assert_eq!(
+            from_config.listen,
+            "127.0.0.1:8080".parse::<SocketAddr>().expect("addr")
+        );
+        assert_eq!(from_config.scopes, vec!["example.com."]);
+        if std::env::var("PULSED_API_TOKEN").is_err() {
+            assert_eq!(from_config.token, "file-token");
+        }
+
+        let overridden = api_options(
+            &matches(&[
+                "--api-listen",
+                "127.0.0.1:9090",
+                "--api-token",
+                "cli-token",
+                "--api-scope",
+                "*.internal.",
+            ]),
+            &config,
+        )
+        .expect("cli api")
+        .expect("enabled");
+        assert_eq!(
+            overridden.listen,
+            "127.0.0.1:9090".parse::<SocketAddr>().expect("addr")
+        );
+        assert_eq!(overridden.token, "cli-token");
+        assert_eq!(overridden.scopes, vec!["*.internal."]);
+    }
+
+    #[test]
+    fn api_listen_without_token_is_rejected() {
+        let config = Config {
+            api_listen: Some("127.0.0.1:8080".parse().expect("addr")),
+            ..Config::default()
+        };
+        if std::env::var("PULSED_API_TOKEN").is_err() {
+            assert!(api_options(&matches(&[]), &config).is_err());
+        }
     }
 
     #[test]

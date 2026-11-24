@@ -12,6 +12,7 @@ use thiserror::Error;
 use crate::config::{ApiConfig, ApiConfigError};
 use crate::handler::Api;
 use crate::http::{HttpLimits, read_request, write_response};
+use crate::journal::Journal;
 use crate::port::ZoneAdmin;
 use crate::problem::Problem;
 
@@ -107,6 +108,25 @@ pub fn serve_with_metrics<Z: ZoneAdmin>(
     store: Arc<Z>,
     extra_metrics: Option<MetricsProvider>,
 ) -> Result<RunningServer, ApiServerError> {
+    serve_with_journal(config, store, extra_metrics, None)
+}
+
+/// Запускает API-сервер с write-ahead journal мутаций.
+///
+/// Интент пишется до применения операции, `committed` — после zonefile-
+/// коммита; `2xx` отдаётся только после `committed`. Recovery выполняет
+/// вызывающая сторона до запуска сервера.
+///
+/// # Errors
+///
+/// [`ApiServerError`] при некорректной конфигурации, занятом адресе или
+/// невозможности запустить поток.
+pub fn serve_with_journal<Z: ZoneAdmin>(
+    config: ApiConfig,
+    store: Arc<Z>,
+    extra_metrics: Option<MetricsProvider>,
+    journal: Option<Arc<Journal>>,
+) -> Result<RunningServer, ApiServerError> {
     let authenticator = config.validate()?;
     let bind = config.bind;
     let listener =
@@ -122,7 +142,13 @@ pub fn serve_with_metrics<Z: ZoneAdmin>(
     };
     let max_connections = config.max_connections;
     let store: Arc<dyn ZoneAdmin> = store;
-    let api = Arc::new(Api::new(&config, store, authenticator, extra_metrics));
+    let api = Arc::new(Api::new(
+        &config,
+        store,
+        authenticator,
+        extra_metrics,
+        journal,
+    ));
     let shutdown = Arc::new(AtomicBool::new(false));
     let workers = Arc::new(Mutex::new(Vec::new()));
     let accept = {

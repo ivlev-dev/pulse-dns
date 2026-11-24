@@ -1,0 +1,25 @@
+# Резолвер с автоматическим обновлением trust anchors (RFC 5011).
+listen_udp = "127.0.0.1:5353"
+listen_tcp = "127.0.0.1:5353"
+metrics_listen = "127.0.0.1:9153"
+workers = 2
+mode = "forward"
+forwarders = ["1.1.1.1:53", "9.9.9.9:53"]
+dnssec_validate = true
+log_level = "info"
+
+# path  — начальный набор доверенных DS (root-anchors);
+# state — персистентное состояние RFC 5011 (0600, атомарная запись).
+# Hold-down по умолчанию 30 дней; в тестах/стенде можно уменьшить.
+[trust_anchor]
+path = "/etc/pulsed/root.ds"
+state = "/var/lib/pulsed/trust-anchors/state.json"
+add_hold_down = 2592000
+revoke_hold_down = 2592000
+
+[cache]
+max_entries = 32768
+max_bytes = 16777216
+min_ttl = 0
+max_ttl = 86400
+shards = 16

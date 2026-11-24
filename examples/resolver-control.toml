@@ -1,0 +1,53 @@
+# Резолвер pulseresolved с control-plane REST API.
+#
+# API слушает только loopback и без TLS. Токен обязателен: предпочтительно
+# задать его через env (не попадает в файл/логи):
+#   export PULSERESOLVED_API_TOKEN="$(openssl rand -hex 32)"
+# Значение control_token ниже — только демонстрационное.
+listen_udp = "127.0.0.1:5353"
+listen_tcp = "127.0.0.1:5353"
+metrics_listen = "127.0.0.1:9153"
+control_listen = "127.0.0.1:9154"
+control_token = "change-me-control-plane-token"
+workers = 2
+mode = "forward"
+forwarders = ["1.1.1.1:53", "9.9.9.9:53"]
+dnssec_validate = true
+trust_anchor = "embedded"
+log_level = "info"
+
+[blocklist]
+paths = ["examples/resolver-blocklist.txt"]
+allowlist = ["safe.ads.example"]
+response = "nxdomain"
+reload_secs = 0
+
+[cache]
+max_entries = 32768
+max_bytes = 16777216
+min_ttl = 0
+max_ttl = 86400
+shards = 16
+
+[control]
+request_timeout_ms = 5000
+write_timeout_ms = 5000
+shutdown_timeout_ms = 5000
+max_connections = 32
+rate_limit_qps = 50
+rate_limit_burst = 100
+
+[rrl]
+enabled = true
+slip = 2
+action = "truncate"
+noerror = { qps = 20, burst = 100 }
+nxdomain = { qps = 5, burst = 20 }
+referral = { qps = 10, burst = 40 }
+error = { qps = 5, burst = 20 }
+source = { qps = 50, burst = 200 }
+
+[timeouts]
+per_query_ms = 2000
+tcp_ms = 3000
+total_ms = 6000

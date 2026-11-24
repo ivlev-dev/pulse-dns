@@ -700,3 +700,262 @@ fn nsec3_restart_with_new_salt_rebuilds_chain() {
     .expect("NSEC3 proof with the new salt");
     second.shutdown().expect("shutdown second");
 }
+
+const OPT_OUT_ZONE: &str = r"$ORIGIN example.com.
+$TTL 3600
+@       IN  SOA ns1.example.com. hostmaster.example.com. (
+                2026112402 7200 900 1209600 300 )
+@       IN  NS  ns1.example.com.
+ns1     IN  A   192.0.2.53
+www     IN  A   192.0.2.20
+
+secure      IN  NS  ns.secure.example.com.
+secure      IN  DS  12345 15 2 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+ns.secure   IN  A   192.0.2.54
+
+insecure    IN  NS  ns.insecure.example.com.
+ns.insecure IN  A   192.0.2.55
+";
+
+fn opt_out_fixture() -> Fixture {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (zone_dir, zone_path) = common::write_text("dnssec-optout", "optout.zone", OPT_OUT_ZONE);
+    let key_dir = directory.path().join("keys");
+    let ksk = PrivateKey::generate(Algorithm::ED25519).expect("ksk");
+    let zsk = PrivateKey::generate(Algorithm::ED25519).expect("zsk");
+    let ksk_paths = write_key_pair(&key_dir, &origin(), &ksk, 257, &NoopAudit).expect("ksk");
+    let zsk_paths = write_key_pair(&key_dir, &origin(), &zsk, 256, &NoopAudit).expect("zsk");
+    let zone = common::TempZone::with_import("dnssec-optout", "example.com.", &zone_path);
+    std::mem::forget(zone_dir);
+    let config_value = json!({
+        "listen_udp": "127.0.0.1:0",
+        "listen_tcp": null,
+        "workers": 1,
+        "zonefile": zone.path(),
+        "durability": "flush",
+        "map_size": 64 * 1024 * 1024,
+        "dnssec": {
+            "example.com.": {
+                "keys": [
+                    {"role": "ksk", "path": ksk_paths.private},
+                    {"role": "zsk", "path": zsk_paths.private}
+                ],
+                "denial": "nsec3",
+                "nsec3_salt": "aabbcc",
+                "nsec3_iterations": 0,
+                "nsec3_opt_out": true
+            }
+        }
+    });
+    let config = Config::from_json_str(&config_value.to_string()).expect("config");
+    config.validate().expect("config validates");
+    Fixture {
+        _dir: directory,
+        _zone: zone,
+        config,
+    }
+}
+
+#[test]
+fn nsec3_opt_out_omits_insecure_delegation_and_proves_referral() {
+    let fixture = opt_out_fixture();
+    let mut server = start(&fixture.config, None);
+    let at = now();
+
+    let response = udp_query(&server, "example.com.", Rtype::DNSKEY, true);
+    let dnskeys = dnskeys_from(response.answers(), &origin());
+    assert_ne!(dnskeys.len(), 0);
+
+    // Положительный ответ остаётся secure.
+    let response = udp_query(&server, "www.example.com.", Rtype::A, true);
+    let owner = name("www.example.com.");
+    let a = rrset_from(response.answers(), &owner, Rtype::A).expect("A");
+    let sigs = rrsigs_from(response.answers(), &owner, Rtype::A);
+    assert!(verify_any(&a, &sigs, &dnskeys, at));
+
+    // NSEC3-цепочка не содержит insecure-делегирование.
+    let nsec3_owners: Vec<Name> = {
+        let response = udp_query(&server, "insecure.example.com.", Rtype::DS, true);
+        response
+            .authority()
+            .iter()
+            .filter(|record| record.rr_type() == Rtype::NSEC3)
+            .map(|record| record.owner().clone())
+            .collect()
+    };
+    assert!(!nsec3_owners.is_empty(), "NSEC3 proof expected");
+    let insecure_hash = pulse_dnssec::rdata_util::nsec3_hash(
+        &name("insecure.example.com."),
+        &[0xAA, 0xBB, 0xCC],
+        0,
+    );
+    let insecure_label = pulse_dnssec::denial::base32hex::encode(&insecure_hash);
+    assert!(
+        nsec3_owners
+            .iter()
+            .all(|owner| owner.first_label() != Some(insecure_label.as_bytes())),
+        "insecure delegation must be left out of NSEC3 chain"
+    );
+    for record in udp_query(&server, "insecure.example.com.", Rtype::DS, true).authority() {
+        if let Rdata::Nsec3(data) = record.rdata() {
+            assert_eq!(data.flags() & 1, 1, "Opt-Out flag must be set");
+        }
+    }
+
+    // DS-запрос к insecure-делегированию доказывается как Opt-Out.
+    let response = udp_query(&server, "insecure.example.com.", Rtype::DS, true);
+    let proofs = nsec3_proofs(response.authority());
+    let outcome = nsec3_ds_nodata(
+        &name("insecure.example.com."),
+        &origin(),
+        &proofs,
+        DenialLimits::new(),
+    )
+    .expect("opt-out DS proof");
+    assert!(outcome.opt_out);
+    assert!(!outcome.is_secure());
+    verify_nsec3_proofs(response.authority(), &dnskeys, at);
+
+    // Secure-делегирование остаётся в цепочке и отдаёт DS.
+    let response = udp_query(&server, "secure.example.com.", Rtype::DS, true);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    assert!(
+        response
+            .answers()
+            .iter()
+            .any(|record| record.rr_type() == Rtype::DS),
+        "secure delegation DS must be served"
+    );
+
+    // NXDOMAIN в opt-out зоне помечается как opt-out-deny (не secure).
+    let response = udp_query(&server, "nope.example.com.", Rtype::A, true);
+    assert_eq!(response.rcode(), Rcode::NXDOMAIN);
+    let proofs = nsec3_proofs(response.authority());
+    let outcome = nsec3_nxdomain(
+        &name("nope.example.com."),
+        &origin(),
+        &proofs,
+        DenialLimits::new(),
+    )
+    .expect("opt-out NXDOMAIN proof");
+    assert_eq!(outcome.outcome, pulse_dnssec::DenialOutcome::NxDomain);
+    assert!(outcome.opt_out);
+
+    server.shutdown().expect("shutdown");
+}
+
+fn rotation_fixture() -> Fixture {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let zone_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("examples/example.com.zone");
+    let key_dir = directory.path().join("keys");
+    let ksk = PrivateKey::generate(Algorithm::ED25519).expect("ksk");
+    let zsk = PrivateKey::generate(Algorithm::ED25519).expect("zsk");
+    let ksk_paths = write_key_pair(&key_dir, &origin(), &ksk, 257, &NoopAudit).expect("ksk");
+    let zsk_paths = write_key_pair(&key_dir, &origin(), &zsk, 256, &NoopAudit).expect("zsk");
+    let zone = common::TempZone::with_import("dnssec-rotation", "example.com.", &zone_path);
+    let config_value = json!({
+        "listen_udp": "127.0.0.1:0",
+        "listen_tcp": null,
+        "workers": 1,
+        "zonefile": zone.path(),
+        "durability": "flush",
+        "map_size": 64 * 1024 * 1024,
+        "dnssec": {
+            "example.com.": {
+                "keys": [
+                    {"role": "ksk", "path": ksk_paths.private},
+                    {"role": "zsk", "path": zsk_paths.private}
+                ],
+                "rotation": {
+                    "key_dir": directory.path().join("rotation/keys"),
+                    "state_path": directory.path().join("rotation/state.json"),
+                    "zsk_lifetime_days": 90,
+                    "ksk_lifetime_days": 365,
+                    "pre_publish_secs": 86400,
+                    "double_sign_secs": 86400,
+                    "retire_secs": 604_800,
+                    "tick_secs": 3600
+                }
+            }
+        }
+    });
+    let config = Config::from_json_str(&config_value.to_string()).expect("config");
+    config.validate().expect("config validates");
+    Fixture {
+        _dir: directory,
+        _zone: zone,
+        config,
+    }
+}
+
+#[test]
+fn rotation_state_is_exposed_and_survives_restart() {
+    let fixture = rotation_fixture();
+    let mut server = start(
+        &fixture.config,
+        Some(ApiOptions {
+            listen: "127.0.0.1:0".parse().expect("api addr"),
+            token: TOKEN.to_owned(),
+            scopes: vec!["example.com.".to_owned()],
+        }),
+    );
+    let api = server.api_addr().expect("api enabled");
+
+    let response = http(api, "GET", "/api/v1/zones/example.com./keys", None);
+    assert_eq!(response.status, 200);
+    let body = response.json();
+    let rotation = body["rotation"].as_object().expect("rotation object");
+    let keys = rotation["keys"].as_array().expect("rotation keys");
+    assert_eq!(keys.len(), 2, "KSK + ZSK");
+    assert!(keys.iter().all(|key| key["state"] == "active"));
+    let tags: Vec<u64> = keys
+        .iter()
+        .map(|key| key["key_tag"].as_u64().expect("tag"))
+        .collect();
+    assert!(rotation["next_event_at"].as_u64().is_some());
+
+    let response = http(api, "POST", "/api/v1/zones/example.com./sign", Some(b"{}"));
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+
+    let at = now();
+    let response = udp_query(&server, "www.example.com.", Rtype::A, true);
+    let dnskeys = dnskeys_from(
+        udp_query(&server, "example.com.", Rtype::DNSKEY, true).answers(),
+        &origin(),
+    );
+    assert_eq!(dnskeys.len(), 2);
+    let owner = name("www.example.com.");
+    let a = rrset_from(response.answers(), &owner, Rtype::A).expect("A");
+    let sigs = rrsigs_from(response.answers(), &owner, Rtype::A);
+    assert!(verify_any(&a, &sigs, &dnskeys, at));
+    server.shutdown().expect("shutdown");
+    drop(server);
+
+    // Рестарт не перегенерирует ключи и сохраняет состояние.
+    let mut restarted = start(
+        &fixture.config,
+        Some(ApiOptions {
+            listen: "127.0.0.1:0".parse().expect("api addr"),
+            token: TOKEN.to_owned(),
+            scopes: vec!["example.com.".to_owned()],
+        }),
+    );
+    let api = restarted.api_addr().expect("api enabled");
+    let response = http(api, "GET", "/api/v1/zones/example.com./keys", None);
+    let body = response.json();
+    let restarted_tags: Vec<u64> = body["rotation"]["keys"]
+        .as_array()
+        .expect("rotation keys")
+        .iter()
+        .map(|key| key["key_tag"].as_u64().expect("tag"))
+        .collect();
+    assert_eq!(restarted_tags, tags, "keys must survive restart");
+    restarted.shutdown().expect("shutdown");
+}

@@ -10,6 +10,8 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pulse_dns::Name;
@@ -20,12 +22,18 @@ use pulse_server::dnssec::{
 };
 use thiserror::Error;
 
-use crate::config::{Config, DnssecDenial, DnssecKeyConfig, DnssecKeyRole};
+use crate::config::{Config, DnssecDenial, DnssecKeyConfig, DnssecKeyRole, DnssecRotationConfig};
+use crate::rotation::{InitialKey, RotationEngine, RotationError, RotationPolicy, RotationStatus};
 
 /// Подписант зоны вместе с denial-политикой из конфигурации.
 struct ConfiguredZone {
-    signer: ZoneSigner,
     denial: DenialPolicy,
+    inner: Mutex<ZoneInner>,
+}
+
+struct ZoneInner {
+    signer: ZoneSigner,
+    rotation: Option<RotationEngine>,
 }
 
 /// Подписанты зон, загруженные при старте.
@@ -34,26 +42,87 @@ pub(crate) struct DnssecSigners {
 }
 
 impl DnssecSigners {
-    /// Подписант зоны, если она настроена на DNSSEC.
-    pub(crate) fn signer(&self, origin: &Name) -> Option<&ZoneSigner> {
-        self.zones.get(origin).map(|zone| &zone.signer)
+    /// Настроена ли зона на DNSSEC.
+    pub(crate) fn is_configured(&self, origin: &Name) -> bool {
+        self.zones.contains_key(origin)
     }
 
-    /// Подписывает зону с настроенной denial-политикой.
+    /// Подписывает зону с настроенной denial-политикой, продвигая ротацию.
     pub(crate) fn sign(
         &self,
         origin: &Name,
         rrsets: &[pulse_dns::Rrset],
         now: u32,
-    ) -> Result<SignedZone, SignZoneError> {
-        let zone = self
-            .zones
-            .get(origin)
-            .ok_or_else(|| SignZoneError::NoKeys {
-                zone: origin.clone(),
+    ) -> Result<SignedZone, Box<DnssecError>> {
+        let zone = self.zones.get(origin).ok_or_else(|| {
+            Box::new(DnssecError::NoKeys {
+                zone: origin.to_string(),
+            })
+        })?;
+        let mut inner = zone.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(rotation) = inner.rotation.as_mut() {
+            rotation.advance(now).map_err(|source| {
+                Box::new(DnssecError::Rotation {
+                    zone: origin.to_string(),
+                    source: Box::new(source),
+                })
             })?;
-        zone.signer
+            inner.signer = rotation.signer().map_err(|source| {
+                Box::new(DnssecError::Rotation {
+                    zone: origin.to_string(),
+                    source: Box::new(source),
+                })
+            })?;
+        }
+        inner
+            .signer
             .sign_zone_with(origin, rrsets, now, &zone.denial)
+            .map_err(|source| {
+                Box::new(DnssecError::Sign {
+                    zone: origin.to_string(),
+                    source: Box::new(source),
+                })
+            })
+    }
+
+    /// Продвигает ротацию всех зон; возвращает зоны, где состояние изменилось.
+    pub(crate) fn advance_all(&self, now: u32) -> Vec<Name> {
+        let mut changed = Vec::new();
+        for (origin, zone) in &self.zones {
+            let mut inner = zone.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(rotation) = inner.rotation.as_mut() else {
+                continue;
+            };
+            match rotation.advance(now) {
+                Ok(report) if report.changed() => changed.push(origin.clone()),
+                Ok(_) => {}
+                Err(error) => crate::logging::error(
+                    "dnssec_rotation",
+                    &format!("zone {origin}: cannot advance rotation: {error}"),
+                ),
+            }
+        }
+        changed
+    }
+
+    /// Минимальный интервал фоновой проверки ротации.
+    pub(crate) fn rotation_tick(&self) -> Option<std::time::Duration> {
+        let mut tick = None;
+        for zone in self.zones.values() {
+            let inner = zone.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(rotation) = &inner.rotation {
+                let seconds = rotation.policy().tick;
+                tick = Some(tick.map_or(seconds, |current: u32| current.min(seconds)));
+            }
+        }
+        tick.map(|seconds| std::time::Duration::from_secs(u64::from(seconds.max(1))))
+    }
+
+    /// Снимок состояния ротации зоны (для `/keys`).
+    pub(crate) fn rotation_status(&self, origin: &Name) -> Option<RotationStatus> {
+        let zone = self.zones.get(origin)?;
+        let inner = zone.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        inner.rotation.as_ref().map(RotationEngine::status)
     }
 
     /// Настроенные origin'ы.
@@ -89,6 +158,7 @@ fn denial_policy(
                     zone: origin.to_string(),
                     source: error,
                 })?;
+            let config = config.with_opt_out(zone_config.nsec3_opt_out.unwrap_or(false));
             Ok(DenialPolicy::Nsec3(config))
         }
     }
@@ -131,9 +201,9 @@ pub(crate) fn load(config: &Config) -> Result<DnssecSigners, DnssecError> {
                 zone: origin.to_string(),
             });
         }
-        let mut keys = Vec::with_capacity(zone_config.keys.len());
+        let mut loaded = Vec::with_capacity(zone_config.keys.len());
         for key_config in &zone_config.keys {
-            keys.push(load_key(&origin, key_config)?);
+            loaded.push(load_key(&origin, key_config)?);
         }
         let validity_days = zone_config.validity_days.unwrap_or(30);
         let validity = validity_days
@@ -142,18 +212,136 @@ pub(crate) fn load(config: &Config) -> Result<DnssecSigners, DnssecError> {
                 zone: origin.to_string(),
                 days: validity_days,
             })?;
-        let signer = ZoneSigner::new(keys, validity, zone_config.inception_skew.unwrap_or(300))
-            .map_err(|source| DnssecError::Signer {
-                zone: origin.to_string(),
-                source,
-            })?;
+        let skew = zone_config.inception_skew.unwrap_or(300);
         let denial = denial_policy(&origin, zone_config)?;
-        zones.insert(origin, ConfiguredZone { signer, denial });
+        let inner = match &zone_config.rotation {
+            Some(rotation) if !loaded.is_empty() => {
+                let engine = build_rotation(&origin, rotation, &loaded, validity, skew)?;
+                let signer = engine.signer().map_err(|source| DnssecError::Rotation {
+                    zone: origin.to_string(),
+                    source: Box::new(source),
+                })?;
+                ZoneInner {
+                    signer,
+                    rotation: Some(engine),
+                }
+            }
+            Some(_) => {
+                return Err(DnssecError::NoKeys {
+                    zone: origin.to_string(),
+                });
+            }
+            None => {
+                let keys = loaded.into_iter().map(|loaded| loaded.key).collect();
+                let signer = ZoneSigner::new(keys, validity, skew).map_err(|source| {
+                    DnssecError::Signer {
+                        zone: origin.to_string(),
+                        source,
+                    }
+                })?;
+                ZoneInner {
+                    signer,
+                    rotation: None,
+                }
+            }
+        };
+        zones.insert(
+            origin,
+            ConfiguredZone {
+                denial,
+                inner: Mutex::new(inner),
+            },
+        );
     }
     Ok(DnssecSigners { zones })
 }
 
-fn load_key(zone: &Name, config: &DnssecKeyConfig) -> Result<ZoneSigningKey, DnssecError> {
+struct LoadedKey {
+    key: ZoneSigningKey,
+    private_path: PathBuf,
+    role: KeyRole,
+    flags: u16,
+}
+
+fn build_rotation(
+    origin: &Name,
+    config: &DnssecRotationConfig,
+    loaded: &[LoadedKey],
+    validity: u32,
+    skew: u32,
+) -> Result<RotationEngine, DnssecError> {
+    let policy = rotation_policy(origin, config)?;
+    let mut initial = Vec::with_capacity(loaded.len());
+    for key in loaded {
+        if key.role == KeyRole::Csk {
+            return Err(DnssecError::InvalidRotation {
+                zone: origin.to_string(),
+                reason: "rotation requires explicit KSK and ZSK keys, not CSK".to_owned(),
+            });
+        }
+        initial.push(InitialKey::new(
+            key.role,
+            key.flags,
+            key.private_path.clone(),
+        ));
+    }
+    RotationEngine::open(
+        origin,
+        config.key_dir.clone(),
+        config.state_path.clone(),
+        policy,
+        validity,
+        skew,
+        &initial,
+        now_unix(),
+    )
+    .map_err(|source| DnssecError::Rotation {
+        zone: origin.to_string(),
+        source: Box::new(source),
+    })
+}
+
+fn rotation_policy(
+    origin: &Name,
+    config: &DnssecRotationConfig,
+) -> Result<RotationPolicy, DnssecError> {
+    let algorithm = Algorithm::from_u8(config.algorithm.unwrap_or(15));
+    if !algorithm.is_sign_supported() {
+        return Err(DnssecError::InvalidRotation {
+            zone: origin.to_string(),
+            reason: format!(
+                "algorithm {} is not supported for signing",
+                algorithm.as_u8()
+            ),
+        });
+    }
+    let days = |value: Option<u32>, default: u32| u64::from(value.unwrap_or(default)) * 86_400;
+    let lifetime = |value: Option<u32>, default: u32| -> Result<u32, DnssecError> {
+        let seconds = days(value, default);
+        u32::try_from(seconds).map_err(|_| DnssecError::InvalidRotation {
+            zone: origin.to_string(),
+            reason: "rotation lifetime does not fit in u32".to_owned(),
+        })
+    };
+    let policy = RotationPolicy {
+        algorithm,
+        zsk_lifetime: lifetime(config.zsk_lifetime_days, 90)?,
+        ksk_lifetime: lifetime(config.ksk_lifetime_days, 365)?,
+        pre_publish: config.pre_publish_secs.unwrap_or(86_400),
+        double_sign: config.double_sign_secs.unwrap_or(86_400),
+        retire: config.retire_secs.unwrap_or(604_800),
+        tick: config.tick_secs.unwrap_or(300),
+    };
+    policy
+        .validate()
+        .map_err(|source| DnssecError::InvalidRotation {
+            zone: origin.to_string(),
+            reason: source.to_string(),
+        })?;
+    Ok(policy)
+}
+
+fn load_key(zone: &Name, config: &DnssecKeyConfig) -> Result<LoadedKey, DnssecError> {
     let path = &config.path;
     let bytes = fs::read(path).map_err(|source| DnssecError::KeyRead {
         path: path.clone(),
@@ -207,9 +395,16 @@ fn load_key(zone: &Name, config: &DnssecKeyConfig) -> Result<ZoneSigningKey, Dns
         (None, None) => KeyRole::Csk,
     };
     let flags = config.flags.unwrap_or_else(|| role.flags());
-    ZoneSigningKey::with_flags(private, role, flags).map_err(|source| DnssecError::Signer {
-        zone: zone.to_string(),
-        source,
+    let key =
+        ZoneSigningKey::with_flags(private, role, flags).map_err(|source| DnssecError::Signer {
+            zone: zone.to_string(),
+            source,
+        })?;
+    Ok(LoadedKey {
+        key,
+        private_path,
+        role,
+        flags,
     })
 }
 
@@ -466,6 +661,32 @@ pub enum DnssecError {
         /// Причина.
         #[source]
         source: Nsec3ConfigError,
+    },
+    /// Ошибка ротации ключей.
+    #[error("zone {zone}: key rotation failed: {source}")]
+    Rotation {
+        /// Origin зоны.
+        zone: String,
+        /// Причина.
+        #[source]
+        source: Box<RotationError>,
+    },
+    /// Некорректная конфигурация ротации.
+    #[error("zone {zone}: invalid key rotation configuration: {reason}")]
+    InvalidRotation {
+        /// Origin зоны.
+        zone: String,
+        /// Причина.
+        reason: String,
+    },
+    /// Ошибка подписи зоны.
+    #[error("zone {zone}: cannot sign zone: {source}")]
+    Sign {
+        /// Origin зоны.
+        zone: String,
+        /// Причина.
+        #[source]
+        source: Box<SignZoneError>,
     },
 }
 

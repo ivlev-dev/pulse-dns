@@ -34,7 +34,9 @@ forward/iterative-резолюцией, кешем, blocklist, overrides и DNSS
 - REST API (`pulse-api`): health/ready/metrics/OpenAPI, zones CRUD, RRset
   CRUD/PATCH, settings, bearer-auth + scopes + per-zone allowlist (404 вне
   allowlist), ETag/If-Match, RFC 9457 problem+json, Idempotency-Key,
-  пагинация, лимиты тела/rate limit.
+  пагинация, лимиты тела/rate limit; write-ahead journal (outbox) мутаций с
+  CRC/seq, crash-recovery, compaction и метриками
+  (`docs/ops/journal.md`).
 - Бинарник `pulsed`: UDP+TCP, зоны только в `pulse-zonefile` v2 (`--data`;
   DNS отвечает из mmap, без полной in-memory копии зон), импорт RFC 1035
   master-файлов командой `pulsed import` (`.zone`, `$ORIGIN`/`$TTL`/`$INCLUDE`),
@@ -55,32 +57,46 @@ forward/iterative-резолюцией, кешем, blocklist, overrides и DNSS
 - Бинарник `pulseresolved`: forward/iterative-резолюция через `pulse-resolver`,
   UDP на `pulse-runtime` (N worker) и TCP с length-prefix, EDNS/TC, REFUSED
   для AXFR/IXFR, кеш, blocklist + overrides, DNSSEC-валидация (AD/SERVFAIL),
-  смешанные upstream (UDP/TCP/DoT/DoH) с failover и cooldown, ACL клиентов
-  (`allow_from`, по умолчанию loopback), per-source token bucket
-  (`drop`/`refused`/`truncate`), метрики `refused_acl_total`,
-  `rate_limited_total` и `upstream_queries_total{transport=...}`,
+  смешанные upstream (UDP/TCP/DoT/DoH) с failover и cooldown, пул
+  keep-alive соединений для DoT/DoH (`upstream_pool.pool_size`, по умолчанию
+  4), ACL клиентов (`allow_from`, по умолчанию loopback), per-source token
+  bucket (`drop`/`refused`/`truncate`), полный RRL по классам ответов
+  (`noerror`/`nxdomain`/`referral`/`error`, `slip`, `truncate`/`drop`/
+  `refused`), метрики `refused_acl_total`, `rate_limited_total`,
+  `rrl_*_total{class}` и `upstream_queries_total{transport=...}`,
   SIGHUP/периодический reload, `GET /metrics` и `GET /healthz` на loopback,
-  graceful shutdown по SIGTERM/SIGINT.
+  control-plane REST API (`control_listen`, bearer-token, RFC 9457
+  problem+json, rate limit на токен, `X-Request-Id`), graceful shutdown по
+  SIGTERM/SIGINT.
+- Серверные защищённые транспорты `pulseresolved`: DoT (`dot_listen`),
+  DoH/1.1 (`doh_listen`), DoH/2 (`doh2_listen`), DoQ (`doq_listen`) и
+  DNSCrypt v2 UDP/TCP (`dnscrypt_listen`, `dnscrypt_tcp_listen`) с общим
+  путём `decode → resolve → encode`, ACL по всем транспортам (`REFUSED`,
+  отдельный `tls_allow_from`), token bucket вместо RRL на TLS/QUIC,
+  hot-reload TLS-пары по SIGHUP, метрики
+  `dot_*`/`doh_*`/`doh_http2_*`/`doq_*`/`dnscrypt_*`.
 - CI/hardening: `fuzz/` (cargo-fuzz, nightly) — 5 таргетов, seed-корпус,
   job `fuzz-smoke` на push в main; Miri на `pulse-dns`/`pulse-master`
   (nightly, continue-on-error); `cargo deny check`.
 
 **Не реализовано (см. `STATUS.md`):** межпроцессная параллельная запись
 (N процессов; в v2.0 — один процесс-писатель, `LOCK_EX`); WAL/journal для
-write-through; DoQ; NSEC3 Opt-Out, NSEC3 для secondary-зон и автоматическая
-ротация DNSSEC-ключей; HTTP/2/3 для DoH (только HTTP/1.1); 0x20 echo; TLS
-для API и метрик (только loopback); полноценный RRL авторитетного сервера;
-REST — MVP-подмножество спецификации; RFC 5011 (trust anchors статические) в
-резолвере; лoom в CI. У резолвера нет DoQ и HTTP/2/3 для DoH-апстримов; RRL
-ограничен per-source token bucket; upstream DoH только HTTP/1.1 с одним
-keep-alive соединением на upstream (сериализация).
+внутренних write-through путей (import/secondary/DNSSEC; REST-мутации
+журналируются); DoQ; NSEC3 для secondary-зон; HTTP/2/3 для DoH (только
+HTTP/1.1); 0x20 echo; TLS для REST API, control-plane резолвера и метрик
+(только loopback); DNS Cookies и
+RRL авторитетного сервера (`pulsed`; у резолвера RRL есть); REST —
+MVP-подмножество спецификации; loom в CI. NSEC3 Opt-Out, автоматическая
+ротация ключей (`pulsed`) и RFC 5011 в резолвере реализованы. У резолвера нет
+DoQ и HTTP/2/3 для DoH-апстримов; upstream DoH — HTTP/1.1 с пулом
+keep-alive соединений (по умолчанию 4).
 
 ## Архитектура
 
 | Крейт | Назначение |
 |---|---|
 | `pulse-dns` | Wire-формат DNS и RR-типы |
-| `pulse-dnssec` | DNSSEC: подпись/валидация alg 8/13/15, RRSIG, NSEC/NSEC3 |
+| `pulse-dnssec` | DNSSEC: подпись/валидация alg 8/13/15, RRSIG, NSEC/NSEC3 (Opt-Out), RFC 5011 trust anchors |
 | `pulse-master` | RFC 1035 master-файлы: парсер, валидация, экспорт |
 | `pulse-transfer` | TSIG, AXFR/IXFR, NOTIFY |
 | `pulse-zonefile` | Бинарный mmap-формат зон: reader, writer/commit, fsck, compact |
@@ -91,7 +107,7 @@ keep-alive соединением на upstream (сериализация).
 | `pulse-api` | REST API управления зонами |
 | `pulse-resolver` | Кеширующий резолвер: forward/iterative, кеш, blocklist, overrides, DNSSEC |
 | `pulsed` | Бинарник сервера (UDP+TCP+DoT+DoH+DNSCrypt+REST) |
-| `pulseresolved` | Бинарник резолвера (UDP+TCP+метрики) |
+| `pulseresolved` | Бинарник резолвера (UDP+TCP+DoT+DoH/1.1+DoH/2+DoQ+DNSCrypt+метрики+control-plane API) |
 
 Спецификации и решения: `docs/adr/`, `docs/spec/`, `docs/api/rest-v1.md`,
 `docs/bench/plan.md`, `docs/plan/roadmap.md`.
@@ -115,13 +131,19 @@ cargo run -p pulsed -- import \
 export PULSED_API_TOKEN="$(openssl rand -hex 32)"
 
 cargo run -p pulsed -- \
-  --config examples/pulsed.json \
+  --config examples/pulsed.toml \
   --data /tmp/pulse-dns.zonefile \
   --listen-udp 127.0.0.1:5353 \
   --listen-tcp 127.0.0.1:5353 \
   --api-listen 127.0.0.1:8080 \
   --api-scope example.com.
 ```
+
+Основной формат конфигурации `pulsed` — TOML. JSON поддерживается для
+обратной совместимости: формат выбирается по расширению `.toml` или `.json`,
+поля и значения по умолчанию одинаковые. Ошибка разбора содержит путь, строку
+и колонку; неизвестное расширение отклоняется с подсказкой.
+`examples/*.json` — legacy-эквиваленты `examples/*.toml`.
 
 Проверка UDP/TCP:
 
@@ -144,7 +166,7 @@ chmod 600 /tmp/pulsed-tls/key.pem
 cargo run -p pulsed -- dnscrypt-gencert --out /tmp/pulsed-tls \
   --provider-name 2.dnscrypt-cert.example.com.
 
-cargo run -p pulsed -- --config examples/transports.json \
+cargo run -p pulsed -- --config examples/transports.toml \
   --data /tmp/pulse-dns.zonefile
 
 kdig @127.0.0.1 -p 8853 +tls +tls-ca=/tmp/pulsed-tls/cert.pem \
@@ -156,10 +178,10 @@ kdig @127.0.0.1 -p 8443 +https +tls-ca=/tmp/pulsed-tls/cert.pem \
 ```
 
 Запуск резолвера (forward на 1.1.1.1/9.9.9.9, blocklist и overrides из
-`examples/resolver.json`):
+`examples/resolver.toml`):
 
 ```bash
-cargo run -p pulseresolved -- --config examples/resolver.json
+cargo run -p pulseresolved -- --config examples/resolver.toml
 dig @127.0.0.1 -p 5353 example.com. A
 dig @127.0.0.1 -p 5353 ads.example. A          # blocklist → NXDOMAIN
 dig @127.0.0.1 -p 5353 router.home. A          # override → 192.168.1.1
@@ -169,25 +191,104 @@ curl -sS http://127.0.0.1:9153/metrics | head
 # После правки blocklist: kill -HUP <pid> (или blocklist.reload_secs > 0)
 ```
 
+Control-plane API резолвера (`examples/resolver-control.toml`): отдельный
+loopback-listener, bearer-token и без TLS. Токен задаётся `control_token` или,
+предпочтительно, `PULSERESOLVED_API_TOKEN` (env важнее файла); без токена
+`control_listen` не запускается.
+
+```bash
+export PULSERESOLVED_API_TOKEN="$(openssl rand -hex 32)"
+cargo run -p pulseresolved -- --config examples/resolver-control.toml &
+API=http://127.0.0.1:9154
+AUTH="Authorization: Bearer $PULSERESOLVED_API_TOKEN"
+
+curl -sS "$API/healthz"                                  # liveness
+curl -sS "$API/readyz"                                   # upstreams/anchors
+curl -sS -H "$AUTH" "$API/metrics" | head
+curl -sS -H "$AUTH" "$API/api/v1/cache/stats"
+curl -sS -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"name":"example.com","type":"A"}' "$API/api/v1/cache/purge"
+curl -sS -X POST -H "$AUTH" "$API/api/v1/cache/purge"    # очистить весь кеш
+curl -sS -H "$AUTH" "$API/api/v1/blocklist"
+curl -sS -X POST -H "$AUTH" "$API/api/v1/blocklist/reload"
+curl -sS -H "$AUTH" "$API/api/v1/upstreams"
+curl -sS -H "$AUTH" "$API/api/v1/trust-anchors"
+curl -sS -X POST -H "$AUTH" "$API/api/v1/trust-anchors/reload"
+curl -sS -H "$AUTH" "$API/api/v1/rrl/stats"
+curl -sS -X PATCH -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"slip":4,"action":"drop","nxdomain":{"qps":2,"burst":10}}' \
+  "$API/api/v1/rrl"
+curl -sS -H "$AUTH" "$API/api/v1/config"                 # только безопасные поля
+```
+
+Коды ошибок — RFC 9457 `application/problem+json`: 401 (нет токена),
+403 (неверный токен), 404/405, 413 (тело > 1 МиБ), 429 (rate limit на токен).
+Все ответы содержат `X-Request-Id`; отказы пишутся в stderr-аудит без токена.
+`cache/purge` не рвёт in-flight запросы, `blocklist/reload` эквивалентен
+SIGHUP, `trust-anchors/reload` перечитывает DS-файл или RFC 5011 state,
+`PATCH /api/v1/rrl` валидирует лимиты до применения.
+
+Основной формат — TOML. JSON поддерживается для обратной совместимости:
+формат выбирается по расширению `.toml` или `.json`, одинаковые поля и
+значения по умолчанию. `examples/resolver.json` — legacy-эквивалент
+`examples/resolver.toml`.
+
 Смешанные upstream, ACL и rate limit (`examples/resolver-secure.json`):
 
 ```bash
 cargo run -p pulseresolved -- --config examples/resolver-secure.json
 # или поверх конфига:
-cargo run -p pulseresolved -- --config examples/resolver.json \
+cargo run -p pulseresolved -- --config examples/resolver.toml \
   --upstream tls://dns.google:853#dns.google \
   --upstream https://cloudflare-dns.com/dns-query
 ```
 
-В JSON `upstreams` принимает строки (`udp://`, `tcp://`, `tls://host:853#name`,
-`https://host/dns-query`) и объекты `{ "addr": "...", "tls": true,
-"server_name": "localhost", "ca": "ca.pem" }`. `allow_from` — список IP/CIDR
-(пусто — только loopback); `rate_limit` — `qps`, `burst`, `max_entries` и
-`action` (`refused`, `drop`, `truncate`).
+В TOML/JSON `upstreams` принимает строки (`udp://`, `tcp://`,
+`tls://host:853#name`, `https://host/dns-query`) и объекты `{ "addr": "...",
+"tls": true, "server_name": "localhost", "ca": "ca.pem" }` (в TOML —
+`{ url = "...", ca = "ca.pem" }`). `allow_from` — список IP/CIDR (пусто —
+только loopback); `rate_limit` — `qps`, `burst`, `max_entries` и `action`
+(`refused`, `drop`, `truncate`); `rrl` — классы `noerror`/`nxdomain`/
+`referral`/`error` с `qps`/`burst`, `slip` и `action` (см.
+`docs/spec/rrl.md`); `upstream_pool` — `pool_size` (по умолчанию 4) и
+backoff переподключения (см. `docs/spec/upstream-pool.md`).
 
-CLI: `--config`, `--listen-udp`, `--listen-tcp`, `--metrics-listen`,
-`--forward` (repeatable), `--upstream` (repeatable, URL/схема), `--workers`,
-`--log-level`, `--blocklist` (repeatable), `--no-dnssec`.
+CLI: `--config` (`.toml` или `.json`), `--listen-udp`, `--listen-tcp`,
+`--dot-listen`, `--doh-listen`, `--doh2-listen`, `--doq-listen`,
+`--dnscrypt-listen`, `--dnscrypt-tcp-listen`, `--tls-cert`, `--tls-key`,
+`--metrics-listen`, `--forward` (repeatable), `--upstream` (repeatable,
+URL/схема), `--workers`, `--log-level`, `--blocklist` (repeatable),
+`--no-dnssec`. CLI-overrides применяются поверх загруженного TOML.
+
+Защищённые серверные транспорты (`examples/resolver-secure-transports.toml`):
+
+```bash
+# TLS-пара для DoT/DoH/DoH2/DoQ (ключ — 0600) и material DNSCrypt
+# (provider/resolver-ключи 0600 + сертификат из `pulsed dnscrypt-gencert`)
+cargo run -p pulseresolved -- --config examples/resolver-secure-transports.toml
+
+kdig @127.0.0.1 -p 853 +tls +tls-ca=/etc/pulse/tls/fullchain.pem \
+  +tls-hostname=dns.example example.com. A       # DoT
+kdig @127.0.0.1 -p 443 +https +tls-ca=/etc/pulse/tls/fullchain.pem \
+  +tls-hostname=dns.example example.com. A       # DoH/1.1
+kdig @127.0.0.1 -p 8443 +https +tls-ca=/etc/pulse/tls/fullchain.pem \
+  +tls-hostname=dns.example example.com. A       # DoH/2
+kdig @127.0.0.1 -p 8853 +quic +tls-ca=/etc/pulse/tls/fullchain.pem \
+  +tls-hostname=dns.example example.com. A       # DoQ
+# DNSCrypt: dnscrypt-proxy/pulse-dnscrypt с сертификатом провайдера
+```
+
+Транспорты включаются независимо (`dot_listen`, `doh_listen`,
+`doh2_listen`, `doq_listen`, `dnscrypt_listen`, `dnscrypt_tcp_listen`),
+работают одновременно и используют общий ACL и rate limit. `tls_allow_from`
+задаёт отдельный ACL для DoT/DoH/DoQ (пусто — общий `allow_from`); клиент
+вне ACL получает `REFUSED` на любом транспорте. RRL применяется только к
+открытому UDP, на TLS/QUIC — per-source token bucket. SIGHUP перечитывает
+blocklist и TLS-пару (`tls_cert`/`tls_key`) для новых соединений. Блок
+`[secure]` задаёт `max_connections`, `max_streams`, таймауты, размер
+сообщения, `worker_threads` и `cache_control`; `[dnscrypt]` — лимиты
+пакетов и anti-replay. Лимиты соединений/стримов и метрики по транспортам
+описаны в `crates/pulseresolved/src/lib.rs`.
 
 Зоны в `pulse-zonefile` v2:
 
@@ -205,20 +306,21 @@ cargo run -p pulsed -- convert --from /tmp/old.v1 --to /tmp/pulse-dns.zonefile
 # повреждённые зоны (подробности — docs/ops/fsck.md)
 cargo run -p pulsed -- fsck --data /tmp/pulse-dns.zonefile
 
-cargo run -p pulsed -- --config examples/pulsed.json \
+cargo run -p pulsed -- --config examples/pulsed.toml \
   --data /tmp/pulse-dns.zonefile --durability flush \
   --commit-mode per-zone --map-size 268435456
 ```
 
-JSON-поля `zones`/`zones_files` больше не принимаются: конфигурация завершится
-с инструкцией миграции. Все зоны живут в `--data`; REST-правки коммитятся в
-тот же файл и сразу видны DNS.
+Поля `zones`/`zones_files` больше не принимаются (ни в TOML, ни в JSON):
+конфигурация завершится с инструкцией миграции. Все зоны живут в `--data`;
+REST-правки коммитятся в тот же файл и сразу видны DNS.
 
 Подробности — в `examples/README.md`.
 
-Запуск с REST: API включается флагом `--api-listen` (токен обязателен,
-предпочтительно через `PULSED_API_TOKEN`; без TLS только loopback). Примеры
-запросов — в `examples/README.md`. Короткий пример:
+Запуск с REST: API включается флагом `--api-listen` или полями `api_listen`/
+`api_token`/`api_scope` в конфигурации (CLI-overrides важнее файла; токен
+обязателен, предпочтительно через `PULSED_API_TOKEN`; без TLS только
+loopback). Примеры запросов — в `examples/README.md`. Короткий пример:
 
 ```bash
 API=http://127.0.0.1:8080
@@ -276,8 +378,11 @@ cargo deny check
   DNSCrypt UDP усекает большие ответы с `TC`, DNSCrypt TCP отдаёт их без
   усечения; DNSCrypt TXT-запись публикуется вручную.
 - REST — MVP-подмножество спецификации; API доступен только на loopback (без TLS).
-- DNSSEC: NSEC и NSEC3 (SHA-1, Opt-Out = 0), автоматической ротации ключей нет;
-  NSEC3 для secondary-зон не генерируется.
+- DNSSEC: NSEC и NSEC3 (SHA-1, Opt-Out включается `nsec3_opt_out`),
+  автоматическая ротация KSK/ZSK по RFC 7583 (`rotation`: pre-publish →
+  double-sign → active → retire, состояние в `0600`-файле), RFC 5011 для
+  резолвера (`trust_anchor = { path, state }`); NSEC3 для secondary-зон не
+  генерируется.
 - Roadmap: `docs/plan/roadmap.md` (M0–M4 выполнены, M5/M6 частично).
 
 ## Лицензия

@@ -8,12 +8,13 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use pulse_api::{
-    AdminError, Conflict, Denial, ListRrsets, ListZones, Precondition, Preconditions, RrsetInput,
-    RrsetPatch, RrsetPatchOutcome, RrsetView, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneFileMetrics,
-    ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView,
+    AdminError, Conflict, Denial, KeyRotationKeyView, KeyRotationView, ListRrsets, ListZones,
+    Precondition, Preconditions, RrsetInput, RrsetPatch, RrsetPatchOutcome, RrsetView,
+    WriteOutcome, ZoneAdmin, ZoneAllow, ZoneFileMetrics, ZoneKind, ZoneMetaInput, ZonePage,
+    ZoneSettings, ZoneSettingsPatch, ZoneSettingsView,
 };
 use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype, Serial, Ttl};
 use pulse_server::{DenialKind, QueryEngine, QueryStats, ZoneState as ServerZoneState, ZoneView};
@@ -129,6 +130,33 @@ impl SharedZoneAdmin {
 
     pub(crate) fn query_stats(&self) -> Arc<QueryStats> {
         Arc::clone(&self.query_stats)
+    }
+
+    /// Интервал фоновой ротации ключей, если она настроена.
+    pub(crate) fn rotation_tick(&self) -> Option<Duration> {
+        self.dnssec.rotation_tick()
+    }
+
+    /// Продвигает ротацию и переподписывает изменившиеся зоны.
+    pub(crate) fn advance_rotations(&self) -> usize {
+        let changed = self.dnssec.advance_all(dnssec::now_unix());
+        let mut resigned = 0_usize;
+        for origin in changed {
+            match ZoneAdmin::sign_zone(self, &origin) {
+                Ok(_) => {
+                    resigned = resigned.saturating_add(1);
+                    logging::info(
+                        "dnssec_rotation",
+                        &format!("zone {origin} re-signed after key rotation"),
+                    );
+                }
+                Err(error) => logging::error(
+                    "dnssec_rotation",
+                    &format!("zone {origin}: cannot re-sign after rotation: {error}"),
+                ),
+            }
+        }
+        resigned
     }
 
     pub(crate) fn transfer(&self) -> &TransferState {
@@ -486,7 +514,7 @@ pub(crate) fn import_loaded_zone(
             loaded.origin
         ));
     }
-    let (rrsets, denial) = if dnssec.signer(&loaded.origin).is_some() {
+    let (rrsets, denial) = if dnssec.is_configured(&loaded.origin) {
         let signed_zone = dnssec
             .sign(&loaded.origin, &loaded.rrsets, dnssec::now_unix())
             .map_err(|error| format!("cannot sign zone {}: {error}", loaded.origin))?;
@@ -1298,7 +1326,7 @@ impl ZoneAdmin for SharedZoneAdmin {
 
     fn sign_zone(&self, origin: &Name) -> Result<pulse_api::ZoneView, AdminError> {
         let store = self.require_store()?;
-        if self.dnssec.signer(origin).is_none() {
+        if !self.dnssec.is_configured(origin) {
             return Err(AdminError::invariant(
                 "/zone",
                 "dnssec-not-configured",
@@ -1336,6 +1364,26 @@ impl ZoneAdmin for SharedZoneAdmin {
         .map_err(AdminError::Storage)?;
         self.after_commit(origin, previous.as_ref());
         zone_view(store, origin)
+    }
+
+    fn key_rotation(&self, origin: &Name) -> Result<Option<KeyRotationView>, AdminError> {
+        Ok(self
+            .dnssec
+            .rotation_status(origin)
+            .map(|status| KeyRotationView {
+                next_event_at: status.next_event_at,
+                keys: status
+                    .keys
+                    .into_iter()
+                    .map(|key| KeyRotationKeyView {
+                        key_tag: key.key_tag,
+                        role: key.role,
+                        state: key.stage.as_str().to_owned(),
+                        created_at: key.created_at,
+                        next_transition: key.next_transition,
+                    })
+                    .collect(),
+            }))
     }
 }
 

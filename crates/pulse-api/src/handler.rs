@@ -20,6 +20,9 @@ use crate::error::{AdminError, FieldIssue, NotFound};
 use crate::etag::{header_matches, normalize_tag};
 use crate::http::{HttpRequest, HttpResponse, Method};
 use crate::idempotency::{Begin, IdempotencyStore};
+use crate::journal::{
+    Begin as JournalBegin, Journal, JournalOp, body_hash_hex, crash_point, intent as journal_intent,
+};
 use crate::metrics::Metrics;
 use crate::port::{
     AllowAll, Denial, ListRrsets, ListZones, Precondition, Preconditions, RrsetInput, RrsetPatch,
@@ -31,6 +34,12 @@ use crate::ratelimit::{Decision, RateLimiter};
 use crate::rdata_text::{format_rdata, parse_rdata};
 use crate::timefmt::rfc3339;
 
+/// Контекст одной мутации: стабильный `op_id` и хеш тела.
+struct MutationContext {
+    op_id: String,
+    body_sha256: String,
+}
+
 /// Обработчик API.
 pub(crate) struct Api {
     store: Arc<dyn ZoneAdmin>,
@@ -39,8 +48,10 @@ pub(crate) struct Api {
     extra_metrics: Option<crate::server::MetricsProvider>,
     limiter: RateLimiter,
     idempotency: IdempotencyStore,
+    journal: Option<Arc<Journal>>,
     max_body_bytes: usize,
     request_counter: AtomicU64,
+    op_counter: AtomicU64,
 }
 
 impl Api {
@@ -50,6 +61,7 @@ impl Api {
         store: Arc<dyn ZoneAdmin>,
         auth: Authenticator,
         extra_metrics: Option<crate::server::MetricsProvider>,
+        journal: Option<Arc<Journal>>,
     ) -> Self {
         Self {
             store,
@@ -58,8 +70,10 @@ impl Api {
             extra_metrics,
             limiter: RateLimiter::new(config.rate_limit_per_sec),
             idempotency: IdempotencyStore::new(config.idempotency_ttl, config.idempotency_capacity),
+            journal,
             max_body_bytes: config.max_body_bytes,
             request_counter: AtomicU64::new(1),
+            op_counter: AtomicU64::new(1),
         }
     }
 
@@ -208,7 +222,8 @@ impl Api {
                 }
             }
         }
-        let result = self.dispatch(request, &route, &principal, request_id, instance);
+        let mutation = self.mutation_context(request, request_id, idempotency_key.as_deref());
+        let result = self.dispatch(request, &route, &principal, request_id, instance, &mutation);
         if let Some(key) = &idempotency_key {
             match &result {
                 Ok(response) if (200..300).contains(&response.status) => {
@@ -289,6 +304,9 @@ impl Api {
             "/metrics" => {
                 if request.method == Method::Get {
                     let mut body = self.metrics.render_with(self.store.zonefile_metrics());
+                    if let Some(journal) = &self.journal {
+                        body.push_str(&journal.metrics().render());
+                    }
                     if let Some(extra) = &self.extra_metrics {
                         body.push_str(&extra());
                     }
@@ -363,9 +381,153 @@ impl Api {
         hasher.update(request.method.as_str().as_bytes());
         hasher.update([0x1F]);
         hasher.update(instance.as_bytes());
+        hasher.update([0x1F]);
+        hasher.update(value.as_bytes());
         Ok(Some(hex_lower(&hasher.finalize())))
     }
 
+    fn mutation_context(
+        &self,
+        request: &HttpRequest,
+        request_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> MutationContext {
+        let body_sha256 = body_hash_hex(&request.body);
+        let op_id = if let Some(key) = idempotency_key {
+            let mut hasher = Sha256::new();
+            hasher.update(b"pulse-op\0");
+            hasher.update(key.as_bytes());
+            hex_lower(&hasher.finalize())
+        } else {
+            let counter = self.op_counter.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
+            let mut hasher = Sha256::new();
+            hasher.update(b"pulse-op\0");
+            hasher.update(nanos.to_le_bytes());
+            hasher.update(counter.to_le_bytes());
+            hasher.update(std::process::id().to_le_bytes());
+            hasher.update(request.method.as_str().as_bytes());
+            hasher.update(request.path.as_bytes());
+            hasher.update(body_sha256.as_bytes());
+            hasher.update(request_id.as_bytes());
+            hex_lower(&hasher.finalize())
+        };
+        MutationContext { op_id, body_sha256 }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn journaled<F, R>(
+        &self,
+        ctx: &MutationContext,
+        request: &HttpRequest,
+        instance: &str,
+        request_id: &str,
+        preconditions: &Preconditions,
+        operation: JournalOp,
+        apply: F,
+        replay: R,
+    ) -> Result<HttpResponse, Problem>
+    where
+        F: FnOnce(&dyn ZoneAdmin) -> Result<(HttpResponse, u64), Problem>,
+        R: FnOnce(&dyn ZoneAdmin) -> Result<HttpResponse, Problem>,
+    {
+        let Some(journal) = &self.journal else {
+            let (response, _) = apply(&*self.store)?;
+            return Ok(response);
+        };
+        let intent = journal_intent(
+            &ctx.op_id,
+            request.method.as_str(),
+            &request.path,
+            &ctx.body_sha256,
+            preconditions,
+            operation.clone(),
+        );
+        let begin = journal
+            .begin(intent)
+            .inspect_err(|_| journal.record_error())
+            .map_err(|error| journal_failure(instance, request_id, &error))?;
+        crash_point("after_intent");
+        let mut replay_response = None;
+        match begin {
+            JournalBegin::New => {}
+            JournalBegin::Conflict => {
+                return Err(Problem::new(
+                    409,
+                    "idempotency-key-reuse",
+                    "The Idempotency-Key was already used with a different request body.",
+                    instance,
+                    request_id,
+                ));
+            }
+            JournalBegin::Pending => match operation.already_applied(&*self.store) {
+                Ok(Some(version)) => {
+                    journal
+                        .commit(&ctx.op_id, version, None)
+                        .inspect_err(|_| journal.record_error())
+                        .map_err(|error| journal_failure(instance, request_id, &error))?;
+                    journal.note_replay();
+                    replay_response = Some(replay(&*self.store)?);
+                }
+                Ok(None) => {}
+                Err(error) => return Err(Problem::from_admin(error, instance, request_id)),
+            },
+            JournalBegin::Response(stored) => {
+                journal.note_replay();
+                return Ok(stored.into_http());
+            }
+            JournalBegin::Committed { version } => {
+                let _ = version;
+                journal.note_replay();
+                return Ok(with_replay_header(replay(&*self.store)?));
+            }
+            JournalBegin::Aborted { reason } => {
+                return Err(Problem::new(
+                    409,
+                    "idempotency-key-reuse",
+                    format!(
+                        "The operation was previously rejected ({reason}); use a new Idempotency-Key."
+                    ),
+                    instance,
+                    request_id,
+                ));
+            }
+        }
+        if let Some(mut response) = replay_response {
+            response.set_header("Idempotent-Replay", "true");
+            return Ok(response);
+        }
+        match apply(&*self.store) {
+            Ok((response, version)) => {
+                crash_point("after_apply");
+                journal
+                    .commit(&ctx.op_id, version, Some(&response))
+                    .inspect_err(|_| journal.record_error())
+                    .map_err(|error| journal_failure(instance, request_id, &error))?;
+                crash_point("after_committed");
+                Ok(response)
+            }
+            Err(problem) if problem.status() >= 500 => Err(problem),
+            Err(problem) => {
+                let retryable = matches!(
+                    problem.code(),
+                    "zone-busy" | "precondition-failed" | "precondition-required"
+                );
+                let response = problem.clone().into_response();
+                if journal
+                    .abort(&ctx.op_id, problem.code(), retryable, Some(&response))
+                    .is_err()
+                {
+                    journal.record_error();
+                }
+                Err(problem)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn dispatch(
         &self,
         request: &HttpRequest,
@@ -373,6 +535,7 @@ impl Api {
         principal: &Principal,
         request_id: &str,
         instance: &str,
+        mutation: &MutationContext,
     ) -> Result<HttpResponse, Problem> {
         match route {
             Route::Health | Route::Ready | Route::Metrics => Err(internal(instance, request_id)),
@@ -380,13 +543,15 @@ impl Api {
             Route::Zones => self.list_zones(request, principal, request_id, instance),
             Route::Zone(origin) => match request.method {
                 Method::Get => self.get_zone(request, origin, request_id, instance),
-                Method::Put => self.put_zone(request, origin, request_id, instance),
-                Method::Delete => self.delete_zone(request, origin, request_id, instance),
+                Method::Put => self.put_zone(request, origin, request_id, instance, mutation),
+                Method::Delete => self.delete_zone(request, origin, request_id, instance, mutation),
                 _ => Err(internal(instance, request_id)),
             },
             Route::ZoneSettings(origin) => match request.method {
                 Method::Get => self.get_settings(origin, request_id, instance),
-                Method::Patch => self.patch_settings(request, origin, request_id, instance),
+                Method::Patch => {
+                    self.patch_settings(request, origin, request_id, instance, mutation)
+                }
                 _ => Err(internal(instance, request_id)),
             },
             Route::ZoneKeys(origin) => self.get_zone_keys(origin, request_id, instance),
@@ -400,15 +565,15 @@ impl Api {
                 Method::Get => {
                     self.get_rrset(request, origin, owner, *rr_type, request_id, instance)
                 }
-                Method::Put => {
-                    self.put_rrset(request, origin, owner, *rr_type, request_id, instance)
-                }
-                Method::Patch => {
-                    self.patch_rrset(request, origin, owner, *rr_type, request_id, instance)
-                }
-                Method::Delete => {
-                    self.delete_rrset(request, origin, owner, *rr_type, request_id, instance)
-                }
+                Method::Put => self.put_rrset(
+                    request, origin, owner, *rr_type, request_id, instance, mutation,
+                ),
+                Method::Patch => self.patch_rrset(
+                    request, origin, owner, *rr_type, request_id, instance, mutation,
+                ),
+                Method::Delete => self.delete_rrset(
+                    request, origin, owner, *rr_type, request_id, instance, mutation,
+                ),
                 _ => Err(internal(instance, request_id)),
             },
         }
@@ -420,7 +585,8 @@ impl Api {
         request_id: &str,
         instance: &str,
     ) -> Result<HttpResponse, Problem> {
-        self.store
+        let zone = self
+            .store
             .get_zone(origin)
             .map_err(|error| Problem::from_admin(error, instance, request_id))?;
         let rrset = match self.store.get_rrset(origin, origin, Rtype::DNSKEY) {
@@ -477,13 +643,36 @@ impl Api {
                 }));
             }
         }
+        let rotation = self
+            .store
+            .key_rotation(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let rotation_json = rotation.map_or(Value::Null, |rotation| {
+            json!({
+                "next_event_at": rotation.next_event_at,
+                "keys": rotation
+                    .keys
+                    .iter()
+                    .map(|key| {
+                        json!({
+                            "key_tag": key.key_tag,
+                            "role": key.role,
+                            "state": key.state,
+                            "created_at": key.created_at,
+                            "next_transition": key.next_transition,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        });
         Ok(HttpResponse::json(
             200,
             json!({
                 "zone": origin.to_string(),
-                "denial": "nsec",
+                "denial": zone.denial.as_str(),
                 "keys": keys,
                 "ds": ds,
+                "rotation": rotation_json,
             }),
         ))
     }
@@ -580,6 +769,7 @@ impl Api {
         origin: &Name,
         request_id: &str,
         instance: &str,
+        mutation: &MutationContext,
     ) -> Result<HttpResponse, Problem> {
         let value = self.json_body(request, instance, request_id)?;
         let body: ZoneWriteBody = deserialize(value, instance, request_id)?;
@@ -645,21 +835,45 @@ impl Api {
             denial,
         };
         let preconditions = preconditions(request, instance, request_id)?;
-        let outcome = self
-            .store
-            .put_zone(origin, &meta, &preconditions)
-            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
-        let created = outcome.is_created();
-        let zone = outcome.value();
-        let mut response = HttpResponse::json(if created { 201 } else { 200 }, zone_json(zone));
-        response.set_header("ETag", zone.etag.clone());
-        if created {
-            response.set_header(
-                "Location",
-                format!("/api/v1/zones/{}", encode_segment(&origin.to_string())),
-            );
-        }
-        Ok(response)
+        let operation = JournalOp::PutZone {
+            origin: origin.to_string(),
+            kind: kind.as_str().to_owned(),
+            default_ttl: default_ttl.as_u32(),
+            denial: denial.as_str().to_owned(),
+        };
+        self.journaled(
+            mutation,
+            request,
+            instance,
+            request_id,
+            &preconditions,
+            operation,
+            |store| {
+                let outcome = store
+                    .put_zone(origin, &meta, &preconditions)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+                let created = outcome.is_created();
+                let zone = outcome.value();
+                let mut response =
+                    HttpResponse::json(if created { 201 } else { 200 }, zone_json(zone));
+                response.set_header("ETag", zone.etag.clone());
+                if created {
+                    response.set_header(
+                        "Location",
+                        format!("/api/v1/zones/{}", encode_segment(&origin.to_string())),
+                    );
+                }
+                Ok((response, zone.version))
+            },
+            |store| {
+                let zone = store
+                    .get_zone(origin)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+                let mut response = HttpResponse::json(200, zone_json(&zone));
+                response.set_header("ETag", zone.etag.clone());
+                Ok(response)
+            },
+        )
     }
 
     fn delete_zone(
@@ -668,12 +882,27 @@ impl Api {
         origin: &Name,
         request_id: &str,
         instance: &str,
+        mutation: &MutationContext,
     ) -> Result<HttpResponse, Problem> {
         let preconditions = preconditions(request, instance, request_id)?;
-        self.store
-            .delete_zone(origin, &preconditions)
-            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
-        Ok(HttpResponse::empty(204))
+        let operation = JournalOp::DeleteZone {
+            origin: origin.to_string(),
+        };
+        self.journaled(
+            mutation,
+            request,
+            instance,
+            request_id,
+            &preconditions,
+            operation,
+            |store| {
+                store
+                    .delete_zone(origin, &preconditions)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+                Ok((HttpResponse::empty(204), 0))
+            },
+            |_store| Ok(HttpResponse::empty(204)),
+        )
     }
 
     fn get_settings(
@@ -697,6 +926,7 @@ impl Api {
         origin: &Name,
         request_id: &str,
         instance: &str,
+        mutation: &MutationContext,
     ) -> Result<HttpResponse, Problem> {
         let value = self.json_body(request, instance, request_id)?;
         let body: SettingsPatchBody = deserialize(value, instance, request_id)?;
@@ -738,13 +968,35 @@ impl Api {
             denial,
         };
         let preconditions = preconditions(request, instance, request_id)?;
-        let settings = self
-            .store
-            .patch_settings(origin, &patch, &preconditions)
-            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
-        let mut response = HttpResponse::json(200, settings_json(&settings));
-        response.set_header("ETag", settings.etag.clone());
-        Ok(response)
+        let operation = JournalOp::PatchSettings {
+            origin: origin.to_string(),
+            default_ttl: default_ttl.map(Ttl::as_u32),
+            denial: denial.map(Denial::as_str).map(str::to_owned),
+        };
+        self.journaled(
+            mutation,
+            request,
+            instance,
+            request_id,
+            &preconditions,
+            operation,
+            |store| {
+                let settings = store
+                    .patch_settings(origin, &patch, &preconditions)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+                let mut response = HttpResponse::json(200, settings_json(&settings));
+                response.set_header("ETag", settings.etag.clone());
+                Ok((response, settings.version))
+            },
+            |store| {
+                let settings = store
+                    .get_settings(origin)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+                let mut response = HttpResponse::json(200, settings_json(&settings));
+                response.set_header("ETag", settings.etag.clone());
+                Ok(response)
+            },
+        )
     }
 
     fn get_rrset(
@@ -772,6 +1024,7 @@ impl Api {
         Ok(response)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn put_rrset(
         &self,
         request: &HttpRequest,
@@ -780,6 +1033,7 @@ impl Api {
         rr_type: Rtype,
         request_id: &str,
         instance: &str,
+        mutation: &MutationContext,
     ) -> Result<HttpResponse, Problem> {
         let value = self.json_body(request, instance, request_id)?;
         let body: RrsetWriteBody = deserialize(value, instance, request_id)?;
@@ -808,28 +1062,58 @@ impl Api {
         let rdata = parse_records(&records, rr_type, instance, request_id)?;
         let input = RrsetInput { ttl, rdata };
         let preconditions = preconditions(request, instance, request_id)?;
-        let outcome = self
-            .store
-            .put_rrset(origin, owner, rr_type, &input, &preconditions)
-            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
-        let created = outcome.is_created();
-        let rrset = outcome.value();
-        let mut response = HttpResponse::json(if created { 201 } else { 200 }, rrset_json(rrset));
-        response.set_header("ETag", rrset.etag.clone());
-        if created {
-            response.set_header(
-                "Location",
-                format!(
-                    "/api/v1/zones/{}/records/{}/{}",
-                    encode_segment(&origin.to_string()),
-                    encode_segment(&owner.to_string()),
-                    rr_type
-                ),
-            );
-        }
-        Ok(response)
+        let operation = JournalOp::PutRrset {
+            origin: origin.to_string(),
+            owner: owner.to_string(),
+            rr_type: rr_type.to_string(),
+            ttl: ttl.as_u32(),
+            records,
+        };
+        self.journaled(
+            mutation,
+            request,
+            instance,
+            request_id,
+            &preconditions,
+            operation,
+            |store| {
+                let outcome = store
+                    .put_rrset(origin, owner, rr_type, &input, &preconditions)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+                let created = outcome.is_created();
+                let rrset = outcome.value();
+                let mut response =
+                    HttpResponse::json(if created { 201 } else { 200 }, rrset_json(rrset));
+                response.set_header("ETag", rrset.etag.clone());
+                if created {
+                    response.set_header(
+                        "Location",
+                        format!(
+                            "/api/v1/zones/{}/records/{}/{}",
+                            encode_segment(&origin.to_string()),
+                            encode_segment(&owner.to_string()),
+                            rr_type
+                        ),
+                    );
+                }
+                let version = store
+                    .get_zone(origin)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?
+                    .version;
+                Ok((response, version))
+            },
+            |store| {
+                let rrset = store
+                    .get_rrset(origin, owner, rr_type)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+                let mut response = HttpResponse::json(200, rrset_json(&rrset));
+                response.set_header("ETag", rrset.etag.clone());
+                Ok(response)
+            },
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn patch_rrset(
         &self,
         request: &HttpRequest,
@@ -838,6 +1122,7 @@ impl Api {
         rr_type: Rtype,
         request_id: &str,
         instance: &str,
+        mutation: &MutationContext,
     ) -> Result<HttpResponse, Problem> {
         let value = self.json_body(request, instance, request_id)?;
         let body: RrsetPatchBody = deserialize(value, instance, request_id)?;
@@ -867,48 +1152,88 @@ impl Api {
             })?),
             None => None,
         };
-        let add = match body.add {
-            Some(records) if !records.is_empty() => {
-                parse_records(&records, rr_type, instance, request_id)?
-            }
+        let add_text = match &body.add {
+            Some(records) if !records.is_empty() => records.clone(),
             _ => Vec::new(),
         };
-        let remove = match body.remove {
-            Some(records) if !records.is_empty() => {
-                parse_records(&records, rr_type, instance, request_id)?
-            }
+        let remove_text = match &body.remove {
+            Some(records) if !records.is_empty() => records.clone(),
             _ => Vec::new(),
+        };
+        let add = if add_text.is_empty() {
+            Vec::new()
+        } else {
+            parse_records(&add_text, rr_type, instance, request_id)?
+        };
+        let remove = if remove_text.is_empty() {
+            Vec::new()
+        } else {
+            parse_records(&remove_text, rr_type, instance, request_id)?
         };
         let patch = RrsetPatch { ttl, add, remove };
         let preconditions = preconditions(request, instance, request_id)?;
-        let outcome = self
-            .store
-            .patch_rrset(origin, owner, rr_type, &patch, &preconditions)
-            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
-        match outcome {
-            RrsetPatchOutcome::Updated {
-                rrset,
-                added,
-                removed,
-            } => {
-                let mut response = HttpResponse::json(
+        let operation = JournalOp::PatchRrset {
+            origin: origin.to_string(),
+            owner: owner.to_string(),
+            rr_type: rr_type.to_string(),
+            ttl: ttl.map(Ttl::as_u32),
+            add: add_text,
+            remove: remove_text,
+        };
+        self.journaled(
+            mutation,
+            request,
+            instance,
+            request_id,
+            &preconditions,
+            operation,
+            |store| {
+                let outcome = store
+                    .patch_rrset(origin, owner, rr_type, &patch, &preconditions)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+                let version = store
+                    .get_zone(origin)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?
+                    .version;
+                let response = match outcome {
+                    RrsetPatchOutcome::Updated {
+                        rrset,
+                        added,
+                        removed,
+                    } => {
+                        let mut response = HttpResponse::json(
+                            200,
+                            json!({
+                                "rrset": rrset_json(&rrset),
+                                "added": added,
+                                "removed": removed,
+                            }),
+                        );
+                        response.set_header("ETag", rrset.etag.clone());
+                        response
+                    }
+                    RrsetPatchOutcome::Deleted { removed } => {
+                        HttpResponse::json(200, json!({ "deleted": true, "removed": removed }))
+                    }
+                };
+                Ok((response, version))
+            },
+            |store| match store.get_rrset(origin, owner, rr_type) {
+                Ok(rrset) => {
+                    let mut response = HttpResponse::json(200, rrset_json(&rrset));
+                    response.set_header("ETag", rrset.etag.clone());
+                    Ok(response)
+                }
+                Err(AdminError::NotFound(NotFound::Rrset)) => Ok(HttpResponse::json(
                     200,
-                    json!({
-                        "rrset": rrset_json(&rrset),
-                        "added": added,
-                        "removed": removed,
-                    }),
-                );
-                response.set_header("ETag", rrset.etag.clone());
-                Ok(response)
-            }
-            RrsetPatchOutcome::Deleted { removed } => Ok(HttpResponse::json(
-                200,
-                json!({ "deleted": true, "removed": removed }),
-            )),
-        }
+                    json!({ "deleted": true, "removed": 0 }),
+                )),
+                Err(error) => Err(Problem::from_admin(error, instance, request_id)),
+            },
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn delete_rrset(
         &self,
         request: &HttpRequest,
@@ -917,12 +1242,33 @@ impl Api {
         rr_type: Rtype,
         request_id: &str,
         instance: &str,
+        mutation: &MutationContext,
     ) -> Result<HttpResponse, Problem> {
         let preconditions = preconditions(request, instance, request_id)?;
-        self.store
-            .delete_rrset(origin, owner, rr_type, &preconditions)
-            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
-        Ok(HttpResponse::empty(204))
+        let operation = JournalOp::DeleteRrset {
+            origin: origin.to_string(),
+            owner: owner.to_string(),
+            rr_type: rr_type.to_string(),
+        };
+        self.journaled(
+            mutation,
+            request,
+            instance,
+            request_id,
+            &preconditions,
+            operation,
+            |store| {
+                store
+                    .delete_rrset(origin, owner, rr_type, &preconditions)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+                let version = store
+                    .get_zone(origin)
+                    .map_err(|error| Problem::from_admin(error, instance, request_id))?
+                    .version;
+                Ok((HttpResponse::empty(204), version))
+            },
+            |_store| Ok(HttpResponse::empty(204)),
+        )
     }
 
     fn list_rrsets(
@@ -1602,4 +1948,23 @@ struct RrsetPatchBody {
 struct SettingsPatchBody {
     default_ttl: Option<u32>,
     denial: Option<String>,
+}
+
+fn with_replay_header(mut response: HttpResponse) -> HttpResponse {
+    response.set_header("Idempotent-Replay", "true");
+    response
+}
+
+fn journal_failure(
+    instance: &str,
+    request_id: &str,
+    error: &crate::journal::JournalError,
+) -> Problem {
+    Problem::new(
+        500,
+        "storage-error",
+        format!("Write-ahead journal failed: {error}"),
+        instance,
+        request_id,
+    )
 }

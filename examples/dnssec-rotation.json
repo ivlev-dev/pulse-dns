@@ -1,0 +1,40 @@
+{
+  "listen_udp": "127.0.0.1:5353",
+  "listen_tcp": "127.0.0.1:5353",
+  "workers": 2,
+  "log_level": "info",
+  "zonefile": "/var/lib/pulsed/zones.pulse",
+  "durability": "flush",
+  "map_size": 268435456,
+  "dnssec": {
+    "example.com.": {
+      "keys": [
+        {
+          "role": "ksk",
+          "path": "/etc/pulsed/keys/Kexample.com.+015+00001.private"
+        },
+        {
+          "role": "zsk",
+          "path": "/etc/pulsed/keys/Kexample.com.+015+00002.private"
+        }
+      ],
+      "validity_days": 30,
+      "inception_skew": 300,
+      "denial": "nsec3",
+      "nsec3_salt": "aabbccddeeff0011",
+      "nsec3_iterations": 0,
+      "nsec3_opt_out": true,
+      "rotation": {
+        "key_dir": "/var/lib/pulsed/dnssec/example.com",
+        "state_path": "/var/lib/pulsed/dnssec/example.com/rotation.json",
+        "algorithm": 15,
+        "zsk_lifetime_days": 90,
+        "ksk_lifetime_days": 365,
+        "pre_publish_secs": 86400,
+        "double_sign_secs": 86400,
+        "retire_secs": 604800,
+        "tick_secs": 300
+      }
+    }
+  }
+}

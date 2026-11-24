@@ -1,4 +1,4 @@
-# Blocklist для examples/resolver.json.
+# Blocklist для examples/resolver.toml (и legacy resolver.json).
 # Точное имя блокирует само имя и все поддомены; *.name — только поддомены.
 # Поддерживаются hosts-строки, adblock-подобные ||domain^ и @@allow.
 

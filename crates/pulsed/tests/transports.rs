@@ -459,6 +459,11 @@ fn dnscrypt_udp_answers_and_rejects_wrong_keys() {
     config.dnscrypt_provider_name = Some(material.provider_name.clone());
     let mut server = Server::start(&config).expect("start server");
     let addr = server.dnscrypt_addr().expect("DNSCrypt address");
+    assert_ne!(
+        addr.port(),
+        0,
+        "server must report the real bound DNSCrypt UDP address, got {addr}"
+    );
 
     let certificate = Certificate::from_hex(&material.certificate_hex).expect("certificate");
     let provider = ProviderPublicKey::from_hex(&material.provider_public_key).expect("provider");
@@ -577,11 +582,21 @@ fn all_three_transports_run_in_parallel_and_export_metrics() {
     assert_eq!(a_records(&decode(&response)), vec!["192.0.2.20"]);
 
     let metrics = http_plain(api_addr, "/metrics", Some("test-token"));
-    assert!(metrics.contains("dot_queries_total 1"), "{metrics}");
-    assert!(metrics.contains("doh_queries_total 1"), "{metrics}");
-    assert!(metrics.contains("dnscrypt_queries_total 1"), "{metrics}");
-    assert!(metrics.contains("dnscrypt_responses_total 1"), "{metrics}");
-    assert!(metrics.contains("dot_handshakes_total 1"), "{metrics}");
+    assert_eq!(metric(&metrics, "dot_queries_total"), 1, "{metrics}");
+    assert_eq!(metric(&metrics, "doh_queries_total"), 1, "{metrics}");
+    // DNSCrypt UDP может быть повторён при таймауте, поэтому проверяем не
+    // «ровно один», а что каждый принятый запрос получил ответ.
+    let dnscrypt_queries = metric(&metrics, "dnscrypt_queries_total");
+    assert!(
+        dnscrypt_queries >= 1,
+        "DNSCrypt must serve at least one query:\n{metrics}"
+    );
+    assert_eq!(
+        metric(&metrics, "dnscrypt_responses_total"),
+        dnscrypt_queries,
+        "every DNSCrypt query must be answered:\n{metrics}"
+    );
+    assert_eq!(metric(&metrics, "dot_handshakes_total"), 1, "{metrics}");
     assert!(metrics.contains("doh_http_requests_total"), "{metrics}");
 
     server.shutdown().expect("shutdown");
@@ -776,24 +791,45 @@ fn big_zone() -> (tempfile::TempDir, common::TempZone) {
     (dir, zone)
 }
 
+/// Сколько раз повторять `DNSCrypt` UDP-запрос перед паникой.
+const DNSCRYPT_UDP_ATTEMPTS: u32 = 5;
+
 fn dnscrypt_exchange(addr: SocketAddr, client: &DnscryptClient, query: &[u8]) -> Vec<u8> {
-    let pending = client
-        .build_query(query, DnscryptTransport::Udp)
-        .expect("build DNSCrypt query");
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("udp client");
-    socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("read timeout");
-    socket
-        .send_to(pending.packet(), addr)
-        .expect("send DNSCrypt query");
-    let mut buffer = [0_u8; 4096];
-    let (length, _) = socket
-        .recv_from(&mut buffer)
-        .expect("recv DNSCrypt response");
-    client
-        .decrypt_response(&pending, &buffer[..length])
-        .expect("decrypt DNSCrypt response")
+    // UDP не гарантирует доставку, а под полной нагрузкой workspace-тестов
+    // worker сервера может не успеть обработать датаграмму за таймаут сокета.
+    // Каждая попытка — новый запрос: сервер включает anti-replay по паре
+    // `(client-pk, client-nonce)` и молча отбрасывает повторный nonce.
+    let exchanged = common::retry(
+        "dnscrypt udp exchange",
+        DNSCRYPT_UDP_ATTEMPTS,
+        Duration::from_millis(100),
+        |_attempt| -> Result<Vec<u8>, String> {
+            let pending = client
+                .build_query(query, DnscryptTransport::Udp)
+                .map_err(|error| format!("build query: {error}"))?;
+            let socket = UdpSocket::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+            socket
+                .set_read_timeout(Some(common::SOCKET_TIMEOUT))
+                .map_err(|error| error.to_string())?;
+            socket
+                .set_write_timeout(Some(common::SOCKET_TIMEOUT))
+                .map_err(|error| error.to_string())?;
+            common::udp_send_to(&socket, pending.packet(), addr)
+                .map_err(|error| format!("send to {addr}: {error}"))?;
+            let mut buffer = [0_u8; 4096];
+            let (length, _) = common::udp_recv_from(&socket, &mut buffer)
+                .map_err(|error| format!("recv from {addr}: {error}"))?;
+            let bytes = buffer
+                .get(..length)
+                .ok_or_else(|| format!("response length {length} out of range"))?;
+            client
+                .decrypt_response(&pending, bytes)
+                .map_err(|error| format!("decrypt from {addr}: {error}"))
+        },
+    );
+    exchanged.unwrap_or_else(|error| {
+        panic!("DNSCrypt UDP exchange with {addr} failed: {error}");
+    })
 }
 
 fn http_plain(addr: SocketAddr, path: &str, token: Option<&str>) -> String {
@@ -835,6 +871,7 @@ fn assert_port_closed(addr: SocketAddr) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return,
             Ok(_) if Instant::now() >= deadline => {
                 panic!("port {addr} still accepts connections after shutdown");
@@ -849,12 +886,34 @@ fn assert_udp_silent(addr: SocketAddr) {
     socket
         .set_read_timeout(Some(Duration::from_millis(300)))
         .expect("read timeout");
-    socket.send_to(b"\x00\x01", addr).expect("send probe");
+    common::udp_send_to(&socket, b"\x00\x01", addr).expect("send probe");
     let mut buffer = [0_u8; 64];
-    assert!(
-        socket.recv_from(&mut buffer).is_err(),
-        "UDP listener {addr} still responds after shutdown"
-    );
+    match common::udp_recv_from(&socket, &mut buffer) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) => {}
+        Err(error) => panic!("unexpected read error on {addr}: {error}"),
+        Ok((length, _)) => {
+            panic!("UDP listener {addr} still responds after shutdown ({length} bytes)");
+        }
+    }
+}
+
+/// Значение счётчика из текстового вывода `/metrics`.
+fn metric(metrics: &str, name: &str) -> u64 {
+    metrics
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next() == Some(name) {
+                parts.next()?.parse().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| panic!("metric {name} not found in:\n{metrics}"))
 }
 
 fn unix_now() -> u64 {
@@ -884,7 +943,7 @@ fn dnscrypt_tcp_answers_multiple_queries_on_one_connection() {
 
     let mut stream = TcpStream::connect(addr).expect("connect DNSCrypt TCP");
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(common::SOCKET_TIMEOUT))
         .expect("read timeout");
 
     for (id, name, expected) in [
@@ -940,7 +999,7 @@ fn dnscrypt_tcp_large_answer_is_not_truncated() {
     let mut stream = TcpStream::connect(server.dnscrypt_tcp_addr().expect("addr"))
         .expect("connect DNSCrypt TCP");
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(common::SOCKET_TIMEOUT))
         .expect("read timeout");
     let pending = client
         .build_query(&query, DnscryptTransport::Tcp)
@@ -988,7 +1047,7 @@ fn dnscrypt_tcp_idle_timeout_and_metrics() {
 
     let mut stream = TcpStream::connect(addr).expect("connect");
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(common::SOCKET_TIMEOUT))
         .expect("read timeout");
     stream.write_all(pending.packet()).expect("write");
     let frame = read_tcp_frame(&mut stream);
@@ -1077,7 +1136,7 @@ fn dnscrypt_tcp_rejects_frames_above_limit() {
 
     let mut stream = TcpStream::connect(addr).expect("connect");
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(common::SOCKET_TIMEOUT))
         .expect("read timeout");
     // Заявленная длина 600 > 512: сервер обязан закрыть соединение.
     let mut frame = vec![0_u8; 602];

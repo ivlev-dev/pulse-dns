@@ -14,6 +14,7 @@
 //! - [`config`] — конфигурация сервера.
 //! - [`server`] — запуск HTTP-сервера с graceful shutdown.
 //! - [`error`] — типизированные ошибки порта.
+//! - [`journal`] — write-ahead journal (outbox) мутаций для crash-recovery.
 //!
 //! # Безопасность
 //!
@@ -92,6 +93,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod journal;
 pub mod memory;
 pub mod port;
 pub mod server;
@@ -113,10 +115,17 @@ mod timefmt;
 pub use auth::{AuthConfigError, Authenticator, Principal, ScopeSet, TokenConfig, ZoneScope};
 pub use config::{ApiConfig, ApiConfigError};
 pub use error::{AdminError, Conflict, FieldIssue, InvariantViolation, NotFound};
+pub use journal::{
+    DEFAULT_SUFFIX as JOURNAL_SUFFIX, FORMAT_VERSION as JOURNAL_FORMAT_VERSION, Journal,
+    JournalConfig, JournalError, JournalMetrics, RecoveryReport,
+};
 pub use memory::{InMemoryZoneAdmin, StoreSnapshot, ZoneSnapshot};
 pub use port::{
-    Denial, ListRrsets, ListZones, Precondition, Preconditions, RrsetInput, RrsetPage, RrsetPatch,
-    RrsetPatchOutcome, RrsetView, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneFileMetrics, ZoneId,
-    ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, ZoneView,
+    Denial, KeyRotationKeyView, KeyRotationView, ListRrsets, ListZones, Precondition,
+    Preconditions, RrsetInput, RrsetPage, RrsetPatch, RrsetPatchOutcome, RrsetView, WriteOutcome,
+    ZoneAdmin, ZoneAllow, ZoneFileMetrics, ZoneId, ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings,
+    ZoneSettingsPatch, ZoneSettingsView, ZoneView,
 };
-pub use server::{ApiServerError, MetricsProvider, RunningServer, serve, serve_with_metrics};
+pub use server::{
+    ApiServerError, MetricsProvider, RunningServer, serve, serve_with_journal, serve_with_metrics,
+};

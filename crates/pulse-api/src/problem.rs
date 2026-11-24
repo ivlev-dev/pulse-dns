@@ -68,6 +68,11 @@ impl Problem {
         self.code
     }
 
+    /// HTTP-статус.
+    pub(crate) fn status(&self) -> u16 {
+        self.status
+    }
+
     /// Создаёт problem+json ответ.
     pub(crate) fn into_response(self) -> HttpResponse {
         let mut body = json!({

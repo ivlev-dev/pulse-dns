@@ -1,0 +1,90 @@
+# pulseresolved: все защищённые транспорты одновременно.
+#
+# DoT (853/tcp), DoH/1.1 (443/tcp), DoH/2 (8443/tcp), DoQ (8853/udp) и
+# DNSCrypt v2 (5443/udp+tcp). RRL применяется только к открытому UDP;
+# на TLS/QUIC-транспортах действует per-source token bucket.
+#
+# Пути ниже — примеры: замените на реальные файлы. Секретные ключи должны
+# иметь права 0600 (валидация конфигурации и запуск это проверяют).
+
+listen_udp = "127.0.0.1:5353"
+listen_tcp = "127.0.0.1:5353"
+metrics_listen = "127.0.0.1:9153"
+workers = 2
+mode = "forward"
+forwarders = ["1.1.1.1:53", "9.9.9.9:53"]
+dnssec_validate = true
+trust_anchor = "embedded"
+log_level = "info"
+
+# --- Защищённые транспорты -------------------------------------------------
+dot_listen = "0.0.0.0:853"
+doh_listen = "0.0.0.0:443"
+doh2_listen = "0.0.0.0:8443"
+doq_listen = "0.0.0.0:8853"
+dnscrypt_listen = "0.0.0.0:5443"
+dnscrypt_tcp_listen = "0.0.0.0:5443"
+
+# PEM-пара для DoT/DoH/DoH2/DoQ; ключ — 0600.
+tls_cert = "/etc/pulse/tls/fullchain.pem"
+tls_key = "/etc/pulse/tls/privkey.pem"
+
+# DNSCrypt: ключи (hex, 0600) и подписанный сертификат
+# (`pulsed dnscrypt-gencert` пишет JSON; принимается также hex/base64).
+dnscrypt_provider_key = "/etc/pulse/dnscrypt/dnscrypt-provider.key"
+dnscrypt_resolver_key = "/etc/pulse/dnscrypt/dnscrypt-resolver.key"
+dnscrypt_cert = "/etc/pulse/dnscrypt/dnscrypt-cert.json"
+
+# ACL: пусто — loopback-only. tls_allow_from действует только на
+# DoT/DoH/DoH2/DoQ; при пустом значении используется общий allow_from.
+allow_from = ["127.0.0.0/8", "::1/128", "192.168.0.0/16"]
+tls_allow_from = ["127.0.0.0/8", "::1/128", "192.168.0.0/16"]
+
+[secure]
+max_connections = 1024
+max_streams = 100
+handshake_timeout_ms = 10000
+request_timeout_ms = 10000
+idle_timeout_ms = 30000
+shutdown_timeout_ms = 5000
+max_message_size = 65535
+worker_threads = 2
+max_requests_per_connection = 100
+cache_control = true
+
+[dnscrypt]
+min_query_len = 256
+max_udp_packet = 4096
+max_tcp_packet = 65535
+replay_ttl_secs = 300
+replay_capacity = 65536
+replay_protection = true
+truncate_udp_responses = true
+
+[rate_limit]
+enabled = true
+qps = 20
+burst = 100
+max_entries = 10000
+action = "refused"
+
+[rrl]
+enabled = true
+slip = 2
+max_entries = 20000
+action = "truncate"
+nxdomain = { qps = 5, burst = 20 }
+error = { qps = 5, burst = 20 }
+source = { qps = 50, burst = 200 }
+
+[cache]
+max_entries = 32768
+max_bytes = 16777216
+min_ttl = 0
+max_ttl = 86400
+shards = 16
+
+[timeouts]
+per_query_ms = 2000
+tcp_ms = 3000
+total_ms = 6000
