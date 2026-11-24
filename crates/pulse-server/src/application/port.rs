@@ -2,7 +2,7 @@
 
 use pulse_dns::{Name, Rclass, Rrset, Rtype};
 
-use crate::domain::{LookupOutcome, ZoneState};
+use crate::domain::{DenialKind, LookupOutcome, ZoneState};
 
 /// Синхронный порт зоны (driven port авторитетного сервиса).
 ///
@@ -80,6 +80,36 @@ pub trait ZoneView: Send + Sync {
     /// proof. `None` — покрывающей записи нет.
     fn nsec_cover(&self, name: &Name) -> Option<Rrset> {
         let _ = name;
+        None
+    }
+
+    /// Механизм denial-of-existence зоны (по умолчанию NSEC).
+    fn denial(&self) -> DenialKind {
+        DenialKind::Nsec
+    }
+
+    /// `NSEC3PARAM`-набор apex, если зона подписана через NSEC3.
+    ///
+    /// Параметры (hash algorithm, iterations, salt) задают hash-пространство
+    /// для поиска NSEC3-доказательств.
+    fn nsec3_param(&self) -> Option<Rrset> {
+        None
+    }
+
+    /// `NSEC3`-набор, owner которого — hashed-имя для `hash`.
+    ///
+    /// Нужен для NODATA/DS-NODATA (exact match) и closest encloser proof.
+    fn nsec3_at(&self, hash: &[u8]) -> Option<Rrset> {
+        let _ = hash;
+        None
+    }
+
+    /// `NSEC3`-набор, hash-интервал которого покрывает `hash` (RFC 5155 §7.2).
+    ///
+    /// Нужен для next closer и wildcard-покрытия в NXDOMAIN и wildcard
+    /// ответах.
+    fn nsec3_cover(&self, hash: &[u8]) -> Option<Rrset> {
+        let _ = hash;
         None
     }
 

@@ -16,7 +16,7 @@ use pulse_api::{
     ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView,
 };
 use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype, Serial, Ttl};
-use pulse_server::{QueryEngine, QueryStats, ZoneState as ServerZoneState, ZoneView};
+use pulse_server::{DenialKind, QueryEngine, QueryStats, ZoneState as ServerZoneState, ZoneView};
 use pulse_transfer::ZoneSnapshot;
 use pulse_zonefile::parallel::{ParallelZone, RootState};
 use sha2::{Digest, Sha256};
@@ -392,6 +392,13 @@ fn build_engine(
     Arc::new(QueryEngine::with_stats(views, Arc::clone(query_stats)))
 }
 
+fn denial_from_kind(kind: DenialKind) -> Denial {
+    match kind {
+        DenialKind::Nsec => Denial::Nsec,
+        DenialKind::Nsec3 => Denial::Nsec3,
+    }
+}
+
 fn server_state(entry: &ZoneEntry, expired: &HashSet<Name>) -> ServerZoneState {
     match entry.state {
         RootState::Serving => {
@@ -419,16 +426,13 @@ pub(crate) fn sign_configured_zones(
                 "DNSSEC is configured for zone {origin}, but the zone is not loaded"
             ));
         };
-        let signer = dnssec
-            .signer(origin)
-            .ok_or_else(|| format!("DNSSEC signer for zone {origin} disappeared"))?;
         let rrsets = store.zone_rrsets(origin)?;
-        let signed_zone = signer
-            .sign_zone(origin, &rrsets, dnssec::now_unix())
+        let signed_zone = dnssec
+            .sign(origin, &rrsets, dnssec::now_unix())
             .map_err(|error| format!("cannot sign zone {origin}: {error}"))?;
         let kind = kind_from_flags(entry.flags);
         let default_ttl = Ttl::new(entry.default_ttl).unwrap_or(Ttl::from_wire(3600));
-        let denial = denial_from_u8(entry.denial).unwrap_or(Denial::Nsec);
+        let denial = denial_from_kind(signed_zone.denial);
         replace_zone_in_file(
             store,
             origin,
@@ -482,20 +486,20 @@ pub(crate) fn import_loaded_zone(
             loaded.origin
         ));
     }
-    let rrsets = if let Some(signer) = dnssec.signer(&loaded.origin) {
-        signer
-            .sign_zone(&loaded.origin, &loaded.rrsets, dnssec::now_unix())
-            .map_err(|error| format!("cannot sign zone {}: {error}", loaded.origin))?
-            .rrsets
+    let (rrsets, denial) = if dnssec.signer(&loaded.origin).is_some() {
+        let signed_zone = dnssec
+            .sign(&loaded.origin, &loaded.rrsets, dnssec::now_unix())
+            .map_err(|error| format!("cannot sign zone {}: {error}", loaded.origin))?;
+        (signed_zone.rrsets, denial_from_kind(signed_zone.denial))
     } else {
-        loaded.rrsets.clone()
+        (loaded.rrsets.clone(), Denial::Nsec)
     };
     replace_zone_in_file(
         store,
         &loaded.origin,
         ZoneKind::Primary,
         loaded.default_ttl,
-        Denial::Nsec,
+        denial,
         &rrsets,
         &[],
     )?;
@@ -1294,21 +1298,22 @@ impl ZoneAdmin for SharedZoneAdmin {
 
     fn sign_zone(&self, origin: &Name) -> Result<pulse_api::ZoneView, AdminError> {
         let store = self.require_store()?;
-        let signer = self.dnssec.signer(origin).ok_or_else(|| {
-            AdminError::invariant(
+        if self.dnssec.signer(origin).is_none() {
+            return Err(AdminError::invariant(
                 "/zone",
                 "dnssec-not-configured",
                 "zone has no DNSSEC keys configured",
-            )
-        })?;
+            ));
+        }
         let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? else {
             return Err(AdminError::zone_not_found());
         };
         let _guard = self.catalog.lock().unwrap_or_else(PoisonError::into_inner);
         let rrsets = store.zone_rrsets(origin).map_err(AdminError::Storage)?;
         let previous = self.previous_snapshot(origin, store);
-        let signed_zone = signer
-            .sign_zone(origin, &rrsets, dnssec::now_unix())
+        let signed_zone = self
+            .dnssec
+            .sign(origin, &rrsets, dnssec::now_unix())
             .map_err(|error| {
                 logging::error(
                     "dnssec_sign",
@@ -1318,12 +1323,13 @@ impl ZoneAdmin for SharedZoneAdmin {
             })?;
         let kind = kind_from_flags(entry.flags);
         let default_ttl = Ttl::new(entry.default_ttl).unwrap_or(Ttl::from_wire(3600));
+        let denial = denial_from_kind(signed_zone.denial);
         replace_zone_in_file(
             store,
             origin,
             kind,
             default_ttl,
-            Denial::Nsec,
+            denial,
             &signed_zone.rrsets,
             &[],
         )

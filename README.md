@@ -197,6 +197,10 @@ cargo run -p pulsed -- import \
 # legacy v1 → v2 (без потери зон/записей/настроек)
 cargo run -p pulsed -- convert --from /tmp/old.v1 --to /tmp/pulse-dns.zonefile
 
+# offline fsck: граф/пулы/утечки; --repair возвращает место и изолирует
+# повреждённые зоны (подробности — docs/ops/fsck.md)
+cargo run -p pulsed -- fsck --data /tmp/pulse-dns.zonefile
+
 cargo run -p pulsed -- --config examples/pulsed.json \
   --data /tmp/pulse-dns.zonefile --durability flush \
   --commit-mode per-zone --map-size 268435456

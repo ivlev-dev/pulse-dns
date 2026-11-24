@@ -1,15 +1,16 @@
 //! Подпись авторитетной зоны и построение NSEC-цепочки (RFC 4033/4034/4035).
 //!
 //! Модуль выполняет **офлайн-подпись** загруженной зоны: добавляет apex
-//! `DNSKEY`, строит NSEC-цепочку для всех имён зоны (включая empty
-//! non-terminals), подписывает `DNSKEY` ключом KSK/CSK, остальные
-//! авторитетные RRset — ключами ZSK/CSK. `DS` не генерируется: он
+//! `DNSKEY`, строит denial-цепочку (NSEC или NSEC3) для всех имён зоны
+//! (включая empty non-terminals), подписывает `DNSKEY` ключом KSK/CSK,
+//! остальные авторитетные RRset — ключами ZSK/CSK. `DS` не генерируется: он
 //! публикуется родительской зоной.
 //!
 //! # Границы
 //!
-//! - NSEC3-подпись не поддерживается (v1 — NSEC; валидация NSEC3 живёт в
-//!   `pulse-dnssec`);
+//! - NSEC3-подпись: SHA-1, настраиваемые salt/iterations, Opt-Out = 0;
+//!   `NSEC3PARAM` публикуется в apex. NSEC3 для secondary-зон не
+//!   реализован;
 //! - `NS` в точке делегирования и glue ниже cut не подписываются;
 //! - existing `RRSIG`/`NSEC`/`NSEC3`/`NSEC3PARAM`/`DNSKEY` во входном наборе
 //!   отбрасываются и пересоздаются (повторная подпись безопасна).
@@ -52,16 +53,22 @@
 //! # }
 //! ```
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use pulse_dns::{
-    DnskeyData, Name, NsecData, Rclass, Rdata, Rrset, Rtype, Ttl, TtlError, TypeBitmap,
+    DnskeyData, Name, Nsec3Data, Nsec3ParamData, NsecData, Rclass, Rdata, Rrset, Rtype, Ttl,
+    TtlError, TypeBitmap,
 };
+use pulse_dnssec::denial::{MAX_NSEC3_ITERATIONS, nsec3_owner_name};
+use pulse_dnssec::rdata_util::nsec3_hash;
 use pulse_dnssec::{
-    DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE_KEY, KeyError, PrivateKey, SignError, SignOptions, sign_rrset,
+    DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE_KEY, DenialError, KeyError, PrivateKey, SignError,
+    SignOptions, sign_rrset,
 };
 use thiserror::Error;
+
+use crate::domain::DenialKind;
 
 /// Роль DNSSEC-ключа в зоне.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +121,93 @@ impl KeyRole {
             Self::Ksk => "ksk",
             Self::Zsk => "zsk",
             Self::Csk => "csk",
+        }
+    }
+}
+
+/// Параметры NSEC3-цепочки для подписи.
+///
+/// Поддерживается только hash algorithm SHA-1 (alg 1) и Opt-Out = 0:
+/// opt-out и подпись secondary-зон в v1 не поддерживаются.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nsec3Config {
+    salt: Vec<u8>,
+    iterations: u16,
+}
+
+impl Nsec3Config {
+    /// Hash algorithm SHA-1 (единственный поддерживаемый, RFC 5155 §5).
+    pub const HASH_SHA1: u8 = 1;
+
+    /// Создаёт параметры NSEC3.
+    ///
+    /// # Errors
+    ///
+    /// [`Nsec3ConfigError::SaltTooLong`] или
+    /// [`Nsec3ConfigError::IterationsTooHigh`].
+    pub fn new(salt: impl Into<Vec<u8>>, iterations: u16) -> Result<Self, Nsec3ConfigError> {
+        let salt = salt.into();
+        if salt.len() > usize::from(u8::MAX) {
+            return Err(Nsec3ConfigError::SaltTooLong { len: salt.len() });
+        }
+        if iterations > MAX_NSEC3_ITERATIONS {
+            return Err(Nsec3ConfigError::IterationsTooHigh {
+                iterations,
+                max: MAX_NSEC3_ITERATIONS,
+            });
+        }
+        Ok(Self { salt, iterations })
+    }
+
+    /// Соль (сырые байты).
+    #[must_use]
+    pub fn salt(&self) -> &[u8] {
+        &self.salt
+    }
+
+    /// Число дополнительных hash-итераций.
+    #[must_use]
+    pub const fn iterations(&self) -> u16 {
+        self.iterations
+    }
+}
+
+/// Ошибка параметров NSEC3.
+#[derive(Debug, Error)]
+pub enum Nsec3ConfigError {
+    /// Соль длиннее 255 октетов.
+    #[error("NSEC3 salt is {len} octets long (max 255)")]
+    SaltTooLong {
+        /// Длина соли.
+        len: usize,
+    },
+    /// Итерации выше лимита валидатора.
+    #[error("NSEC3 iterations {iterations} exceed limit {max}")]
+    IterationsTooHigh {
+        /// Запрошенные итерации.
+        iterations: u16,
+        /// Лимит.
+        max: u16,
+    },
+}
+
+/// Политика denial-of-existence при подписи зоны.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DenialPolicy {
+    /// NSEC-цепочка (RFC 4034).
+    #[default]
+    Nsec,
+    /// NSEC3-цепочка без Opt-Out (RFC 5155).
+    Nsec3(Nsec3Config),
+}
+
+impl DenialPolicy {
+    /// Механизм, который публикует подписанная зона.
+    #[must_use]
+    pub const fn kind(&self) -> DenialKind {
+        match self {
+            Self::Nsec => DenialKind::Nsec,
+            Self::Nsec3(_) => DenialKind::Nsec3,
         }
     }
 }
@@ -298,12 +392,27 @@ impl ZoneSigner {
     ) -> Result<SignedZone, SignZoneError> {
         sign_zone(origin, rrsets, self, now)
     }
+
+    /// Подписывает зону с выбранной denial-политикой (NSEC или NSEC3).
+    ///
+    /// # Errors
+    ///
+    /// [`SignZoneError`] при нарушении структуры зоны или ошибке криптографии.
+    pub fn sign_zone_with(
+        &self,
+        origin: &Name,
+        rrsets: &[Rrset],
+        now: u32,
+        denial: &DenialPolicy,
+    ) -> Result<SignedZone, SignZoneError> {
+        sign_zone_with(origin, rrsets, self, now, denial)
+    }
 }
 
 /// Результат подписи зоны.
 #[derive(Debug, Clone)]
 pub struct SignedZone {
-    /// RRset зоны вместе с `DNSKEY`/`NSEC`/`RRSIG`.
+    /// RRset зоны вместе с `DNSKEY`/`NSEC`/`NSEC3`/`RRSIG`.
     pub rrsets: Vec<Rrset>,
     /// Публичные DNSKEY зоны.
     pub dnskeys: Vec<DnskeyData>,
@@ -311,6 +420,8 @@ pub struct SignedZone {
     pub key_tags: Vec<u16>,
     /// Сколько RRSIG сгенерировано.
     pub rrsig_count: usize,
+    /// Опубликованный механизм denial-of-existence.
+    pub denial: DenialKind,
 }
 
 /// Ошибка построения подписанта.
@@ -330,6 +441,12 @@ pub enum ZoneSignerError {
 /// Ошибка подписи зоны.
 #[derive(Debug, Error)]
 pub enum SignZoneError {
+    /// У зоны нет настроенных ключей подписи.
+    #[error("zone {zone}: no DNSSEC signing keys configured")]
+    NoKeys {
+        /// Origin зоны.
+        zone: Name,
+    },
     /// В зоне нет apex `SOA`.
     #[error("zone {zone}: apex SOA is required for signing")]
     MissingSoa {
@@ -380,6 +497,15 @@ pub enum SignZoneError {
         #[source]
         source: KeyError,
     },
+    /// Ошибка построения denial-цепочки.
+    #[error("zone {zone}: denial error: {source}")]
+    Denial {
+        /// Origin зоны.
+        zone: Name,
+        /// Причина.
+        #[source]
+        source: DenialError,
+    },
     /// Ошибка подписи RRset.
     #[error("zone {zone}: cannot sign {owner} {rr_type}: {source}")]
     Sign {
@@ -423,6 +549,13 @@ impl SignZoneError {
             source: error,
         }
     }
+
+    fn denial(zone: &Name, error: DenialError) -> Self {
+        Self::Denial {
+            zone: zone.clone(),
+            source: error,
+        }
+    }
 }
 
 /// Подписывает зону.
@@ -436,6 +569,28 @@ pub fn sign_zone(
     rrsets: &[Rrset],
     signer: &ZoneSigner,
     now: u32,
+) -> Result<SignedZone, SignZoneError> {
+    sign_zone_with(origin, rrsets, signer, now, &DenialPolicy::Nsec)
+}
+
+/// Подписывает зону с явной denial-политикой.
+///
+/// При `DenialPolicy::Nsec3` в apex добавляется `NSEC3PARAM`, а для каждого
+/// авторитетного имени (включая empty non-terminals и точки делегирования)
+/// строится hashed-владелец `<base32hex(SHA-1(name))>.zone`. Opt-Out всегда
+/// выключен, поэтому NSEC3-цепочка покрывает и незащищённые делегирования.
+///
+/// # Errors
+///
+/// [`SignZoneError`] при нарушении структуры зоны, ошибке denial-цепочки или
+/// криптографии.
+#[allow(clippy::too_many_lines)]
+pub fn sign_zone_with(
+    origin: &Name,
+    rrsets: &[Rrset],
+    signer: &ZoneSigner,
+    now: u32,
+    denial: &DenialPolicy,
 ) -> Result<SignedZone, SignZoneError> {
     validate_owners(origin, rrsets)?;
 
@@ -491,29 +646,15 @@ pub fn sign_zone(
     .map_err(|error| SignZoneError::rrset(origin, error))?;
     data.insert((origin.clone(), Rtype::DNSKEY), dnskey_rrset);
 
-    // 3. NSEC-цепочка: каждый узел указывает на следующий в каноническом
-    //    порядке; последний замыкается на apex.
-    let mut ordered: Vec<Name> = nodes.iter().cloned().collect();
-    ordered.sort_by(Name::cmp_canonical);
-    for (index, name) in ordered.iter().enumerate() {
-        let Some(next) = ordered.get((index + 1) % ordered.len()) else {
-            continue;
-        };
-        let mut bitmap_types: BTreeSet<Rtype> = types.get(name).cloned().unwrap_or_default();
-        bitmap_types.insert(Rtype::NSEC);
-        bitmap_types.insert(Rtype::RRSIG);
-        let bitmap = TypeBitmap::from_types(bitmap_types);
-        let nsec = NsecData::new(next.clone(), bitmap)
-            .map_err(|error| SignZoneError::rdata(origin, error))?;
-        let rrset = Rrset::new(
-            name.clone(),
-            Rtype::NSEC,
-            Rclass::IN,
-            nsec_ttl,
-            [Rdata::Nsec(nsec)],
-        )
-        .map_err(|error| SignZoneError::rrset(origin, error))?;
-        data.insert((name.clone(), Rtype::NSEC), rrset);
+    // 3. Denial-цепочка: NSEC (канонический порядок) или NSEC3
+    //    (hash-порядок). NSEC3PARAM публикуется в apex.
+    match denial {
+        DenialPolicy::Nsec => {
+            build_nsec_chain(origin, &mut data, &types, &nodes, nsec_ttl)?;
+        }
+        DenialPolicy::Nsec3(config) => {
+            build_nsec3_chain(origin, &mut data, &types, &nodes, nsec_ttl, config)?;
+        }
     }
 
     // 4. Подпись: DNSKEY — KSK/CSK, данные — ZSK/CSK. NS в точке cut и
@@ -521,7 +662,14 @@ pub fn sign_zone(
     let mut signatures: HashMap<Name, (Ttl, Vec<Rdata>)> = HashMap::new();
     let mut rrsig_count = 0_usize;
     for ((owner, rr_type), rrset) in &data {
-        let Some(signers) = signers_for(owner, *rr_type, &cuts, signer) else {
+        let signers = if matches!(*rr_type, Rtype::NSEC3 | Rtype::NSEC3PARAM) {
+            // NSEC3-владелец синтетический: подписываем данными, не проверяя
+            // совпадение с точкой делегирования.
+            Some(signer.data_signers.as_slice())
+        } else {
+            signers_for(owner, *rr_type, &cuts, signer)
+        };
+        let Some(signers) = signers else {
             continue;
         };
         for index in signers {
@@ -570,7 +718,116 @@ pub fn sign_zone(
         dnskeys,
         key_tags,
         rrsig_count,
+        denial: denial.kind(),
     })
+}
+
+/// Строит NSEC-цепочку: каждый узел указывает на следующий в каноническом
+/// порядке; последний замыкается на первый.
+fn build_nsec_chain(
+    origin: &Name,
+    data: &mut HashMap<(Name, Rtype), Rrset>,
+    types: &HashMap<Name, BTreeSet<Rtype>>,
+    nodes: &HashSet<Name>,
+    nsec_ttl: Ttl,
+) -> Result<(), SignZoneError> {
+    let mut ordered: Vec<Name> = nodes.iter().cloned().collect();
+    ordered.sort_by(Name::cmp_canonical);
+    for (index, name) in ordered.iter().enumerate() {
+        let Some(next) = ordered.get((index + 1) % ordered.len()) else {
+            continue;
+        };
+        let mut bitmap_types: BTreeSet<Rtype> = types.get(name).cloned().unwrap_or_default();
+        bitmap_types.insert(Rtype::NSEC);
+        bitmap_types.insert(Rtype::RRSIG);
+        let bitmap = TypeBitmap::from_types(bitmap_types);
+        let nsec = NsecData::new(next.clone(), bitmap)
+            .map_err(|error| SignZoneError::rdata(origin, error))?;
+        let rrset = Rrset::new(
+            name.clone(),
+            Rtype::NSEC,
+            Rclass::IN,
+            nsec_ttl,
+            [Rdata::Nsec(nsec)],
+        )
+        .map_err(|error| SignZoneError::rrset(origin, error))?;
+        data.insert((name.clone(), Rtype::NSEC), rrset);
+    }
+    Ok(())
+}
+
+/// Строит NSEC3-цепочку (SHA-1, Opt-Out = 0) и apex `NSEC3PARAM`.
+fn build_nsec3_chain(
+    origin: &Name,
+    data: &mut HashMap<(Name, Rtype), Rrset>,
+    types: &HashMap<Name, BTreeSet<Rtype>>,
+    nodes: &HashSet<Name>,
+    nsec_ttl: Ttl,
+    config: &Nsec3Config,
+) -> Result<(), SignZoneError> {
+    let mut hashes: BTreeMap<Vec<u8>, BTreeSet<Rtype>> = BTreeMap::new();
+    for name in nodes {
+        let hash = nsec3_hash(name, config.salt(), config.iterations());
+        let entry = hashes.entry(hash).or_default();
+        if let Some(node_types) = types.get(name) {
+            entry.extend(node_types.iter().copied());
+        }
+    }
+    let apex_hash = nsec3_hash(origin, config.salt(), config.iterations());
+    let apex_types = hashes.entry(apex_hash).or_default();
+    apex_types.insert(Rtype::DNSKEY);
+    apex_types.insert(Rtype::NSEC3PARAM);
+
+    let entries: Vec<(Vec<u8>, BTreeSet<Rtype>)> = hashes.into_iter().collect();
+    for (index, (hash, entry_types)) in entries.iter().enumerate() {
+        let Some((next_hash, _)) = entries.get((index + 1) % entries.len()) else {
+            continue;
+        };
+        let mut bitmap_types = entry_types.clone();
+        // Empty non-terminal: bitmap остаётся пустым (RFC 5155 §7.1).
+        if !bitmap_types.is_empty() {
+            bitmap_types.insert(Rtype::RRSIG);
+        }
+        let bitmap = TypeBitmap::from_types(bitmap_types);
+        let owner =
+            nsec3_owner_name(origin, hash).map_err(|error| SignZoneError::denial(origin, error))?;
+        let nsec3 = Nsec3Data::new(
+            Nsec3Config::HASH_SHA1,
+            0,
+            config.iterations(),
+            config.salt().to_vec(),
+            next_hash.clone(),
+            bitmap,
+        )
+        .map_err(|error| SignZoneError::rdata(origin, error))?;
+        let rrset = Rrset::new(
+            owner.clone(),
+            Rtype::NSEC3,
+            Rclass::IN,
+            nsec_ttl,
+            [Rdata::Nsec3(nsec3)],
+        )
+        .map_err(|error| SignZoneError::rrset(origin, error))?;
+        data.insert((owner, Rtype::NSEC3), rrset);
+    }
+
+    let param = Nsec3ParamData::new(
+        Nsec3Config::HASH_SHA1,
+        0,
+        config.iterations(),
+        config.salt().to_vec(),
+    )
+    .map_err(|error| SignZoneError::rdata(origin, error))?;
+    let rrset = Rrset::new(
+        origin.clone(),
+        Rtype::NSEC3PARAM,
+        Rclass::IN,
+        nsec_ttl,
+        [Rdata::Nsec3Param(param)],
+    )
+    .map_err(|error| SignZoneError::rrset(origin, error))?;
+    data.insert((origin.clone(), Rtype::NSEC3PARAM), rrset);
+    Ok(())
 }
 
 fn validate_owners(origin: &Name, rrsets: &[Rrset]) -> Result<(), SignZoneError> {

@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pulse_api::{Denial, ZoneFileMetrics, ZoneKind};
 use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype, Ttl};
-use pulse_server::{LookupOutcome, ZoneState as ServerZoneState, ZoneView};
+use pulse_server::{DenialKind, LookupOutcome, ZoneState as ServerZoneState, ZoneView};
 use pulse_transfer::ZoneSnapshot;
 use pulse_zonefile::RrsetView as StoredRrsetView;
 use pulse_zonefile::key::NameRle;
@@ -730,6 +730,15 @@ impl ZoneStore {
 
     /// NSEC-записи зоны (для denial-of-existence).
     pub(crate) fn nsec_records(&self, origin: &Name) -> Result<Vec<Rrset>, String> {
+        self.denial_records(origin, Rtype::NSEC)
+    }
+
+    /// NSEC3-записи зоны (для denial-of-existence).
+    pub(crate) fn nsec3_records(&self, origin: &Name) -> Result<Vec<Rrset>, String> {
+        self.denial_records(origin, Rtype::NSEC3)
+    }
+
+    fn denial_records(&self, origin: &Name, rr_type: Rtype) -> Result<Vec<Rrset>, String> {
         let Some(entry) = self.zone_entry(origin)? else {
             return Ok(Vec::new());
         };
@@ -737,7 +746,7 @@ impl ZoneStore {
         let rrsets = group_records(&entry.origin, records)?;
         Ok(rrsets
             .into_iter()
-            .filter(|rrset| rrset.rr_type() == Rtype::NSEC)
+            .filter(|rrset| rrset.rr_type() == rr_type)
             .collect())
     }
 
@@ -1292,6 +1301,45 @@ impl ZoneView for FileZoneView {
         None
     }
 
+    fn denial(&self) -> DenialKind {
+        if self.nsec3_param().is_some() {
+            DenialKind::Nsec3
+        } else {
+            DenialKind::Nsec
+        }
+    }
+
+    fn nsec3_param(&self) -> Option<Rrset> {
+        self.lookup_stored(&self.origin, Rtype::NSEC3PARAM)
+    }
+
+    fn nsec3_at(&self, hash: &[u8]) -> Option<Rrset> {
+        let owner = pulse_dnssec::denial::nsec3_owner_name(&self.origin, hash).ok()?;
+        self.lookup_stored(&owner, Rtype::NSEC3)
+    }
+
+    fn nsec3_cover(&self, hash: &[u8]) -> Option<Rrset> {
+        for rrset in self.store.nsec3_records(&self.origin).ok()? {
+            let owner = rrset.owner();
+            let Some(label) = owner.first_label() else {
+                continue;
+            };
+            let Ok(owner_hash) = pulse_dnssec::denial::base32hex::decode(label) else {
+                continue;
+            };
+            let Some(next) = rrset.rdatas().iter().find_map(|rdata| match rdata {
+                Rdata::Nsec3(data) => Some(data.next_hashed_owner()),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if nsec3_covers(&owner_hash, next, hash) {
+                return Some(rrset);
+            }
+        }
+        None
+    }
+
     fn is_delegation(&self, name: &Name) -> bool {
         if name == &self.origin || !name.is_subdomain_of(&self.origin) {
             return false;
@@ -1312,6 +1360,17 @@ impl ZoneView for FileZoneView {
 
     fn node_exists(&self, name: &Name) -> bool {
         name.is_subdomain_of(&self.origin) && self.node(name).is_some_and(|node| node.exists)
+    }
+}
+
+/// RFC 5155 §7.2: покрывает ли hash-интервал `(owner, next)` значение `hash`.
+fn nsec3_covers(owner: &[u8], next: &[u8], hash: &[u8]) -> bool {
+    if hash == owner {
+        return false;
+    }
+    match owner.cmp(next) {
+        std::cmp::Ordering::Less => hash > owner && hash < next,
+        std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => hash > owner || hash < next,
     }
 }
 

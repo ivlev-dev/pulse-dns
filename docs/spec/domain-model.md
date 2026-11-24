@@ -377,8 +377,8 @@ Expired         -> Transferring(retry) | Expired
 `plan_sign(zone, keys, now) -> Result<SignedZone, SignError>`: определяет, какие `Rrset` подписываются, `RRSIG`-окна (`inception = now − clock_skew`, `expiration = now + validity`), цепочку denial-of-existence, `DS` для KSK. Криптография — через порт `Signer` (в `pulse-dns`, реализация в `pulse-server::infrastructure`); домен только формирует план и валидирует результат по инвариантам.
 
 **Решение по NSEC/NSEC3 (v1):**
-- домен моделирует `denial: Nsec | Nsec3` (`Zone.dnssec_policy`), валидатор (`pulseresolved`, M5) обязан поддерживать **оба** типа;
-- **подпись в v1 — только NSEC**; NSEC3-подпись — v1.1. `SigningPlan` с `denial = Nsec3` возвращает `SignError::NotImplemented` (API → `501`, см. `docs/api/rest-v1.md` §7.6);
+- домен моделирует `denial: Nsec | Nsec3` (`Zone.dnssec_policy`), валидатор (`pulseresolved`, M5) поддерживает **оба** типа;
+- подпись поддерживает **оба** механизма: NSEC и NSEC3 (SHA-1, salt/iterations, Opt-Out = 0, `NSEC3PARAM` в apex); NSEC3 Opt-Out и NSEC3-подпись secondary-зон — вне v1;
 - импорт/secondary могут содержать NSEC3-подписанные зоны — они валидируются и обслуживаются как есть (без переподписи); валидатор обязан принимать **пустой type bitmap** в NSEC3 (empty non-terminal, RFC 5155 §8.5), тогда как пустой bitmap в NSEC — `BadRdata` (INV-22).
 
 ### 4.5. Прикладывание `RRSIG` к ответу (политика домена)
@@ -390,7 +390,7 @@ Expired         -> Transferring(retry) | Expired
 - **Подписанная зона, но подпись отсутствует** при `DO=1` → `SERVFAIL` + метрика `dnssec_missing_rrsig_total` (fail-closed, ADR 0004). Ответ без подписи «как будто не подписано» запрещён.
 - **Неподписанная зона** → `RRSIG` не добавляются, `DO` игнорируется (зона честно insecure).
 - **Просроченные/невалидные по времени** подписи не подменяются и не выдумываются: отдаются как есть + метрика `rrsig_expired_total`; переподпись — job подписанта. Валидацию (secure/bogus) выполняет резолвер, не authoritative.
-- **Denial of existence:** NSEC-цепочка (`next_name` + `lookup_all(NSEC)`) строится доменом для NXDOMAIN/NODATA; для импортированных NSEC3-зон — по `lookup_all(NSEC3)`/`NSEC3PARAM` (v1 их не подписывает, §4.4).
+- **Denial of existence:** NSEC- или NSEC3-цепочка (по `Zone.dnssec_policy.denial`) строится доменом для NXDOMAIN/NODATA/wildcard/DS-NODATA: NSEC — `next_name` + `lookup_all(NSEC)`, NSEC3 — `lookup_all(NSEC3)`/`NSEC3PARAM` с closest encloser/next closer/wildcard proofs (§4.4).
 
 ---
 
@@ -640,7 +640,7 @@ pub enum WriteIntent {
 | `Signing` | все INV строго; разрешены только DNSSEC-типы (`RRSIG`/`NSEC`/`NSEC3`/`DNSKEY`/`DS`); прочие типы → `IntentForbidden` | **никогда** (попытка изменить TTL/обычные RRset → `IntentForbidden`) | `warnings` пуст |
 | `Replication` | как `Import`, плюс: принятая зона обязана завершиться `Serving` (SOA+NS присутствуют, иначе `InvariantViolation(INV-4)` → карантин, не публикуется); новый SOA serial новее текущего (RFC 1982), иначе `SerialConflict`; `subtree`-удаления разрешены | как `Import` | как `Import` + `serial` в `CommitOutcome` |
 
-`Signing` v1 подписывает только NSEC (`Zone.dnssec_policy.denial = Nsec`); NSEC3-подпись — v1.1 (§4.4), до неё `plan_sign` возвращает `SignError::NotImplemented` и writer не вызывается. `NSEC3`/`NSEC3PARAM` как типы данных в `Signing`-правке допустимы только для импортированных/secondary зон (переподпись в NSEC3 не выполняется).
+`Signing` v1 подписывает NSEC или NSEC3 в зависимости от `Zone.dnssec_policy.denial` (§4.4); при NSEC3 пересоздаются `NSEC3`/`NSEC3PARAM`, при NSEC — `NSEC`. Для secondary-зон NSEC3-подпись не выполняется (зона обслуживается как есть).
 
 #### 5.2.2. `Edit` и операции
 
@@ -762,10 +762,10 @@ pub struct ZoneSettingsPatch {
 ```
 
 - **Формат:** ≤ 4 KiB **всего**; inline — по ёмкости страницы (4016 байт при `page_size=4096`), иначе overflow-страницы; суммарный лимит `MAX_ZONE_META = 256 KiB` (подтверждается вместе с форматом); превышение → `InvalidEdit`/`EditTooLarge`. `ZoneId`, `origin`, `kind`, `SOA.serial` в meta-блок не входят (kind/origin — в `ZoneEntry`, serial — в apex `SOA`).
-- **Валидация:** `default_ttl` ≤ `MAX_TTL`; `soa_timers`: `refresh ≥ 1`, `retry ≥ 1`, `expire > refresh + retry` (u64), полные `u32` без clamp (INV-21); `forward_upstreams` ≤ 16 и только для `Forward`; `denial = Nsec3` допустим для импортированных/secondary зон, но не включает NSEC3-подпись (§4.4).
+- **Валидация:** `default_ttl` ≤ `MAX_TTL`; `soa_timers`: `refresh ≥ 1`, `retry ≥ 1`, `expire > refresh + retry` (u64), полные `u32` без clamp (INV-21); `forward_upstreams` ≤ 16 и только для `Forward`; `denial = Nsec3` включает NSEC3-подпись для primary-зон (§4.4).
 - **Атомарность:** `SetZoneMeta` в одном `Edit`/транзакции с RRset-правками — либо применяются все, либо ни одной; читатели видят старую или новую meta целиком (в рамках снапшота). `commit` не публикует meta и RRset раздельно.
 - **Чтение:** `ZoneStore::meta(snap, zone) -> ZoneSettingsRef<'a>` — O(1), zero-copy; серверу не нужно разбирать `SOA`-RDATA и обходить зону, чтобы получить `default_ttl`/`denial`/таймеры.
-- **Смена `denial`** сохраняется как настройка; переподпись NSEC→NSEC3 (когда появится в v1.1) выполняет application-job, writer её не инициирует.
+- **Смена `denial`** сохраняется как настройка; переподпись NSEC↔NSEC3 выполняет application-job (`POST /sign` или старт после смены конфигурации), writer её не инициирует.
 - **Единственный путь записи:** `EditOp::SetZoneMeta`. Отдельного метода `set_zone_meta` в порте нет; application-хелпер `apply_zone_meta(zone, patch, durability)` — тонкая обёртка `begin → apply(Edit{SetZoneMeta}) → commit`, без собственной логики.
 
 #### 5.2.6. Обслуживание: `sync` и `compact_zone`

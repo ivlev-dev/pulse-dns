@@ -436,6 +436,9 @@ pub enum DenialError {
     /// Opt-Out установлен неожиданно.
     #[error("opt-out flag is not allowed here")]
     OptOutUnexpected,
+    /// Ошибка генерации случайной соли NSEC3.
+    #[error("cannot generate a random NSEC3 salt")]
+    Nsec3SaltRandom,
     /// NSEC3 hash algorithm не поддерживается.
     #[error("NSEC3 hash algorithm {algorithm} is not supported")]
     Nsec3HashUnsupported {

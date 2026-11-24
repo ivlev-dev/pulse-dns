@@ -37,8 +37,9 @@
 //!   additional через [`application::ZoneView::lookup_all_rrsig`], включая
 //!   негативные ответы; при `DO = 0` подписи не отдаются. `AD` на
 //!   authoritative-сервере всегда `0`. Для подписанных зон негативные ответы
-//!   дополняются NSEC + RRSIG (NXDOMAIN — покрытие QNAME и wildcard, NODATA —
-//!   NSEC самого имени); NSEC3-подпись пока не генерируется.
+//!   дополняются denial-записями + RRSIG по политике зоны: NSEC (покрытие
+//!   QNAME и wildcard, NSEC самого имени) или NSEC3 (closest encloser,
+//!   next closer, wildcard, DS-NODATA).
 //! - **CNAME → делегирование** — если цель `CNAME`/`DNAME` находится ниже
 //!   zone cut, цепочка останавливается на уже собранном ответе: клиент или
 //!   резолвер получит referral отдельным запросом.
@@ -112,4 +113,4 @@ pub use application::{
     EngineConfig, NEGATIVE_TTL_CAP, QueryEngine, QueryError, QueryStats, StatsSnapshot, Transport,
     ZoneView,
 };
-pub use domain::{LookupOutcome, ZoneState};
+pub use domain::{DenialKind, LookupOutcome, ZoneState};

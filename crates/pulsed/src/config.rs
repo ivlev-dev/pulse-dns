@@ -436,6 +436,28 @@ const fn default_true() -> bool {
     true
 }
 
+/// Механизм denial-of-existence при подписи зоны.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnssecDenial {
+    /// NSEC-цепочка (по умолчанию).
+    #[default]
+    Nsec,
+    /// NSEC3-цепочка (SHA-1, без Opt-Out).
+    Nsec3,
+}
+
+impl DnssecDenial {
+    /// Строковое имя для логов.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nsec => "nsec",
+            Self::Nsec3 => "nsec3",
+        }
+    }
+}
+
 /// Роль DNSSEC-ключа в конфигурации.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -492,6 +514,15 @@ pub struct DnssecZoneConfig {
     /// Запас на расхождение часов в секундах (по умолчанию 300).
     #[serde(default)]
     pub inception_skew: Option<u32>,
+    /// Denial-of-existence: `nsec` (по умолчанию) или `nsec3`.
+    #[serde(default)]
+    pub denial: Option<DnssecDenial>,
+    /// Соль NSEC3 в hex. `null` — случайная соль на время жизни процесса.
+    #[serde(default)]
+    pub nsec3_salt: Option<String>,
+    /// Число NSEC3 hash-итераций (0..=100, по умолчанию 0).
+    #[serde(default)]
+    pub nsec3_iterations: Option<u16>,
 }
 
 /// Полная конфигурация процесса.
@@ -528,6 +559,14 @@ pub struct Config {
     pub dnscrypt_cert: Option<PathBuf>,
     /// Полное имя провайдера, например `2.dnscrypt-cert.example.com.`.
     pub dnscrypt_provider_name: Option<String>,
+    /// Адрес DNSCrypt over TCP; `null` отключает TCP-транспорт DNSCrypt.
+    pub dnscrypt_tcp_listen: Option<SocketAddr>,
+    /// Максимум одновременных DNSCrypt TCP-соединений.
+    pub dnscrypt_tcp_max_connections: usize,
+    /// Idle timeout DNSCrypt TCP-соединения в миллисекундах.
+    pub dnscrypt_tcp_idle_timeout_ms: u64,
+    /// Максимум полезной нагрузки DNSCrypt TCP-кадра (без 2-байтового префикса).
+    pub dnscrypt_tcp_max_frame: usize,
     /// Число UDP worker'ов; `0` — по числу доступных ядер.
     pub workers: usize,
     /// Уровень логирования.
@@ -580,6 +619,10 @@ impl Default for Config {
             dnscrypt_resolver_key: None,
             dnscrypt_cert: None,
             dnscrypt_provider_name: None,
+            dnscrypt_tcp_listen: None,
+            dnscrypt_tcp_max_connections: 1024,
+            dnscrypt_tcp_idle_timeout_ms: 10_000,
+            dnscrypt_tcp_max_frame: 65_535,
             workers: 0,
             log_level: LogLevel::Info,
             tcp: TcpConfig::default(),
@@ -641,14 +684,17 @@ impl Config {
             && self.dot_listen.is_none()
             && self.doh_listen.is_none()
             && self.dnscrypt_listen.is_none()
+            && self.dnscrypt_tcp_listen.is_none()
         {
             return Err(ConfigError::Invalid(
-                "at least one of listen_udp/listen_tcp/dot_listen/doh_listen/dnscrypt_listen must be set"
+                "at least one of listen_udp/listen_tcp/dot_listen/doh_listen/\
+                 dnscrypt_listen/dnscrypt_tcp_listen must be set"
                     .to_owned(),
             ));
         }
         self.validate_tls()?;
         self.validate_dnscrypt()?;
+        self.validate_dnssec()?;
         if self.workers > 1024 {
             return Err(ConfigError::Invalid(format!(
                 "workers must be in 0..=1024, got {}",
@@ -874,7 +920,7 @@ impl Config {
                 )));
             }
         }
-        if self.dnscrypt_listen.is_none() {
+        if self.dnscrypt_listen.is_none() && self.dnscrypt_tcp_listen.is_none() {
             return Ok(());
         }
         for (field, value) in [
@@ -886,8 +932,71 @@ impl Config {
                 Some(path) if !path.as_os_str().is_empty() => {}
                 _ => {
                     return Err(ConfigError::Invalid(format!(
-                        "dnscrypt_listen requires {field}"
+                        "dnscrypt listener requires {field}"
                     )));
+                }
+            }
+        }
+        if !(1..=65_535).contains(&self.dnscrypt_tcp_max_connections) {
+            return Err(ConfigError::Invalid(format!(
+                "dnscrypt_tcp_max_connections must be in 1..=65535, got {}",
+                self.dnscrypt_tcp_max_connections
+            )));
+        }
+        if !(100..=600_000).contains(&self.dnscrypt_tcp_idle_timeout_ms) {
+            return Err(ConfigError::Invalid(format!(
+                "dnscrypt_tcp_idle_timeout_ms must be in 100..=600000, got {}",
+                self.dnscrypt_tcp_idle_timeout_ms
+            )));
+        }
+        if !(512..=65_535).contains(&self.dnscrypt_tcp_max_frame) {
+            return Err(ConfigError::Invalid(format!(
+                "dnscrypt_tcp_max_frame must be in 512..=65535, got {}",
+                self.dnscrypt_tcp_max_frame
+            )));
+        }
+        Ok(())
+    }
+
+    /// Проверяет параметры DNSSEC-подписи.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] при некорректном denial/соли/итерациях.
+    pub fn validate_dnssec(&self) -> Result<(), ConfigError> {
+        for (origin, zone) in &self.dnssec {
+            let denial = zone.denial.unwrap_or_default();
+            match denial {
+                DnssecDenial::Nsec => {
+                    if zone.nsec3_salt.is_some() || zone.nsec3_iterations.is_some() {
+                        return Err(ConfigError::Invalid(format!(
+                            "dnssec zone {origin}: nsec3_salt/nsec3_iterations require denial=nsec3"
+                        )));
+                    }
+                }
+                DnssecDenial::Nsec3 => {
+                    if let Some(salt) = &zone.nsec3_salt {
+                        let decoded = hex::decode(salt.trim()).map_err(|error| {
+                            ConfigError::Invalid(format!(
+                                "dnssec zone {origin}: nsec3_salt is not hex: {error}"
+                            ))
+                        })?;
+                        if decoded.len() > usize::from(u8::MAX) {
+                            return Err(ConfigError::Invalid(format!(
+                                "dnssec zone {origin}: nsec3_salt is {} octets long (max 255)",
+                                decoded.len()
+                            )));
+                        }
+                    }
+                    if let Some(iterations) = zone.nsec3_iterations
+                        && iterations > pulse_dnssec::denial::MAX_NSEC3_ITERATIONS
+                    {
+                        return Err(ConfigError::Invalid(format!(
+                            "dnssec zone {origin}: nsec3_iterations {} exceed limit {}",
+                            iterations,
+                            pulse_dnssec::denial::MAX_NSEC3_ITERATIONS
+                        )));
+                    }
                 }
             }
         }
@@ -949,6 +1058,9 @@ impl Config {
         if let Some(addr) = overrides.dnscrypt_listen {
             self.dnscrypt_listen = Some(addr);
         }
+        if let Some(addr) = overrides.dnscrypt_tcp_listen {
+            self.dnscrypt_tcp_listen = Some(addr);
+        }
         if let Some(path) = &overrides.dnscrypt_provider_key {
             self.dnscrypt_provider_key = Some(path.clone());
         }
@@ -1001,8 +1113,10 @@ pub struct Overrides {
     pub tls_reload_secs: Option<u64>,
     /// Новый IP/CIDR allowlist DoT/DoH.
     pub tls_allow_from: Vec<String>,
-    /// Новый адрес DNSCrypt.
+    /// Новый адрес DNSCrypt (UDP).
     pub dnscrypt_listen: Option<SocketAddr>,
+    /// Новый адрес DNSCrypt over TCP.
+    pub dnscrypt_tcp_listen: Option<SocketAddr>,
     /// Новый файл provider-ключа DNSCrypt.
     pub dnscrypt_provider_key: Option<PathBuf>,
     /// Новый файл resolver-ключа DNSCrypt.
@@ -1097,6 +1211,7 @@ mod tests {
             tls_reload_secs: None,
             tls_allow_from: Vec::new(),
             dnscrypt_listen: None,
+            dnscrypt_tcp_listen: None,
             dnscrypt_provider_key: None,
             dnscrypt_resolver_key: None,
             dnscrypt_cert: None,
@@ -1288,5 +1403,78 @@ mod tests {
             Some("2.dnscrypt-cert.example.com.")
         );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn dnscrypt_tcp_requires_material_and_valid_limits() {
+        let mut config = Config {
+            listen_udp: None,
+            listen_tcp: None,
+            dnscrypt_tcp_listen: Some("127.0.0.1:5444".parse().unwrap()),
+            ..Config::default()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("dnscrypt_provider_key"), "{error}");
+
+        config.dnscrypt_provider_key = Some(PathBuf::from("provider.key"));
+        config.dnscrypt_resolver_key = Some(PathBuf::from("resolver.key"));
+        config.dnscrypt_cert = Some(PathBuf::from("cert.json"));
+        assert!(config.validate().is_ok());
+
+        config.dnscrypt_tcp_max_connections = 0;
+        assert!(config.validate().is_err());
+        config.dnscrypt_tcp_max_connections = 1024;
+        config.dnscrypt_tcp_idle_timeout_ms = 10;
+        assert!(config.validate().is_err());
+        config.dnscrypt_tcp_idle_timeout_ms = 10_000;
+        config.dnscrypt_tcp_max_frame = 128;
+        assert!(config.validate().is_err());
+        config.dnscrypt_tcp_max_frame = 65_535;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn nsec3_options_are_validated() {
+        let mut config = Config::default();
+        config.dnssec.insert(
+            "example.com.".to_owned(),
+            DnssecZoneConfig {
+                denial: Some(DnssecDenial::Nsec3),
+                nsec3_salt: Some("aabb".to_owned()),
+                nsec3_iterations: Some(5),
+                ..DnssecZoneConfig::default()
+            },
+        );
+        assert!(config.validate().is_ok());
+
+        config.dnssec.insert(
+            "example.com.".to_owned(),
+            DnssecZoneConfig {
+                denial: Some(DnssecDenial::Nsec3),
+                nsec3_salt: Some("zz".to_owned()),
+                ..DnssecZoneConfig::default()
+            },
+        );
+        assert!(config.validate().is_err());
+
+        config.dnssec.insert(
+            "example.com.".to_owned(),
+            DnssecZoneConfig {
+                denial: Some(DnssecDenial::Nsec3),
+                nsec3_iterations: Some(101),
+                ..DnssecZoneConfig::default()
+            },
+        );
+        assert!(config.validate().is_err());
+
+        config.dnssec.insert(
+            "example.com.".to_owned(),
+            DnssecZoneConfig {
+                denial: Some(DnssecDenial::Nsec),
+                nsec3_salt: Some("aabb".to_owned()),
+                ..DnssecZoneConfig::default()
+            },
+        );
+        assert!(config.validate().is_err());
     }
 }

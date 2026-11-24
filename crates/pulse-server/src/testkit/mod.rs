@@ -12,7 +12,7 @@ use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype};
 use thiserror::Error;
 
 use crate::application::ZoneView;
-use crate::domain::{LookupOutcome, ZoneState};
+use crate::domain::{DenialKind, LookupOutcome, ZoneState};
 
 /// Ошибка наполнения in-memory зоны.
 #[derive(Debug, Error)]
@@ -346,6 +346,63 @@ impl ZoneView for InMemoryZone {
             _ => None,
         })?;
         nsec_covers(owner, next, name).then(|| rrset.clone())
+    }
+
+    fn denial(&self) -> DenialKind {
+        if self
+            .rrsets
+            .contains_key(&(self.origin.clone(), Rtype::NSEC3PARAM))
+        {
+            DenialKind::Nsec3
+        } else {
+            DenialKind::Nsec
+        }
+    }
+
+    fn nsec3_param(&self) -> Option<Rrset> {
+        self.rrsets
+            .get(&(self.origin.clone(), Rtype::NSEC3PARAM))
+            .cloned()
+    }
+
+    fn nsec3_at(&self, hash: &[u8]) -> Option<Rrset> {
+        let owner = pulse_dnssec::denial::nsec3_owner_name(&self.origin, hash).ok()?;
+        self.rrsets.get(&(owner, Rtype::NSEC3)).cloned()
+    }
+
+    fn nsec3_cover(&self, hash: &[u8]) -> Option<Rrset> {
+        for ((owner, rr_type), rrset) in &self.rrsets {
+            if *rr_type != Rtype::NSEC3 {
+                continue;
+            }
+            let Some(label) = owner.first_label() else {
+                continue;
+            };
+            let Ok(owner_hash) = pulse_dnssec::denial::base32hex::decode(label) else {
+                continue;
+            };
+            let Some(next) = rrset.rdatas().iter().find_map(|rdata| match rdata {
+                Rdata::Nsec3(data) => Some(data.next_hashed_owner()),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if nsec3_covers(&owner_hash, next, hash) {
+                return Some(rrset.clone());
+            }
+        }
+        None
+    }
+}
+
+/// RFC 5155 §7.2: покрывает ли hash-интервал `(owner, next)` значение `hash`.
+fn nsec3_covers(owner: &[u8], next: &[u8], hash: &[u8]) -> bool {
+    if hash == owner {
+        return false;
+    }
+    match owner.cmp(next) {
+        Ordering::Less => hash > owner && hash < next,
+        Ordering::Greater | Ordering::Equal => hash > owner || hash < next,
     }
 }
 

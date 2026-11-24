@@ -10,13 +10,16 @@
 //! DNSCrypt не поднимается; клиенты, получившие `TC`, должны использовать
 //! обычные DoT/DoH или UDP/TCP-транспорты `pulsed`.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::Write as _;
-use std::net::SocketAddr;
+use std::io::{Read as _, Write as _};
+use std::net::{Shutdown as SocketShutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pulse_dns::Name;
 use pulse_dnscrypt::{
@@ -78,6 +81,13 @@ pub enum DnscryptError {
     /// Ошибка UDP-рантайма.
     #[error(transparent)]
     Runtime(#[from] pulse_runtime::RuntimeError),
+    /// Ошибка TCP-listener'а DNSCrypt.
+    #[error("DNSCrypt TCP transport error: {source}")]
+    Tcp {
+        /// Причина.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -523,6 +533,371 @@ impl DnscryptService {
 #[derive(Debug, Error)]
 #[error("DNS handler produced no response")]
 struct NoResponse;
+
+const DNSCRYPT_TCP_ACCEPT_POLL: Duration = Duration::from_millis(20);
+const DNSCRYPT_TCP_ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+static NEXT_DNSCRYPT_TCP_CONNECTION: AtomicU64 = AtomicU64::new(1);
+
+/// Запущенный DNSCrypt TCP-сервер.
+///
+/// Кадры — 2-байтовый big-endian length-prefix + payload DNSCrypt. На одном
+/// соединении разрешено несколько последовательных запросов; idle timeout
+/// закрывает простаивающее соединение. Большие ответы не усекаются (в отличие
+/// от UDP): кадр ограничен `dnscrypt_tcp_max_frame`.
+pub(crate) struct DnscryptTcpService {
+    local_addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    connections: Arc<Mutex<HashMap<u64, TcpStream>>>,
+    active: Arc<AtomicU64>,
+    idle_timeout: Duration,
+    provider_name: Option<String>,
+    serial: u32,
+    valid_until: u32,
+    acceptor: Option<JoinHandle<()>>,
+}
+
+impl DnscryptTcpService {
+    /// Поднимает DNSCrypt TCP listener.
+    ///
+    /// # Errors
+    ///
+    /// [`DnscryptError`] при ошибке ключей, сертификата, bind или spawn'а
+    /// acceptor-потока.
+    pub(crate) fn start(
+        config: &Config,
+        addr: SocketAddr,
+        admin: Arc<SharedZoneAdmin>,
+        stats: Arc<Stats>,
+        metrics: Arc<TransportMetrics>,
+    ) -> Result<Self, DnscryptError> {
+        let (dnscrypt, certificate) = load_server(config)?;
+        let serial = certificate.serial();
+        let valid_until = certificate.ts_end();
+        let listener = TcpListener::bind(addr).map_err(DnscryptError::tcp)?;
+        listener.set_nonblocking(true).map_err(DnscryptError::tcp)?;
+        let local_addr = listener.local_addr().map_err(DnscryptError::tcp)?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicU64::new(0));
+        let idle_timeout = Duration::from_millis(config.dnscrypt_tcp_idle_timeout_ms);
+        let max_connections = config.dnscrypt_tcp_max_connections;
+        let max_frame = config.dnscrypt_tcp_max_frame;
+        let acceptor = {
+            let shutdown = Arc::clone(&shutdown);
+            let connections = Arc::clone(&connections);
+            let active = Arc::clone(&active);
+            thread::Builder::new()
+                .name("pulse-dnscrypt-tcp-accept".to_owned())
+                .spawn(move || {
+                    let context = TcpAcceptContext {
+                        max_connections,
+                        max_frame,
+                        idle_timeout,
+                        admin,
+                        stats,
+                        metrics,
+                        dnscrypt,
+                    };
+                    accept_loop(&listener, &context, &shutdown, &connections, &active);
+                })
+                .map_err(DnscryptError::tcp)?
+        };
+        Ok(Self {
+            local_addr,
+            shutdown,
+            connections,
+            active,
+            idle_timeout,
+            provider_name: config.dnscrypt_provider_name.clone(),
+            serial,
+            valid_until,
+            acceptor: Some(acceptor),
+        })
+    }
+
+    /// Фактический адрес listener'а.
+    pub(crate) fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Имя провайдера из конфигурации.
+    pub(crate) fn provider_name(&self) -> Option<&str> {
+        self.provider_name.as_deref()
+    }
+
+    /// Серийный номер загруженного сертификата.
+    pub(crate) fn serial(&self) -> u32 {
+        self.serial
+    }
+
+    /// Конец действия сертификата (Unix-время).
+    pub(crate) fn valid_until(&self) -> u32 {
+        self.valid_until
+    }
+
+    /// Останавливает acceptor и закрывает открытые соединения.
+    ///
+    /// # Errors
+    ///
+    /// Ошибка join'а acceptor-потока.
+    pub(crate) fn shutdown(&mut self) -> Result<(), DnscryptError> {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(acceptor) = self.acceptor.take() {
+            acceptor.join().map_err(|_| {
+                DnscryptError::tcp(std::io::Error::other(
+                    "dnscrypt tcp acceptor thread panicked",
+                ))
+            })?;
+        }
+        let streams: Vec<TcpStream> = {
+            let connections = self
+                .connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            connections
+                .values()
+                .filter_map(|stream| stream.try_clone().ok())
+                .collect()
+        };
+        for stream in streams {
+            let _ = stream.shutdown(SocketShutdown::Both);
+        }
+        let deadline = Instant::now() + self.idle_timeout + Duration::from_millis(500);
+        while self.active.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if self.active.load(Ordering::Acquire) > 0 {
+            crate::logging::warn(
+                "dnscrypt_tcp_shutdown",
+                &format!(
+                    "{} DNSCrypt TCP connection(s) still active after graceful deadline",
+                    self.active.load(Ordering::Acquire)
+                ),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DnscryptTcpService {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+impl DnscryptError {
+    fn tcp(source: std::io::Error) -> Self {
+        Self::Tcp { source }
+    }
+}
+
+struct TcpAcceptContext {
+    max_connections: usize,
+    max_frame: usize,
+    idle_timeout: Duration,
+    admin: Arc<SharedZoneAdmin>,
+    stats: Arc<Stats>,
+    metrics: Arc<TransportMetrics>,
+    dnscrypt: Arc<DnscryptServer>,
+}
+
+fn accept_loop(
+    listener: &TcpListener,
+    context: &TcpAcceptContext,
+    shutdown: &Arc<AtomicBool>,
+    connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
+    active: &Arc<AtomicU64>,
+) {
+    while !shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _peer)) => spawn_connection(stream, context, shutdown, connections, active),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(DNSCRYPT_TCP_ACCEPT_POLL);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                context.metrics.dnscrypt_tcp_error();
+                crate::logging::warn("dnscrypt_tcp_accept", &format!("accept failed: {error}"));
+                thread::sleep(DNSCRYPT_TCP_ACCEPT_BACKOFF);
+            }
+        }
+    }
+}
+
+fn spawn_connection(
+    stream: TcpStream,
+    context: &TcpAcceptContext,
+    shutdown: &Arc<AtomicBool>,
+    connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
+    active: &Arc<AtomicU64>,
+) {
+    let active_now = usize::try_from(active.load(Ordering::Acquire)).unwrap_or(usize::MAX);
+    if active_now >= context.max_connections {
+        context.metrics.dnscrypt_tcp_rejected();
+        let _ = stream.shutdown(SocketShutdown::Both);
+        return;
+    }
+    active.fetch_add(1, Ordering::AcqRel);
+    context.metrics.dnscrypt_tcp_connection();
+    let id = NEXT_DNSCRYPT_TCP_CONNECTION.fetch_add(1, Ordering::Relaxed);
+    let guard = TcpConnectionGuard {
+        id,
+        connections: Arc::clone(connections),
+        active: Arc::clone(active),
+        metrics: Arc::clone(&context.metrics),
+    };
+    if let Ok(tracked) = stream.try_clone() {
+        guard
+            .connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, tracked);
+    }
+    let admin = Arc::clone(&context.admin);
+    let stats = Arc::clone(&context.stats);
+    let metrics = Arc::clone(&context.metrics);
+    let dnscrypt = Arc::clone(&context.dnscrypt);
+    let shutdown = Arc::clone(shutdown);
+    let idle_timeout = context.idle_timeout;
+    let max_frame = context.max_frame;
+    let spawned = thread::Builder::new()
+        .name(format!("pulse-dnscrypt-tcp-{id}"))
+        .spawn(move || {
+            let _guard = guard;
+            if let Err(error) = handle_tcp_connection(
+                stream,
+                &dnscrypt,
+                &admin,
+                &stats,
+                &metrics,
+                &shutdown,
+                idle_timeout,
+                max_frame,
+            ) {
+                metrics.dnscrypt_tcp_error();
+                crate::logging::debug(
+                    "dnscrypt_tcp_connection",
+                    &format!("connection {id} closed with error: {error}"),
+                );
+            }
+        });
+    if let Err(error) = spawned {
+        crate::logging::warn(
+            "dnscrypt_tcp_spawn",
+            &format!("cannot spawn DNSCrypt TCP connection thread: {error}"),
+        );
+    }
+}
+
+struct TcpConnectionGuard {
+    id: u64,
+    connections: Arc<Mutex<HashMap<u64, TcpStream>>>,
+    active: Arc<AtomicU64>,
+    metrics: Arc<TransportMetrics>,
+}
+
+impl Drop for TcpConnectionGuard {
+    fn drop(&mut self) {
+        self.connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        self.metrics.dnscrypt_tcp_connection_closed();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_tcp_connection(
+    mut stream: TcpStream,
+    dnscrypt: &DnscryptServer,
+    admin: &SharedZoneAdmin,
+    stats: &Stats,
+    metrics: &TransportMetrics,
+    shutdown: &AtomicBool,
+    idle_timeout: Duration,
+    max_frame: usize,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(idle_timeout))?;
+    stream.set_write_timeout(Some(idle_timeout))?;
+    stream.set_nodelay(true)?;
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some(frame) = read_frame(&mut stream, max_frame, metrics)? else {
+            return Ok(());
+        };
+        let engine = admin.engine();
+        let handler = |query: &[u8]| -> Result<Vec<u8>, NoResponse> {
+            dns::respond(query, Transport::Tcp, &engine, stats).ok_or(NoResponse)
+        };
+        let response = match dnscrypt.handle_tcp_frame(&frame, &handler) {
+            Ok(response) => response,
+            Err(error) => {
+                metrics.dnscrypt_tcp_error();
+                crate::logging::debug(
+                    "dnscrypt_tcp_frame",
+                    &format!("cannot process DNSCrypt TCP frame: {error}"),
+                );
+                return Ok(());
+            }
+        };
+        stream.write_all(&response)?;
+        stream.flush()?;
+        metrics.dnscrypt_tcp_query();
+        metrics.dnscrypt_tcp_response();
+    }
+}
+
+fn read_frame(
+    stream: &mut TcpStream,
+    max_frame: usize,
+    metrics: &TransportMetrics,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut prefix = [0_u8; 2];
+    if !read_exact_idle(stream, &mut prefix)? {
+        return Ok(None);
+    }
+    let length = usize::from(u16::from_be_bytes(prefix));
+    if length == 0 {
+        return Ok(None);
+    }
+    if length > max_frame {
+        metrics.dnscrypt_tcp_error();
+        return Ok(None);
+    }
+    let mut payload = vec![0_u8; length];
+    if !read_exact_idle(stream, &mut payload)? {
+        return Ok(None);
+    }
+    let mut frame = Vec::with_capacity(2 + payload.len());
+    frame.extend_from_slice(&prefix);
+    frame.extend_from_slice(&payload);
+    Ok(Some(frame))
+}
+
+fn read_exact_idle(stream: &mut TcpStream, buffer: &mut [u8]) -> std::io::Result<bool> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => return Ok(false),
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
 
 #[cfg(test)]
 mod tests {

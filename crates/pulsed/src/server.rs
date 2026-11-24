@@ -13,7 +13,7 @@ use pulse_server::StatsSnapshot as QueryStatsSnapshot;
 use thiserror::Error;
 
 use crate::config::{Config, ConfigError};
-use crate::dnscrypt::{DnscryptError, DnscryptService};
+use crate::dnscrypt::{DnscryptError, DnscryptService, DnscryptTcpService};
 use crate::dnssec::{self, DnssecError};
 use crate::metrics::TransportMetrics;
 use crate::secondary::SecondaryScheduler;
@@ -58,6 +58,7 @@ pub struct Server {
     tcp: Option<TcpService>,
     tls: Option<TlsTransports>,
     dnscrypt: Option<DnscryptService>,
+    dnscrypt_tcp: Option<DnscryptTcpService>,
     api: Option<RunningServer>,
     secondary: Option<SecondaryScheduler>,
 }
@@ -143,6 +144,7 @@ impl Server {
             config.dot_listen.is_some(),
             config.doh_listen.is_some(),
             config.dnscrypt_listen.is_some(),
+            config.dnscrypt_tcp_listen.is_some(),
         ));
         let tls = TlsTransports::start(
             config,
@@ -152,6 +154,16 @@ impl Server {
         )?;
         let dnscrypt = match config.dnscrypt_listen {
             Some(addr) => Some(DnscryptService::start(
+                config,
+                addr,
+                Arc::clone(&admin),
+                Arc::clone(&stats),
+                Arc::clone(&metrics),
+            )?),
+            None => None,
+        };
+        let dnscrypt_tcp = match config.dnscrypt_tcp_listen {
+            Some(addr) => Some(DnscryptTcpService::start(
                 config,
                 addr,
                 Arc::clone(&admin),
@@ -218,6 +230,7 @@ impl Server {
             tcp,
             tls,
             dnscrypt,
+            dnscrypt_tcp,
             api,
             secondary,
         })
@@ -253,6 +266,14 @@ impl Server {
         self.dnscrypt.as_ref().map(DnscryptService::local_addr)
     }
 
+    /// Фактический адрес DNSCrypt over TCP (полезен при `port = 0`).
+    #[must_use]
+    pub fn dnscrypt_tcp_addr(&self) -> Option<SocketAddr> {
+        self.dnscrypt_tcp
+            .as_ref()
+            .map(DnscryptTcpService::local_addr)
+    }
+
     /// Снимок счётчиков DoT, если DoT запущен.
     #[must_use]
     pub fn dot_stats(&self) -> Option<pulse_tls::StatsSnapshot> {
@@ -277,18 +298,33 @@ impl Server {
         self.dnscrypt
             .as_ref()
             .and_then(DnscryptService::provider_name)
+            .or_else(|| {
+                self.dnscrypt_tcp
+                    .as_ref()
+                    .and_then(DnscryptTcpService::provider_name)
+            })
     }
 
     /// Серийный номер загруженного DNSCrypt-сертификата.
     #[must_use]
     pub fn dnscrypt_serial(&self) -> Option<u32> {
-        self.dnscrypt.as_ref().map(DnscryptService::serial)
+        self.dnscrypt
+            .as_ref()
+            .map(DnscryptService::serial)
+            .or_else(|| self.dnscrypt_tcp.as_ref().map(DnscryptTcpService::serial))
     }
 
     /// Конец действия DNSCrypt-сертификата (Unix-время).
     #[must_use]
     pub fn dnscrypt_valid_until(&self) -> Option<u32> {
-        self.dnscrypt.as_ref().map(DnscryptService::valid_until)
+        self.dnscrypt
+            .as_ref()
+            .map(DnscryptService::valid_until)
+            .or_else(|| {
+                self.dnscrypt_tcp
+                    .as_ref()
+                    .map(DnscryptTcpService::valid_until)
+            })
     }
 
     /// Число DNSCrypt UDP worker'ов.
@@ -392,6 +428,11 @@ impl Server {
             && let Err(error) = dnscrypt.shutdown()
         {
             first_error.get_or_insert(ServerError::Dnscrypt(DnscryptError::Runtime(error)));
+        }
+        if let Some(mut dnscrypt_tcp) = self.dnscrypt_tcp.take()
+            && let Err(error) = dnscrypt_tcp.shutdown()
+        {
+            first_error.get_or_insert(ServerError::Dnscrypt(error));
         }
         if let Some(mut tcp) = self.tcp.take()
             && let Err(error) = tcp.shutdown()

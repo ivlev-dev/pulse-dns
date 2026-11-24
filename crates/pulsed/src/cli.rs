@@ -25,6 +25,7 @@ pub(crate) fn run() -> ExitCode {
     match matches.subcommand() {
         Some(("import", matches)) => return import_zone(matches),
         Some(("convert", matches)) => return convert_zonefile(matches),
+        Some(("fsck", matches)) => return fsck_zonefile(matches),
         Some(("dnscrypt-gencert", matches)) => return dnscrypt_gencert(matches),
         _ => {}
     }
@@ -45,6 +46,9 @@ pub(crate) fn run() -> ExitCode {
             .map(|values| values.cloned().collect())
             .unwrap_or_default(),
         dnscrypt_listen: matches.get_one::<SocketAddr>("dnscrypt-listen").copied(),
+        dnscrypt_tcp_listen: matches
+            .get_one::<SocketAddr>("dnscrypt-tcp-listen")
+            .copied(),
         dnscrypt_provider_key: matches.get_one::<PathBuf>("dnscrypt-provider-key").cloned(),
         dnscrypt_resolver_key: matches.get_one::<PathBuf>("dnscrypt-resolver-key").cloned(),
         dnscrypt_cert: matches.get_one::<PathBuf>("dnscrypt-cert").cloned(),
@@ -454,6 +458,103 @@ fn convert_zonefile(matches: &ArgMatches) -> ExitCode {
     }
 }
 
+/// Offline `fsck --verify` / `fsck --repair` для v2-файла.
+#[allow(clippy::too_many_lines)]
+fn fsck_zonefile(matches: &ArgMatches) -> ExitCode {
+    logging::init(LogLevel::Info);
+    let Some(data) = matches.get_one::<PathBuf>("data").cloned() else {
+        logging::error("fsck", "--data is required");
+        return ExitCode::from(2);
+    };
+    if matches.get_flag("repair") {
+        return match pulse_zonefile::parallel::fsck_repair(&data) {
+            Ok(report) => {
+                println!(
+                    "fsck --repair {}: repaired={} remaining={} deferred={} quarantined={:?} ok={}",
+                    data.display(),
+                    report.repaired_pages,
+                    report.remaining_leaks,
+                    report.deferred_leaks,
+                    report.quarantined_zones,
+                    report.ok
+                );
+                for issue in &report.issues {
+                    println!("  issue: {issue}");
+                }
+                if report.ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                }
+            }
+            Err(error) => {
+                logging::error("fsck", &format!("{}: {error}", data.display()));
+                ExitCode::from(1)
+            }
+        };
+    }
+    let store = match pulse_zonefile::parallel::open_read_only(&data) {
+        Ok(store) => store,
+        Err(error) => {
+            logging::error("fsck", &format!("{}: {error}", data.display()));
+            return ExitCode::from(1);
+        }
+    };
+    let lite = match store.fsck_lite() {
+        Ok(report) => report,
+        Err(error) => {
+            logging::error("fsck", &format!("{}: {error}", data.display()));
+            return ExitCode::from(1);
+        }
+    };
+    let graph = match store.fsck_graph() {
+        Ok(report) => report,
+        Err(error) => {
+            logging::error("fsck", &format!("{}: {error}", data.display()));
+            return ExitCode::from(1);
+        }
+    };
+    let ratio = if graph.durable_pages == 0 {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            graph.leaked_pages as f64 / graph.durable_pages as f64
+        }
+    };
+    println!(
+        "fsck {}: ok={} fatal={:?} durable_pages={} reachable={} chain={} buckets={} free={} leaked={} ratio={:.4} damaged={:?}",
+        data.display(),
+        lite.ok && graph.ok,
+        graph.fatal.or(lite.fatal),
+        graph.durable_pages,
+        graph.reachable_pages,
+        graph.chain_pages,
+        graph.bucket_pages,
+        graph.free_pages,
+        graph.leaked_pages,
+        ratio,
+        graph.damaged_zones
+    );
+    println!(
+        "  alloc: DP={} DT={} max_root_page_limit={} max_root_version={} zones={} page.txn_max={}",
+        lite.durable_page_limit,
+        lite.durable_txn_limit,
+        lite.max_root_page_limit,
+        lite.max_root_version,
+        lite.zones,
+        graph.max_page_txn
+    );
+    for issue in lite.issues.iter().chain(graph.issues.iter()) {
+        println!("  issue: {issue}");
+    }
+    if lite.ok && graph.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
 fn dnscrypt_gencert(matches: &ArgMatches) -> ExitCode {
     let Some(out_dir) = matches.get_one::<PathBuf>("out").cloned() else {
         logging::error("dnscrypt-gencert", "--out is required");
@@ -696,6 +797,13 @@ fn command() -> Command {
                 .help("Enable DNSCrypt v2 over UDP, e.g. 0.0.0.0:443"),
         )
         .arg(
+            Arg::new("dnscrypt-tcp-listen")
+                .long("dnscrypt-tcp-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNSCrypt v2 over TCP, e.g. 0.0.0.0:443"),
+        )
+        .arg(
             Arg::new("dnscrypt-provider-key")
                 .long("dnscrypt-provider-key")
                 .value_name("PATH")
@@ -830,6 +938,24 @@ fn command() -> Command {
                         .value_name("BYTES")
                         .value_parser(value_parser!(u64))
                         .help("Destination map size in bytes (default 4 GiB, sparse)"),
+                ),
+        )
+        .subcommand(
+            Command::new("fsck")
+                .about("Verify (and optionally repair) a pulse-zonefile v2 file offline")
+                .arg(
+                    Arg::new("data")
+                        .long("data")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(PathBuf))
+                        .help("Zonefile v2 to check"),
+                )
+                .arg(
+                    Arg::new("repair")
+                        .long("repair")
+                        .action(ArgAction::SetTrue)
+                        .help("Return safe leaked pages to the free pool and quarantine damaged zones"),
                 ),
         )
         .subcommand(

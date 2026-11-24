@@ -2,4 +2,4 @@
 
 mod resolve;
 
-pub use resolve::{LookupOutcome, ZoneState};
+pub use resolve::{DenialKind, LookupOutcome, ZoneState};

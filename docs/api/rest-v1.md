@@ -40,11 +40,11 @@
     "metrics": true, "jobs": true
   },
   "features": { "dnssec": true, "axfr": true, "ixfr": true, "notify": true, "ecs": false,
-                "dnssec_denial": ["nsec"], "dnssec_denial_validation": ["nsec", "nsec3"] }
+                "dnssec_denial": ["nsec", "nsec3"], "dnssec_denial_validation": ["nsec", "nsec3"] }
 }
 ```
 
-`features.dnssec_denial` — что процесс умеет **подписывать** (v1: только `nsec`); `dnssec_denial_validation` — что умеет валидировать (оба). Каждый процесс имеет собственные `jobs`, аудит, хранилище токенов и `/metrics`; кросс-процессной агрегации в v1 нет — Prometheus опрашивает оба инстанса.
+`features.dnssec_denial` — что процесс умеет **подписывать** (`nsec` и `nsec3`); `dnssec_denial_validation` — что умеет валидировать (оба). Каждый процесс имеет собственные `jobs`, аудит, хранилище токенов и `/metrics`; кросс-процессной агрегации в v1 нет — Prometheus опрашивает оба инстанса.
 
 ---
 
@@ -211,7 +211,7 @@ Authorization: Bearer pd_live_7Q2m...   # непрозрачный токен, �
 | `too-many-jobs` | 429 | превышено число параллельных jobs |
 | `internal-error` | 500 | непредвиденная ошибка (детали — в логе) |
 | `not-implemented` | 501 | функция заявлена, но не реализована в v1 |
-| `nsec3-signing-not-implemented` | 501 | подпись NSEC3 отложена до v1.1 (домен/валидатор NSEC3 поддерживают) |
+| `nsec3-opt-out-unsupported` | 422 | NSEC3 Opt-Out и NSEC3 для secondary-зон не поддерживаются |
 | `peer-identity-mismatch` | 403 | mTLS-сертификат peer'а не совпал с закреплённым отпечатком |
 | `unavailable` | 503 | сервис не готов (зона `Expired`, store закрыт, идёт восстановление, таймаут координатора коммита — транзакция не опубликована, повтор безопасен) |
 | `gateway-timeout` | 504 | превышен таймаут операции |
@@ -663,7 +663,7 @@ If-Match: "rr_8f3a2b"
 ```
 Ответ `202` → job, который применяет шаги по таймеру; повторный rollover при активном → `409 zone-busy`.
 - `POST /dnssec/enable` принимает `{"denial":"nsec","nsec3":null,"validity":"30d","algorithm":"ecdsa-p256-sha256"}`; несовместимый с уже существующими ключами алгоритм → `422`.
-- **NSEC/NSEC3 (решение):** домен и валидатор поддерживают оба типа denial; **подпись в v1 — только NSEC**. `denial: "nsec3"` на `enable`/`sign`/`rollover` → `501 Not Implemented` с `code: "nsec3-signing-not-implemented"` и `detail` о плане v1.1. `GET /dnssec` может возвращать `denial: "nsec3"` для импортированной/secondary зоны — она обслуживается как есть, переподпись в NSEC3 не выполняется.
+- **NSEC/NSEC3 (решение):** домен, подпись и валидатор поддерживают оба типа denial. `denial: "nsec3"` включает NSEC3-подпись (SHA-1, salt/iterations, Opt-Out = 0); `POST /sign` и старт применяют выбранный denial и пересобирают цепочку. NSEC3 Opt-Out и NSEC3-подпись secondary-зон не поддерживаются (`422`).
 - `GET /dnssec/ds` → `{"ds":[{"key_tag":...,"algorithm":13,"digest_type":2,"digest":"..."}]}` в presentation-формате для передачи регистратору.
 
 ### 7.7. Репликация
@@ -890,4 +890,4 @@ POST /api/v1/auth/tokens
 7. **Коды состояния для `DELETE` primary-зоны** — требовать `confirm_origin` (предложено) или отдельный `?force=true` с аудитом?
 8. **Разделение `replication:manage`** — coarse-scope соответствует ADR 0004, но не позволяет выдать «только NOTIFY» без права менять peers. Нужен ли `replication:notify` в v1.1?
 
-Решено Оркестратором и зафиксировано в спецификации: anti-enumeration/`zone_scope` — 403 только за operation-scope, 404 `zone_not_found` для зоны вне allowlist (ADR 0004 SEC-API-014, §2.3); bootstrap-токен — env `PULSED_BOOTSTRAP_TOKEN`/`PULSERESOLVED_BOOTSTRAP_TOKEN` (§2.6), хранилища токенов у процессов раздельные; NSEC3-подпись — `501` до v1.1, валидация NSEC3 — да (§7.6); процессы — два, метрики/jobs/аудит раздельные (§1.1, §7.3); IXFR — in-memory ринг с `AxfrRequired`; state-файл сервера — JSON + `schema_version` (спецификация `docs/spec/server-state-v1.md`, M3).
+Решено Оркестратором и зафиксировано в спецификации: anti-enumeration/`zone_scope` — 403 только за operation-scope, 404 `zone_not_found` для зоны вне allowlist (ADR 0004 SEC-API-014, §2.3); bootstrap-токен — env `PULSED_BOOTSTRAP_TOKEN`/`PULSERESOLVED_BOOTSTRAP_TOKEN` (§2.6), хранилища токенов у процессов раздельные; NSEC3-подпись и валидация — да (Opt-Out вне v1, §7.6); процессы — два, метрики/jobs/аудит раздельные (§1.1, §7.3); IXFR — in-memory ринг с `AxfrRequired`; state-файл сервера — JSON + `schema_version` (спецификация `docs/spec/server-state-v1.md`, M3).

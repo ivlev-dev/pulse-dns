@@ -122,7 +122,11 @@ impl TlsClient {
         socket.set_write_timeout(Some(Duration::from_secs(5)))?;
         socket.set_nodelay(true)?;
         while connection.is_handshaking() {
-            connection.complete_io(&mut socket)?;
+            match connection.complete_io(&mut socket) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(Self {
             connection,
@@ -141,7 +145,11 @@ impl TlsClient {
             .write_all(data)
             .map_err(std::io::Error::other)?;
         while self.connection.wants_write() {
-            self.connection.write_tls(&mut self.socket)?;
+            match self.connection.write_tls(&mut self.socket) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -172,7 +180,13 @@ impl TlsClient {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error),
             }
-            let read = self.connection.read_tls(&mut self.socket)?;
+            let read = loop {
+                match self.connection.read_tls(&mut self.socket) {
+                    Ok(read) => break read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            };
             if read == 0 {
                 return Ok(0);
             }
@@ -848,4 +862,234 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time")
         .as_secs()
+}
+
+#[test]
+fn dnscrypt_tcp_answers_multiple_queries_on_one_connection() {
+    let zone =
+        common::TempZone::with_import("dnscrypt-tcp", "example.com.", &common::example_zone());
+    let material = generate_dnscrypt();
+    let mut config = common::base_config(zone.path());
+    config.dnscrypt_tcp_listen = Some("127.0.0.1:0".parse().expect("dnscrypt tcp addr"));
+    config.dnscrypt_provider_key = Some(material.provider_key.clone());
+    config.dnscrypt_resolver_key = Some(material.resolver_key.clone());
+    config.dnscrypt_cert = Some(material.cert.clone());
+    let mut server = Server::start(&config).expect("start server");
+    let addr = server.dnscrypt_tcp_addr().expect("DNSCrypt TCP address");
+
+    let certificate = Certificate::from_hex(&material.certificate_hex).expect("certificate");
+    let provider = ProviderPublicKey::from_hex(&material.provider_public_key).expect("provider");
+    let now = unix_now();
+    let client = DnscryptClient::new(certificate.clone(), provider, now).expect("client");
+
+    let mut stream = TcpStream::connect(addr).expect("connect DNSCrypt TCP");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+
+    for (id, name, expected) in [
+        (0x7001_u16, "www.example.com.", "192.0.2.20"),
+        (0x7002, "ns1.example.com.", "192.0.2.53"),
+    ] {
+        let query = dns_query(name, Rtype::A, id);
+        let pending = client
+            .build_query(&query, DnscryptTransport::Tcp)
+            .expect("build DNSCrypt TCP query");
+        stream
+            .write_all(pending.packet())
+            .expect("write DNSCrypt TCP query");
+        let frame = read_tcp_frame(&mut stream);
+        let response = client
+            .decrypt_response(&pending, &frame)
+            .expect("decrypt DNSCrypt TCP response");
+        let message = decode(&response);
+        assert_eq!(message.id(), id);
+        assert_eq!(a_records(&message), vec![expected]);
+    }
+
+    let wrong = pulse_dnscrypt::ProviderKeypair::generate()
+        .expect("provider")
+        .public_key();
+    assert!(
+        DnscryptClient::new(certificate, wrong, now).is_err(),
+        "a different provider key must be rejected for TCP too"
+    );
+
+    drop(stream);
+    server.shutdown().expect("shutdown");
+    assert_port_closed(addr);
+}
+
+#[test]
+fn dnscrypt_tcp_large_answer_is_not_truncated() {
+    let (_big_dir, zone) = big_zone();
+    let material = generate_dnscrypt();
+    let mut config = common::base_config(zone.path());
+    config.listen_udp = None;
+    config.dnscrypt_tcp_listen = Some("127.0.0.1:0".parse().expect("dnscrypt tcp addr"));
+    config.dnscrypt_provider_key = Some(material.provider_key.clone());
+    config.dnscrypt_resolver_key = Some(material.resolver_key.clone());
+    config.dnscrypt_cert = Some(material.cert.clone());
+    let mut server = Server::start(&config).expect("start server");
+
+    let certificate = Certificate::from_hex(&material.certificate_hex).expect("certificate");
+    let provider = ProviderPublicKey::from_hex(&material.provider_public_key).expect("provider");
+    let client = DnscryptClient::new(certificate, provider, unix_now()).expect("client");
+    let query = dns_query("many.big.test.", Rtype::A, 0x7003);
+
+    let mut stream = TcpStream::connect(server.dnscrypt_tcp_addr().expect("addr"))
+        .expect("connect DNSCrypt TCP");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    let pending = client
+        .build_query(&query, DnscryptTransport::Tcp)
+        .expect("build DNSCrypt TCP query");
+    stream.write_all(pending.packet()).expect("write query");
+    let frame = read_tcp_frame(&mut stream);
+    let response = client
+        .decrypt_response(&pending, &frame)
+        .expect("decrypt response");
+    let message = decode(&response);
+    assert!(!message.flags().tc(), "DNSCrypt TCP must not set TC");
+    assert_eq!(message.answers().len(), 40);
+
+    drop(stream);
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn dnscrypt_tcp_idle_timeout_and_metrics() {
+    let zone =
+        common::TempZone::with_import("dnscrypt-tcp-m", "example.com.", &common::example_zone());
+    let material = generate_dnscrypt();
+    let mut config = common::base_config(zone.path());
+    config.dnscrypt_tcp_listen = Some("127.0.0.1:0".parse().expect("dnscrypt tcp addr"));
+    config.dnscrypt_tcp_idle_timeout_ms = 200;
+    config.dnscrypt_provider_key = Some(material.provider_key.clone());
+    config.dnscrypt_resolver_key = Some(material.resolver_key.clone());
+    config.dnscrypt_cert = Some(material.cert.clone());
+    let api = ApiOptions {
+        listen: "127.0.0.1:0".parse().expect("api addr"),
+        token: "test-token".to_owned(),
+        scopes: Vec::new(),
+    };
+    let mut server = Server::start_with_api(&config, Some(api)).expect("start server");
+    let addr = server.dnscrypt_tcp_addr().expect("DNSCrypt TCP");
+    let api_addr = server.api_addr().expect("API");
+
+    let certificate = Certificate::from_hex(&material.certificate_hex).expect("certificate");
+    let provider = ProviderPublicKey::from_hex(&material.provider_public_key).expect("provider");
+    let client = DnscryptClient::new(certificate, provider, unix_now()).expect("client");
+    let query = dns_query("www.example.com.", Rtype::A, 0x7004);
+    let pending = client
+        .build_query(&query, DnscryptTransport::Tcp)
+        .expect("build query");
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    stream.write_all(pending.packet()).expect("write");
+    let frame = read_tcp_frame(&mut stream);
+    let response = client.decrypt_response(&pending, &frame).expect("decrypt");
+    assert_eq!(a_records(&decode(&response)), vec!["192.0.2.20"]);
+
+    let metrics = http_plain(api_addr, "/metrics", Some("test-token"));
+    assert!(
+        metrics.contains("dnscrypt_tcp_connections_total 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("dnscrypt_tcp_queries_total 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("dnscrypt_tcp_responses_total 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("dnscrypt_tcp_active_connections 1"),
+        "{metrics}"
+    );
+
+    // Idle timeout закрывает соединение без нового запроса.
+    let mut probe = [0_u8; 1];
+    let read = stream.read(&mut probe).expect("read after idle timeout");
+    assert_eq!(read, 0, "idle connection must be closed");
+
+    drop(stream);
+    server.shutdown().expect("shutdown");
+    assert_port_closed(addr);
+}
+
+fn read_tcp_frame(stream: &mut TcpStream) -> Vec<u8> {
+    let mut prefix = [0_u8; 2];
+    stream.read_exact(&mut prefix).expect("read frame prefix");
+    let length = usize::from(u16::from_be_bytes(prefix));
+    let mut payload = vec![0_u8; length];
+    stream.read_exact(&mut payload).expect("read frame payload");
+    let mut frame = Vec::with_capacity(2 + length);
+    frame.extend_from_slice(&prefix);
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+#[test]
+fn dnscrypt_tcp_rejects_mismatched_resolver_key() {
+    let zone =
+        common::TempZone::with_import("dnscrypt-tcp-bad", "example.com.", &common::example_zone());
+    let material = generate_dnscrypt();
+    let other = pulse_dnscrypt::ResolverKeypair::generate().expect("resolver");
+    write_private(
+        &material.resolver_key,
+        hex::encode(*other.to_secret_bytes()).as_bytes(),
+    );
+    let mut config = common::base_config(zone.path());
+    config.listen_udp = None;
+    config.dnscrypt_tcp_listen = Some("127.0.0.1:0".parse().expect("dnscrypt tcp addr"));
+    config.dnscrypt_provider_key = Some(material.provider_key.clone());
+    config.dnscrypt_resolver_key = Some(material.resolver_key.clone());
+    config.dnscrypt_cert = Some(material.cert.clone());
+    assert!(
+        Server::start(&config).is_err(),
+        "a resolver key that does not match the certificate must be rejected"
+    );
+}
+
+#[test]
+fn dnscrypt_tcp_rejects_frames_above_limit() {
+    let zone = common::TempZone::with_import(
+        "dnscrypt-tcp-limit",
+        "example.com.",
+        &common::example_zone(),
+    );
+    let material = generate_dnscrypt();
+    let mut config = common::base_config(zone.path());
+    config.listen_udp = None;
+    config.dnscrypt_tcp_listen = Some("127.0.0.1:0".parse().expect("dnscrypt tcp addr"));
+    config.dnscrypt_tcp_max_frame = 512;
+    config.dnscrypt_provider_key = Some(material.provider_key.clone());
+    config.dnscrypt_resolver_key = Some(material.resolver_key.clone());
+    config.dnscrypt_cert = Some(material.cert.clone());
+    let mut server = Server::start(&config).expect("start server");
+    let addr = server.dnscrypt_tcp_addr().expect("addr");
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    // Заявленная длина 600 > 512: сервер обязан закрыть соединение.
+    let mut frame = vec![0_u8; 602];
+    frame[0..2].copy_from_slice(&600_u16.to_be_bytes());
+    stream.write_all(&frame).expect("write oversized frame");
+    let mut probe = [0_u8; 1];
+    match stream.read(&mut probe) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("oversized frame must close the connection, got {other:?}"),
+    }
+
+    drop(stream);
+    server.shutdown().expect("shutdown");
 }

@@ -14,25 +14,83 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pulse_dns::Name;
 use pulse_dnssec::{Algorithm, KeyError, KeyFileError, PrivateKey, bind};
-use pulse_server::dnssec::{KeyRole, ZoneSigner, ZoneSignerError, ZoneSigningKey};
+use pulse_server::dnssec::{
+    DenialPolicy, KeyRole, Nsec3Config, Nsec3ConfigError, SignZoneError, SignedZone, ZoneSigner,
+    ZoneSignerError, ZoneSigningKey,
+};
 use thiserror::Error;
 
-use crate::config::{Config, DnssecKeyConfig, DnssecKeyRole};
+use crate::config::{Config, DnssecDenial, DnssecKeyConfig, DnssecKeyRole};
+
+/// Подписант зоны вместе с denial-политикой из конфигурации.
+struct ConfiguredZone {
+    signer: ZoneSigner,
+    denial: DenialPolicy,
+}
 
 /// Подписанты зон, загруженные при старте.
 pub(crate) struct DnssecSigners {
-    zones: HashMap<Name, ZoneSigner>,
+    zones: HashMap<Name, ConfiguredZone>,
 }
 
 impl DnssecSigners {
     /// Подписант зоны, если она настроена на DNSSEC.
     pub(crate) fn signer(&self, origin: &Name) -> Option<&ZoneSigner> {
-        self.zones.get(origin)
+        self.zones.get(origin).map(|zone| &zone.signer)
+    }
+
+    /// Подписывает зону с настроенной denial-политикой.
+    pub(crate) fn sign(
+        &self,
+        origin: &Name,
+        rrsets: &[pulse_dns::Rrset],
+        now: u32,
+    ) -> Result<SignedZone, SignZoneError> {
+        let zone = self
+            .zones
+            .get(origin)
+            .ok_or_else(|| SignZoneError::NoKeys {
+                zone: origin.clone(),
+            })?;
+        zone.signer
+            .sign_zone_with(origin, rrsets, now, &zone.denial)
     }
 
     /// Настроенные origin'ы.
     pub(crate) fn origins(&self) -> impl Iterator<Item = &Name> {
         self.zones.keys()
+    }
+}
+
+fn denial_policy(
+    origin: &Name,
+    zone_config: &crate::config::DnssecZoneConfig,
+) -> Result<DenialPolicy, DnssecError> {
+    match zone_config.denial.unwrap_or_default() {
+        DnssecDenial::Nsec => Ok(DenialPolicy::Nsec),
+        DnssecDenial::Nsec3 => {
+            let salt = match &zone_config.nsec3_salt {
+                Some(text) => {
+                    hex::decode(text.trim()).map_err(|error| DnssecError::InvalidSalt {
+                        zone: origin.to_string(),
+                        reason: format!("not valid hex: {error}"),
+                    })?
+                }
+                None => pulse_dnssec::denial::random_salt(8).map_err(|error| {
+                    DnssecError::InvalidSalt {
+                        zone: origin.to_string(),
+                        reason: error.to_string(),
+                    }
+                })?,
+            };
+            let iterations = zone_config.nsec3_iterations.unwrap_or(0);
+            let config =
+                Nsec3Config::new(salt, iterations).map_err(|error| DnssecError::InvalidNsec3 {
+                    zone: origin.to_string(),
+                    source: error,
+                })?;
+            Ok(DenialPolicy::Nsec3(config))
+        }
     }
 }
 
@@ -51,7 +109,7 @@ pub(crate) fn now_unix() -> u32 {
 /// [`DnssecError`] при некорректном origin, правах файла, разборе ключа или
 /// пустом наборе ключей.
 pub(crate) fn load(config: &Config) -> Result<DnssecSigners, DnssecError> {
-    let mut zones: HashMap<Name, ZoneSigner> = HashMap::with_capacity(config.dnssec.len());
+    let mut zones: HashMap<Name, ConfiguredZone> = HashMap::with_capacity(config.dnssec.len());
     for (origin_text, zone_config) in &config.dnssec {
         let origin =
             Name::parse(origin_text.trim()).map_err(|source| DnssecError::InvalidOrigin {
@@ -89,7 +147,8 @@ pub(crate) fn load(config: &Config) -> Result<DnssecSigners, DnssecError> {
                 zone: origin.to_string(),
                 source,
             })?;
-        zones.insert(origin, signer);
+        let denial = denial_policy(&origin, zone_config)?;
+        zones.insert(origin, ConfiguredZone { signer, denial });
     }
     Ok(DnssecSigners { zones })
 }
@@ -391,4 +450,68 @@ pub enum DnssecError {
         #[source]
         source: ZoneSignerError,
     },
+    /// Некорректная соль NSEC3.
+    #[error("zone {zone}: invalid nsec3_salt: {reason}")]
+    InvalidSalt {
+        /// Origin зоны.
+        zone: String,
+        /// Причина.
+        reason: String,
+    },
+    /// Некорректные параметры NSEC3.
+    #[error("zone {zone}: invalid NSEC3 configuration: {source}")]
+    InvalidNsec3 {
+        /// Origin зоны.
+        zone: String,
+        /// Причина.
+        #[source]
+        source: Nsec3ConfigError,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DnssecZoneConfig;
+
+    fn origin() -> Name {
+        Name::parse("example.com.").expect("origin")
+    }
+
+    #[test]
+    fn nsec3_without_salt_generates_random_salt() {
+        let zone = DnssecZoneConfig {
+            denial: Some(DnssecDenial::Nsec3),
+            ..DnssecZoneConfig::default()
+        };
+        let DenialPolicy::Nsec3(config) = denial_policy(&origin(), &zone).expect("policy") else {
+            panic!("expected NSEC3 policy");
+        };
+        assert_eq!(config.salt().len(), 8);
+        assert_eq!(config.iterations(), 0);
+    }
+
+    #[test]
+    fn nsec3_hex_salt_and_iterations_are_applied() {
+        let zone = DnssecZoneConfig {
+            denial: Some(DnssecDenial::Nsec3),
+            nsec3_salt: Some("AAbb".to_owned()),
+            nsec3_iterations: Some(7),
+            ..DnssecZoneConfig::default()
+        };
+        let DenialPolicy::Nsec3(config) = denial_policy(&origin(), &zone).expect("policy") else {
+            panic!("expected NSEC3 policy");
+        };
+        assert_eq!(config.salt(), &[0xAA, 0xBB]);
+        assert_eq!(config.iterations(), 7);
+    }
+
+    #[test]
+    fn nsec_denial_has_no_nsec3_parameters() {
+        let zone = DnssecZoneConfig::default();
+        assert_eq!(
+            denial_policy(&origin(), &zone).expect("policy"),
+            DenialPolicy::Nsec
+        );
+    }
 }

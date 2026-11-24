@@ -12,6 +12,41 @@ use crate::rdata_util::nsec3_hash;
 use super::base32hex;
 use super::{DenialLimits, DenialOutcome, DenialResult, check_record_limit};
 
+/// Строит hashed-имя NSEC3 (`<base32hex(hash)>.zone`).
+///
+/// # Errors
+///
+/// [`DenialError::Nsec3OwnerHash`], если hash не помещается в DNS-метку или
+/// имя не кодируется в wire-формат.
+pub fn nsec3_owner_name(zone: &Name, hash: &[u8]) -> Result<Name, DenialError> {
+    let label = base32hex::encode(hash);
+    let length = u8::try_from(label.len()).map_err(|_| DenialError::Nsec3OwnerHash {
+        reason: "hash label is too long",
+    })?;
+    let mut wire = Vec::with_capacity(1 + label.len() + zone.wire_len());
+    wire.push(length);
+    wire.extend_from_slice(label.as_bytes());
+    wire.extend_from_slice(zone.as_wire());
+    Name::from_wire(&wire).map_err(|_| DenialError::Nsec3OwnerHash {
+        reason: "cannot build NSEC3 owner name",
+    })
+}
+
+/// Генерирует случайную соль NSEC3 заданной длины.
+///
+/// # Errors
+///
+/// [`DenialError::Nsec3SaltRandom`] при отказе системного RNG.
+pub fn random_salt(len: usize) -> Result<Vec<u8>, DenialError> {
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+
+    let mut salt = vec![0_u8; len];
+    SystemRandom::new()
+        .fill(&mut salt)
+        .map_err(|_| DenialError::Nsec3SaltRandom)?;
+    Ok(salt)
+}
+
 /// Параметры NSEC3-цепочки.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nsec3Params {

@@ -2,6 +2,29 @@
 
 use pulse_dns::{Name, Rrset};
 
+/// Механизм denial-of-existence, опубликованный зоной.
+///
+/// Зона использует ровно один механизм: NSEC (RFC 4034) или NSEC3
+/// (RFC 5155). В v1 поддерживается только `NSEC3` без Opt-Out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DenialKind {
+    /// NSEC-цепочка.
+    Nsec,
+    /// NSEC3-цепочка с `NSEC3PARAM` в apex.
+    Nsec3,
+}
+
+impl DenialKind {
+    /// Строковое имя для логов/API.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nsec => "nsec",
+            Self::Nsec3 => "nsec3",
+        }
+    }
+}
+
 /// Состояние зоны в модели обслуживания.
 ///
 /// Значения соответствуют `ZoneState` из `domain-model.md` §2.7.

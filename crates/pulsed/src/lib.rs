@@ -3,8 +3,8 @@
 //! Крейт является **composition root** для авторитетного процесса: читает
 //! JSON-настройки сервера, открывает `pulse-zonefile` (`--data`) как
 //! единственный источник истины зон, поднимает UDP (`pulse-runtime`,
-//! io_uring), TCP (std), DoT/DoH (`pulse-tls`), DNSCrypt v2 (`pulse-dnscrypt`)
-//! и опциональный REST API (`pulse-api`) и обслуживает
+//! io_uring), TCP (std), DoT/DoH (`pulse-tls`), DNSCrypt v2 по UDP/TCP
+//! (`pulse-dnscrypt`) и опциональный REST API (`pulse-api`) и обслуживает
 //! `SIGTERM`/`SIGINT`/`SIGHUP`.
 //!
 //! DNS-ответы читаются из mmap v2 (`ParallelStore`/`ZoneReader`): на каждый

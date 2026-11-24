@@ -302,7 +302,7 @@ L4   pulseresolved    -> pulse-resolver, pulse-api, pulse-runtime, pulse-dns
 
 ## 7. Открытые вопросы
 
-Решено Оркестратором (см. §2.3 и ADR 0002): два процесса без объединённого режима; `TransferState`/`Peer`/ключи — state-файл сервера (JSON + `schema_version`, спецификация `docs/spec/server-state-v1.md` на M3); `SecretStore` v1 — файл 0600 в каталоге 0700; IXFR — in-memory ринг; NSEC/NSEC3 — подпись только NSEC в v1; bootstrap-токены и хранилища токенов — раздельные на процесс. Остаются:
+Решено Оркестратором (см. §2.3 и ADR 0002): два процесса без объединённого режима; `TransferState`/`Peer`/ключи — state-файл сервера (JSON + `schema_version`, спецификация `docs/spec/server-state-v1.md` на M3); `SecretStore` v1 — файл 0600 в каталоге 0700; IXFR — in-memory ринг; NSEC/NSEC3 — подпись обоих механизмов (NSEC3: SHA-1, Opt-Out = 0; обновлено после реализации); bootstrap-токены и хранилища токенов — раздельные на процесс. Остаются:
 
 1. **Мультиарендность:** нужны ли изолированные namespace'ы зон (арендаторы) в v1? Сейчас модель — единый владелец; при добавлении потребуется `TenantId` в `ZoneId` и в токенах.
 2. **Политика версионирования shared kernel** при 0.x: считается ли удаление варианта `Rdata` breaking (предлагается — да, minor bump + миграция формата).

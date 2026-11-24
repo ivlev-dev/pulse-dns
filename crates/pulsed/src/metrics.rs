@@ -12,10 +12,12 @@ use pulse_tls::Stats;
 
 /// Общие счётчики защищённых транспортов.
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)] // независимые флаги транспортов
 pub(crate) struct TransportMetrics {
     dot_enabled: bool,
     doh_enabled: bool,
     dnscrypt_enabled: bool,
+    dnscrypt_tcp_enabled: bool,
     dot: Arc<Stats>,
     doh: Arc<Stats>,
     dnscrypt_packets: AtomicU64,
@@ -23,18 +25,31 @@ pub(crate) struct TransportMetrics {
     dnscrypt_responses: AtomicU64,
     dnscrypt_errors: AtomicU64,
     dnscrypt_dropped: AtomicU64,
+    dnscrypt_tcp_connections: AtomicU64,
+    dnscrypt_tcp_rejected: AtomicU64,
+    dnscrypt_tcp_active: AtomicU64,
+    dnscrypt_tcp_queries: AtomicU64,
+    dnscrypt_tcp_responses: AtomicU64,
+    dnscrypt_tcp_errors: AtomicU64,
     tls_reloads: AtomicU64,
     tls_reload_errors: AtomicU64,
 }
 
 impl TransportMetrics {
     /// Создаёт набор счётчиков для включённых транспортов.
-    #[allow(clippy::similar_names)] // dot/doh — имена протоколов, не опечатка.
-    pub(crate) fn new(enable_dot: bool, enable_doh: bool, enable_dnscrypt: bool) -> Self {
+    #[allow(clippy::similar_names)]
+    #[allow(clippy::fn_params_excessive_bools)] // флаги транспортов независимы
+    pub(crate) fn new(
+        enable_dot: bool,
+        enable_doh: bool,
+        enable_dnscrypt: bool,
+        enable_dnscrypt_tcp: bool,
+    ) -> Self {
         Self {
             dot_enabled: enable_dot,
             doh_enabled: enable_doh,
             dnscrypt_enabled: enable_dnscrypt,
+            dnscrypt_tcp_enabled: enable_dnscrypt_tcp,
             dot: Arc::new(Stats::new()),
             doh: Arc::new(Stats::new()),
             ..Self::default()
@@ -69,6 +84,32 @@ impl TransportMetrics {
 
     pub(crate) fn dnscrypt_drop(&self) {
         self.dnscrypt_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_connection(&self) {
+        self.dnscrypt_tcp_connections
+            .fetch_add(1, Ordering::Relaxed);
+        self.dnscrypt_tcp_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_connection_closed(&self) {
+        self.dnscrypt_tcp_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_rejected(&self) {
+        self.dnscrypt_tcp_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_query(&self) {
+        self.dnscrypt_tcp_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_response(&self) {
+        self.dnscrypt_tcp_responses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_error(&self) {
+        self.dnscrypt_tcp_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn tls_reload(&self) {
@@ -131,6 +172,45 @@ impl TransportMetrics {
                 "dnscrypt_dropped_total",
                 "DNSCrypt responses dropped because the transport buffer was too small.",
                 self.dnscrypt_dropped.load(Ordering::Relaxed),
+            );
+        }
+        if self.dnscrypt_tcp_enabled {
+            append_counter(
+                &mut out,
+                "dnscrypt_tcp_connections_total",
+                "Accepted DNSCrypt TCP connections.",
+                self.dnscrypt_tcp_connections.load(Ordering::Relaxed),
+            );
+            append_counter(
+                &mut out,
+                "dnscrypt_tcp_connections_rejected_total",
+                "DNSCrypt TCP connections rejected by the connection limit.",
+                self.dnscrypt_tcp_rejected.load(Ordering::Relaxed),
+            );
+            let _ = write!(
+                out,
+                "# HELP dnscrypt_tcp_active_connections Currently open DNSCrypt TCP connections.\n\
+                 # TYPE dnscrypt_tcp_active_connections gauge\n\
+                 dnscrypt_tcp_active_connections {}\n",
+                self.dnscrypt_tcp_active.load(Ordering::Relaxed)
+            );
+            append_counter(
+                &mut out,
+                "dnscrypt_tcp_queries_total",
+                "Authenticated DNSCrypt queries answered over TCP.",
+                self.dnscrypt_tcp_queries.load(Ordering::Relaxed),
+            );
+            append_counter(
+                &mut out,
+                "dnscrypt_tcp_responses_total",
+                "DNSCrypt TCP responses sent to clients.",
+                self.dnscrypt_tcp_responses.load(Ordering::Relaxed),
+            );
+            append_counter(
+                &mut out,
+                "dnscrypt_tcp_errors_total",
+                "DNSCrypt TCP frames rejected or failed by the handler.",
+                self.dnscrypt_tcp_errors.load(Ordering::Relaxed),
             );
         }
         out
@@ -228,16 +308,22 @@ mod tests {
 
     #[test]
     fn renders_enabled_transports_only() {
-        let metrics = TransportMetrics::new(true, false, true);
+        let metrics = TransportMetrics::new(true, false, true, true);
         metrics.dnscrypt_packet();
         metrics.dnscrypt_query();
         metrics.dnscrypt_response();
+        metrics.dnscrypt_tcp_connection();
+        metrics.dnscrypt_tcp_query();
+        metrics.dnscrypt_tcp_response();
         metrics.tls_reload();
         let text = metrics.render();
         assert!(text.contains("dot_queries_total 0"));
         assert!(!text.contains("doh_queries_total"));
         assert!(text.contains("dnscrypt_packets_total 1"));
         assert!(text.contains("dnscrypt_responses_total 1"));
+        assert!(text.contains("dnscrypt_tcp_connections_total 1"));
+        assert!(text.contains("dnscrypt_tcp_active_connections 1"));
+        assert!(text.contains("dnscrypt_tcp_queries_total 1"));
         assert!(text.contains("pulsed_tls_reload_total 1"));
     }
 }

@@ -14,8 +14,12 @@ use pulse_dns::{
     Rrset, Rtype,
 };
 use pulse_dnssec::{
-    Algorithm, DenialLimits, NoopAudit, NsecProof, PrivateKey, VerifyOptions, denial::nsec_nodata,
-    denial::nsec_nxdomain, verify_rrsig, write_key_pair,
+    Algorithm, DenialLimits, NoopAudit, Nsec3Proof, NsecProof, PrivateKey, VerifyOptions,
+    denial::{
+        nsec_nodata, nsec_nxdomain, nsec3_ds_nodata, nsec3_nodata, nsec3_nxdomain,
+        nsec3_wildcard_answer, nsec3_wildcard_nodata,
+    },
+    verify_rrsig, write_key_pair,
 };
 use pulsed::config::Config;
 use pulsed::server::{ApiOptions, Server};
@@ -45,6 +49,10 @@ struct Fixture {
 }
 
 fn fixture(with_api: bool) -> Fixture {
+    fixture_with(with_api, None)
+}
+
+fn fixture_with(with_api: bool, denial: Option<serde_json::Value>) -> Fixture {
     let directory = tempfile::tempdir().expect("temp dir");
     let zone_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -57,6 +65,21 @@ fn fixture(with_api: bool) -> Fixture {
     let zsk_paths = write_key_pair(&key_dir, &origin(), &zsk, 256, &NoopAudit).expect("write zsk");
 
     let zone = common::TempZone::with_import("dnssec", "example.com.", &zone_path);
+    let mut zone_config = json!({
+        "keys": [
+            {"role": "ksk", "path": ksk_paths.private},
+            {"role": "zsk", "path": zsk_paths.private}
+        ],
+        "validity_days": 30,
+        "inception_skew": 300
+    });
+    if let Some(denial) = denial
+        && let (Some(target), Some(extra)) = (zone_config.as_object_mut(), denial.as_object())
+    {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
     let config_value = json!({
         "listen_udp": "127.0.0.1:0",
         "listen_tcp": null,
@@ -65,14 +88,7 @@ fn fixture(with_api: bool) -> Fixture {
         "durability": "flush",
         "map_size": 64 * 1024 * 1024,
         "dnssec": {
-            "example.com.": {
-                "keys": [
-                    {"role": "ksk", "path": ksk_paths.private},
-                    {"role": "zsk", "path": zsk_paths.private}
-                ],
-                "validity_days": 30,
-                "inception_skew": 300
-            }
+            "example.com.": zone_config
         }
     });
     let _ = with_api;
@@ -83,6 +99,21 @@ fn fixture(with_api: bool) -> Fixture {
         _zone: zone,
         config,
     }
+}
+
+fn nsec3_fixture(with_api: bool) -> Fixture {
+    nsec3_fixture_with_salt(with_api, "aabbcc", 5)
+}
+
+fn nsec3_fixture_with_salt(with_api: bool, salt: &str, iterations: u16) -> Fixture {
+    fixture_with(
+        with_api,
+        Some(json!({
+            "denial": "nsec3",
+            "nsec3_salt": salt,
+            "nsec3_iterations": iterations
+        })),
+    )
 }
 
 fn start(config: &Config, api: Option<ApiOptions>) -> Server {
@@ -184,6 +215,31 @@ fn verify_nsec_proofs(records: &[Record], dnskeys: &[pulse_dns::DnskeyData], at:
         assert!(
             verify_any(&rrset, &signatures, dnskeys, at),
             "NSEC RRSIG must verify for {owner}"
+        );
+    }
+}
+
+fn nsec3_proofs(records: &[Record]) -> Vec<Nsec3Proof> {
+    records
+        .iter()
+        .filter_map(|record| Nsec3Proof::from_record(record, DenialLimits::new()).ok())
+        .collect()
+}
+
+fn verify_nsec3_proofs(records: &[Record], dnskeys: &[pulse_dns::DnskeyData], at: u32) {
+    let owners: Vec<Name> = records
+        .iter()
+        .filter(|record| record.rr_type() == Rtype::NSEC3)
+        .map(|record| record.owner().clone())
+        .collect();
+    assert!(!owners.is_empty(), "NSEC3 proof expected in authority");
+    for owner in owners {
+        let rrset = rrset_from(records, &owner, Rtype::NSEC3).expect("NSEC3 rrset");
+        let signatures = rrsigs_from(records, &owner, Rtype::NSEC3);
+        assert!(!signatures.is_empty(), "NSEC3 RRSIG expected for {owner}");
+        assert!(
+            verify_any(&rrset, &signatures, dnskeys, at),
+            "NSEC3 RRSIG must verify for {owner}"
         );
     }
 }
@@ -426,4 +482,221 @@ fn import_sign_writes_rrsig_to_zonefile() {
     let dnskeys = dnskeys_from(response.answers(), &origin());
     assert!(!dnskeys.is_empty(), "DNSKEY must be stored");
     server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn nsec3_signed_zone_serves_verifiable_denial_proofs() {
+    let fixture = nsec3_fixture(false);
+    let mut server = start(&fixture.config, None);
+    let at = now();
+
+    // DNSKEY для независимой проверки подписей.
+    let response = udp_query(&server, "example.com.", Rtype::DNSKEY, true);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    let dnskeys = dnskeys_from(response.answers(), &origin());
+    assert!(!dnskeys.is_empty(), "DNSKEY answer expected");
+
+    // NSEC3PARAM: alg 1, flags 0, настроенные salt/iterations, RRSIG.
+    let response = udp_query(&server, "example.com.", Rtype::NSEC3PARAM, true);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    let param = rrset_from(response.answers(), &origin(), Rtype::NSEC3PARAM).expect("NSEC3PARAM");
+    let Rdata::Nsec3Param(data) = param.rdatas().first().expect("param rdata") else {
+        panic!("expected NSEC3PARAM rdata");
+    };
+    assert_eq!(data.hash_algorithm(), 1);
+    assert_eq!(data.flags(), 0);
+    assert_eq!(data.salt(), &[0xAA, 0xBB, 0xCC]);
+    assert_eq!(data.iterations(), 5);
+    let param_sigs = rrsigs_from(response.answers(), &origin(), Rtype::NSEC3PARAM);
+    assert!(
+        verify_any(&param, &param_sigs, &dnskeys, at),
+        "NSEC3PARAM RRSIG must verify"
+    );
+
+    // Положительный ответ.
+    let response = udp_query(&server, "www.example.com.", Rtype::A, true);
+    let owner = name("www.example.com.");
+    let a = rrset_from(response.answers(), &owner, Rtype::A).expect("A answer");
+    let sigs = rrsigs_from(response.answers(), &owner, Rtype::A);
+    assert!(verify_any(&a, &sigs, &dnskeys, at));
+
+    // NXDOMAIN: closest encloser + next closer + wildcard.
+    let qname = name("nope.example.com.");
+    let response = udp_query(&server, "nope.example.com.", Rtype::A, true);
+    assert_eq!(response.rcode(), Rcode::NXDOMAIN);
+    let proofs = nsec3_proofs(response.authority());
+    let outcome = nsec3_nxdomain(&qname, &origin(), &proofs, DenialLimits::new())
+        .expect("NSEC3 NXDOMAIN proof");
+    assert_eq!(outcome.outcome, pulse_dnssec::DenialOutcome::NxDomain);
+    assert!(outcome.is_secure(), "Opt-Out must be disabled");
+    verify_nsec3_proofs(response.authority(), &dnskeys, at);
+    assert!(
+        response
+            .authority()
+            .iter()
+            .all(|record| record.rr_type() != Rtype::NSEC),
+        "NSEC3 zone must not emit NSEC"
+    );
+
+    // NODATA.
+    let qname = name("www.example.com.");
+    let response = udp_query(&server, "www.example.com.", Rtype::AAAA, true);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    assert_eq!(response.answers().len(), 0);
+    let proofs = nsec3_proofs(response.authority());
+    let outcome = nsec3_nodata(&qname, Rtype::AAAA, &origin(), &proofs, DenialLimits::new())
+        .expect("NSEC3 NODATA proof");
+    assert_eq!(outcome.outcome, pulse_dnssec::DenialOutcome::NoData);
+    verify_nsec3_proofs(response.authority(), &dnskeys, at);
+
+    // Wildcard answer: RRSIG + next closer proof.
+    let qname = name("foo.wild.example.com.");
+    let response = udp_query(&server, "foo.wild.example.com.", Rtype::A, true);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    let answer = rrset_from(response.answers(), &qname, Rtype::A).expect("wildcard A");
+    let answer_sigs = rrsigs_from(response.answers(), &qname, Rtype::A);
+    assert!(verify_any(&answer, &answer_sigs, &dnskeys, at));
+    let proofs = nsec3_proofs(response.authority());
+    let outcome = nsec3_wildcard_answer(
+        &qname,
+        &name("wild.example.com."),
+        &origin(),
+        &proofs,
+        DenialLimits::new(),
+    )
+    .expect("NSEC3 wildcard answer proof");
+    assert_eq!(
+        outcome.outcome,
+        pulse_dnssec::DenialOutcome::WildcardExpansion
+    );
+
+    // Wildcard NODATA.
+    let qname = name("foo.wild.example.com.");
+    let response = udp_query(&server, "foo.wild.example.com.", Rtype::AAAA, true);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    let proofs = nsec3_proofs(response.authority());
+    let outcome =
+        nsec3_wildcard_nodata(&qname, Rtype::AAAA, &origin(), &proofs, DenialLimits::new())
+            .expect("NSEC3 wildcard NODATA proof");
+    assert_eq!(outcome.outcome, pulse_dnssec::DenialOutcome::WildcardNoData);
+
+    // DS NODATA в apex.
+    let qname = origin();
+    let response = udp_query(&server, "example.com.", Rtype::DS, true);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    let proofs = nsec3_proofs(response.authority());
+    let outcome =
+        nsec3_ds_nodata(&qname, &origin(), &proofs, DenialLimits::new()).expect("DS NODATA proof");
+    assert_eq!(outcome.outcome, pulse_dnssec::DenialOutcome::NoData);
+
+    // DO=0: без RRSIG и NSEC3.
+    let response = udp_query(&server, "nope.example.com.", Rtype::A, false);
+    assert_eq!(response.rcode(), Rcode::NXDOMAIN);
+    assert!(
+        response
+            .answers()
+            .iter()
+            .chain(response.authority())
+            .all(|record| record.rr_type() != Rtype::RRSIG && record.rr_type() != Rtype::NSEC3)
+    );
+
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn nsec3_sign_endpoint_rebuilds_chain_with_same_salt() {
+    let fixture = nsec3_fixture(true);
+    let mut server = start(
+        &fixture.config,
+        Some(ApiOptions {
+            listen: "127.0.0.1:0".parse().expect("api addr"),
+            token: TOKEN.to_owned(),
+            scopes: vec!["example.com.".to_owned()],
+        }),
+    );
+    let api = server.api_addr().expect("api enabled");
+    let at = now();
+
+    let before = udp_query(&server, "example.com.", Rtype::NSEC3PARAM, true);
+    let before_param =
+        rrset_from(before.answers(), &origin(), Rtype::NSEC3PARAM).expect("NSEC3PARAM before");
+
+    let response = http(api, "POST", "/api/v1/zones/example.com./sign", Some(b"{}"));
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+
+    let after = udp_query(&server, "example.com.", Rtype::NSEC3PARAM, true);
+    let after_param =
+        rrset_from(after.answers(), &origin(), Rtype::NSEC3PARAM).expect("NSEC3PARAM after");
+    assert_eq!(
+        before_param
+            .rdatas()
+            .first()
+            .map(pulse_dns::Rdata::to_canonical_wire),
+        after_param
+            .rdatas()
+            .first()
+            .map(pulse_dns::Rdata::to_canonical_wire),
+        "re-sign must keep the configured salt/iterations"
+    );
+
+    let response = udp_query(&server, "nope.example.com.", Rtype::A, true);
+    assert_eq!(response.rcode(), Rcode::NXDOMAIN);
+    let dnskeys = dnskeys_from(
+        udp_query(&server, "example.com.", Rtype::DNSKEY, true).answers(),
+        &origin(),
+    );
+    let proofs = nsec3_proofs(response.authority());
+    nsec3_nxdomain(
+        &name("nope.example.com."),
+        &origin(),
+        &proofs,
+        DenialLimits::new(),
+    )
+    .expect("NSEC3 proof after re-sign");
+    verify_nsec3_proofs(response.authority(), &dnskeys, at);
+
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn nsec3_restart_with_new_salt_rebuilds_chain() {
+    let first_fixture = nsec3_fixture_with_salt(false, "aabbcc", 5);
+    let mut first = start(&first_fixture.config, None);
+    let first_response = udp_query(&first, "example.com.", Rtype::NSEC3PARAM, true);
+    let first_param = rrset_from(first_response.answers(), &origin(), Rtype::NSEC3PARAM)
+        .expect("first NSEC3PARAM");
+    let Rdata::Nsec3Param(first_data) = first_param.rdatas().first().expect("first rdata") else {
+        panic!("expected NSEC3PARAM");
+    };
+    assert_eq!(first_data.salt(), &[0xAA, 0xBB, 0xCC]);
+    first.shutdown().expect("shutdown first");
+
+    let second_fixture = nsec3_fixture_with_salt(false, "ddeeff", 5);
+    let mut second = start(&second_fixture.config, None);
+    let second_response = udp_query(&second, "example.com.", Rtype::NSEC3PARAM, true);
+    let second_param = rrset_from(second_response.answers(), &origin(), Rtype::NSEC3PARAM)
+        .expect("second NSEC3PARAM");
+    let Rdata::Nsec3Param(second_data) = second_param.rdatas().first().expect("second rdata")
+    else {
+        panic!("expected NSEC3PARAM");
+    };
+    assert_eq!(second_data.salt(), &[0xDD, 0xEE, 0xFF]);
+
+    // Новая соль → новая цепочка; негативные доказательства валидируются.
+    let response = udp_query(&second, "nope.example.com.", Rtype::A, true);
+    assert_eq!(response.rcode(), Rcode::NXDOMAIN);
+    let proofs = nsec3_proofs(response.authority());
+    nsec3_nxdomain(
+        &name("nope.example.com."),
+        &origin(),
+        &proofs,
+        DenialLimits::new(),
+    )
+    .expect("NSEC3 proof with the new salt");
+    second.shutdown().expect("shutdown second");
 }

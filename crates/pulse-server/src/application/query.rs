@@ -8,11 +8,12 @@ use pulse_dns::{
     Opcode, Rclass, Rcode, Rdata, RdataError, Record, RecordError, Rrset, RrsetError, Rtype, Ttl,
     TtlError,
 };
+use pulse_dnssec::{DenialLimits, Nsec3Params};
 use thiserror::Error;
 
 use super::port::ZoneView;
 use super::stats::QueryStats;
-use crate::domain::{LookupOutcome, ZoneState};
+use crate::domain::{DenialKind, LookupOutcome, ZoneState};
 
 /// UDP payload без EDNS0 (RFC 1035 §4.2.1).
 pub const UDP_PAYLOAD_WITHOUT_EDNS: u16 = 512;
@@ -736,8 +737,107 @@ fn append_rrset(
     Ok(())
 }
 
-/// Добавляет NSEC-доказательство к негативному или wildcard-ответу.
+/// Добавляет denial-доказательство к негативному или wildcard-ответу.
 fn append_denial_proofs(zone: &dyn ZoneView, qname: &Name, resolution: &mut Resolution) {
+    match zone.denial() {
+        DenialKind::Nsec => append_nsec_proofs(zone, qname, resolution),
+        DenialKind::Nsec3 => append_nsec3_proofs(zone, qname, resolution),
+    }
+}
+
+/// Добавляет NSEC3-доказательство к негативному или wildcard-ответу.
+///
+/// Наборы подбираются только по hash-пространству из `NSEC3PARAM`: closest
+/// encloser, next closer и wildcard. Каждый proof получает RRSIG через
+/// обычный [`append_rrset`] (owner NSEC3 — hashed-имя).
+fn append_nsec3_proofs(zone: &dyn ZoneView, qname: &Name, resolution: &mut Resolution) {
+    let Some(params) = nsec3_params(zone) else {
+        return;
+    };
+    let mut proofs: Vec<Rrset> = Vec::new();
+    match resolution.status {
+        Status::NxDomain => {
+            let closest = closest_encloser(zone, qname);
+            push_nsec3_exact(zone, &params, &closest, &mut proofs);
+            if let Some(next) = next_closer_name(qname, &closest) {
+                push_nsec3_cover(zone, &params, &next, &mut proofs);
+            }
+            if let Some(wildcard) = wildcard_name(&closest) {
+                push_nsec3_cover(zone, &params, &wildcard, &mut proofs);
+            }
+        }
+        Status::NoData => {
+            if let Some(wildcard) = &resolution.wildcard {
+                if let Some(closest) = wildcard.parent() {
+                    push_nsec3_exact(zone, &params, &closest, &mut proofs);
+                    if let Some(next) = next_closer_name(qname, &closest) {
+                        push_nsec3_cover(zone, &params, &next, &mut proofs);
+                    }
+                }
+                push_nsec3_exact(zone, &params, wildcard, &mut proofs);
+            } else {
+                push_nsec3_exact(zone, &params, qname, &mut proofs);
+            }
+        }
+        Status::Answer => {
+            if let Some(wildcard) = &resolution.wildcard
+                && let Some(closest) = wildcard.parent()
+            {
+                push_nsec3_exact(zone, &params, &closest, &mut proofs);
+                if let Some(next) = next_closer_name(qname, &closest) {
+                    push_nsec3_cover(zone, &params, &next, &mut proofs);
+                }
+            }
+        }
+        Status::Referral | Status::YxDomain => {}
+    }
+    resolution.authority.append(&mut proofs);
+}
+
+fn push_nsec3_exact(
+    zone: &dyn ZoneView,
+    params: &Nsec3Params,
+    name: &Name,
+    proofs: &mut Vec<Rrset>,
+) {
+    if let Some(exact) = zone.nsec3_at(&params.hash(name)) {
+        push_proof(proofs, exact);
+    }
+}
+
+fn push_nsec3_cover(
+    zone: &dyn ZoneView,
+    params: &Nsec3Params,
+    name: &Name,
+    proofs: &mut Vec<Rrset>,
+) {
+    if let Some(cover) = zone.nsec3_cover(&params.hash(name)) {
+        push_proof(proofs, cover);
+    }
+}
+
+/// Denial-запись, доказывающая отсутствие `DS` в точке делегирования.
+fn denial_at(zone: &dyn ZoneView, name: &Name) -> Option<Rrset> {
+    match zone.denial() {
+        DenialKind::Nsec => zone.nsec_at(name),
+        DenialKind::Nsec3 => {
+            let params = nsec3_params(zone)?;
+            zone.nsec3_at(&params.hash(name))
+        }
+    }
+}
+
+fn nsec3_params(zone: &dyn ZoneView) -> Option<Nsec3Params> {
+    let param = zone.nsec3_param()?;
+    let data = param.rdatas().iter().find_map(|rdata| match rdata {
+        Rdata::Nsec3Param(data) => Some(data),
+        _ => None,
+    })?;
+    Nsec3Params::from_nsec3param(data, DenialLimits::new()).ok()
+}
+
+/// Добавляет NSEC-доказательство к негативному или wildcard-ответу.
+fn append_nsec_proofs(zone: &dyn ZoneView, qname: &Name, resolution: &mut Resolution) {
     let mut proofs: Vec<Rrset> = Vec::new();
     match resolution.status {
         Status::NxDomain => {
@@ -942,10 +1042,11 @@ fn referral_for(
                 if let Some(ds) = ds {
                     resolution.authority.push(ds);
                 } else if zone.signed()
-                    && let Some(nsec) = zone.nsec_at(&cut)
+                    && let Some(proof) = denial_at(zone, &cut)
                 {
-                    // Insecure delegation: NSEC at the cut proves DS absence.
-                    resolution.authority.push(nsec);
+                    // Insecure delegation: denial record at the cut proves
+                    // DS absence (NSEC or NSEC3 depending on the zone).
+                    resolution.authority.push(proof);
                 }
             }
             Ok(Some(resolution))
