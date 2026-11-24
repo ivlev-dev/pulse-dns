@@ -29,14 +29,14 @@ forward/iterative-резолюцией, кешем, blocklist, overrides и DNSS
 - Формат зон (`pulse-zonefile`): v2 `ParallelStore` — один mmap-файл,
   lock-free аллокатор страниц, ring-головы версий A/B, chain, per-zone пулы и
   GC, in-process пины читателей, group commit (2 `fdatasync` на группу зон),
-  `Flush`/`Memory`/`Sync`, recovery и `fsck`; v1-файлы читаются для
-  `pulsed convert`.
+  `Flush`/`Memory`/`Sync`, recovery, полный `fsck --verify` и `--repair`;
+  v1-файлы читаются для `pulsed convert`.
 - REST API (`pulse-api`): health/ready/metrics/OpenAPI, zones CRUD, RRset
   CRUD/PATCH, settings, bearer-auth + scopes + per-zone allowlist (404 вне
   allowlist), ETag/If-Match, RFC 9457 problem+json, Idempotency-Key,
   пагинация, лимиты тела/rate limit.
 - Бинарник `pulsed`: UDP+TCP, зоны только в `pulse-zonefile` v2 (`--data`;
-  DNS отвечает из mmap, без полной in-memory копии), импорт RFC 1035
+  DNS отвечает из mmap, без полной in-memory копии зон), импорт RFC 1035
   master-файлов командой `pulsed import` (`.zone`, `$ORIGIN`/`$TTL`/`$INCLUDE`),
   конвертация legacy v1-файлов `pulsed convert`, REST с per-zone writer'ами
   (разные зоны коммитятся параллельно; `--commit-mode per-zone|group`,
@@ -61,22 +61,26 @@ forward/iterative-резолюцией, кешем, blocklist, overrides и DNSS
   `rate_limited_total` и `upstream_queries_total{transport=...}`,
   SIGHUP/периодический reload, `GET /metrics` и `GET /healthz` на loopback,
   graceful shutdown по SIGTERM/SIGINT.
+- CI/hardening: `fuzz/` (cargo-fuzz, nightly) — 5 таргетов, seed-корпус,
+  job `fuzz-smoke` на push в main; Miri на `pulse-dns`/`pulse-master`
+  (nightly, continue-on-error); `cargo deny check`.
 
 **Не реализовано (см. `STATUS.md`):** межпроцессная параллельная запись
-(N процессов; в v2.0 — один процесс-писатель, `LOCK_EX`); полный `fsck --repair`;
-WAL/journal для write-through; DoQ; NSEC3 Opt-Out и NSEC3 для secondary-зон;
-HTTP/2/3 для DoH (только HTTP/1.1); 0x20 echo; TLS для API и метрик
-(только loopback); fuzz/Miri/loom в CI; полноценный RRL авторитетного сервера;
-REST — MVP-подмножество спецификации; автоматическая ротация DNSSEC-ключей.
-У резолвера нет RFC 5011 (trust anchors статические), DoQ и
-HTTP/2/3 для DoH-апстримов; RRL ограничен per-source token bucket.
+(N процессов; в v2.0 — один процесс-писатель, `LOCK_EX`); WAL/journal для
+write-through; DoQ; NSEC3 Opt-Out, NSEC3 для secondary-зон и автоматическая
+ротация DNSSEC-ключей; HTTP/2/3 для DoH (только HTTP/1.1); 0x20 echo; TLS
+для API и метрик (только loopback); полноценный RRL авторитетного сервера;
+REST — MVP-подмножество спецификации; RFC 5011 (trust anchors статические) в
+резолвере; лoom в CI. У резолвера нет DoQ и HTTP/2/3 для DoH-апстримов; RRL
+ограничен per-source token bucket; upstream DoH только HTTP/1.1 с одним
+keep-alive соединением на upstream (сериализация).
 
 ## Архитектура
 
 | Крейт | Назначение |
 |---|---|
 | `pulse-dns` | Wire-формат DNS и RR-типы |
-| `pulse-dnssec` | DNSSEC: подпись/валидация alg 8/13/15, RRSIG, NSEC |
+| `pulse-dnssec` | DNSSEC: подпись/валидация alg 8/13/15, RRSIG, NSEC/NSEC3 |
 | `pulse-master` | RFC 1035 master-файлы: парсер, валидация, экспорт |
 | `pulse-transfer` | TSIG, AXFR/IXFR, NOTIFY |
 | `pulse-zonefile` | Бинарный mmap-формат зон: reader, writer/commit, fsck, compact |
@@ -230,7 +234,7 @@ curl -sS -X PUT "$API/api/v1/zones/dynamic.test." \
 cargo test --workspace
 ```
 
-Полный набор workspace-тестов (1083 теста, включая doctests) проходит. Также проходят
+Полный набор workspace-тестов (1138 тестов, включая doctests) проходит. Также проходят
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` и
 rustdoc без warnings.
 
