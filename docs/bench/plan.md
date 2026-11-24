@@ -237,7 +237,7 @@ pulseload --server 10.0.0.1:53 --mode udp|tcp --threads 8 --qps 100000 \
 | A11 | Обход 1M RRset (`enumerate`) | `criterion` | ≤ 250 мс, порядок канонический |
 | A12 | Компакция 1M | `compact_zone` | ≤ 2 с, размер файла не растёт |
 | A13 | Golden-file §22 спеки | тест читает пример байт-в-байт | совпадение |
-| A14 | Fuzz/Miri/loom | `cargo-fuzz` 24 ч (**4 таргета**: `zonefile_read/write/roundtrip`, `reader_table_state`), `Miri` на чистой логике, **`loom`/TSan** на `pin`/`unpin` × `oldest_reader_txn`/`reclaim_txn` | нет паник/UB/OOM; инвариант «страница с `free_txn > reader_txn` не выдаётся и не перезаписывается» не нарушается |
+| A14 | Fuzz/Miri/loom | `cargo-fuzz` 24 ч (**4 таргета**: `zonefile_read/write/roundtrip`, `reader_table_state`), `Miri` на чистой логике, **`loom`/TSan** на `pin`/`unpin` × `oldest_reader_txn`/`reclaim_txn` | нет паник/UB/OOM; инвариант «страница с `free_txn < durable_watermark` **и** `free_txn ≤ oldest_reader_txn` может выдаваться; иначе не выдаётся и не перезаписывается» не нарушается |
 | A15 | **Форматная готовность к DNSSEC** (golden-тесты канонизации) | NSEC-порядок = обход `next_name`; RR внутри RRset отсортированы по каноническому RDATA; RDATA без компрессии; lowercase-инвариант; `RRSIG` различаются по `subtype` | совпадение с эталоном RFC 4034 §6.1/§6.3; **подпись не проверяется (M5)** |
 | A16 | Поведение при исчерпании карты | файл `map_size` 64 МиБ, заполнить до `page_count_max` | `MapFull` (не паника, не порча), чтение продолжает работать |
 | A17 | Отказ при невозможном `mmap` | квота/`RLIMIT`/ФС без sparse | отказ старта `MapAllocFailed` с понятной причиной |
@@ -245,7 +245,7 @@ pulseload --server 10.0.0.1:53 --mode udp|tcp --threads 8 --qps 100000 \
 | A19 | Per-zone meta-блок | inline-настройки ≤ 4016 Б; upstream-блоб 4096 Б → overflow; `EditOp::SetZoneMeta` в одной транзакции с правкой RRset | чтение `ZoneSettingsRef` O(1) по фиксированным полям; `ZoneMetaTooLarge` при > 256 KiB; kill -9 в момент `SetZoneMeta` не даёт смеси |
 | A20 | Два writer'а на одном файле | два процесса открывают writer на один файл | второй получает `Busy` (lock-файл `<zonefile>.lock`); данные не меняются |
 | A21 | Усечённый существующий файл | `truncate` готового файла на 1 страницу; открыть writer'ом и читателем | оба получают `TruncatedFile`; `ftruncate` не выполняется, файл не «доращивается» |
-| A22 | Внутрипроцессный читатель (M1) | N потоков берут снапшоты, писатель коммитит 10⁴ раз; прогон под **TSan** и в `loom`-модели (pin/unpin × reclaim) | читатели видят только целые снапшоты; `oldest_reader_txn` учитывается; нет переиспользования страниц с `free_txn > reader_txn`; межпроцессный вариант — M3 |
+| A22 | Внутрипроцессный читатель (M1) | N потоков берут снапшоты, писатель коммитит 10⁴ раз; прогон под **TSan** и в `loom`-модели (pin/unpin × reclaim) | читатели видят только целые снапшоты; `oldest_reader_txn` учитывается; нет переиспользования страниц с `free_txn ≥ durable_watermark` или `free_txn > oldest_reader_txn`; межпроцессный вариант — M3 |
 
 **Область M1:** один процесс, несколько потоков. Межпроцессный доступ (несколько процессов на один файл, отдельный lock-файл writer'а, `LONG_HOLD`) — **критерии M3**, в M1 не тестируется.
 

@@ -1,13 +1,16 @@
 # Спецификация формата файла зон pulse (v1)
 
 - **Файл:** один, содержит все зоны, подключается через `mmap`
-- **Версия формата:** 1.0 (спецификация — ревизия 1.2, после независимого ревью)
+- **Версия формата:** 1.0 (разделы §1–§24); **2.0** — дельта §25 (параллельная запись по зонам)
+- **Версия спецификации:** ревизия 1.6, 2026-11-24 (добавлена §25, решение — `docs/adr/0005-parallel-writers.md`)
 - **Статус:** проект, на утверждение
 - **Реализует:** `pulse-zonefile` (адаптер портов `ZoneStore` / `ZoneWriter`)
 - **Источник истины по ID безопасности:** `docs/adr/0004-security-model.md` §1.1
-- **Связанные:** `docs/adr/0003-zonefile-format.md`, `docs/adr/0001-ddd-architecture.md`, `docs/spec/domain-model.md` (§5.1–5.2)
+- **Связанные:** `docs/adr/0003-zonefile-format.md`, `docs/adr/0005-parallel-writers.md`, `docs/adr/0001-ddd-architecture.md`, `docs/spec/domain-model.md` (§5.1–5.2)
 
 Документ самодостаточен для реализации: все поля, смещения, порядок байт и инварианты. Любое «на усмотрение реализации» помечено и снабжено списком допустимых вариантов.
+
+> **Читать вместе с §25.** §1–§24 описывают раскладку и алгоритмы для одного writer'а на файл (формат 1.0). §25 — нормативная дельта формата 2.0: головы зон вместо глобальной meta, `epoch`/`version`, per-zone freelist, group commit, recovery по зонам. При расхождении §25 имеет приоритет.
 
 ---
 
@@ -23,14 +26,19 @@
 | ENT | empty non-terminal: имя существует только как предок другого имени |
 | cut | zone cut: точка делегирования (`NS` без `SOA`) |
 | COW | copy-on-write: изменение страницы = новая версия по новому `PageId` |
-| `durable_txn` | максимальный `txnid`, про который известно, что его данные и meta на диске |
-| `reclaim_txn` | `min(durable_txn, oldest_reader_txn)` — граница переиспользования страниц |
+| `durable_txn` | поле meta: последний `txnid`, чьи данные **и эта meta** гарантированно на диске для данной меты; `≤ txnid`, может быть меньше у `Flush`/`Memory` |
+| `durable_watermark` | `max` по всем валидным meta от `min(durable_txn, txnid)` — **единственный** watermark, который используют recovery, `effective_mode`/`check_commit` и advisory `reclaim_txn`; не понижается выбором более старой meta |
+| `reclaim_txn` | `min(durable_watermark − 1, oldest_reader_txn)` — **строгая** граница переиспользования; при `durable_watermark = 1` равна 0 (переиспользование невозможно) |
+| `recovered_unsynced` | диагностический признак: recovery принял meta `T > durable_watermark` по политике `Sync`/`Flush` (§13.7) |
+| `torn_meta` | диагностический признак: один из двух слотов meta невалиден (torn/недописан), второй валиден; сам по себе **не** требует `NEEDS_FSCK` (§13.7 шаг 5) |
+| `memory_tail_discarded` | диагностический признак: `Memory`-файл открыт чисто на подтверждённой meta `txnid ≤ durable_watermark`; неподтверждённый хвост отброшен (§13.7 шаг 7a) |
 | reader / snapshot | зафиксированный `txnid`, по которому читаются данные |
 | writer | единственный поток/процесс, выполняющий коммиты |
 
 Соглашения:
 
-- Все целые — **little-endian**.
+- Все целые **поля структур и ключей** — **little-endian** (`type`/`class`/`subtype` в ключе, `LeafValue.*`, `rdlen`, `ttl`, `val_u32` и т. д.).
+- **Исключение — DNS wire:** `u16 rdlength` внутри inline/overflow `payload` (§11.2/§11.4) хранится **big-endian**, как в DNS-сообщении; сама `rdata[]` — opaque wire-байты (порядок задаёт тип RR). Это единственное место, где байты payload не LE.
 - Структуры плотные, без паддинга, кроме явных `reserved`.
 - Смещения внутри страницы — `u16` от начала страницы (страница ≤ 16384 < 65536).
 - Смещения/размеры файла — `u32` (`PageId`) или `u64` (байты).
@@ -90,16 +98,27 @@ MAX_CUT_SUBTREE_RECORDS  = 100_000
 MAX_FORWARD_UPSTREAMS    = 32
 MAX_FORWARD_BLOB         = 4096
 MAX_ZONE_META            = 262_144   // 256 KiB — предел блока §12.2 с overflow-цепочкой
-MAX_ZONE_META_PAGES      = ceil(MAX_ZONE_META / (page_size - OVERFLOW_HEADER_SIZE))  // 65 @4096, 33 @8192, 17 @16384
+// MAX_ZONE_META_PAGES — функция от page_size (не константа файла):
+// const fn max_zone_meta_pages(page_size: u32) -> u32 {
+//     ceil(MAX_ZONE_META / (page_size - OVERFLOW_HEADER_SIZE))
+// }  → 65 @4096, 33 @8192, 17 @16384
 
 MODE_NOSYNC              = 0
 MODE_NOMETASYNC          = 1
 MODE_SYNC                = 2
 DEFAULT_SYNC_MODE        = MODE_SYNC          // MODE_NOSYNC — экспериментальный, по умолчанию выключен (§13.6)
 
+// Persistent-коды поля superblock.sync_mode (§4). Это ОТДЕЛЬНЫЙ enum:
+// его значения НЕ совпадают с кодами MODE_* выше.
+SYNC_MODE_SYNC           = 0    // Sync: данные и meta fsync'нуты
+SYNC_MODE_FLUSH          = 1    // Flush: данные fsync'нуты, meta — нет
+SYNC_MODE_MEMORY         = 2    // Memory: ни данные, ни meta не форсируются
+SYNC_MODE_FIELD_VERSION  = 1    // версия поля (+625); 0 в legacy-файле = «поля не было»
+
 READER_SLOTS             = 1024
 READER_SLOTS_PER_THREAD  = 4        // вложенные снапшоты одного потока (§6.3)
 GC_INTERVAL_MS           = 3_600_000 // maintenance-задача GC tombstone-зон раз в час (§13.8)
+SYNC_INTERVAL_MS         = 1_000     // эксплуатационный максимум между sync() в Flush/Memory (§13.6); не формат
 MAX_RECLAIM_ZONES_PER_COMMIT = 16       // opportunistic GC на коммите (домен §5.2.4)
 MAX_RECLAIM_PAGES_PER_COMMIT = 8_192    // предохранитель latency коммита; format-side default
 READER_SLOT_SIZE         = 32
@@ -212,16 +231,18 @@ offset 0                +-----------------------------------+
 |---|---|
 | I-1 | `MAGIC`, `version_major`, `page_size` в обеих копиях superblock совпадают; иначе `Corrupt` |
 | I-2 | `page_count_high_water ≤ page_count_max`; размер файла = `page_count_max * page_size` |
-| I-3 | Активна ровно одна meta: среди валидных мет с `txnid ≤ durable_txn` выбирается максимальная (§13.7) |
-| I-4 | Страницы, достижимые из `meta(T)`, не изменяются, пока `reclaim_txn < T` (правило §14) |
+| I-3 | Активна ровно одна meta: среди валидных (прошедших проверку против superblock) выбирается **самая новая по `txnid`**; ограничение `txnid ≤ durable_txn` снято (§13.7) |
+| I-4 | Страницы, достижимые из `meta(T)`, не изменяются: страница, освобождённая в `F`, переиспользуется только при `F < durable_watermark` **и** `F ≤ oldest_reader_txn` (эквивалентно `F ≤ reclaim_txn`, §14) |
 | I-5 | `txnid` строго возрастает, `txnid ≠ 0` |
-| I-6 | `durable_txn ≤ txnid(active)`; страница с `free_txn > reclaim_txn` не выдаётся (правило и обоснование — §14) |
+| I-6 | `durable_watermark ≤ txnid(active)`; watermark не понижается при recovery/приёме `Flush`-meta; страница с `free_txn ≥ durable_watermark` не выдаётся, даже если `oldest_reader_txn` больше (правило и обоснование — §14) |
 | I-7 | Ключи в дереве строго возрастают по компаратору §8.3 |
 | I-8 | `branch.key[i]` = точный минимум поддерева `branch.child[i]` |
 | I-9 | Глубина любого дерева ≤ `MAX_TREE_DEPTH` |
 | I-10 | Ни одна страница не достижима из двух мест |
 | I-11 | Свободные страницы не достижимы из активной meta |
 | I-12 | Каждая meta содержит **полный** набор корней (дерево зон, freelist, reader table, счётчики) — восстановление не зависит от предыдущей meta |
+| I-13 | `sync_mode` — нижняя граница durability; после `durable_watermark > 1` (первый успешный `Sync`/`sync()`) все последующие коммиты обязаны быть `Sync` (липкий режим, §4.1/§13.6) |
+| I-14 | `durable_watermark = max(min(durable_txn, txnid))` по валидным meta; recovery и runtime используют только его. `durable_txn(selected) < durable_watermark` — нарушение монотонности: `NEEDS_FSCK` + `write_locked` (read-only до offline fsck), не тихое принятие (§13.7, §17 W-10) |
 
 ---
 
@@ -254,13 +275,27 @@ offset 0                +-----------------------------------+
 | +104 | 4 | `page_reader_table_count` | 9 при 4096 (`ceil(32768/(page_size-32))`) |
 | +108 | 4 | `section_count` | 0..16 |
 | +112 | 512 | `sections[16]` | 16 дескрипторов по 32 байта |
-| +624 | … | `reserved` | нули до 4088 |
+| +624 | 1 | `sync_mode` | persistent-режим durability: 0 = Sync, 1 = Flush, 2 = Memory; иное → `Corrupt` |
+| +625 | 1 | `sync_mode_version` | `1` для новых файлов; хранится в superblock и пишется при encode; `0` = поля не было (legacy) → Sync |
+| +626 | … | `reserved` | нули до 4088 |
 | +4088 | 4 | `reserved_tail` | 0 |
 | +4092 | 4 | `reserved_tail2` | 0 (последние 4 байта записи) |
 
-> `sections` занимает байты `[+112, +624)`; байты `[+624, +4088)` — `reserved` (нули).
+> `sections` занимает байты `[+112, +624)`; `sync_mode`/`sync_mode_version` — `[+624, +626)`; байты `[+626, +4088)` — `reserved` (нули). Смещения всех полей до `+624` не менялись, поэтому golden-файлы, где `sync_mode = Sync = 0`, сохраняют нулевой байт в `+624`.
 
-Дескриптор секции (32 байта): `id u16 | version u16 | first_page u32 | page_count u32 | flags u64 | reserved[12]`.
+Дескриптор секции (32 байта, выровненный layout):
+
+| Смещение | Размер | Поле |
+|---|---|---|
+| +0 | 2 | `id` |
+| +2 | 2 | `version` |
+| +4 | 4 | `first_page` |
+| +8 | 4 | `page_count` |
+| +12 | 4 | `pad` (MUST 0) |
+| +16 | 8 | `flags` |
+| +24 | 8 | `reserved` (MUST 0) |
+
+`pad[4]` существует только для выравнивания `u64 flags` по 8 байт: плотная упаковка поставила бы `flags` на +12, что на некоторых архитектурах делает доступ невыровненным и ломает детерминированные смещения. С `pad` все поля лежат по естественным адресам, `size_of == 32`, и смещения одинаковы на любой платформе. Читатель проверяет `pad == 0` и `reserved == 0` при декодировании всегда (несовпадение — `Corrupt(Bounds)`); `strict` эту проверку не ослабляет, а на значения полей в рантайме полагаться нельзя.
 
 | id | Имя | v1 | Назначение |
 |---|---|---|---|
@@ -273,41 +308,71 @@ offset 0                +-----------------------------------+
 | 7 | IXFR_HISTORY | нет | резерв: персистентная история IXFR-out |
 | 0x8000+ | vendor | — | приватные расширения |
 
-Superblock B — копия с `superblock_copy = 1`. Расхождение `page_size`/`page_count_max`/`instance_uuid` между копиями → `Corrupt`. При открытии побеждает копия с валидным CRC (при обеих — A).
+### 4.1. `sync_mode`: persistent-режим durability
+
+`sync_mode` — **неизменяемое свойство файла**, задаётся при создании из `CreateConfig.sync_mode` и описывает, какой класс durability разрешён коммитам этого файла. Причина, по которой поле живёт в superblock, а не в meta: recovery обязан знать, гарантированы ли данные у **самой новой** валидной meta, ещё до выбора/принятия этой meta (§13.7).
+
+| `sync_mode` | Порт (`Durability`) | Runtime-константа (§2) | Что гарантировано для данных meta |
+|---|---|---|---|
+| 0 `Sync` | `Sync` | `MODE_SYNC = 2` | данные и meta fsync'нуты |
+| 1 `Flush` | `Flush` | `MODE_NOMETASYNC = 1` | данные fsync'нуты до записи meta; сама meta не форсируется |
+| 2 `Memory` | `Memory` | `MODE_NOSYNC = 0` | данные не форсируются; meta может пережить данные |
+
+Правила:
+
+1. **Валидация.** Поле занимает два байта: `sync_mode` (`u8`, `+624`) и `sync_mode_version` (`u8`, `+625`, `SYNC_MODE_FIELD_VERSION = 1`). Проверка выполняется при открытии, до выбора/принятия meta (fail-closed):
+   - `sync_mode_version == 0` — legacy-файл, поля не было: допустим **только** при `sync_mode == 0` и трактуется как `Sync`; `sync_mode != 0` при версии 0 → `Corrupt { kind: Bounds, detail: OffsetOutOfRange }`;
+   - `sync_mode_version == 1` — требует `sync_mode ∈ {0,1,2}`; `sync_mode > 2` (в частности, любое значение вне enum) → `Corrupt { kind: Bounds, detail: OffsetOutOfRange }`;
+   - `sync_mode_version ∉ {0,1}` — версия поля новее, чем понимает сборка → `UnsupportedVersion { found: Version { major: FORMAT_VERSION_MAJOR, minor: u16::from(sync_mode_version) }, supported: Version { major: FORMAT_VERSION_MAJOR, minor: 1 }, required_flags: 0 }` (§21.1). Не открывать файл «на удачу».
+2. **Копии A/B и хранение.** Поле пишется в **обе** копии superblock при создании (шаг 5 ниже, `pwrite` в page 0 и page 1) и после создания не меняется. `sync_mode` и `sync_mode_version` — **отдельные сохраняемые поля** superblock: обе величины обязаны храниться в in-memory структуре, записываться при encode (а не подставляться константой), декодироваться при open и сравниваться между A и B наравне. Обе валидные копии обязаны иметь одинаковые `sync_mode` и `sync_mode_version`; расхождение любой из двух величин, в частности `A: version=1, B: version=0`, → `Corrupt` (как для `page_size`/`page_count_max`/`instance_uuid`). Поле неизменяемо после создания, поэтому расхождение — признак порчи, а не «штатного» обновления.
+3. **Режим — нижняя граница, а не потолок.** Коммит вправе быть **сильнее** файлового режима (`Flush`-файл может коммитить `Sync`; `Memory`-файл — любой до первого `sync()`), но не слабее: `commit(Durability::Memory)` на `Sync`/`Flush`-файле и `commit(Flush)` на `Sync`-файле отклоняются `InvariantViolation(DurabilityBelowFileMode)`. Иначе recovery доверился бы `sync_mode` и принял бы meta, чьи данные не fsync'нуты. Числовые `MODE_*` (runtime, §2) и дисковые коды `sync_mode` (0/1/2) — **разные enum'ы** с противоположным порядком; сравнивать их напрямую запрещено, сравнение — только по классу `Memory < Flush < Sync`.
+4. **`0 = Sync` — безопасный legacy-default.** В файлах, созданных до появления поля, байт `+624` нулевой; трактовка «0 = Sync» сохраняет их поведение и не ломает golden-байты. `sync_mode_version = 0` отличает такие файлы от новых.
+5. **Смена режима — только пересозданием/компакцией** (`zonefile compact --out`), как `page_size`/`map_size`; на ходу поле не меняется. Это осознанный компромисс: один файл — один класс durability, зато recovery не зависит от истории коммитов.
+6. **Липкое повышение (sticky upgrade).** После первого успешного `Sync`/`sync()` (`durable_watermark > 1`, см. §13.7/§14) единственный допустимый режим коммита — `Sync`. Правило выводится из единого watermark, отдельного поля не требуется: два последующих слабых коммита затирают слоты, включая слот durable-меты `D` (`D+1` пишется вместо `D−1`, `D+2` — вместо `D`), и power loss откатил бы состояние ниже подтверждённого `Sync`. Поэтому `sync()` в `Flush`/`Memory`-файле — **чекпойнт**: после него файл навсегда коммитит `Sync`; понижение запрещено (`InvariantViolation(DurabilityBelowFileMode)`, §15 F-12). `superblock.sync_mode` при этом не меняется — он остаётся нижней границей и историческим классом файла.
+
+Superblock B — копия с `superblock_copy = 1`. Расхождение `page_size`/`page_count_max`/`instance_uuid`/`sync_mode`/`sync_mode_version` между копиями → `Corrupt`. При открытии побеждает копия с валидным CRC (при обеих — A).
 
 **Создание файла** (B-12) — строгая последовательность, один раз:
 
 ```
-1. open(path, O_CREAT|O_EXCL|O_RDWR, 0600) + fchmod(0600)   # только создание
-2. ftruncate(map_size); mmap(PROT_READ)
-3. записать superblock A и B (fields, CRC); pwrite, оба
-4. записать начальную meta в page 2:
+1. проверить существование пути (lstat): существует → AlreadyExists (ДО lock'а,
+   чтобы повторное создание не выглядело как Busy)
+2. open(path + ".lock", O_CREAT|O_RDWR, 0600) + flock(LOCK_EX|LOCK_NB) → Busy
+3. open(path, O_CREAT|O_EXCL|O_RDWR, 0600) + fchmod(0600)   # только создание
+4. ftruncate(map_size); mmap(PROT_READ)
+5. записать superblock A и B (fields, CRC, `sync_mode = CreateConfig.sync_mode`,
+     `sync_mode_version = 1`); pwrite, оба
+6. записать начальную meta в page 2:
      txnid = 1, durable_txn = 1, все корни 0,
      page_count_high_water = page_data_first, free_page_count = 0,
-     next_zone_seq = 1, meta_flags = 0
-5. записать страницы reader table (type 7, crc=0, все слоты 0)
-6. page 3 оставить нулевой (второй meta-слот невалиден)
-7. fdatasync(fd); fsync каталога
+     next_zone_seq = 1, meta_flags = 0, commit_unix_ns = created_unix_ns
+7. записать страницы reader table (type 7, crc=0, все слоты 0)
+8. page 3 оставить нулевой (второй meta-слот невалиден)
+9. fdatasync(fd); fsync каталога
 ```
 
-`durable_txn = 1` обязателен: иначе правило выбора meta (§13.7: `txnid ≤ durable_txn`) не находит ни одной валидной meta и свежий файл не открывается. **Первый пользовательский коммит — `txnid = 2`.**
+**`commit_unix_ns` начальной meta равен `created_unix_ns`** (а не 0): время создания — единственная осмысленная метка для initial-состояния; 0 означал бы «никогда не коммитили» и ломал бы эвристику §13.7 шаг 11.
+
+`durable_txn = 1` начальной meta даёт `durable_watermark = 1`: recovery берёт самую новую валидную meta (§13.7), поэтому свежий файл открывается. **Первый пользовательский коммит — `txnid = 2`.** Пока `durable_watermark = 1`, `reclaim_txn = min(0, oldest_reader_txn) = 0`: переиспользование страниц невозможно; для `Flush`/`Memory` это означает обязательный периодический `sync()` (§13.6, §16).
 
 **Отказы при создании (R-20).** Частично созданный файл не восстанавливается и не открывается; удаляет его **создатель** (`ZoneFile::create`), а не `open`:
 
 | Момент | Ошибка | Кто удаляет файл |
 |---|---|---|
-| шаг 1–2 (создание/`ftruncate`) | `MapAllocFailed` / `Io` | создатель (файл мог не появиться — удаление best-effort) |
-| шаг 3–5 (superblock/meta/reader) | `Io` | создатель |
-| шаг 7 (`fdatasync`/`fsync`) | `Io` | создатель |
-| `open()` на существующем частичном файле | `CorruptNoValidMeta` / `BadReaderRegion` / `TruncatedFile` | **никто** — `open` read-only по контракту, файл остаётся для диагностики |
+| шаг 1 (путь существует) | `AlreadyExists` | — (ничего не создано, lock не берётся) |
+| шаг 2 (lock занят) | `Busy` | lock-файл не удаляется (владелец — другой процесс) |
+| шаг 3–4 (создание/`ftruncate`) | `MapAllocFailed` / `Io` | создатель: закрыть fd, `unlink(path)` (best-effort), затем отпустить и `unlink` `<zonefile>.lock` |
+| шаг 5–8 (superblock/meta/reader) | `Io` | создатель: то же (файл + lock-файл) |
+| шаг 9 (`fdatasync`/`fsync`) | `Io` | создатель: то же |
+| `open()` на существующем частичном файле | `CorruptNoValidMeta` / `BadReaderRegion` / `TruncatedFile` | **никто** — `open` не удаляет и не «дочинивает» (SEC-ZF-011) |
 
-`open()` никогда не удаляет и не «дочинивает» файл (SEC-ZF-011); решение об удалении — только у администратора.
+**Очистка при отказе создания.** Ошибка на шагах 3–9 не должна оставлять ни частичный файл, ни lock-файл: создатель в обратном порядке `munmap` → `close` → `unlink(path)` → `flock(UN)` → `close(lock_fd)` → `unlink(lock)`. Если `unlink` не удался (нет прав/RO-ФС), исходная ошибка возвращается, а путь логируется — «осиротевший» частичный файл затем даёт `CorruptNoValidMeta`/`AlreadyExists` при следующей попытке, что диагностируемо. `open()` никогда не удаляет файл: решение — за администратором.
 
 ---
 
 ## 5. Meta-страница (page 2 и page 3)
 
-Собственная раскладка (не §7). Активна валидная с максимальным `txnid` при условии `txnid ≤ durable_txn` (§13.7).
+Собственная раскладка (не §7). Активна **самая новая валидная meta** (максимальный `txnid`, прошедшая проверку против superblock) — ограничение `txnid ≤ durable_txn` снято (§13.7). `durable_txn` в meta — per-meta значение; единый `durable_watermark` вычисляется как `max(min(durable_txn, txnid))` по валидным meta и используется для sticky/reclaim (§13.7, §14).
 
 | Смещение | Размер | Поле | Описание |
 |---|---|---|---|
@@ -317,7 +382,7 @@ Superblock B — копия с `superblock_copy = 1`. Расхождение `pa
 | +8 | 4 | `page_no` | 2 или 3 |
 | +12 | 4 | `crc32c` | CRC всей страницы, поле = 0 |
 | +16 | 8 | `txnid` | ≥ 1 |
-| +24 | 8 | `durable_txn` | ≤ `txnid`; см. §13.7 |
+| +24 | 8 | `durable_txn` | ≤ `txnid`; per-meta watermark: последняя meta, чьи данные **и** она сама были гарантированно на диске; может быть `< txnid` (Flush/Memory, §13.7). Агрегат по валидным метам — `durable_watermark` (§1, §13.7) |
 | +32 | 2 | `version_major` | 1 |
 | +34 | 2 | `version_minor` | 0 |
 | +36 | 4 | `page_size` | копия |
@@ -338,7 +403,7 @@ Superblock B — копия с `superblock_copy = 1`. Расхождение `pa
 | +96 | 8 | `total_rrsets` | |
 | +104 | 8 | `total_rrs` | |
 | +112 | 8 | `commit_unix_ns` | |
-| +120 | 8 | `reclaim_txn` | вычислен при коммите |
+| +120 | 8 | `reclaim_txn` | `min(durable_watermark − 1, oldest_reader_txn)` на момент коммита; 0 = переиспользование запрещено |
 | +128 | 4 | `next_zone_seq` | аллокатор `ZoneId` (§12.3) |
 | +132 | 4 | `name_dict_root` | 0 в v1 |
 | +136 | 4 | `changeset_log_root` | 0 в v1 |
@@ -349,7 +414,7 @@ Superblock B — копия с `superblock_copy = 1`. Расхождение `pa
 | +160 | 32 | `fsck_hint` | ASCIIZ |
 | +192 | … | `reserved` | нули до конца страницы |
 
-Валидация meta при чтении: `page_type`, `page_no == слот`, CRC, версия, `page_size`, `page_count_high_water ≤ page_count_max`, корни < `high_water` (или 0), `zone_dir_level ≤ MAX_TREE_DEPTH`, `freelist_entries ≤ page_count_high_water`, `durable_txn ≤ txnid`.
+Валидация meta при чтении: `page_type`, `page_no == слот`, CRC, версия, `page_size`, `page_count_high_water ≤ page_count_max`, корни < `high_water` (или 0), `zone_dir_level ≤ MAX_TREE_DEPTH`, `freelist_entries ≤ page_count_high_water`, `durable_txn ≤ txnid`, `reclaim_txn ≤ durable_txn`. `durable_txn < txnid` — **допустимое** состояние (unsynced tail после Flush/Memory), а не ошибка; recovery его не «исправляет» повышением `durable_txn`. `reclaim_txn` — advisory-значение коммита: при открытии он пересчитывается как `min(durable_watermark − 1, oldest_reader_txn)` и не является доверенным входом для выдачи страниц (§13.7).
 
 **Правило записи:** writer всегда пишет **неактивную** meta (младший `txnid`); активная не перезаписывается.
 
@@ -404,7 +469,7 @@ Superblock B — копия с `superblock_copy = 1`. Расхождение `pa
 
 | Роль | Механизм | Правило |
 |---|---|---|
-| writer | отдельный файл `<zonefile>.lock`: `O_CREAT|O_RDWR, 0600`, `flock(LOCK_EX|LOCK_NB)` | второй writer → `Busy`; lock снимается смертью процесса |
+| writer | отдельный файл `<zonefile>.lock`: `O_CREAT\|O_RDWR`, 0600, `O_NOFOLLOW`, `fstat` → regular-file, `flock(LOCK_EX\|LOCK_NB)` | второй writer → `Busy`; lock не regular → `NotRegularFile`; lock снимается смертью процесса |
 | reader | **никаких flock** | регистрируется только в reader table; не блокирует writer'а и не блокируется им |
 | внешний писатель | исключён правами (`0600`, каталог `0700`) + `O_NOFOLLOW` | `fstat`/`dev`/`ino` перед `mmap` |
 
@@ -414,16 +479,16 @@ Superblock B — копия с `superblock_copy = 1`. Расхождение `pa
 
 | Смещение | Размер | Поле | Описание |
 |---|---|---|---|
-| +0 | 8 | `owner_token` | 0 = свободен; `(pid<<32) | incarnation` |
+| +0 | 8 | `owner_token` | 0 = свободен; `(pid<<32) | incarnation`; `incarnation = 0` — «неизвестен» (probe `Unknown` при регистрации), не «мёртв» |
 | +8 | 8 | `active_txn` | 0 = не держит; иначе удерживаемый `txnid` |
 | +16 | 8 | `heartbeat_ns` | `CLOCK_MONOTONIC` |
 | +24 | 8 | `flags` | bit0 LONG_HOLD, bit1 IN_PROCESS |
 
-`incarnation` — `starttime` (поле 22 `/proc/<pid>/stat`), усечённое до u32.
+`incarnation` — `starttime` (поле 22 `/proc/<pid>/stat`), усечённое до u32. `0` зарезервирован как «неизвестен»: он не доказывает смерть PID и не даёт права вытеснять слот (§6.4.1).
 
 ### 6.3. Двухфазный пин (B-4) и жизненный цикл снапшота (R-4, R-5)
 
-Пиннинг выполняет **сам адаптер** при взятии снапшота: `ZoneFile::snapshot()` → `pin()`, `Drop` последнего держателя → `unpin()`. Пользователь (домен/сервер) не вызывает `pin`/`unpin` напрямую — это внутренние операции адаптера.
+Пиннинг выполняет **сам адаптер** при взятии снапшота: успешный `Reader::snapshot()` → `pin()`, `Drop` последнего держателя → `unpin()`. Пользователь (домен/сервер) не вызывает `pin`/`unpin` напрямую — это внутренние операции адаптера (`pub(crate)`), публично доступен только RAII-`Snapshot` (§20.3).
 
 Нормативная модель (refcount):
 
@@ -451,7 +516,7 @@ pin() -> Txn:
 unpin(): store(slot.active_txn, 0, Release)
 ```
 
-**Почему это корректно.** Пока `T` — активная meta, writer не может освободить страницы графа `T`: освобождение страниц, заменённых в `T+1`, требует `T+1 ≤ reclaim_txn ≤ oldest_reader_txn`, а `oldest_reader_txn ≤ txnid(active) = T < T+1` (пока `T` активна). Если за время между фазами 1 и 2 meta продвинулась, читатель откатывается и повторяет — и **до** успешной проверки не читает ни одной страницы данных. После успешной проверки `slot.active_txn = T` гарантирует, что любой следующий коммит увидит `oldest_reader_txn ≤ T` и не тронет граф `T`.
+**Почему это корректно.** Пока `T` — активная meta, writer не может освободить страницы графа `T`: освобождение страниц, заменённых в `T+1`, требует `T+1 ≤ oldest_reader_txn`, но `oldest_reader_txn ≤ txnid(active) = T < T+1` (пока `T` активна). Строгая граница по `durable_watermark` добавляет независимую защиту от отката recovery и здесь не ослабляет правило. Если за время между фазами 1 и 2 meta продвинулась, читатель откатывается и повторяет — и **до** успешной проверки не читает ни одной страницы данных. После успешной проверки `slot.active_txn = T` гарантирует, что любой следующий коммит увидит `oldest_reader_txn ≤ T` и не тронет граф `T`.
 
 Refcount-вариант (для вложенных снапшотов в одном потоке): на поток — 2–4 слота; `pin` занимает любой свободный слот потока; `unpin` освобождает. Требование «один писатель `active_txn` на слот» сохраняется (слот принадлежит одному потоку).
 
@@ -462,16 +527,48 @@ Refcount-вариант (для вложенных снапшотов в одн�
 | Регистрация | CAS `owner_token: 0 → token`; слоты распределяются по потокам; нет свободных → `TooManyReaders` |
 | Dereg | `active_txn = 0`, затем `owner_token = 0` (порядок обязателен) |
 | Heartbeat | раз в 1 с `store_relaxed(heartbeat_ns, now)` |
-| Вытеснение | **только** если PID мёртв **или** `incarnation` не совпадает. Живой PID с совпадающим `incarnation` не вытесняется **никогда** (SEC-ZF-007) |
+| Вытеснение | **только** если PID мёртв **или** `incarnation` не совпадает **и известен (`≠ 0`)**. Живой PID с совпадающим `incarnation` не вытесняется **никогда** (SEC-ZF-007). `incarnation = 0` (probe вернул `Unknown` при регистрации) — «неизвестен», трактуется как живой, не вытесняется, `NEEDS_FSCK`. `ProcessProbe::Unknown` (EACCES/parse error/`/proc` недоступен) — также живой, не вытесняется (§6.4.1) |
 | `heartbeat` старше `STALE_READER_TIMEOUT_MS` | вытеснения нет; это только диагностика: метрика `readers_stalled`, событие `ReadersStalled`, предупреждение для `LONG_HOLD`-слотов |
 | `LONG_HOLD` | снимается только смертью процесса; влияет на диагностику (порог предупреждения), не на вытеснение |
+
+#### 6.4.1. Проверка процесса: `ProcessProbe`
+
+Вытеснение слота требует ответа «процесс мёртв», а не «не удалось проверить». Поэтому probe трёхзначен и вынесен за тестируемую абстракцию (в тестах подменяется без `/proc`):
+
+```rust
+pub(crate) trait ProcessProbe {
+    /// Liveness и incarnation для PID. Ошибки чтения не маскируются под смерть.
+    fn probe(&self, pid: u32) -> ProcStatus;
+}
+
+pub(crate) enum ProcStatus {
+    Alive { incarnation: u32 },   // /proc/<pid>/stat прочитан, starttime получен
+    Dead,                          // ENOENT/ESRCH: PID не существует
+    Unknown { errno: i32 },        // EACCES/EPERM, parse error, таймаут, /proc недоступен
+}
+```
+
+| `ProcStatus` | Действие |
+|---|---|
+| `Alive { incarnation }` и `incarnation` совпадает с `owner_token` | слот принадлежит живому читателю; **не вытесняется** (§6.4/SEC-ZF-007) |
+| `Alive { incarnation }`, но `incarnation` не совпадает | PID переиспользован → слот мёртв: очистить и **всегда** `NEEDS_FSCK` (§13.7 шаг 9) |
+| `Dead` | слот мёртв: очистить и **всегда** `NEEDS_FSCK` |
+| `incarnation` слота `= 0` (неизвестен) | трактуется как живой: **не вытеснять**, `NEEDS_FSCK` (нельзя доказать ни жизнь, ни смерть); `active_txn` сохраняется, метрика `process_probe_unknown_total`. Проверка `incarnation = 0` выполняется **до** сравнения с probe |
+| `Unknown` | считать **живым**, не вытеснять, выставить `NEEDS_FSCK` (safe > available); метрика `process_probe_unknown_total` |
+
+Правило «ENOENT → `Dead`» относится к **конкретному** PID. Если недоступен сам `/proc` (нет каталога/точки монтирования), это `Unknown` для всех PID, а не массовая смерть: probe обязан различать «PID нет» и «/proc нет». Внутрипроцессные слоты (`flags.IN_PROCESS`) проверяются по in-process реестру потоков; `/proc` для них — только источник `incarnation` и fallback-диагностика. Тесты используют `MockProcessProbe` (Alive/Dead/Unknown/incarnation-mismatch/parse-error) — `/proc` в тестах не требуется.
+
+Слот с `incarnation = 0` **никогда** не вытесняется по несовпадению: `0` означает «при регистрации probe не дал incarnation» (`Dead`/`Unknown`), а не «умер». Если probe позже отвечает `Alive { incarnation: x ≠ 0 }`, это не доказывает переиспользование PID — слот остаётся живым, выставляется `NEEDS_FSCK`, `active_txn` сохраняется.
+
+`Unknown` **не** даёт права освободить страницы: слот продолжает удерживать `active_txn`, writer может дойти до `NoSpace`/`ReadersStalled` — это диагностируемое состояние, а не повод для вытеснения.
+
 
 `oldest_reader_txn` = минимум `active_txn` по слотам, где **`owner_token ≠ 0` И `active_txn ≠ 0`**.
 
 - Слот с `active_txn = 0` **никогда не считается читателем**: 0 означает «пин не взят» (простой потока, откат двухфазного пина §6.3, окно между `dereg`-записями). Включение такого слота в минимум дало бы `oldest_reader_txn = 0` → `reclaim_txn = 0` → переиспользование невозможно → ложный `NoSpace`/`MapFull`.
 - Если подходящих слотов нет — **читателей нет**, и берётся `txnid(active)` (консервативный запас: страницы, освобождённые текущей транзакцией, всё равно не выдаются — §11.7 п.3).
 
-`reclaim_txn = min(durable_txn, oldest_reader_txn)`.
+`reclaim_txn = min(durable_watermark − 1, oldest_reader_txn)`. При `durable_watermark = 1` это 0: freelist не отдаёт ничего, пока не выполнен первый `sync()`/`Sync` (§13.6, §14).
 
 **Worked example (B-1).** 1024 слота, на поток до 4:
 
@@ -724,6 +821,8 @@ node_predecessor(page, k) -> Option<usize>  # последний i: key[i] <= k
 payload = { u16 rdlength; u8 rdata[rdlength] } * rr_count
 ```
 
+**Порядок байт.** `rdlength` — **big-endian** (DNS wire, как в самом сообщении); `rdata[]` — opaque wire-байты. Поля страницы (`LeafValue.rdlen`, `rr_count`, `ttl`, `val_u32`) — **little-endian** (§1). Это разные поля: `LeafValue.rdlen` — суммарная длина RDATA набора (LE), `payload`-`rdlength` — длина одного RR (BE).
+
 Инварианты: `0 ≤ rdlength ≤ MAX_RDLENGTH (65535)` (u16 — предел протокола; 0 допустим для типов, где это законно); `sum(rdlength) == rdlen`; `payload_bytes = rdlen + 2*rr_count ≤ MAX_RRSET_PAYLOAD`; RR отсортированы по каноническому RDATA (RFC 4034 §6.3); `kind=INLINE` ⟺ `payload_bytes ≤ INLINE_VALUE_MAX` **и** item целиком влезает в страницу (иначе OVERFLOW); `kind=NODE` ⟺ ключ `T_NODE`, `rr_count=rdlen=0`, `ttl=0`.
 
 ### 11.3. Флаги
@@ -763,7 +862,7 @@ payload = { u16 rdlength; u8 rdata[rdlength] } * rr_count
 payload = { u16 rdlength; u8 rdata[rdlength] } * rr_count
 ```
 
-нарезанные последовательно: страница 1 несёт первые `data_len` байт, страница 2 — следующие и т.д. Разрыв может проходить внутри `rdlength`, внутри `rdata`, между RR — это норма.
+нарезанные последовательно: страница 1 несёт первые `data_len` байт, страница 2 — следующие и т.д. Разрыв может проходить внутри `rdlength`, внутри `rdata`, между RR — это норма. `rdlength` внутри потока — **big-endian** (DNS wire), как в §11.2; `data_len`/`next_page` — LE поля страницы.
 
 Инварианты:
 
@@ -838,20 +937,20 @@ Bucket-страница (`PAGE_TYPE_FREELIST`, `payload_len = 64 + 4*count`):
 
 **Правила.**
 
-1. **Порядок.** `free_txn` монотонно возрастает вдоль списка (инвариант; проверяется `fsck`). Новый bucket добавляется в **хвост** за O(1) (`freelist_tail`).
-2. **Выдача.** Аллокатор идёт от головы и берёт страницы только из bucket'ов с `free_txn ≤ reclaim_txn` **и** `free_txn < current_txn`. Так как список отсортирован, при первом «слишком молодом» bucket'е обход прекращается — стоимость O(число отданных страниц), не O(длина списка).
-3. **Запрет выдачи в той же транзакции (двойное освобождение).** Страницы, освобождённые в txn `T`, попадают в bucket с `free_txn = T` и в txn `T` не выдаются никогда. Причина: они ещё достижимы из `meta(T-1)`, а `reclaim_txn ≤ T-1` до публикации `T`. Нарушение этого правила — единственный способ получить страницу, на которую ссылаются два места (I-10). `fsck` проверяет: нет `PageId` в двух bucket'ах, нет `PageId` одновременно в freelist и в графе.
+1. **Порядок.** `free_txn` монотонно возрастает вдоль списка (инвариант; проверяется `fsck`) и всегда `free_txn ≥ 2`: txn 1 — initial-состояние, страниц не освобождает; bucket с `free_txn < 2` — `Corrupt`. Новый bucket добавляется в **хвост** за O(1) (`freelist_tail`).
+2. **Выдача.** Аллокатор идёт от головы и берёт страницы только из bucket'ов с `free_txn ≤ reclaim_txn`, где `reclaim_txn = min(durable_watermark − 1, oldest_reader_txn)`, **и** `free_txn < current_txn`. Иначе говоря: `free_txn < durable_watermark` **и** `free_txn ≤ oldest_reader_txn`. Так как список отсортирован, при первом «слишком молодом» bucket'е обход прекращается — стоимость O(число отданных страниц), не O(длина списка). Строгость по `durable_watermark` обязательна: худшая восстановимая meta — `durable_watermark−1`, поэтому страницы, освобождённые в `durable_watermark`, ещё достижимы из неё. `durable_watermark` **не понижается** recovery/приёмом `Flush`-meta (§14) и не берётся из одной выбранной meta: иначе страницы с `free_txn ≥ durable_watermark` стали бы доступны, и откат после потери meta прочитал бы перезаписанные данные.
+3. **Запрет выдачи в той же транзакции (двойное освобождение).** Страницы, освобождённые в txn `T`, попадают в bucket с `free_txn = T` и в txn `T` не выдаются никогда (`free_txn < current_txn`). Причина: они ещё достижимы из `meta(T-1)`, а recovery может выбрать `T-1` или новее. Нарушение этого правила — единственный способ получить страницу, на которую ссылаются два места (I-10). `fsck` проверяет: нет `PageId` в двух bucket'ах, нет `PageId` одновременно в freelist и в графе.
 4. **Bucket-страницы неизменяемы: только COW (N-5).** Bucket, достижимый из активной meta, **никогда не мутируется на месте** — иначе читатель/восстановление увидят freelist, не соответствующий своей meta. Любая выдача из bucket `B` (и любое добавление) порождает новую страницу-образ:
 
    - пусть из `B` берётся `k` страниц. Пишется новый bucket `B'` (`free_txn = B.free_txn`, `count = B.count − k`, оставшиеся `page_ids`) в **свободную страницу** `p`; `val`-указатель головы/соседа переключается на `B'` при коммите.
    - `B` (старый образ) отправляется в набор «освобождено в текущей транзакции» и попадёт в bucket с `free_txn = T` (см. п. 5). Так он не теряется и не становится недостижимым.
    - если `B` опустел (`count == k`), новый образ не пишется: `B` просто уходит в набор освобождённых, а указатель соседа/головы снимается. Поэтому **пустых bucket'ов в цепочке не существует**.
-   - откуда взять `p` (единый порядок, как в п. 7): (1) **eligible**-страница — та, что уже разрешена к выдаче (`free_txn ≤ reclaim_txn`), тогда `high_water` не растёт; (2) иначе `high_water`; (3) если исчерпан и он — одна из `k` выдаваемых страниц (`p` не возвращается вызывающему: он стал bucket-страницей). Рекурсия «чтобы освободить страницу, нужна страница» исключена: `p` либо свободная, либо новая, либо уже отдаваемая. Если `p` взята из **другого** bucket'а (не из `B`), тот тоже получает COW-образ — итого 0–2 образа на проход выдачи; это учтено в оценке п. 5.
+   - откуда взять `p` (единый порядок, как в п. 7): (1) **eligible**-страница — та, что уже разрешена к выдаче (`free_txn ≤ reclaim_txn`, см. п. 2), тогда `high_water` не растёт; (2) иначе `high_water`; (3) если исчерпан и он — одна из `k` выдаваемых страниц (`p` не возвращается вызывающему: он стал bucket-страницей). Рекурсия «чтобы освободить страницу, нужна страница» исключена: `p` либо свободная, либо новая, либо уже отдаваемая. Если `p` взята из **другого** bucket'а (не из `B`), тот тоже получает COW-образ — итого 0–2 образа на проход выдачи; это учтено в оценке п. 5.
 
    **Инвариант отсутствия сирот:** каждая bucket-страница либо достижима из `meta` по цепочке `next_bucket`, либо лежит в `page_ids` некоторого bucket'а этой же цепочки (то есть «свободна как данные»), либо является образом, который будет записан в текущем коммите. Третьего состояния нет: старый образ `B` всегда попадает в набор освобождённых того же коммита, а набор освобождённых всегда конвертируется в bucket до записи meta (§13.6). `fsck` проверяет: множества {bucket-страницы} и {page_ids} не пересекаются с графом данных и не теряют ни одной страницы из `page_count_high_water`.
 5. **Стоимость коммита O(depth).** Все страницы, освобождённые транзакцией `T` (включая старые образы bucket'ов), собираются в **один** новый bucket и добавляются в хвост — амортизированно O(1), без обхода списка. Выдача страниц внутри транзакции даёт 0–1 COW-образ на затронутый bucket (обычно один и тот же, пока он не опустеет). Размер списка не влияет на латентность коммита.
 6. **Слияние bucket'ов запрещено**: слияние потребовало бы перезаписи `free_txn`, что ломает инвариант порядка и COW-семантику.
-7. **Следствие «+1 страница на коммит с освобождениями».** Каждому коммиту, который что-то освободил, нужна одна страница под образ нового bucket'а. Она берётся в порядке п. 4: сначала **eligible**-страница (тогда `high_water` не растёт), иначе `high_water` — и это `+1` к файлу. Такая страница становится доступной как данные только после того, как её `free_txn` перестанет быть «молодым» (следующие коммиты), — то есть `high_water` монотонно растёт на «холодном» старте и после всплесков удалений. Возврат в оборот: `compact_zone` (или offline `zonefile compact`) пересобирает freelist и обнуляет этот запас; на стабильной нагрузке число bucket-страниц ограничено непустыми bucket'ами (§11.7 п.4) и не растёт.
+7. **Следствие «+1 страница на коммит с освобождениями».** Каждому коммиту, который что-то освободил, нужна одна страница под образ нового bucket'а. Она берётся в порядке п. 4: сначала **eligible**-страница (тогда `high_water` не растёт), иначе `high_water` — и это `+1` к файлу. Такая страница становится доступной как данные только после того, как её `free_txn` перестанет быть «молодой»: нужно `free_txn < durable_watermark` и `free_txn ≤ oldest_reader_txn`, то есть обычно ещё один-два успешных `Sync`/`sync()` (строгая граница `durable_watermark−1` добавляет один коммит задержки). На «холодном» старте и после всплесков удалений `high_water` растёт; возврат в оборот: `compact_zone` (или offline `zonefile compact`) пересобирает freelist и обнуляет этот запас; на стабильной нагрузке число bucket-страниц ограничено непустыми bucket'ами (§11.7 п.4) и не растёт.
 8. **`free_page_count`** в meta = `freelist_entries` (включая «молодые»); для метрики «сколько реально доступно сейчас» используется производная `reclaim_txn` (считается при коммите).
 
 ---
@@ -923,7 +1022,7 @@ Bucket-страница (`PAGE_TYPE_FREELIST`, `payload_len = 64 + 4*count`):
 | inline | `80 + upstream_bytes ≤ page_size` (4016 байт данных при `page_size=4096`, 8112 при 8192) |
 | overflow | байтовая цепочка, `upstream_bytes ≤ MAX_FORWARD_BLOB = 4096`, `upstream_total == upstream_bytes` |
 | предел блока | `MAX_ZONE_META = 256 KiB` — логический потолок; сегодня блок занимает `80 + upstream_bytes` (≤ 4176), остальное зарезервировано под будущие поля и большие наборы |
-| страниц в цепочке | `ceil(upstream_bytes / (page_size − 48))`; при 4096 это 2 (4048·2 = 8096 ≥ 4096), при 8192/16384 — 1 |
+| страниц в цепочке | `ceil(upstream_bytes / (page_size − 48))`; при 4096 это 2 (4048·2 = 8096 ≥ 4096), при 8192/16384 — 1. Предел блока — `max_zone_meta_pages(page_size)` = `ceil(MAX_ZONE_META / (page_size − 48))` → 65/33/17 |
 | записей | формат: ≤ `MAX_FORWARD_UPSTREAMS = 32`; домен (`domain-model` §2.7, §5.2.2) допускает ≤ 16 — writer обязан отклонять > 16 по intents, формат терпит до 32 ради будущего расширения без смены версии |
 
 **Почему `MAX_ZONE_META = 256 KiB` не конфликтует с лимитами страниц.** 256 KiB — это верхняя граница *логического* размера блока (для будущих полей и больших upstream-наборов), а не требование уместить 256 KiB в цепочку из `MAX_OVERFLOW_PAGES = 64`. Если блок когда-либо достигнет 256 KiB, ему понадобится `ceil(262144/(page_size−48))` = 65 страниц при 4096 (33 при 8192, 17 при 16384). Поэтому для цепочек `ZONE_META` действует отдельный лимит `MAX_ZONE_META_PAGES` (§2), а `MAX_OVERFLOW_PAGES = 64` остаётся только для RRset. Расчёт: 65 > 64 — вот почему нельзя было обойтись общим лимитом; это зафиксировано явно, а не «подогнано».
@@ -992,8 +1091,11 @@ Bucket-страница (`PAGE_TYPE_FREELIST`, `payload_len = 64 + 4*count`):
 
 ```
 open(path, cfg):
-  1. open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC); fstat → обычный файл, owner/mode/uid (§21.4)
-  2. read 4096 @0 и @page_size → superblock A/B; валидировать (magic/version/page_size/CRC)
+  1. open(path, O_RDWR|O_NOFOLLOW|O_CLOEXEC); fstat → обычный файл, owner/mode/uid (§21.4).
+     O_RDWR нужен и читателю: он пишет слоты в writable reader-table (§6.1), поэтому
+     **у читателя должны быть права на запись в файл**; данные/деревья всё равно
+     маппятся PROT_READ и через этот дескриптор не пишутся
+  2. read 4096 @0 и @page_size → superblock A/B; валидировать (magic/version/page_size/CRC/sync_mode §4.1)
   3. валидировать регион reader table: off % 64 == 0,
      pages == ceil(1024*32/(page_size-32)), len == pages*page_size,
      off + len <= page_count_max*page_size
@@ -1009,7 +1111,7 @@ open(path, cfg):
      — единственный writable-маппинг (SEC-ZF-014); неудача → MapAllocFailed
   9. валидировать каждую страницу региона: page_type=7, page_no, slots_used_in_page, crc=0
  10. выбрать meta (§13.7); валидировать поля
- 11. зарегистрировать слот(ы) читателя (CAS в reader table, §6.4)
+ 11. слоты читателя здесь НЕ занимаются: регистрация ленивая, при первом `snapshot()` (§6.3)
  12. построить ZoneIndex (O(Z*depth))
 ```
 
@@ -1139,69 +1241,174 @@ fill(page)    = content(page) / usable
 ### 13.6. Коммит, `sync()`, group commit (B-12)
 
 ```
-commit(mode):        # mode ∈ {NOSYNC=0, NOMETASYNC=1, SYNC=2}
-  1. инварианты в памяти: порядок ключей, нет дублей PageId в dirty-set,
+commit(mode):        # runtime mode ∈ {NOSYNC=0, NOMETASYNC=1, SYNC=2} (MODE_* §2;
+                     #  это НЕ disk-коды sync_mode §4.1 — см. таблицу соответствия)
+  1. floor = max_class(superblock.sync_mode,
+                       if durable_watermark > 1 { Sync } else { superblock.sync_mode })
+     проверить: mode не слабее floor (класс durability: Memory < Flush < Sync;
+     числовые коды MODE_* и disk-коды §4.1 НЕ сравнивать напрямую — они инвертированы),
+     иначе InvariantViolation(DurabilityBelowFileMode) (§4.1, §15 F-12)
+  2. инварианты в памяти: порядок ключей, нет дублей PageId в dirty-set,
      overflow-цепочки замкнуты, depth ≤ MAX, encoded_size ≤ page_size
-  2. собрать набор освобождённых страниц (заменённые/удалённые + старые образы
+  3. собрать набор освобождённых страниц (заменённые/удалённые + старые образы
      bucket'ов из §11.7) в ОДИН новый bucket с free_txn = txnid+1; bucket — часть
      dirty-set (N-4). Обновить freelist_head/tail/buckets/entries/free_page_count
      в НОВОМ образе meta (не в текущей).
-  3. заполнить PageHeader каждой dirty-страницы (page_no, txn, lsn, crc, payload_len)
-  4. pwritev(dirty, включая bucket) — целыми страницами, батчами ≤ 64
-  5. if mode >= NOMETASYNC: fdatasync(fd)          # данные ДО любой meta
-  6. durable' = if mode >= NOMETASYNC then txnid else durable_txn
-  7. write(meta, неактивный слот): txnid+1, все корни (вкл. новый freelist),
-     durable_txn = durable', reclaim_txn = min(durable', oldest_reader_txn),
+  4. заполнить PageHeader каждой dirty-страницы (page_no, txn, lsn, crc, payload_len)
+  5. pwritev(dirty, включая bucket) — целыми страницами, батчами ≤ 64
+  6. if mode >= NOMETASYNC: fdatasync(fd)          # данные ДО любой meta
+  7. durable_watermark' = if mode == SYNC then txnid+1 else durable_watermark
+     # Sync:  новая meta становится durable-водоразделом (txnid+1)
+     # Flush: данные fsync'нуты, но meta — нет; watermark НЕ двигается
+     # Memory: ни данные, ни meta не форсируются; watermark НЕ двигается
+  8. write(meta, неактивный слот): txnid+1, все корни (вкл. новый freelist),
+     durable_txn = durable_watermark', reclaim_txn = min(durable_watermark' − 1, oldest_reader_txn),
      page_count_high_water, счётчики
-  8. if mode == SYNC: fdatasync(fd)
-  9. fence(Release); publish(active_txn = txnid+1)
- 10. CommitOutcome { commit_id, ... }
+  9. if mode == SYNC: fdatasync(fd)
+ 10. fence(Release); publish(active_txn = txnid+1)
+ 11. CommitOutcome { commit_id, ... }
 ```
+
+**`durable_watermark' = txnid+1`, а не `txnid`.** Новая meta описывает **свой** коммит `txnid+1`; в `Sync` она и есть последняя гарантированно записанная meta. В `Flush` `durable_watermark` остаётся на последнем `Sync`/`sync()`: meta не fsync'нута, поэтому объявлять её durable нельзя. Именно это удерживает watermark переиспользования страниц ниже неподтверждённой meta (§14) и делает откат после потери meta безопасным.
+
+**Липкий режим.** Если `durable_watermark > 1`, шаг 1 требует `mode = Sync`; коммит `Flush`/`Memory` отклоняется `DurabilityBelowFileMode`, даже если `superblock.sync_mode` — `Flush`/`Memory`. Это защищает подтверждённый `Sync` от затирания durable-слота слабыми метами (§4.1 п. 6, §15 F-12).
 
 **Почему bucket формируется до записи meta (N-4).** Страницы, освобождённые транзакцией, должны быть достижимы из **новой** meta — иначе после публикации они не принадлежат ни графу, ни freelist (нарушение I-11/W-9 и утечка на каждом удалении). Поэтому bucket входит в тот же `pwritev`, что и данные, а `freelist_head/entries` пишутся в новую meta; старая meta продолжает указывать на старую цепочку, где этих страниц ещё нет — и это корректно, поскольку старая meta их всё ещё использует как граф.
 
-**Group commit.** `fdatasync` шага 5 может покрывать данные нескольких готовых коммитов; порядок диапазонов не важен, но **все** диапазоны данных синхронизируются до записи **любой** meta. Затем metas пишутся по возрастанию `txnid`. Каждая meta самодостаточна (§I-12), поэтому восстановление не зависит от порядка их записи.
+**Group commit.** `fdatasync` шага 6 может покрывать данные нескольких готовых коммитов; порядок диапазонов не важен, но **все** диапазоны данных синхронизируются до записи **любой** meta. Затем metas пишутся по возрастанию `txnid`. Каждая meta самодостаточна (§I-12), поэтому восстановление не зависит от порядка их записи.
 
-**`sync()`** (обязателен в `NOSYNC`):
+**`sync()`** (обязателен для прогресса в `Flush` и `Memory`):
 
 ```
 sync():
   1. fdatasync(fd) по всем данным, записанным с прошлого sync/коммита
-  2. write(неактивная meta, txnid+1, те же корни, durable_txn = txnid+1)
+  2. write(неактивная meta, txnid+1, те же корни, durable_txn = txnid+1,
+           reclaim_txn = min(txnid, oldest_reader_txn))
   3. fdatasync(fd)
-  4. publish(active_txn = txnid+1); durable_txn := txnid+1
+  4. publish(active_txn = txnid+1); durable_watermark := txnid+1
 ```
 
-Без `sync()` в `NOSYNC` `durable_txn` не растёт → `reclaim_txn` не растёт → freelist не отдаёт «молодые» страницы → возможен `MapFull` при живом свободном месте. Это осознанная цена режима и задокументирована в §15.
+`sync()` — единственный способ поднять `durable_watermark` в `Flush`/`Memory`. Пока он не вызван, `reclaim_txn` стоит на месте (при `durable_watermark = 1` — равен 0), freelist не отдаёт страницы с `free_txn ≥ durable_watermark`, и при исчерпании `high_water` коммит возвращает `NoSpace`/`MapFull` при живом свободном месте. Это осознанная цена: переиспользовать страницу выше последней fsync'нутой meta нельзя, иначе откат после потери meta прочитает перезаписанные данные (§14).
 
-**`MODE_NOSYNC` — экспериментальный и по умолчанию выключен** (`DEFAULT_SYNC_MODE = MODE_SYNC`). Он даёт защиту от **порчи** файла, но не от потери: правило восстановления (`txnid ≤ durable_txn`) откатывает состояние к последнему `sync()`, в том числе после падения процесса. Включается явным конфигом и помечается в `meta_flags.EXPERIMENTAL`.
+**`sync()` — односторонний чекпойнт.** Успешный `sync()` в `Flush`/`Memory`-файле делает `durable_watermark > 1`; с этого момента режим файла **навсегда** `Sync` (липко, §4.1 п. 6). Понижение до `Flush`/`Memory` невозможно (`DurabilityBelowFileMode`). Поэтому `sync()` не «бесплатная» расконсервация freelist: он поднимает класс durability файла.
+
+**Эксплуатационное требование (Flush/Memory).** Пока `durable_watermark = 1`, любая страница, освобождённая коммитом `F ≥ 2`, не может быть переиспользована (`F < 1` невозможно): файл только растёт, а power loss может оставить оба meta-слота невалидными (initial-meta затёрта слабыми коммитами). Поэтому writer обязан выполнять `sync()` периодически — не реже `SYNC_INTERVAL_MS` (§2) и/или при приближении к `MapFull`, а также перед graceful shutdown. Метрики: `durable_lag_txns = txnid(active) − durable_watermark` (должна быть ограничена; при `durable_watermark = 1` и ненулевом `durable_lag_txns` — алерт), `freelist_eligible_pages` (страницы с `free_txn ≤ reclaim_txn`; ноль при живом свободном месте — сигнал вызвать `sync()`), `no_space_total`, `sync_total`. Для `Sync`-файла `durable_lag_txns` всегда 0 после успешного коммита.
+
+**`Flush` (MODE_NOMETASYNC) — «переживает рестарт процесса, не гарантирует power loss».** Режим применим только до первого `sync()` (`durable_watermark = 1`): после него липкий режим требует `Sync` (§4.1 п. 6). Данные fsync'нуты до записи meta, поэтому после падения процесса (`kill -9`) вся page cache цела: recovery выбирает самую новую валидную meta `T > durable_watermark`, принимает её с `recovered_unsynced = true` и **без** `NEEDS_FSCK` — `reclaim_txn = 0`, страницы не переиспользовались, граф `T` цел. При потере питания meta `T` могла не долететь на диск: recovery откатывается к последней **долетевшей** валидной meta (не ниже `durable_watermark`), данные выбранной meta fsync'нуты, файл валиден; теряются только коммиты, чья meta не долетела. Битый/пустой второй слот — штатный `torn_meta`; `NEEDS_FSCK` — только если у битого слота читаемый `txnid` больше выбранного (§13.7 шаг 5). Гарантия `Flush` — «подтверждённый коммит виден после рестарта процесса»; durability после power loss даёт только `Sync`/`sync()`.
+
+**`Memory` (MODE_NOSYNC) — экспериментальный и по умолчанию выключен** (`DEFAULT_SYNC_MODE = MODE_SYNC`). Ни данные, ни meta не форсируются; ядро вправе записать meta раньше данных, поэтому после power loss валидная meta `T > durable_watermark` **может ссылаться на отсутствующие данные**. Recovery сначала пытается открыть самую новую валидную meta с `txnid ≤ durable_watermark` (чисто, без fsck): теряются только неподтверждённые Memory-коммиты. Если такой meta нет — без `allow_unsynced_memory_recovery` отказ `UnsyncedMemoryRecovery { txnid, durable_txn: durable_watermark }` (файл не меняется, `NEEDS_FSCK` не выставляется); с флагом — принимается max-valid, `NEEDS_FSCK`, файл **read-only до offline fsck** и ленивые проверки на каждом чтении (§13.7). Даже падение процесса не даёт гарантии: recovery не отличает его от power loss и применяет ту же политику. Режим помечается `meta_flags.EXPERIMENTAL`.
 
 ### 13.7. Восстановление (B-12)
 
 ```
 recover():
-  1. superblock A/B → конфигурация; иначе Corrupt
-  2. прочитать обе meta; валидные = CRC + page_no + версия + page_size
-  3. D = max(meta.durable_txn) по валидным метам; если нет валидных → CorruptNoValidMeta
-  4. candidates = валидные meta с txnid <= D; если пусто → CorruptNoValidMeta
-  5. active = max(candidates, by txnid)        # НЕ просто max valid txnid
-  6. durable_txn = min(active.durable_txn, active.txnid)
-  7. проверить high_water, границы корней, reader region
-  8. санитизировать reader table (только мёртвые PID / несовпадение incarnation)
-  9. если meta_flags.NEEDS_FSCK или durable_txn < txnid(active): выставить NEEDS_FSCK
-     (диагностика; режим sync в файле не хранится и на восстановление не влияет)
- 10. ОТКАТ НА INITIAL META: если active.txnid == 1 (initial-состояние), а
+  1. superblock A/B → конфигурация; проверить sync_mode/sync_mode_version (§4.1),
+     A/B должны совпадать; mode > 2 или расхождение → Corrupt,
+     version ∉ {0,1} → UnsupportedVersion
+  2. прочитать обе meta; структурно валидные = CRC + page_no + версия + page_size.
+     Валидные кандидаты = структурно валидные И прошедшие проверку против
+     superblock (high_water, корни, reader region). Meta, прошедшая CRC, но не
+     superblock, в кандидаты и в watermark НЕ входит; её txnid запоминается
+     только для политики шага 5 (диагностика, не выбор).
+     durable_watermark = max по валидным кандидатам от min(durable_txn, txnid)
+  3. если валидных кандидатов нет → CorruptNoValidMeta
+  4. active = валидная meta с МАКСИМАЛЬНЫМ txnid    # не «txnid <= durable_txn»
+     tie-break при равных txnid: больший номер слота (B, page 3)
+     Равные txnid с разными корнями/счётчиками → NEEDS_FSCK.
+  5. torn/невалидная meta (диагностика `torn_meta`):
+     - слот пуст (все нули) → норма, если он никогда не записывался
+       (initial-файл); иначе — аномалия → NEEDS_FSCK;
+     - одна meta невалидна, вторая валидна → ШТАТНЫЙ крах: torn_meta = true,
+       NEEDS_FSCK НЕ выставляется; выбирается валидная;
+     - исключение: у невалидного слота поле txnid декодируется (≥1) и
+       txnid > active.txnid → NEEDS_FSCK (нельзя доказать, что потерянный
+       коммит был неподтверждённым);
+     - невалидный слот с txnid <= active.txnid или с нечитаемым txnid →
+       только диагностика (torn-запись не несёт информации о коммите);
+     - обе meta невалидны → CorruptNoValidMeta (шаг 3).
+     Если сама active не проходит финальную проверку границ/high_water/reader
+     region → Corrupt (fail-closed), без отката на более старую meta.
+  6. durable_watermark уже вычислен на шаге 2.
+     если active.durable_txn < durable_watermark:
+        NEEDS_FSCK, write_locked = true   # нарушение монотонности, W-10
+        # read-only до offline fsck; не тихое принятие
+     recovered_unsynced = active.txnid > durable_watermark
+     durable_watermark НЕ понижается до active.durable_txn: это watermark §14.
+  7. политика по recovered_unsynced и ЭФФЕКТИВНОМУ режиму
+     mode = superblock.sync_mode.effective_mode(durable_watermark)
+     (§4.1 п.6: после durable_watermark > 1 файл липко Sync; сырой sync_mode
+     здесь неприменим — иначе Memory-файл после sync() ушёл бы в opt-in-ветку):
+     - mode ∈ {Sync, Flush}: принять meta; если recovered_unsynced = true —
+       только диагностика, NEEDS_FSCK из этого факта НЕ выставляется (данные
+       fsync'нуты до meta; free_txn >= durable_watermark не переиспользовались);
+       W-10/NEEDS_FSCK с шага 6 не снимается;
+     - mode == Memory и recovered_unsynced:
+       a. найти самую новую валидную meta с txnid <= durable_watermark.
+          Если найдена:
+            active = fallback; memory_tail_discarded = true;
+            если fallback.durable_txn < durable_watermark →
+              NEEDS_FSCK, write_locked = true (W-10, не «чисто»);
+            иначе — чисто: NEEDS_FSCK не выставляется, recovered_unsynced = false;
+            теряются только неподтверждённые Memory-коммиты;
+       b. иначе (подтверждённой meta нет):
+          allow_unsynced_memory_recovery = false → отказ
+            UnsyncedMemoryRecovery { txnid, durable_txn: durable_watermark },
+            файл не меняется;
+          true → принять max-valid, NEEDS_FSCK, write_locked = true,
+            READ-ONLY до offline fsck;
+            ленивые проверки на каждом чтении: page.txn <= snapshot.txnid,
+            CRC, границы, payload_len; freelist НЕ использовать для выдачи.
+     - Memory и !recovered_unsynced: принять, если W-10 с шага 6 не сработал;
+       иначе остаётся NEEDS_FSCK + read-only.
+  8. проверить high_water, границы корней, reader region активной meta
+  9. санитизировать reader table по политике ниже (fail-closed для живого читателя;
+     мёртвый PID/incarnation mismatch (incarnation ≠ 0) → очистка и ВСЕГДА NEEDS_FSCK;
+     incarnation = 0 → считать живым, не вытеснять, NEEDS_FSCK;
+     ProcessProbe::Unknown → считать живым, не вытеснять, NEEDS_FSCK)
+  9a. reclaim_txn = min(durable_watermark − 1, oldest_reader_txn) по санитизированной
+      таблице; обновить advisory-поле в памяти (в файл не писать, §5/§14)
+ 10. если meta_flags.NEEDS_FSCK или NEEDS_FSCK выставлен шагами 5/6/7/9 → сохранить:
+     при writable-открытии — записать в meta (штатный путь); в read-only
+     (Memory opt-in / W-10) — только Stats/лог, meta не меняется, флаг
+     переоткрывается заново при следующем старте, пока offline fsck не снимет причину
+ 11. ОТКАТ НА INITIAL META: если active.txnid == 1 (initial-состояние), а
      created_unix_ns старше ROLLBACK_ALERT_AGE_MS (=60 000) на момент открытия —
      это признак ранее существовавшего файла, а не нового: выставить NEEDS_FSCK,
      вернуть RolledBackToInitial { instance_uuid, created_unix_ns }, писать алерт;
      старт продолжается только при OpenConfig.allow_rollback_to_initial = true
      (явное подтверждение оператора). instance_uuid логируется для корреляции.
- 11. опубликовать снапшот
+ 12. опубликовать снапшот; recovered_unsynced отдать в Stats/логи
 ```
 
 Обе meta содержат полный набор корней, поэтому откат на `T-1` не требует чтения `T`.
 
-Правило шага 10 нужно, чтобы откат к `txnid=1` не выглядел как «новый пустой файл»: новый файл имеет `created_unix_ns ≈ now`, ранее существовавший — заметно старше. Порог намеренно грубый (60 с): он различает «только что создан» и «жил и потерял данные», а не измеряет время точно.
+**Единый `durable_watermark` — не `durable_txn` выбранной meta.** Watermark вычисляется по **всем** валидным кандидатам: `max(min(durable_txn, txnid))`. Recovery, `effective_mode`/`check_commit` и advisory `reclaim_txn` используют только его; это закрывает обход sticky через выбор меты с меньшим `durable_txn`. Если `durable_txn(selected) < durable_watermark` — нарушение монотонности (W-10): `NEEDS_FSCK` + `write_locked=true` (read-only до offline fsck), а не тихое принятие. Это же правило ловит Memory-фолбэк на мету старше подтверждённого watermark.
+
+**Почему выбирается max-valid, а не `txnid ≤ durable_txn`.** Старое правило отбрасывало любую meta новее `durable_txn`, а `Flush` не fsync'ит meta и потому не поднимает watermark. В результате коммиты `Flush` исчезали даже после обычного рестарта процесса, хотя их данные уже были на диске. Новое правило принимает самую новую **валидную** meta, потому что COW-граф цел: страницы, освобождённые при `txn > durable_watermark`, не переиспользовались (строгая граница `free_txn < durable_watermark`, §14), а данные meta `Flush`/`Sync` fsync'нуты до её записи. `durable_watermark` остаётся границей переиспользования и диагностическим watermark, а не фильтром выбора.
+
+**`recovered_unsynced` — диагностика, не ошибка.** `true` означает «принята meta новее `durable_watermark`»; для `Flush` это норма после рестарта процесса, для `Sync` — аномалия «meta дописана, fsync не подтверждён», для `Memory` — только вместе с `NEEDS_FSCK`/opt-in. Чистый `Memory`-фолбэк на meta `txnid ≤ durable_watermark` выставляет не `recovered_unsynced`, а `memory_tail_discarded` (если durable-мета не ниже watermark; иначе — W-10). Флаг не влияет на `reclaim_txn` и не понижает watermark.
+
+**`torn_meta` — диагностика штатного краха.** Один невалидный слот при валидном втором — ожидаемый результат незавершённой записи meta (torn write). Это **не** повреждение графа и не повод для `fsck`: теряется максимум незавершённый (неподтверждённый) коммит. `NEEDS_FSCK` выставляется только когда потеря подтверждённого коммита доказуема или вероятна: у невалидного слота **декодируется** `txnid > active.txnid`, либо есть иная неопределённость (аномально пустой слот при `active.txnid > 1`, расхождение корней при равных `txnid`). Обе meta невалидны → `CorruptNoValidMeta` (открывать нечего). Нечитаемый `txnid` сам по себе трактуется как «информации о более новом коммите нет».
+
+**Read-only Memory-recovery (opt-in).** Когда подтверждённой meta `txnid ≤ durable_watermark` нет, а оператор разрешил `allow_unsynced_memory_recovery`, файл открывается **read-only** (`writer()` → `ReadOnly`, коммиты и запись meta/данных запрещены; регистрация и санитизация слотов reader table по §6/шагу 9 допустимы — это не данные зон) с `NEEDS_FSCK` в памяти/Stats (meta не переписывается, пока файл read-only), потому что meta могла пережить данные и граф может ссылаться на потерянные страницы. До offline `zonefile fsck --verify`/`--repair` каждое чтение выполняет ленивые проверки: `page.txn ≤ snapshot.txnid`, CRC, границы, `payload_len`, `page_no`/`page_type` (§7); при первом нарушении — `Corrupt` (SERVFAIL), без частичных ответов. Freelist в этом состоянии **не используется для выдачи** (он может указывать на потерянные bucket-страницы); это дополнительно гарантируется read-only-режимом. После успешного offline `fsck --repair` причина устраняется, флаг `NEEDS_FSCK` снимается, файл переоткрывается для записи. Тот же read-only-режим действует при W-10 (`durable_txn(selected) < durable_watermark`): чтение разрешено, запись — только после fsck.
+
+Правило шага 11 нужно, чтобы откат к `txnid=1` не выглядел как «новый пустой файл»: новый файл имеет `created_unix_ns ≈ now`, ранее существовавший — заметно старше. Порог намеренно грубый (60 с): он различает «только что создан» и «жил и потерял данные», а не измеряет время точно.
+
+**Политика санитизации reader table (шаг 9) — нормативно:**
+
+| Состояние слота | Действие |
+|---|---|
+| `owner_token = 0` (пуст), файл в initial-состоянии (`txnid(active) = 1`) | норма (файл только что создан), ничего не делаем |
+| `owner_token = 0` (пуст), `txnid(active) > 1` | **аномалия**: слот освобождён без `dereg` (баг/частичная запись) → `NEEDS_FSCK`, метрика `reader_slot_leaked_total`; слот остаётся свободным |
+| `owner_token ≠ 0`, `incarnation = 0` | **неизвестен**: считать живым, **не вытеснять**, `NEEDS_FSCK`; `active_txn` сохраняется. Проверяется до сравнения с probe (§6.4.1) |
+| PID мёртв (`ProcStatus::Dead`) **или** `incarnation` не совпадает (при `incarnation ≠ 0`) | слот очищается (`owner_token = 0`), **ВСЕГДА** `NEEDS_FSCK` — независимо от того, выглядели ли `active_txn`/`flags` корректно; инвариант «занятый слот принадлежит живому процессу» нарушен |
+| `ProcessProbe::Unknown` (EACCES/EPERM, parse error, `/proc` недоступен) | считать живым, **не вытеснять**, `NEEDS_FSCK` (safe > available); слот продолжает удерживать `active_txn` (§6.4.1) |
+| PID жив, `incarnation` совпадает, `active_txn > txnid(active)` | **fail-closed**: `Corrupt { kind: Bounds, detail: BadReaderRegion }` — слот ссылается на несуществующий снапшот; **не вытесняется** (живой процесс, возможно, читает) |
+| PID жив, `incarnation` совпадает, ненулевые reserved-биты `flags` | **fail-closed**: `Corrupt { kind: Bounds, detail: BadReaderRegion }` — формат не знает такой семантики; **не вытесняется** |
+| PID жив, `incarnation` совпадает, `active_txn ≤ txnid(active)` | норма, слот сохраняется как есть |
+
+Правило «живой читатель не вытесняется никогда» (§6.4, SEC-ZF-007) действует и здесь: при сомнении восстановление отказывает (`Corrupt`) либо не вытесняет и помечает `NEEDS_FSCK`, но не «чинит» слот — иначе можно освободить страницы, которые процесс ещё читает.
+
 
 ### 13.8. Компакция
 
@@ -1223,11 +1430,13 @@ recover():
 - обход всех деревьев: CRC (кроме reader table), порядок ключей, сепараторы, `n_restarts` по формуле, `items_start`, `shared_len ≤ len(prev)`;
 - overflow: `sum(data_len) == payload_bytes` (сходимость потока) и отсутствие циклов; разрыв RR/RDATA между страницами — норма (§11.4) и нарушением не считается;
 - **тип значения по ключу** (R-19): `T_ZONE_ENTRY` → item ровно `4+suffix+72`, `rdlen/rr_count` не читаются; `T_NODE` → `kind=0, rr_count=0`; RRset → `kind∈{1,2}`, payload = `rdlen + 2*rr_count`;
-- freelist: отсутствие пересечений (страница в двух bucket'ах / в bucket'е и в графе), монотонность `free_txn`, **неизменяемость bucket'ов** (bucket-страницы не входят в граф данных, §11.7), отсутствие пустых bucket'ов;
+- freelist: отсутствие пересечений (страница в двух bucket'ах / в bucket'е и в графе), монотонность `free_txn` и `free_txn ≥ 2`, **неизменяемость bucket'ов** (bucket-страницы не входят в граф данных, §11.7), отсутствие пустых bucket'ов;
 - `ZoneEntry`: `state`/`deleted_txn` согласованы (0 ⟺ не tombstone), `meta_root ≠ 0` для живой, флаги не дублируются с meta-блоком (R-14);
 - lower-case инвариант ключей, отсортированность RDATA, `TTL ≤ 2^31−1`.
 
-`repair(--to-txn T)`: разрешён **только** при `T ≥ reclaim_txn` (иначе страницы `T` могли быть переиспользованы) → `RefuseToRollback`. Утечки возвращаются в freelist, выставляется `NEEDS_FSCK`.
+`repair(--to-txn T)`: разрешён **только** при `T ≥ durable_watermark − 1` **и** `T ≥ oldest_reader_txn` (иначе страницы, освобождённые после `T`, могли быть переиспользованы или удерживаются читателем) → `RefuseToRollback`. Порог по watermark строгий: страницы, освобождённые в `F`, переиспользуются только при `F < durable_watermark`, поэтому откат на `durable_watermark−1` безопасен, а на `durable_watermark−2` — уже нет (страницы `durable_watermark−1` могли быть выданы и перезаписаны). Утечки возвращаются в freelist, выставляется `NEEDS_FSCK`.
+
+`verify()` не считает torn одного из двух meta повреждением, если второй валиден и выбранная meta проходит все проверки: это штатный след незавершённой записи (`torn_meta`), а не bit rot. `--repair` при одном валидном слоте не «дочинивает» второй, а оставляет его пустым/невалидным до следующего коммита.
 
 ---
 
@@ -1235,15 +1444,18 @@ recover():
 
 - Состояние = `(meta(T), граф страниц T)`. Writer создаёт новый граф; неизменённые страницы общие.
 - Публикация — атомарная запись meta + `publish` (§13.6 шаги 7–9). Читатель фиксирует `T` через протокол §6.3.
-- Страницы, заменённые в транзакции `F` (то есть достижимые из `F-1`), разрешено переиспользовать только при `F ≤ reclaim_txn`, где `reclaim_txn = min(durable_txn, oldest_reader_txn)`. `oldest_reader_txn` writer читает из слотов с `Acquire` (§6.4) — иначе публикация читателя может быть не видна и страницы освободятся преждевременно.
+- Страницы, заменённые в транзакции `F` (то есть достижимые из `F-1`), разрешено переиспользовать только при `F < durable_watermark` **и** `F ≤ oldest_reader_txn`; эквивалентно `F ≤ reclaim_txn`, где `reclaim_txn = min(durable_watermark − 1, oldest_reader_txn)`. `oldest_reader_txn` writer читает из слотов с `Acquire` (§6.4) — иначе публикация читателя может быть не видна и страницы освободятся преждевременно. Единственная реализация правила — `pulse_zonefile::is_reclaimable(free_txn, durable_watermark, oldest_reader_txn)`; при `durable_watermark = 1` она всегда `false`, при `F == durable_watermark` — `false`.
 - Bucket-страницы freelist тоже подчиняются COW (§11.7): мутация на месте запрещена, старый образ уходит в набор освобождённых того же коммита.
 
-  Обоснование обеих границ:
-  - `F ≤ durable_txn`: если meta `F` на диске, восстановление никогда не откатится на `F-1`; иначе страницы `F-1` обязаны быть целы.
-  - `F ≤ oldest_reader_txn`: все живые читатели видят мету ≥ `F`, значит страницы, заменённые в `F`, им не нужны.
-  - При отсутствии читателей `oldest_reader_txn = txnid(active)` — поэтому «молодые» страницы не выдаются мгновенно, что даёт запас на откат.
+  Обоснование границ:
+  - `F < durable_watermark` (строго): `D = durable_watermark` — подтверждённый водораздел по **всем** валидным метам. Recovery не обязан увидеть мету `≥ D`: слот `D` может быть затёрт начатой записью `D+2`, пока meta `D+1` не долетела, поэтому худшая восстановимая meta — `D−1`. Страницы, освобождённые в `F = D`, ещё достижимы из `D−1`, значит переиспользовать их нельзя. При `F < D` любая восстановимая meta `≥ D−1 ≥ F` уже не содержит эти страницы.
+  - `F ≤ oldest_reader_txn`: все живые читатели видят мету `≥ F`, значит страницы, заменённые в `F`, им не нужны (читатель на `F` уже не содержит старую версию).
+  - При отсутствии читателей `oldest_reader_txn = txnid(active)` — «молодые» страницы не выдаются мгновенно, что даёт запас на откат.
+  - При `durable_watermark = 1` (`Flush`/`Memory` без `sync()`) `reclaim_txn = 0`: переиспользование невозможно в принципе. Это эксплуатационное требование к периодическому `sync()` (§13.6), а не «утечка»: пока нет подтверждённой meta, любой откат может потребовать любую освобождённую страницу.
 
-- **В `NOSYNC`** `durable_txn` растёт только через `sync()`; следовательно `reclaim_txn` стоит на месте, freelist голодает, а при исчерпании `high_water` коммит возвращает `MapFull`. Это документированное поведение, а не баг.
+- **Recovery не понижает `durable_watermark`.** Принятие meta `T > durable_watermark` в `Sync`/`Flush` (§13.7) — это выбор состояния, а не подтверждение durability: watermark остаётся на максимуме подтверждённых мет. Иначе `Flush` легализовал бы переиспользование страниц `F ∈ [watermark, T]`, а последующая потеря meta `T` (power loss) откатила бы recovery на перезаписанные данные. Именно правило «`free_txn ≥ durable_watermark` не переиспользуется» делает выбор max-valid meta в `Flush` безопасным. Если `durable_txn(selected) < durable_watermark`, это W-10: `NEEDS_FSCK` + read-only, а не тихое понижение (§13.7, §17).
+- **В `Flush`** режим применим только до первого `sync()` (`durable_watermark = 1`): после него липкий режим требует `Sync` (§4.1 п.6). Пока `durable_watermark = 1`, `reclaim_txn = 0`; файл только растёт, поэтому нужен периодический `sync()` до исчерпания `high_water`. Это документированная цена безопасного `Flush`, а не баг.
+- **В `Memory` (NOSYNC)** — то же (`reclaim_txn = 0` до `sync()`), плюс recovery не доверяет meta новее `durable_watermark`: сначала чистый откат на meta `≤ durable_watermark`, иначе `NEEDS_FSCK`/opt-in и read-only до offline fsck (§13.7).
 - Если свободных страниц нет, но они есть в freelist — `NoSpace` (retry после `sync()`/освобождения читателей). Разграничение — §16.
 - `ReadersStalled` — диагностика, когда `reclaim_txn` не двигается дольше `STALE_READER_TIMEOUT_MS` при живом слоте; данные при этом не портятся.
 
@@ -1253,23 +1465,34 @@ recover():
 
 | # | Момент | Диск/кэш | После рестарта | Потери |
 |---|---|---|---|---|
-| F-1 | во время записи data (SYNC/NOMETASYNC) | старый meta валиден | `T` | нет |
-| F-2 | после fdatasync данных, до meta | старый meta | `T` | нет |
-| F-3 | torn-write meta | CRC не сходится → meta невалидна | `T` | нет |
-| F-4 | NOMETASYNC: meta в кэше, питания нет | meta могла не долететь | `T` или `T+1`, **файл валиден** | последние коммиты |
-| F-5 | SYNC: оба fsync прошли | всё на диске | `T+1` | нет |
-| F-6 | NOSYNC: потеря питания/сбой ОС | произвольное подмножество кэша | состояние последнего `Sync`/`Flush`-коммита или последнего `sync()`; возможна потеря всех коммитов после него | данные после последней синхронизации |
-| F-6a | NOSYNC: **падение только процесса** (kill -9) | page cache цел, файл не испорчен | `recover()` выбирает meta с `txnid ≤ durable_txn`, поэтому откат к последнему `sync()` | коммиты после последнего `sync()` не видны (но физически в кэше); порчи нет |
+| F-1 | во время записи data (`Sync`/`Flush`) | старый meta валиден | `T` | нет |
+| F-2 | после fdatasync данных, до meta | старый meta валиден; новые данные не достижимы | `T` | нет |
+| F-3 | torn-write meta | CRC не сходится → слот невалиден | `T` (последняя валидная); `torn_meta = true`; `NEEDS_FSCK` — только если у битого слота декодируется `txnid > T`, иначе чисто (§13.7 шаг 5) | данных нет; последний (неподтверждённый) коммит не виден |
+| F-4 | `Flush`: meta в кэше, **потеря питания** (сценарий применим только при `durable_watermark = 1`, до первого `sync()`) | данные fsync'нуты, meta могла не долететь | последняя **долетевшая** валидная meta; данные выбранной meta fsync'нуты, **файл валиден**; пустой/старый второй слот — чисто, `NEEDS_FSCK` — только по §13.7 шаг 5. Если оба слота не долетели/битые — `CorruptNoValidMeta` (цена отсутствия `sync()`). После первого `sync()` режим липко `Sync` (§4.1 п.6), поэтому слабых коммитов больше нет | коммиты, чья meta не долетела; данные выбранной meta fsync'нуты |
+| F-4a | `Flush`: **падение только процесса** (kill -9), `durable_watermark = 1` | page cache цел; данные fsync'нуты, meta валидна | самая новая валидная meta `T+1` принимается (`recovered_unsynced = true`, `sync_mode = Flush`) **без** `NEEDS_FSCK`; `reclaim_txn = 0`, переиспользования не было | нет — `Flush` переживает рестарт процесса |
+| F-4b | `Sync`/`Flush`: активная meta новее `durable_watermark` (ручной/аномальный сценарий, сбой между записью meta и её подтверждением) | meta структурно валидна, `txnid > durable_watermark` | meta принимается, `recovered_unsynced = true`, `NEEDS_FSCK` **не** выставляется; watermark не понижается | нет: у `Sync`/`Flush` данные fsync'нуты до meta |
+| F-5 | `Sync`: оба fsync прошли | всё на диске | `T+1` | нет |
+| F-6 | `Memory`: потеря питания/сбой ОС | произвольное подмножество кэша; meta могла пережить данные | сначала чистое открытие последней валидной meta `txnid ≤ durable_watermark` (теряются только неподтверждённые Memory-коммиты); если такой нет — `NEEDS_FSCK` + `allow_unsynced_memory_recovery`, файл read-only до offline fsck; без флага — отказ `UnsyncedMemoryRecovery` | неподтверждённые Memory-коммиты (до первого `sync()`; после него режим липко `Sync`); при opt-in возможна порча графа (ловится CRC/fsck) |
+| F-6a | `Memory`: **падение только процесса** (kill -9) | page cache цел, но recovery не отличает его от power loss | та же политика: сначала meta `≤ durable_watermark` чисто; иначе `NEEDS_FSCK` + opt-in + read-only до fsck; без флага — отказ | гарантий нет; подтверждённые коммиты не теряются, неподтверждённые Memory-коммиты могут не восстановиться |
 | F-7 | переиспользование при живом читателе | запрещено I-6/§14 | — | невозможно |
 | F-8 | bit rot | CRC не сходится | `Corrupt` на ветви → SERVFAIL | запись недоступна |
 | F-9 | усечение файла (внешнее или после сбоя) | размер < `page_count_max × page_size` | `TruncatedFile` при open — **и у writer, и у reader**; `ftruncate` не выполняется, файл не «доращивается»; работающий процесс — SIGBUS fail-stop | восстановление из бэкапа/пересоздание |
 | F-10 | второй writer | занят `<zonefile>.lock` (`LOCK_EX\|LOCK_NB`) | `Busy` | — |
+| F-11 | невалидный/неизвестный `sync_mode`, неизвестная версия поля, расхождение A/B | поле не читается по §4.1 | `Corrupt` для mode/расхождения; `UnsupportedVersion` для `sync_mode_version ∉ {0,1}` | работа невозможна до fsck/пересоздания |
+| F-12 | попытка коммита слабее floor: `Memory` в `Flush`/`Sync`-файле, `Flush`/`Memory` после первого `Sync`/`sync()` (`durable_watermark > 1`) | файл не меняется, meta не пишется | `InvariantViolation(DurabilityBelowFileMode)`; `superblock.sync_mode` не меняется, липкий режим сохраняется | нет; понижение режима запрещено |
+| F-13 | **регрессия watermark**: `durable_txn(selected) < durable_watermark` (в т.ч. Memory-фолбэк на мету старше подтверждённого watermark) | обе/несколько meta валидны, но выбранная несёт меньший `durable_txn` | `NEEDS_FSCK` + `write_locked = true`: read-only до offline fsck; watermark не понижается, `effective_mode`/`check_commit`/`reclaim_txn` считаются от `durable_watermark` | подтверждённые после `durable_txn(selected)` коммиты могут быть не видны; решает fsck |
 
 **Усечение — fail-closed.** `ftruncate` разрешён только в цикле создания (§4, `O_CREAT|O_EXCL`). Если открывается существующий файл короче `page_count_max × page_size`, это признак потери данных, а не «недороста»: и writer, и reader получают `TruncatedFile`. Автоматическое «доращивание» маскировало бы усечение и могло бы вернуть мусор вместо данных.
 
-**Уточнение формулировок (B-12).** В `NOSYNC` гарантий сохранности нет ни при потере питания, ни при падении процесса: восстановление всегда откатывается к `durable_txn`, то есть к последнему `sync()` (F-6, F-6a). Гарантируется только отсутствие порчи (откат идёт на целую мету, а не на смесь). Слово «консистентен» в прежней редакции было неточным.
+**Гарантии по режимам (B-12, ревизия 1.5.3).**
 
-**Почему читатель не видит полу-запись во всех трёх режимах.** Видимость определяется не чтением meta-страницы, а in-process указателем `active_txn`, который публикуется после полной записи meta (шаг 8). Читатель никогда не сканирует meta на hot-path, поэтому torn-страница в page cache не может быть прочитана как данные. Граф `T` неизменяем до `reclaim_txn ≥ T` (§14). В `NOSYNC` это свойство сохраняется в пределах жизни процесса/ядра; после F-6 снапшот откатывается целиком, но не «размазывается».
+- `Sync`: подтверждённый коммит переживает и рестарт процесса, и потерю питания (F-5). `durable_watermark` двигается каждым коммитом. Строгая граница `free_txn < durable_watermark` даёт запас: страницы последнего durable-коммита не переиспользуются, пока не появится следующий `Sync`.
+- `Flush`: коммит-гарантия действует только до первого `sync()` (`durable_watermark = 1`): подтверждённый коммит **гарантированно** виден после рестарта процесса (F-4a), данные fsync'нуты до meta, переиспользования не было (`reclaim_txn = 0`). При потере питания возможен откат к последней долетевшей meta, данные выбранного состояния fsync'нуты, файл валиден (F-4); `NEEDS_FSCK` — только по §13.7 шаг 5. После первого `sync()` режим липко `Sync` (§4.1 п.6), поэтому гарантия `Sync` не теряется последующими `Flush` (F-12).
+- `Memory`: гарантий сохранности нет ни при потере питания, ни при падении процесса (F-6/F-6a). Meta может пережить данные; recovery сначала чисто откатывается на meta `txnid ≤ durable_watermark`, иначе требует `allow_unsynced_memory_recovery`, `NEEDS_FSCK` и read-only до offline `fsck`. Гарантируется только структурная валидность страниц, а не консистентность графа, пока не выполнен `fsck`.
+
+**Почему `Flush`-коммиты больше не теряются при рестарте процесса.** Старое правило `txnid ≤ durable_txn` отбрасывало meta `T+1`, потому что `Flush` не fsync'ит meta и не поднимает watermark; данные при этом уже были на диске. Новое правило (§13.7) выбирает max-valid meta, а `durable_watermark` остаётся границей `reclaim_txn`. Безопасность обеспечивает §14: страницы с `free_txn ≥ durable_watermark` не переиспользуются, поэтому граф принятой meta цел; принятие meta **не** повышает watermark. При `durable_watermark = 1` не переиспользуется вообще ничего, так что граф цел тривиально.
+
+**Почему читатель не видит полу-запись во всех трёх режимах.** Видимость определяется не чтением meta-страницы, а in-process указателем `active_txn`, который публикуется после полной записи meta (шаг 10 §13.6). Читатель никогда не сканирует meta на hot-path, поэтому torn-страница в page cache не может быть прочитана как данные. Граф `T` неизменяем, пока жив хотя бы один читатель `T`: страницы, освобождённые в `F > T`, не выдаются, так как `F ≤ oldest_reader_txn ≤ T` невозможно (§14). В `Memory` это свойство сохраняется в пределах жизни процесса/ядра; после F-6 снапшот откатывается целиком (или принимается только через opt-in+fsck), но не «размазывается».
 
 ---
 
@@ -1301,8 +1524,13 @@ recover():
 | Ошибка | Условие | Действие |
 |---|---|---|
 | `MapFull` | `page_count_high_water == page_count_max` (адресное пространство файла исчерпано) | расширить `map_size` (offline compact) |
-| `NoSpace` | `high_water < page_count_max`, но все свободные страницы «молодые» (`free_txn > reclaim_txn`) | выполнить `sync()` / дождаться читателей; повторить |
+| `NoSpace` | `high_water < page_count_max`, но все свободные страницы «молодые»: `free_txn ≥ durable_watermark` или `free_txn > oldest_reader_txn` (эквивалентно `free_txn > reclaim_txn`) | выполнить `sync()` / дождаться читателей; повторить. В `Flush`/`Memory` до первого `sync()` `durable_watermark = 1`, `reclaim_txn = 0` — переиспользование невозможно; нужен периодический `sync()` (§13.6) |
 | `MapAllocFailed` | `ftruncate`/`mmap` не удались (квота, ENOMEM) | отказ старта с подсказкой |
+
+**Влияние строгой границы `free_txn < durable_watermark` на лимиты.** Освобождённые страницы становятся доступны только после того, как `durable_watermark` перешагнёт их `free_txn` (и читатели отпустят эпоху), то есть обычно после одного-двух успешных `Sync`/`sync()`. На `Sync`-файле это задерживает возврат страниц на один коммит относительно старой границы `≤ watermark`; на `Flush`/`Memory` без `sync()` возврата нет вообще (`reclaim_txn = 0`). Watermark берётся как максимум по валидным метам, а не из выбранной meta; регрессия `durable_txn(selected) < durable_watermark` блокирует запись (W-10, §13.7). Практические следствия:
+- при `durable_watermark = 1` серия удалений/перезаписей монотонно растит `page_count_high_water` и упирается в `MapFull`, даже если в freelist есть страницы; это ожидаемое поведение, лечится `sync()` (он же делает режим липко-`Sync`) или offline `compact`;
+- метрика `freelist_eligible_pages` (страницы с `free_txn ≤ reclaim_txn`) и `durable_lag_txns` (§13.6) — эксплуатационные индикаторы: `eligible = 0` при `free_page_count > 0` означает «нужен `sync()`»;
+- планировщик ёмкости обязан считать худший случай без переиспользования, пока не подтверждён хотя бы один `Sync`.
 
 Правила арифметики (MUST, тесты + Miri):
 
@@ -1344,7 +1572,7 @@ recover():
 | W-7 | `branch.key[i]` = минимум поддерева |
 | W-8 | Каждый `PageId` в графе один раз |
 | W-9 | Освобождённые страницы → bucket с `free_txn = txn`; в этом txn не выдаются |
-| W-10 | `durable_txn` не уменьшается; `reclaim_txn` вычисляется при коммите |
+| W-10 | `durable_watermark = max(min(durable_txn, txnid))` по валидным meta не уменьшается; повышается только успешным `fdatasync` meta (`Sync`/`sync()`), **не** коммитом `Flush`/`Memory` и **не** recovery; `reclaim_txn = min(durable_watermark−1, oldest_reader_txn)` вычисляется при коммите. `durable_txn(selected) < durable_watermark` — нарушение монотонности: `NEEDS_FSCK` + `write_locked=true`, не тихое принятие. После `durable_watermark > 1` коммит только `Sync` (липкий режим) |
 | W-11 | `DELEGATION` не содержит SOA; **в состоянии `Serving`** apex содержит SOA+NS (INV-4/INV-9 применяются только к `Serving`); для `Initializing` SOA/NS не обязательны — допустимое частично заполненное состояние |
 | W-12 | CNAME не сосуществует с другими типами (домен валидирует) |
 | W-13 | TTL: clamp при записи, `InvariantViolation` для транзакции, `min` для импорта |
@@ -1354,6 +1582,9 @@ recover():
 | W-17 | `Import`/`Replication`: дубликаты RDATA в RRset удалены (дедуп до записи), TTL нормализован; `Transaction`/`Signing` — без нормализации (§11.5) |
 | W-18 | Freelist-страницы не мутируются на месте: только COW-образ (§11.7); освобождённые страницы входят в bucket **до** записи meta (§13.6) |
 | W-19 | Классификация зоны (`SECONDARY/FORWARD/DYNAMIC/FROZEN`) — только в `ZoneEntry.flags`; `SIGNED/denial` — только в meta-блоке (§12.1) |
+| W-20 | `superblock.sync_mode` неизменяем после создания; коммит слабее файлового режима → `InvariantViolation(DurabilityBelowFileMode)` (§4.1) |
+| W-21 | Страница с `free_txn ≥ durable_watermark` не выдаётся из freelist, даже если `free_txn ≤ oldest_reader_txn`; выдача разрешена только при `free_txn < durable_watermark` **и** `free_txn ≤ oldest_reader_txn` (§14) |
+| W-22 | `superblock.sync_mode_version` хранится как поле (не константа), пишется при encode, декодируется при open и сравнивается A/B наравне с `sync_mode`; `A:1/B:0` → `Corrupt` (§4.1) |
 
 ---
 
@@ -1394,7 +1625,7 @@ Minor: новые поля в `reserved`, новые секции, новые `o
 | G-4 | Снапшот иммутабелен и детерминирован |
 | G-5 | `Snapshot` — `Send + Sync`; клон ≤ 20 нс |
 | G-6 | Нет паник на данных файла |
-| G-7 | Чтение не выходит за `[0, high_water)` |
+| G-7 | Чтение данных не выходит за `[page_data_first, high_water)`; публичного raw-`page()` нет. Любое чтение — только `page_header` (валидирует CRC, `txn ≤ snapshot`, page_no/type, reserved, `payload_len`) + типизированные accessor'ы; невалидная страница → `Corrupt` |
 | G-8 | Ни один `RrsetRef` не требует чтения более `MAX_TREE_DEPTH + MAX_OVERFLOW_PAGES` страниц; материализация ≥ 2 RR одновременно не требуется ни одним методом |
 
 ### 20.3. API-эскиз
@@ -1405,15 +1636,82 @@ Minor: новые поля в `reserved`, новые секции, новые `o
 pub struct ZoneFile { /* Arc<File>, Arc<Mmap>, ReaderRegion, OpenConfig, ZoneIndex */ }
 pub struct Snapshot { inner: Arc<SnapshotInner> }        // Clone ≤ 20 ns
 
-pub struct OpenConfig { pub read_only: bool, pub map_size: u64,
-                        pub lock_mode: LockMode, pub strict: bool,
-                        pub allow_rollback_to_initial: bool }   // §13.7 шаг 10
+pub struct OpenConfig { pub read_only: bool,   // логический режим, файл всё равно O_RDWR (п.7)
+                        pub map_size: u64,
+                        pub lock_mode: LockMode,
+                        pub strict: bool,       // только тесты; в production игнорируется (п.8)
+                        pub allow_rollback_to_initial: bool,        // §13.7 шаг 11
+                        pub allow_unsynced_memory_recovery: bool }  // §13.7 шаг 7; default false
 
 impl ZoneFile {
+    /// Открывает существующий файл. Слоты reader table НЕ занимает.
     pub fn open(path: &Path, cfg: OpenConfig) -> Result<Self, ZoneFileError>;
-    pub fn snapshot(&self) -> Snapshot;                  // O(1), без syscall
+    /// Создаёт новый файл (§4): AlreadyExists → Busy → O_EXCL → ftruncate.
+    pub fn create(path: &Path, cfg: CreateConfig) -> Result<Self, ZoneFileError>;
+    /// Ленивый вход читателя: слот(ы) занимаются при первом `Reader::snapshot()`.
+    pub fn reader(&self) -> Reader<'_>;
+    // Публичного `ZoneFile::snapshot()` нет: единственный вход — `Reader::snapshot()`,
+    // чтобы пиннинг/RAII нельзя было обойти и забыть `unpin`.
     pub fn writer(&self) -> Result<Writer<'_>, ZoneFileError>;
-    pub fn stats(&self) -> Stats;                        // high_water, free, fill, map_size
+    pub fn stats(&self) -> Stats;                        // high_water, free, fill, map_size,
+                                                         // durable_watermark, reclaim_txn, diagnostics
+    /// Единственный публичный путь чтения страницы: заголовок с проверками §7.
+    /// Только страницы данных `[page_data_first, high_water)`; raw-байты наружу
+    /// не отдаются (типизированное чтение — фаза 2). Снапшот обязан принадлежать
+    /// этому файлу (`instance_uuid`), иначе `SnapshotFromDifferentFile`: чужой
+    /// пин не защищает страницы от переиспользования.
+    pub fn page_header(&self, snapshot: &Snapshot, page_no: u32)
+        -> Result<PageHeader, ZoneFileError>;
+}
+
+pub struct Stats {
+    pub high_water: u32,
+    pub free_page_count: u32,
+    pub fill_ratio: f32,
+    pub map_size: u64,
+    /// `durable_watermark = max(min(durable_txn, txnid))` по валидным meta;
+    /// не `durable_txn` одной выбранной meta.
+    pub durable_watermark: u64,
+    /// Текущая граница переиспользования: `min(durable_watermark − 1, oldest_reader_txn)`.
+    pub reclaim_txn: u64,
+    /// Recovery принял meta с `txnid > durable_watermark` (§13.7); диагностика, не ошибка.
+    pub recovered_unsynced: bool,
+    /// Один meta-слот невалиден (torn), второй валиден; штатный крах, не ошибка.
+    pub torn_meta: bool,
+    /// `Memory`: recovery чистым откатом отбросил неподтверждённый хвост (§13.7 шаг 7a).
+    pub memory_tail_discarded: bool,
+}
+
+/// Параметры создания файла (§4). Намеренно отдельный от `OpenConfig`:
+/// при создании задаются величины, которых у существующего файла уже нет.
+pub struct CreateConfig {
+    // общее с OpenConfig:
+    pub map_size: u64,              // 0 = дефолт 4 GiB (§3.1)
+    pub lock_mode: LockMode,        // Writer | None (reader при создании не нужен)
+    // только при создании:
+    pub page_size: u32,             // 4096 | 8192 | 16384 (§2), фиксируется навсегда
+    pub instance_uuid: Option<[u8; 16]>,   // None = сгенерировать UUIDv7
+    pub created_unix_ns: Option<u64>,      // None = now(); задаётся и в meta.commit_unix_ns
+    pub feature_flags_required: u64,       // §2, дефолт F0..F5
+    pub sync_mode: SyncMode,               // неизменяем; дефолт Sync; см. §4.1
+}
+
+/// Persistent-коды §4.1 (НЕ совпадают с MODE_* §2).
+pub enum SyncMode { Sync /* disk 0 */, Flush /* disk 1 */, Memory /* disk 2 */ }
+// OpenConfig (для открытия) содержит read_only/map_size/lock_mode/strict/
+// allow_rollback_to_initial/allow_unsynced_memory_recovery; page_size/uuid/
+// created_ns/sync_mode берутся из файла и задать их при открытии нельзя.
+
+/// Поток-локальный читатель: держит до READER_SLOTS_PER_THREAD лениво занятых слотов.
+/// `pin`/`unpin` — `pub(crate)`; наружу торчит только RAII-`Snapshot`.
+pub struct Reader<'a> { /* &'a ZoneFile + lazily claimed slots */ }
+impl<'a> Reader<'a> {
+    /// Пиннит слот: первый держатель делает `pin()`, `Drop` последнего — `unpin()`.
+    /// Вложенные снапшоты того же потока занимают отдельные слоты (≤ 4), клон —
+    /// только refcount, без повторного пина.
+    /// Ошибки: `ReaderContended` — у потока уже 4 снапшота либо 8 попыток пина
+    /// не удались; `TooManyReaders` — свободных слотов в таблице нет (весь файл).
+    pub fn snapshot(&self) -> Result<Snapshot, ZoneFileError>;
 }
 
 impl Snapshot {
@@ -1511,11 +1809,22 @@ impl<'a> NameRef<'a> {
 
 `write_wire` обходит метки RLE от конца к началу и пишет `(len, bytes)` в forward-порядке; промежуточный буфер не нужен, стоимость O(255), ноль аллокаций. Отдельного `labels_wire` нет: прямой порядок получается только через `write_wire`, обратный — `labels_rev` (R-8).
 
+**Пиннинг и RAII — нормативно.**
+
+1. `pin`/`unpin` — **`pub(crate)`**; публичного API для них нет. Пользователь получает только `Result<Snapshot, ZoneFileError>` из `Reader::snapshot()`.
+2. `Snapshot` — RAII: первый держатель (из `Reader::snapshot()`) выполняет двухфазный `pin()` (§6.3), последний `Drop` — `unpin()`, затем освобождает `SnapshotInner`.
+3. `Snapshot: Clone` не пиннит повторно: клон только увеличивает refcount `Arc<SnapshotInner>` (≤ 20 нс); `unpin` — ровно один раз, на `Drop` последнего клона.
+4. Вложенные снапшоты одного потока (несколько вызовов `Reader::snapshot()`) занимают отдельные слоты (≤ `READER_SLOTS_PER_THREAD = 4`); исчерпание слотов потока или 8 неудачных попыток пина — `ReaderContended`; исчерпание слотов всей таблицы (1024) — `TooManyReaders`. Оба случая возвращаются `Result`, снапшот не создаётся и слот не остаётся занятым. Внутри одного `Snapshot` клоны делят один слот/refcount.
+5. `Drop` не паникует; `active_txn = 0` публикуется с `Release` **до** освобождения `Arc`/слота, чтобы writer увидел снятие пина.
+6. **Публичного raw-доступа к страницам нет.** `ZoneFile::page()` удалён; единственный путь чтения — `page_header(snapshot, page_no)` с обязательной валидацией `PageHeader` (CRC, `txn ≤ snapshot.txnid`, page_no/type, reserved, `payload_len`, диапазон `[page_data_first, page_count_high_water)`) и типизированные accessor'ы поверх него. `page_no < page_data_first` (superblock/meta/reader table) → `Ok(None)`/`Corrupt` по контракту `page_header`; reader-region наружу не отдаётся. Срез/заголовок живёт не дольше `Snapshot`; читать без живого пина нельзя.
+7. **`read_only` — логический режим, не `O_RDONLY`.** `OpenConfig.read_only = true` запрещает `writer()` (→ `ReadOnly`) и любые мутации (superblock/meta/reader-region), но файл всё равно открывается `O_RDWR`: читателю нужны права на запись в reader table (слоты, §6.1). `read_only` не мешает `reader()`/`snapshot()`.
+8. **`strict` — только для тестов.** В production проверки идентичности файла (владелец, права, `st_dev/st_ino`, `pad`/`reserved`) выполняются всегда, а значение `OpenConfig.strict` игнорируется. Ослабление (`strict = false`) допускается только в тестовых сборках/фикстурах; переносить его в production-конфиг нельзя (SEC-ZF-009/010).
+
 **(B) Адаптер порта `ZoneStore`** (в `pulse-server::infrastructure`):
 
 | Метод порта | Примитив |
 |---|---|
-| `snapshot()` | `ZoneFile::snapshot()`; `SnapshotHandle = Arc<SnapshotInner>` |
+| `snapshot()` | `ZoneFile::reader().snapshot()?`; `SnapshotHandle = Arc<SnapshotInner>`; `Drop` последнего держателя → `unpin()`. `ReaderContended`/`TooManyReaders` пробрасываются как ошибка порта (не паника) |
 | `zones()` / `zone_meta()` | `Snapshot::zones()`, `zone()`; `meta()` → `ZoneSettingsRef` (O(1) для фиксированных полей) |
 | `find_zone(qname)` | `Snapshot::find_zone` (§12.4) |
 | `serial(zone)` | `ZoneRef::serial()` |
@@ -1557,6 +1866,7 @@ pub enum CommitResult { Committed(CommitOutcome), Aborted }
 Правила (из домена, формат их не меняет):
 
 - одновременно активна максимум одна неявная транзакция; `create_zone`/`delete_zone`/`compact_zone`/`sync` при активной транзакции → `Busy`;
+- `sync` — `fdatasync` данных + запись/fdatasync meta; в `Flush`/`Memory`-файле это **односторонний** чекпойнт: `durable_watermark > 1`, после чего все коммиты обязаны быть `Sync` (§4.1 п.6); в read-only-режиме (`Memory` opt-in recovery / W-10) → `ReadOnly`;
 - повторный `apply` должен совпадать по `(zone, intent)`, иначе `Busy`;
 - `commit` без активной транзакции → `UnknownTxn`; `CommitPolicy::Abort` = откат;
 - `apply` после `Commit`/`Abort` начинает новую транзакцию; drop `ZoneWriter` отбрасывает неприменённое (`dangling_txn_total`);
@@ -1570,7 +1880,7 @@ pub enum CommitResult { Committed(CommitOutcome), Aborted }
 | `DeleteOutcome { zone, deleted_txn: Txn, reclaim_after: Txn }` | `ZoneEntry.deleted_txn: u64` | `reclaim_after == deleted_txn` — порог условия `reclaim_txn ≥ deleted_txn`, не дедлайн |
 | `ZoneMeta.deleted_txn: Option<Txn>` | `ZoneEntry.deleted_txn: u64` | `0 ↔ None`; **`Some(0)` запрещён** (`Corrupt(BadZoneMeta)` на чтении, `InvalidEdit` на записи) |
 | `CommitResult::Committed(CommitOutcome)` | `CommitOutcome { commit_id, snapshot, … }` | `commit_id` = `txnid` опубликованной meta |
-| `CommitPolicy::Commit(Durability)` | `MODE_SYNC` / `MODE_NOMETASYNC` / `MODE_NOSYNC` | §5.2 ADR 0003 |
+| `CommitPolicy::Commit(Durability)` | `MODE_SYNC` / `MODE_NOMETASYNC` / `MODE_NOSYNC` | §5.2 ADR 0003; режим не слабее floor (файлового `superblock.sync_mode` или липкого `Sync` при `durable_watermark > 1`), иначе `InvariantViolation(DurabilityBelowFileMode)` §4.1 |
 | `CompactOutcome { zone, pages_before, pages_after, commit_id, snapshot }` | `compact_zone` | `pages_*` — по `page_count_high_water`/`free_page_count` до и после |
 | `ZoneOptions { kind, default_ttl, denial, initial_soa, initial_ns, forward_upstreams, durability }` | `ZoneEntry` + блок §12.2 | `initial_soa`/`initial_ns` в той же транзакции → `Serving`; без них — `Initializing` |
 | `ZoneSettings { default_ttl, denial, soa_timers, forward_upstreams }` | `ZoneSettingsRef` | `state` в meta-блоке отсутствует: только `ZoneEntry.state` |
@@ -1638,10 +1948,14 @@ pub enum ZoneFileError {
     CorruptNoValidMeta,                            // = Corrupt{NoValidMeta}; вариант для ADR 0004
     TruncatedFile,                                 // = Corrupt{Bounds}; файл короче page_count_max*page_size
     UnsupportedVersion { found: Version, supported: Version, required_flags: u64 },
+                                                   // версия формата/страницы/поля sync_mode (§4.1)
+    AlreadyExists,                                 // create(): путь уже существует (проверяется до lock)
     Busy,                                          // второй writer (lock-файл)
+    NotRegularFile,                                // lock-файл (или файл зон) не regular: O_NOFOLLOW+fstat
     TooManyReaders,                                // reader table заполнена
-    ReaderContended,                               // 8 попыток пиннинга не удались
+    ReaderContended,                               // у потока уже 4 снапшота или 8 попыток пиннинга не удались
     ReadersStalled { oldest_txn: u64, since_ns: u64 },
+    UnsyncedMemoryRecovery { txnid: u64, durable_txn: u64 },   // Memory: нет meta ≤ durable_watermark; durable_txn = watermark (§13.7)
     MapFull { high_water: u32, page_count_max: u32 },          // адресное пространство исчерпано
     NoSpace { needed: u32, free: u32 },                        // страницы есть, но «молодые»
     MapAllocFailed { size: u64, errno: i32, hint: &'static str },
@@ -1651,8 +1965,9 @@ pub enum ZoneFileError {
     ZoneTooLarge, UpstreamTooLarge, ZoneMetaTooLarge,
     InvariantViolation(InvariantId),
     ReadOnly,
-    RefuseToRollback,                              // fsck --to-txn < reclaim_txn (R-3)
-    RolledBackToInitial { instance_uuid: [u8;16], created_unix_ns: u64 },  // §13.7 шаг 10
+    SnapshotFromDifferentFile,                     // Snapshot от другого ZoneFile (instance_uuid mismatch)
+    RefuseToRollback,                              // fsck --to-txn T < max(durable_watermark−1, oldest_reader_txn) (R-3, §13.9)
+    RolledBackToInitial { instance_uuid: [u8;16], created_unix_ns: u64 },  // §13.7 шаг 11
 }
 
 /// 9 значений — ровно как в `domain-model` §6.
@@ -1660,7 +1975,7 @@ pub enum CorruptKind { NoValidMeta, PageChecksum, TreeOrder, Bounds,
                        FreelistCycle, BadTtl, BadZoneMeta, BadRdata, BadName }
 
 /// Внутренняя детализация (в публичный `StoreError` не выходит) — §20.4.
-pub enum CorruptDetail { BadMagic, Checksum, KeyOrder, SeparatorMismatch,
+pub enum CorruptDetail { NoValidMeta, BadMagic, Checksum, KeyOrder, SeparatorMismatch,
     PageNo, PageType, ChildRange, DepthExceeded, OffsetOutOfRange, Truncated,
     Cycle, Overlap, TtlOutOfRange, ZoneMetaField, ZoneMetaTooLarge,
     OverflowChain, RdataSum, BadNameEncoding, CompressionByte, BadReaderRegion }
@@ -1668,9 +1983,22 @@ pub enum CorruptDetail { BadMagic, Checksum, KeyOrder, SeparatorMismatch,
 
 > В тексте `Corrupt(Kind)` — сокращение для `Corrupt { kind: Kind, page: None, detail }`; `detail` уточняет причину, `kind` — то, что видит домен.
 
+**Новые варианты (ревизия 1.5.3):**
+
+- `UnsyncedMemoryRecovery { txnid, durable_txn }` — `Memory`-файл, recovery выбрал meta `txnid > durable_watermark`, а валидной meta с `txnid ≤ durable_watermark` нет, и `OpenConfig.allow_unsynced_memory_recovery = false`. Отказ fail-closed: meta могла пережить данные; оператор либо разрешает старт с `NEEDS_FSCK`+read-only+`fsck`, либо откатывает файл. Если подтверждённая meta `≤ durable_watermark` есть, recovery открывает её чисто (при условии, что её `durable_txn` не ниже watermark; иначе W-10) (§13.7 шаг 7).
+- `NotRegularFile` — `<zonefile>.lock` (или сам файл зон) не является regular-файлом (FIFO/device/dir/symlink после `O_NOFOLLOW`). Возвращается до `flock`; lock-файл **не удаляется** и не пересоздаётся (SEC-ZF-009/010).
+- `SnapshotFromDifferentFile` — `ZoneFile::page_header` получил `Snapshot`, созданный другим `ZoneFile` (несовпадение `instance_uuid`). Ошибка использования API, не повреждение файла: пин чужой reader table не удерживает `oldest_reader_txn` этого файла и не защищает страницы от переиспользования.
+- `InvariantViolation(DurabilityBelowFileMode)` — `commit` запросил режим слабее floor (§4.1): файлового `superblock.sync_mode` или липкого `Sync` после `durable_watermark > 1` (§15 F-12). `InvariantId` получает вариант `DurabilityBelowFileMode`. Понижение режима запрещено.
+- `Stats.durable_watermark` / `Stats.recovered_unsynced` / `Stats.torn_meta` / `Stats.memory_tail_discarded` — диагностика §13.7 (метрики `recovered_unsynced_total`, `torn_meta_total`, `memory_tail_discarded_total`, лог при старте). `durable_watermark` — единый агрегат, не `durable_txn` выбранной meta. Для `Flush` `recovered_unsynced` — норма после рестарта процесса; `torn_meta` — норма после незавершённой записи meta (без `NEEDS_FSCK`, если второй слот валиден и не новее); для `Memory` `recovered_unsynced` — только вместе с `NEEDS_FSCK`/opt-in.
+- Неизвестный `sync_mode` (`> 2`), `sync_mode_version != 1` (кроме legacy `0`) или расхождение A/B → файл не открывается (§4.1): `mode > 2` / legacy `version = 0` при `mode != 0` / расхождение копий → `Corrupt { kind: Bounds, detail: OffsetOutOfRange }`; `version ∉ {0,1}` → `UnsupportedVersion` (в `found.minor` — версия поля, `supported.minor = 1`, `required_flags = 0`).
+- `ReaderContended` / `TooManyReaders` возвращает только `Reader::snapshot()` (§20.3 п.4): потолок слотов потока/8 неудачных пинов и заполненная таблица соответственно; `Snapshot` при этом не создаётся.
+
+
 ### 21.2. Политика при повреждении
 
 - Чтение: `Corrupt` → SERVFAIL, `zonefile_corrupt_total{kind}`, `zone_degraded`; частичных ответов нет.
+- Recovery: `recovered_unsynced = true` → `recovered_unsynced_total`, запись в лог старта; для `Flush` это норма, `NEEDS_FSCK` не выставляется. `Memory` при `txnid > durable_watermark` сначала пытается чисто открыть meta `≤ durable_watermark`; если такой нет и `allow_unsynced_memory_recovery = false` → отказ старта `UnsyncedMemoryRecovery` (файл не меняется), иначе — `NEEDS_FSCK` и read-only до offline `fsck` (§13.7).
+- Recovery: `durable_txn(selected) < durable_watermark` (W-10) → `NEEDS_FSCK`, `write_locked`, read-only до offline `fsck`, метрика `durable_watermark_regression_total`; не тихое принятие.
 - Запись: сомнение → `abort`, файл не меняется, `NEEDS_FSCK`.
 - `--repair` — только офлайн; авторемонта нет.
 - SIGBUS → fail-stop, `sigbus_detected`.
@@ -1683,10 +2011,10 @@ pub enum CorruptDetail { BadMagic, Checksum, KeyOrder, SeparatorMismatch,
 
 | Правило | Деталь |
 |---|---|
-| Открытие данных | `O_NOFOLLOW | O_CLOEXEC`; `fstat`: обычный файл, `st_uid == geteuid()` (владелец `pulse-dns`), `mode & 0o077 == 0` |
+| Открытие данных | `O_RDWR | O_NOFOLLOW | O_CLOEXEC` (и writer, и reader — reader'у нужны права на запись из-за reader-table, §6.1); `fstat`: обычный файл, `st_uid == geteuid()` (владелец `pulse-dns`), `mode & 0o077 == 0` |
 | TOCTOU | `st_dev/st_ino` перепроверяются непосредственно перед каждым `mmap` (оба маппинга) |
 | Создание | `O_CREAT|O_EXCL|O_RDWR, 0600` + `fchmod(0600)`; каталог `0700` |
-| Эксклюзивность writer'а | **отдельный** файл `<zonefile>.lock` (0600), `flock(LOCK_EX|LOCK_NB)`; второй writer → `Busy` |
+| Эксклюзивность writer'а | **отдельный** файл `<zonefile>.lock` (0600), `O_CREAT\|O_RDWR\|O_NOFOLLOW`, `fstat` → regular-file, `flock(LOCK_EX\|LOCK_NB)`; второй writer → `Busy`; не regular → `NotRegularFile` |
 | Читатели | **flock не берут**; регистрируются только в reader table. Читатель не блокирует writer'а и не блокируется им |
 | Writable-маппинг | **один**, только регион reader table (`PROT_READ|PROT_WRITE`, `MAP_SHARED`, `off % 64 == 0`, длина по формуле §6.1). Данные/деревья/overflow/meta — строго `PROT_READ`; запись через `pwritev` |
 | SIGBUS | обработчик `SA_SIGINFO`: `si_addr` в лог, `sigbus_detected++`, `abort()` (fail-stop) |
@@ -1696,9 +2024,9 @@ pub enum CorruptDetail { BadMagic, Checksum, KeyOrder, SeparatorMismatch,
 
 ---
 
-## 22. Golden-пример (пересчитан: заголовок 40, LeafValue 20, reader table 9×4064)
+## 22. Golden-пример (пересчитан: заголовок 40, LeafValue 20, reader table 9×4064; apex A, ключи LE, rdlength BE)
 
-Зона `example.com`, RRset `www.example.com. IN A 192.0.2.1`, `page_size = 4096`, `map_size = 4 GiB`.
+Зона `example.com`, RRset `example.com. IN A 192.0.2.1` (apex; A-запись — item1 дерева зоны), `page_size = 4096`, `map_size = 4 GiB`.
 
 ```
 page 0  SUPERBLOCK_A: magic "PULSEZF1", ver 1.0, page_size 4096,
@@ -1708,9 +2036,10 @@ page 0  SUPERBLOCK_A: magic "PULSEZF1", ver 1.0, page_size 4096,
         reader_region_align = 4096,
         page_meta_a = 2, page_meta_b = 3, page_data_first = 13,
         page_reader_table = 4, page_reader_table_count = 9,
+        sync_mode = 0 (Sync), sync_mode_version = 1,
         sections[0] = {id=1, CORE, first_page=0, page_count=1048576}
 page 1  SUPERBLOCK_B: копия, superblock_copy = 1
-page 2  META_A: txnid=2, durable_txn=2, page_count_high_water=16,
+page 2  META_A: txnid=2, durable_txn=2, reclaim_txn=1, page_count_high_water=16,
         zone_dir_root=13, zone_dir_level=1, zone_count=1,
         freelist_head=0, freelist_tail=0, freelist_entries=0, free_page_count=0,
         next_zone_seq=2, reader_region_off=16384, reader_region_len=36864
@@ -1721,8 +2050,9 @@ pages 4..12  READER_TABLE (9 страниц, собственный дескри
         slots_used_in_page=0 означает, что на момент фикстуры нет ни одного читателя
         (ни один поток не зарегистрировал слот), поэтому все 1024×32 Б — нули
 page 13 LEAF (каталог зон), level=0, n_items=1, n_restarts=1:
-        item0: shared_len=0, suffix_len=19
-               suffix = RLE(example.com) [13 байт] || FE FF | 00 00 | 00 00
+        arrays: restart_offsets=[4001], slots=[4001]; items_start=4001
+        item0 @4001: shared_len=0, suffix_len=19
+               suffix = RLE(example.com) [13 байт] || FE FF | 00 00 | 00 00   (T_ZONE_ENTRY=0xFFFE, LE)
                       = 03 63 6f 6d 07 65 78 61 6d 70 6c 65 00 FE FF 00 00 00 00
                значение — 72-байтовый ZoneEntry (для ключа T_ZONE_ENTRY LeafValue
                не используется; область значения интерпретируется по типу ключа):
@@ -1733,16 +2063,20 @@ page 13 LEAF (каталог зон), level=0, n_items=1, n_restarts=1:
         item_bytes = 4 + 19 + 72 = 95
         encoded_size = 56 + 2*1 + 2*1 + 95 = 155; free_bytes = 3941
 page 14 LEAF (дерево зоны), level=0, n_items=2, n_restarts=1:
-        item0: shared_len=0, suffix_len=19
-               suffix = RLE(example.com) || 00 00 | 00 00 | 00 00        (T_NODE)
+        arrays: restart_offsets=[4017] (2 Б), slots=[4017, 4060] (4 Б);
+                items_start=4017 (заголовок+массивы = 62 Б; свободно [62,4017) = 3955 Б)
+        item0 @4017: shared_len=0, suffix_len=19
+               suffix = RLE(example.com) || 00 00 | 00 00 | 00 00        (T_NODE: type=0, class=0, subtype=0; LE)
                LeafValue: kind=NODE, flags=APEX, ttl=0, rr_count=0, rdlen=0, val_u32=0
                item_bytes = 4 + 19 + 20 = 43
-        item1: shared_len=14, suffix_len=5
-               суффикс = 01 00 01 00 00     (type=1 A, class=1, subtype=0)
+        item1 @4060: shared_len=13, suffix_len=6
+               суффикс = 01 00 | 01 00 | 00 00     (type=A(1), class=IN(1), subtype=0; LE)
                LeafValue: kind=INLINE, flags=0, ttl=300, rr_count=1, rdlen=4, val_u32=0
                payload (сразу за LeafValue) = 00 04 C0 00 02 01
-               item_bytes = 4 + 5 + 20 + 6 = 35
-        encoded_size = 56 + 2*1 + 2*2 + 43 + 35 = 140; free_bytes = 3956
+                        (u16 rdlength = 00 04 — big-endian DNS wire = 4; rdata C0 00 02 01 = 192.0.2.1)
+               item_bytes = 4 + 6 + 20 + 6 = 36
+        encoded_size = 56 + 2*1 + 2*2 + 43 + 36 = 141; free_bytes = 3955
+        restart_offsets[0] == slots[0] == items_start ✓; n_restarts = ceil(2/8) = 1 ✓
 page 15 ZONE_META (type 9): flags=0, denial=0 (NSEC), default_ttl=300,
         soa_refresh=3600, soa_retry=600, soa_expire=604800, soa_minimum=300,
         upstream_count=0, upstream_bytes=0, upstream_layout=0, upstream_ref=0
@@ -1757,12 +2091,17 @@ page 15 ZONE_META (type 9): flags=0, denial=0 (NSEC), default_ttl=300,
 | `reader_region_len` | `9 * 4096 = 36864` ✓ |
 | `page_data_first` | `4 + 9 = 13` ✓ |
 | `high_water` | первый невыданный номер после страниц 13, 14, 15 → **16** ✓ |
-| ключ item1 | 13 байт имени + 6 байт хвоста = 19; `shared_len=14` (13 байт имени + первый `0x00` хвоста item0), суффикс 5 байт ✓ |
+| ключ item1 | `RLE(example.com)` 13 Б + 6 Б хвоста = 19; `shared_len=13` (имя целиком, включая терминатор), суффикс 6 Б = `01 00 01 00 00 00` ✓ |
 | порядок | `T_NODE` (0x0000) < `A` (0x0001) ✓ |
 | `encoded_size` каталога | `56 + 2 + 2 + 95 = 155` ✓ (ZoneEntry 72 байта) |
-| `encoded_size` дерева | `56 + 2 + 4 + 43 + 35 = 140` ✓ |
+| `encoded_size` дерева | `56 + 2 + 4 + 43 + 36 = 141` ✓ |
+| массивы page 14 | `items_start=4017`; `slots=[4017,4060]`; `restart=[4017]`; `62 + 3955 + 79 = 4096` ✓ |
+| payload item1 | `rdlength = 00 04` (**BE**) = 4; `rdata = C0 00 02 01` = 192.0.2.1; `LeafValue.rdlen = 04 00` (**LE**) = 4 ✓ |
 | `zone_seq` | первый выданный = 1 (0 зарезервирован как «не назначен»), `next_zone_seq = 2` ✓ |
-| `txnid` | создание файла = 1 (§4), первый пользовательский коммит = **2**; `durable_txn = 2` ✓ |
+| `txnid` | создание файла = 1 (§4), первый пользовательский коммит = **2**; `durable_txn = 2` в meta (коммит `Sync`) ✓ |
+| `durable_watermark` | `max(min(durable_txn, txnid))` по валидным meta = `min(2,2) = 2` ✓ |
+| `reclaim_txn` | `min(durable_watermark − 1, oldest_reader_txn) = min(1, ≥1) = 1` (читателей нет, `oldest_reader_txn` ≥ 1 по §6.4) ✓ |
+| `sync_mode` | `0` (Sync), `sync_mode_version = 1`; байт `+624` нулевой, смещения golden не сдвинуты ✓ |
 | `state` | `Initializing` (0): SOA ещё нет — допустимо только в этом состоянии (W-11); apex-only/Serving появится после первого коммита с SOA+NS |
 
 Golden-file в тестах: побайтово все 16 страниц (0..15), включая дескрипторы reader table (crc=0) и 72-байтовый `ZoneEntry`.
@@ -1779,7 +2118,7 @@ RLE(b.example.com)   = 03 63 6f 6d 07 65 78 61 6d 70 6c 65 01 62 00        (15 �
 RLE(a.b.example.com) = 03 63 6f 6d 07 65 78 61 6d 70 6c 65 01 62 01 61 00  (17 Б)
 RLE(c.b.example.com) = 03 63 6f 6d 07 65 78 61 6d 70 6c 65 01 62 01 63 00  (17 Б)
 
-ключ A-записи в b.example.com = RLE(b.example.com) || 00 01 | 00 01 | 00 00   (21 Б)
+ключ A-записи в b.example.com = RLE(b.example.com) || 01 00 | 01 00 | 00 00   (21 Б; type=A(1), class=IN(1) — LE)
 ключ T_NODE  в b.example.com  = RLE(b.example.com) || 00 00 | 00 00 | 00 00   (21 Б)
 ```
 
@@ -1824,13 +2163,13 @@ RLE(c.b.example.com) = 03 63 6f 6d 07 65 78 61 6d 70 6c 65 01 62 01 63 00  (17 �
 | SEC-ZF-005 | §16 (лимиты, guards), §21.3, §2 | `V:unit`, `V:fuzz` |
 | SEC-ZF-006 | не применимо (компрессия запрещена, §8.1); эквиваленты: §8.4, §11.4, §16 | `V:unit`, `V:fuzz` |
 | SEC-ZF-007 | §13.6, §14, §6.3–6.4 (живой PID не вытесняется; `stale` — только диагностика), §15 (F-7) | `V:unit`, `V:integ`, `V:prop` |
-| SEC-ZF-008 | §13.6 (порядок), §13.7, §15 (F-1..F-6), §19 | `V:unit`, `V:integ`, `V:prop` |
+| SEC-ZF-008 | §13.6 (порядок), §13.7, §15 (F-1..F-6a, F-11..F-13), §19 | `V:unit`, `V:integ`, `V:prop` |
 | SEC-ZF-009 | §21.4, §6.1.1, §15 F-9, §13.1 шаги 5–6 | `V:integ`, `V:manual` |
 | SEC-ZF-010 | §21.4 (права, `O_NOFOLLOW`, lock-файл 0600), §4 | `V:unit`, `V:integ` |
 | SEC-ZF-011 | §21.1 (`Corrupt{kind,page}`, `CorruptNoValidMeta`, `UnsupportedVersion`, `TruncatedFile`), §13.1 шаг 4 (**усечённый существующий файл → `TruncatedFile` и для writer, и для reader**; `ftruncate` только при создании, §4), **§13.1 шаг 6/§3.1: перед каждым `mmap` сверяется `st_size`, а не только `dev/ino`** (truncate-race → `TruncatedFile`, не SIGBUS), §13.9, §13.7 | `V:integ` (truncate существующего файла, в т.ч. между `open` и `mmap`), `V:unit` |
 | SEC-ZF-012 | §16 п.9 (**4 таргета**: `zonefile_read`, `zonefile_write`, `zonefile_roundtrip`, `reader_table_state`) + §22, §21.2 | `V:fuzz` (4 таргета) |
 | SEC-ZF-013 | §16 п.9, §8.3, §10.2, §11.2 | `V:miri` |
-| SEC-ZF-014 | §16 п.8, §6.1 (дескриптор, `off % 64`, формула длины, валидация при открытии), §21.4, §20.2 | `V:lint`, `V:manual` |
+| SEC-ZF-014 | §16 п.8, §6.1 (дескриптор, `off % 64`, формула длины, валидация при открытии), §13.1 шаг 1 (**reader тоже `O_RDWR`: права на запись нужны для слотов; данные — `PROT_READ`**), §21.4, §20.2 | `V:lint`, `V:manual` |
 
 ---
 
@@ -1845,12 +2184,174 @@ RLE(c.b.example.com) = 03 63 6f 6d 07 65 78 61 6d 70 6c 65 01 62 01 63 00  (17 �
 
 Ранее закрытые (для истории): TTL clamp (§11.5), `WriteIntent`/`Edit`/`ApplyOutcome` (ссылки, §11.5), `lookup_all`/`WrongAccessor` (§12.5), `Memory`-режим (§13.6), `MAX_ZONE_META_PAGES` (§12.2), `TooManyReaders` (§21.1), лимит `rdlength` (§11.4).
 
-**Известные компромиссы ревизии 1.4** (описаны, не «тихие»):
+**Известные компромиссы ревизии 1.4/1.5.3** (описаны, не «тихие»):
 
 | Компромисс | Цена | Почему принят |
 |---|---|---|
 | COW bucket-страниц (§11.7) | +1 страница-образ на проход выдачи и на коммит с освобождениями; при исчерпании high-water образ берётся из числа выдаваемых | без COW мутация freelist ломает восстановление (и MVCC-инвариант) |
+| `Flush` не двигает `durable_watermark` (§13.6/§14) | `reclaim_txn = 0` до первого `sync()`: файл только растёт, нужен периодический `sync()`; после него режим липко `Sync` | иначе откат после потери meta прочитает переиспользованные страницы; `Flush` обязан переживать рестарт процесса без порчи |
+| строгая граница `free_txn < durable_watermark` (§14) | страницы последнего durable-коммита возвращаются в оборот на один коммит позже, чем при `≤ watermark`; `high_water` растёт чуть выше после всплесков удалений | худшая восстановимая meta — `watermark−1`; переиспользование `F = watermark` могло бы отдать страницу, ещё достижимую из `D−1` |
+| единый `durable_watermark` + W-10 (§13.7/§17) | `durable_txn(selected) < watermark` переводит файл в read-only до fsck; выбор «самой новой» меты не может тихо понизить watermark | иначе sticky обходится метой с меньшим `durable_txn`, а `effective_mode`/reclaim считаются от неё |
+| липкий `Sync` после первого `sync()` (§4.1 п.6) | `Flush`/`Memory` нельзя использовать как «постоянно слабый» режим; `sync()` необратимо повышает класс файла | два слабых коммита после `Sync` затирают durable-слот, и power loss откатывает ниже подтверждённого коммита |
+| `sync_mode` — свойство файла, не коммита (§4.1) | нельзя менять класс durability на ходу; коммит слабее floor отклоняется | одно persistent-поле не может честно описывать смесь режимов; recovery должен знать класс данных до выбора meta |
+| `Memory` требует `allow_unsynced_memory_recovery` (§13.7) | при отсутствии подтверждённой meta — отказ старта вместо «тихого» принятия meta без данных; opt-in даёт read-only до offline fsck | safety > availability: meta могла пережить данные |
 | GC tombstone раз в 5 мин (§13.8) | место возвращается с задержкой до интервала | мгновенное освобождение невозможно: на страницы ссылаются живые снапшоты |
 | Публичный `CorruptKind` — 9 значений (§20.4) | домен теряет детализацию причины (она остаётся в `detail` для логов) | единый контракт ошибок с `domain-model` §6 |
 | `FORWARD` — в `ZoneEntry`, `SIGNED/denial` — в meta-блоке (§12.1) | `meta()` читает страницу при проверке подписи | устранено дублирование; `find_zone` остаётся одностраничным для классификации |
 | Guard 148/351 item'ов (§16 п.3) | верхняя оценка; фактическая ёмкость зависит от длин суффиксов | guard защищает от «бомбы» в файле, а не моделирует раскладку |
+
+---
+
+## 25. Дельта формата v2: параллельная запись по зонам
+
+Раздел нормативен для **v2.0** в части **семантики** и **границ применимости**. Точная раскладка полей и пошаговые протоколы — `docs/spec/parallel-writes-v2.md` (единственная нормативная детализация; этот раздел её не дублирует). Решения и обоснование — `docs/adr/0005-parallel-writers.md`; требования безопасности — `docs/adr/0006-parallel-writers-safety.md` и `docs/adr/0004-security-model.md` §1.3 (`SEC-PW-001..014`). Приоритет при расхождении: ADR-0006 → ADR-0005 → `parallel-writes-v2` → этот раздел.
+
+Принятые решения, на которых стоит раздел: **D-A** — запись корня 64 Б (без отдельного `ZoneRootBlock`); **D-C** — курсор аллокатора и `txn`-билет в памяти, второй writable-регион не вводится; **F-9** — `snapshot_seq` не ceiling (`ceiling = ∞`), retention — только `freeze()`.
+
+### 25.1. Что вытесняется
+
+| Положение v1 | Замена |
+|---|---|
+| §3 «Meta A / Meta B», §5 (meta, `durable_txn`, `reclaim_txn`, `freelist_*`, `zone_dir_root`) | root ring + chain + `ALLOC_RECORD` (`parallel-writes-v2` §3–§4) |
+| `PAGE_META_A/B` (2, 3) | `page 2` — `LayoutHead` A, **`page 3` — `LayoutHead` B**; `PAGE_WRITER_REG = 4`; `PAGE_ALLOC_RECORD_A/B = 5/6`; `PAGE_READER_TABLE = 7`; `PAGE_TYPE_META` зарезервирован |
+| §5 «пишется только неактивная meta» | §25.3 (выбор версии ring/chain) |
+| §6.2 слот 32 Б, `active_txn` | слот 128 Б, `pins[6]` по 16 Б (u64-версия), seqlock (`parallel-writes-v2` §5.2–5.3) |
+| §7 `reserved1` (+12) = 0 | `owner_zone` под `F_PARALLEL_WRITES` |
+| §11.7 глобальный freelist | per-zone пулы; bucket — фаза 1, `free_head` — в `RootEntry V` |
+| §12.1 `ZoneEntry` 72 Б | 24 Б идентичности; мутируемое — в 64-байтовой записи корня |
+| §13.6/§13.7 (коммит/recovery) | §25.6/§25.7 |
+| §14 (`oldest_reader_txn`/`reclaim_txn`) | §25.8 (`MP(z)`/`RV_z`/`freeze_epoch`) |
+| I-3, I-4, I-6, I-12, I-14, W-1, W-9, W-21 | §25.10 |
+
+Без изменений: `LeafValue` (§11.1), payload/overflow (§11.2–11.4), ключи/компаратор (§8–§10), `ZoneMeta`-блок (§12.2), `ZoneState`-семантика (§12.6), CRC (§19), лимиты (§16), суперблок/секции (§4) — кроме `version_major = 2` и новых required-флагов.
+
+### 25.2. Физическая раскладка v2
+
+| Страница | Содержимое |
+|---|---|
+| 0, 1 | Superblock A / B |
+| 2, 3 | `LayoutHead` A / **B** (отдельные страницы, F-2) |
+| 4 | Writer registry (M3; в M1 `term = 1`) |
+| 5, 6 | `ALLOC_RECORD` A / B (отдельные страницы) |
+| 7 … 7+N−1 | Reader table; N = 33 @4096, 17 @8192, 9 @16384 |
+| далее | Root directory A/B регионы: `2 × ceil(max_zones / 16)` страниц |
+| далее | data pages: branch/leaf/overflow/zone-meta/chain/buckets |
+
+```
+reader_region_off   = 7 * page_size            # % 64 == 0
+page_root_dir_first = 7 + N
+page_data_first     = page_root_dir_first + 2 * ceil(max_zones / 16)
+```
+
+`max_zones` фиксируется при создании (дефолт 65536). **Второго writable-региона нет**: единственный writable — reader table (SEC-ZF-014 сохраняется); `reserve_cursor`/`reserve_txn` живут в памяти процесса (D-C), durable-барьер — `ALLOC_RECORD` (`pwritev`, 2 копии в разных страницах).
+
+### 25.3. Версии и выбор состояния
+
+| Величина | Смысл |
+|---|---|
+| `txn` | глобальный монотонный номер коммита (CAS-блок в памяти); не per-zone |
+| `version(Z)` | `txn` последнего коммита зоны; строго возрастает внутри зоны |
+| `DP` / `DT` | durable `page_limit` / `txn_limit` из `ALLOC_RECORD`; не убывают |
+| `D_z` | max версия, чей корень fsync'нут |
+| `MP(z)` | минимум пинов зоны (∞ = нет пинов) |
+| `RV_z` | `min(D_z − 1, MP(z), freeze_epoch)`; гейт выдачи страниц |
+| `snapshot_seq` | `published_txn` на момент `snapshot()`; **аудит/`X-Commit-Txn`, не ceiling** |
+| `freeze_epoch` | `0` = нет freeze; иначе EPOCH-барьер удержания |
+| `zone_guard[z]` | seqlock зоны (чётный = стабильно) |
+
+Выбор версии: `select(z, ceiling) = max { version : CRC ok ∧ owner_zone ok ∧ version ≤ ceiling }`; tie-break — копия A. Обычное чтение — `ceiling = ∞` (последняя версия); при отсутствии в ring — chain до `MAX_ROOT_CHAIN_HOPS = 4096`; цикл/превышение — `Corrupt`; версия ниже доступной истории — `StaleRoot`; зоны нет/tombstone — `NoZoneVersion`. Чтение-на-`T` — только `freeze()` + EPOCH-пин или `fsck --at-epoch T`.
+
+**`PageHeader.txn`** — `txn` создавшей версии; проверка `page.txn ≤ version` выполняется **только вместе с** `owner_zone == zone_seq` (иначе страница чужой зоны с меньшим `txn` прошла бы проверку — кросс-зонный ABA; это file-fatal, §25.9).
+
+### 25.4. Новые объекты (детали — `parallel-writes-v2`)
+
+| Объект | Назначение |
+|---|---|
+| `RootEntry` 64 Б (D-A) | immutable-запись версии: `root_page`, `tree_level`, `meta_root`, `state`, `deleted_txn`, `soa_serial`, `rrset_count`, `free_head`, `prev_record`, `page_limit_at_commit`; `zones()`/`find_zone`/`serial` — одна запись, без второй страницы |
+| Root ring 4 версии × 2 копии в **разных** A/B-страницах, 16 зон/страница-копия | публикация корня без глобальной meta; torn одной копии без потерь |
+| `PAGE_TYPE_ROOT_CHAIN = 11` | safety valve: одна запись на страницу, `prev_record` → предыдущая; достижим из durable-записи |
+| `ALLOC_RECORD` (2 копии в разных страницах) | durable `page_limit`/`txn_limit`/`leader_term`/`seq` |
+| `owner_zone` в `PageHeader.reserved1` | привязка страницы к зоне; 0 = глобальный объект |
+| Reader slot 128 Б, `pins[6]` × 16 Б | per-zone пины (u64-версия) + EPOCH-пин при overflow |
+| Per-zone free pools (bucket) | реюз только после durable drop |
+
+`ZoneRootBlock` и `ALLOC_CTRL` **не существуют** (D-A/D-C): все поля зоны — в `RootEntry`; курсор — в памяти.
+
+### 25.5. `owner_zone`
+
+| Значение | Смысл |
+|---|---|
+| 0 | глобальный объект: superblock, `LayoutHead`, каталог, `ALLOC_RECORD`, root dir/chain, reader table, donation-пул |
+| `zone_seq` | страница принадлежит зоне; ставится до публикации, проверяется при чтении |
+
+Несовпадение `owner_zone` при валидном CRC (или `version`/`owner_zone` записи от чужой зоны) — **file-fatal** (§25.9), а не деградация зоны: это признак нарушения изоляции множеств страниц. `owner_zone` иммутабелен для опубликованной страницы; free-страница переписывается новым владельцем при выдаче. v1-файлы (read-only): `owner_zone = 0`, проверка пропускается; конвертер проставляет владельцев.
+
+### 25.6. Коммит и durability
+
+Нормативная последовательность — `parallel-writes-v2` §4.5: **фаза 1** (`ALLOC_RECORD` + данные + bucket `dropped(V)` + chain-страницы → `fdatasync`), **фаза 2** (2 копии `RootEntry` → `fdatasync`), публикация, ack. Два `fdatasync` на пачку; один fsync (данные+корни) запрещён (`PW-I5`). Корень не пишется, пока `DP > max_allocated_id` и `DT ≥ V`. `free_head` и `prev_record` входят в `RootEntry V` и валидируются `< page_limit_at_commit`.
+
+| Режим | Фаза 1 | Фаза 2 | `D_z` | Гарантия |
+|---|---|---|---|---|
+| `Sync` | да | да | двигается | подтверждённый коммит переживает power loss |
+| `Flush` | да | корни без fsync | не двигается | переживает рестарт процесса; power loss → откат зоны на `V−1` |
+| `Memory` | нет | нет | не двигается | гарантий нет (политика v1 §13.7) |
+
+Sticky-`Sync` — как §4.1 п.6: после первой durable-группы (`DT > 1`) только `Sync`. `sync()` — глобальный барьер (двигает `D_z` всех зон). Auto-promotion в `Sync` — только когда ring блокирует `D_z` при отсутствии пинов (`parallel-writes-v2` §4.3); при пинах — chain, запись не блокируется. `freeze()` запись не блокирует, только задерживает рекламацию.
+
+### 25.7. Восстановление
+
+`recover()` (только под `LOCK_EX`): superblock → `LayoutHead` → reader region → `ALLOC_RECORD` (max-valid по `seq`; обе невалидны → `CorruptNoValidMeta`) → каталог → для каждой зоны `select(z, +inf)` (ring/chain) → проверки (`owner_zone`, `root_page`/`prev_record`/`free_head`, `page_limit_at_commit`, `state`/`deleted_txn`) → `DP = max(ALLOC_RECORD.page_limit, max root.page_limit_at_commit, max pool.page_id+1, page_data_first)`; `DT` — максимум → `reserve_txn = max(DT, max version) + 1`; `reserve_cursor := DP` (курсор только в памяти, D-C) → `D_z = version`, `RV_z = min(D_z − 1, MP(z), freeze_epoch)` → санитизация reader table (§13.7 шаг 9) → публикация.
+
+`max page.txn` на открытии не считается (обход деревьев запрещён); `fsck --verify` проверяет `page.txn ≤ version` и при `page.txn ≥ reserve_txn` поднимает `reserve_txn` + `NEEDS_FSCK`. Откат «всего файла» не существует: каждая зона выбирается независимо (PW-L1). Понижение `DP`/`DT` → `AllocWatermarkRegression` → **file-fatal** (§25.9). Обе версии записи корня невалидны → `Corrupt(BadZoneHead)` **по зоне**; при `strict_corruption = file` — отказ файла.
+
+### 25.8. Рекламация
+
+`RV_z = min(D_z − 1, MP(z), freeze_epoch)`, где `MP(z)` — минимум пинов зоны и EPOCH-пинов; обновляет GC-проход (10 мс, плюс по требованию при `NoSpace`) под `zone_guard[z]` (RAII `EpochGuard`); писатели не сканируют таблицу. Условие выдачи страницы зоне `Z`:
+
+```
+drop_txn ≥ 2 ∧ drop_txn < D_z ∧ drop_txn ≤ RV_z ∧ drop_txn < current_version(Z)
+```
+
+Страницы «never published» реюзаются без гейта. **Порядок F-10:** bucket `dropped(V)` пишется в фазе 1 того же коммита, `RootEntry V.free_head` указывает на него; после краха bucket достижим только из durable-головы. Drop становится durable в фазе 2; reuse — не раньше `V+1` (`drop_txn < D_z`). Крах между фазой 1 и корнем → bucket недостижим (утечка), не double-free. Donation — двумя фазами (durable drop → donate-record следующей группой → выдача при `donated_at_txn < DP`).
+
+### 25.9. File-fatal vs zone-fatal (F-6)
+
+**File-fatal** (всегда `write_locked` + read-only до `fsck`; `strict_corruption` не применяется): `head.page_limit_at_commit > DP`; пересечение множеств страниц зон; `owner_zone`/`version` чужой зоны при валидном CRC; битый/несовместимый `LayoutHead`/`ALLOC_RECORD`/каталог; регрессия `DP`/`DT`/`txn`; `page.txn > version` у достижимой страницы при валидном CRC.
+
+**Zone-fatal** (деградирует только зона): обе копии записи torn; `page_limit_at_commit < root_page`; CRC/`page_no`/`payload_len` собственной страницы; `state`/`deleted_txn` несогласованы; `ZoneDegraded`. `strict_corruption = zone` (дефолт) применяется **только** к этому классу; `file` возвращает v1-поведение.
+
+### 25.10. Инварианты v2
+
+| ID | v2 |
+|---|---|
+| I-3 | Для зоны активна версия с максимальным валидным `version ≤ ceiling` (`ceiling = ∞` по умолчанию); tie-break — копия A |
+| I-4 | Страницы версии `V` неизменны, пока `V ≥ RV_z + 1` или удерживаются пином |
+| I-6 | `DP`/`DT` не убывают; `D_z` не понижается при recovery |
+| I-12 | Запись корня самодостаточна для выбора версии (все поля зоны в ней); глобально recovery зависит от `LayoutHead`/каталога/`ALLOC_RECORD` (PW-L7) |
+| I-14 | `DT > 1` ⇒ файл липко `Sync` |
+| I-15 | `root_page`/`meta_root`/`free_head`/`prev_record` = 0 или `< page_limit_at_commit` |
+| I-16 | Множества страниц разных зон не пересекаются |
+| I-17 | `version(Z)` и `txn` строго возрастают; `txn` не переиспользуется |
+| I-18 | `owner_zone` опубликованной страницы зоны `Z` = `Z`; проверяется при чтении |
+| I-19 | Ring исчерпан ⇒ вытеснение в chain; chain достижим из durable-записи; запись не блокируется (патология — `ZoneWriterStalled{zone}`) |
+| I-20 | `snapshot_seq` не ограничивает `zone_snapshot`; отказ чтения по нему запрещён |
+| W-1' | Пишется группа версии ring; версия `≥ MP(z)` вытесняется в chain, версия `≥ D_z` при отсутствии пинов — auto-promotion `Sync`, затем перезапись |
+| W-9' | Выброшенные страницы — в bucket фазы 1 того же коммита; `free_head` — в `RootEntry V` |
+| W-21' | Выдача страницы — четыре условия §25.8 |
+
+### 25.11. `fsck` v2
+
+Дополнения к §13.9: валидность ring и выбор max-valid; chain (монотонность `version`, `owner_zone`, CRC, освобождённый хвост — не ошибка); `owner_zone` записи корня и каждой страницы; `root_page`/`prev_record`/`free_head < page_limit_at_commit`; `page.txn ≤ version`; дизъюнктность множеств зон битсетом; `drop_txn < D_z` в пулах; возврат утёкших страниц `< DP`; `page_limit ≥ max root.page_limit_at_commit`. `--repair --zone <origin>` при `V ≥ D_z − 1` ∧ `V ≥ RV_z`, иначе `RefuseToRollback`.
+
+### 25.12. Совместимость, миграция, golden
+
+v1-файл: читается (reader-путь v1 на один релизный цикл); writer → `ReadOnly { reason: ConvertRequired }`. v2 под v1-сборкой → `UnsupportedVersion`. Конвертер — ADR 0005 §9. Даунгрейд не поддерживается. Golden-фикстуры страниц/ключей v1 переиспользуются; **v2-фикстуры пролога и ring/chain/`ALLOC_RECORD`/reader-слота регенерируются** (page 3 → `LayoutHead` B, registry → 4, `ALLOC_RECORD` → 5/6, reader → 7).
+
+### 25.13. Приёмка M1
+
+Нормативные условия **C-1…C-11** (ADR-0006 §12) и тесты **T-1…T-5** — `parallel-writes-v2` §15. Раздел §25 их не дублирует; непройденное условие = M1 не принят.
+
+### 25.14. Что этот раздел намеренно не содержит
+
+Раскладку полей, пошаговые протоколы пина/публикации/chain/GC, значения лимитов и матрицу отказов — всё это в `parallel-writes-v2.md` и ADR-0006. Дублирование здесь создало бы второй источник истины.
+

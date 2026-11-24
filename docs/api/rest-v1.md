@@ -199,7 +199,7 @@ Authorization: Bearer pd_live_7Q2m...   # непрозрачный токен, �
 | `rrset-exists` | 409 | создание существующего RRset без `If-Match` |
 | `serial-not-newer` | 409 | запрошенный serial не новее текущего (RFC 1982) |
 | `serial-ambiguous` | 409 | разница ровно 2^31 (RFC 1982) |
-| `zone-busy` | 409 | идёт трансфер/импорт, операция несовместима |
+| `zone-busy` | 409 | зона занята: идёт трансфер/импорт/компакция либо параллельная правка **той же** зоны (аренда). Относится только к этой зоне; другие зоны доступны. `Retry-After` рекомендуется |
 | `zone-read-only` | 409 | попытка править secondary/forward-зону напрямую |
 | `invalid-zone-state` | 409 | операция недопустима в текущем `TransferState` |
 | `transfer-in-progress` | 409 | повторный триггер трансфера |
@@ -213,7 +213,7 @@ Authorization: Bearer pd_live_7Q2m...   # непрозрачный токен, �
 | `not-implemented` | 501 | функция заявлена, но не реализована в v1 |
 | `nsec3-signing-not-implemented` | 501 | подпись NSEC3 отложена до v1.1 (домен/валидатор NSEC3 поддерживают) |
 | `peer-identity-mismatch` | 403 | mTLS-сертификат peer'а не совпал с закреплённым отпечатком |
-| `unavailable` | 503 | сервис не готов (зона `Expired`, store закрыт, идёт восстановление) |
+| `unavailable` | 503 | сервис не готов (зона `Expired`, store закрыт, идёт восстановление, таймаут координатора коммита — транзакция не опубликована, повтор безопасен) |
 | `gateway-timeout` | 504 | превышен таймаут операции |
 | `idempotency-key-reuse` | 409 | тот же `Idempotency-Key` с другим телом (ADR 0004 SEC-API-008) |
 | `idempotency-in-progress` | 409 | повторный запрос с тем же ключом, пока первый выполняется |
@@ -277,17 +277,44 @@ GET /api/v1/zones/example.com./rrsets?limit=100&cursor=eyJvIjoiYS5leGFtcGxlLmNvb
 
 ### 5.2. Оптимистическая блокировка (ETag / If-Match)
 
-- `GET` ресурса возвращает `ETag: "z42-s2026112301"` (для зоны — включает `ZoneId` и serial; для RRset — хеш канонического набора).
-- `PUT`/`PATCH`/`DELETE` RRset и `PUT` настроек **требуют** `If-Match` при `strict_preconditions=true` (по умолчанию включено для RRset); иначе `428`.
-- Несовпадение → `412 precondition-failed` (тело: актуальный `ETag` в поле `current_etag`).
+- `GET` ресурса возвращает `ETag`. Две формы:
+  - **зона:** `"z42-v118-t9042"` = `zone_id`, `zone_version` (версия зоны, ADR 0005) и `txn` (глобальный номер коммита); меняется на **любом** коммите этой зоны (serial, RRset, настройки). Поле `zone_version` дублируется в теле объекта зоны как `version` (целое).
+  - **RRset:** `"rr_8f3a2b"` = хеш канонического набора `(owner, type, class, ttl, sorted rdata)`. **Не зависит** от правок других owner'ов в той же зоне — параллельная запись в другой RRset не инвалидирует ETag.
+- `PUT`/`PATCH`/`DELETE` RRset и `PUT`/`PATCH` настроек **требуют** `If-Match` при `strict_preconditions=true` (по умолчанию включено для RRset); иначе `428`.
+- **Проверка выполняется внутри транзакции записи** (внутри аренды зоны, ADR 0005 §5.3): условие передаётся в `Edit.precondition`, адаптер сверяет его с версией, на которой держится аренда. Окна TOCTOU между `GET` и записью нет. Несовпадение → `412 precondition-failed` с актуальным `current_etag`/`current_version`.
 - `If-Match: *` разрешён для «перезаписать что есть» (осознанное перезаписывание).
 - `If-None-Match: *` на `PUT` = «создать, только если нет» → `412`, если существует.
+- ETag зоны **не** используется для защиты конкретного RRset: правка чужого RRset меняет `zone_version` и «сбросила» бы `If-Match` зоны. Для RRset-эндпоинтов обязателен RRset-ETag; `If-Match` зоны принимается только там, где меняется зона целиком (`PUT /zones/{z}/content`, `PATCH /zones/{z}`).
 
 ### 5.3. Атомарность RRset
 
 - Все изменения набора `(owner, type, class)` применяются одной транзакцией `ZoneWriter` (см. `docs/spec/domain-model.md` §5.2).
 - `PATCH` с `add`+`remove` применяется как единое целое: либо всё, либо ничего.
 - Изменение TTL — операция над всем набором (`Rrset.ttl`), не над отдельной записью.
+
+### 5.4. Параллельные правки зон
+
+Запись параллельна **по зонам**: правки разных зон выполняются одновременно и не блокируют друг друга; правки одной зоны сериализуются арендой (`docs/adr/0005-parallel-writers.md` §4–§5).
+
+| Ситуация | Ответ | `code` | Поведение клиента |
+|---|---|---|---|
+| Две правки **разных** зон одновременно | `200`/`201`/`204` обе | — | без изменений; общего лока нет |
+| Две правки **одной** зоны одновременно | один запрос `200`, второй `409` | `zone-busy` + `Retry-After: 0` | повторить (backoff 10–50 мс) или использовать `If-Match` и разрешить конфликт |
+| `If-Match` не совпал (кто-то успел раньше) | `412` | `precondition-failed` + `current_etag` | перечитать и повторить |
+| Долгая операция (импорт, трансфер, `compact`) в зоне | `409` для правок **этой** зоны | `zone-busy` (импорт/трансфер), `invalid-zone-state` | ждать; другие зоны доступны |
+| Долгая операция в одной зоне, правки в **других** | `200` | — | без изменений (PR-3 ADR 0005) |
+| Создание зоны, пока идёт запись в другие | `201` | — | каталог-коммит короткий; при занятости — `409 zone-busy` с `Retry-After` |
+| Удаление зоны, пока её пишут | `409` | `zone-busy` | дождаться завершения транзакции зоны |
+| `commit` не уложился в таймаут координатора | `503` | `unavailable` + `Retry-After` | повтор безопасен (транзакция не опубликована) |
+
+Правила:
+
+1. **`409 zone-busy` — только про ту зону, к которой относится запрос.** Он **не** означает «сервер занят» и не должен приводить к глобальному backoff клиента.
+2. `Retry-After` для `zone-busy` — `0` (секунд) при аренде (конфликт микросекундный); при импорте/трансфере — оценка оставшегося времени, если известна, иначе `1`.
+3. Идемпотентность (`Idempotency-Key`) не меняется: повтор с тем же ключом и телом возвращает сохранённый ответ; `zone-busy`/`412` **не** сохраняются как ответ (клиент вправе повторить).
+4. **Bulk-операции** (`PUT /zones/{z}/content`, импорт) — одна транзакция одной зоны: параллельность достигается запуском нескольких независимых jobs на разные зоны; один job на зону.
+5. **Rate limit** остаётся per-token/IP (`§2.5`); параллелизм зон не даёт права обходить лимит. При массовых правках многих зон рекомендуется несколько `Idempotency-Key` и последовательные пачки, а не один запрос на 1000 зон.
+6. `GET`-запросы во время правок не блокируются и не возвращают `409`: они видят либо версию до, либо после (MVCC).
 
 ---
 
@@ -421,6 +448,7 @@ Retry-After: 2
   "origin": "example.com.",
   "kind": "primary",
   "serial": 2026112301,
+  "version": 118,
   "default_ttl": 3600,
   "rrsets": 1482,
   "dnssec": { "signed": true, "algorithm": "ecdsa-p256-sha256", "denial": "nsec" },
@@ -459,7 +487,11 @@ POST /api/v1/zones
 }
 ```
 - `201` + `Location: /api/v1/zones/example.com.` + `ETag`.
-- При создании primary генерируется apex `SOA` (serial = 1 или текущая дата, см. настройку `serial_scheme`) и `NS` из `nameservers`. Apex `NS` обязателен (INV-4).
+- `ETag` зоны — `"z<id>-v<version>-t<txn>"`; `version` монотонно растёт на каждом коммите зоны и возвращается в теле (`version`). Для условных запросов на уровне зоны (`PUT /content`, `PATCH /zones/{z}`) `If-Match` принимает эту форму.
+- **MVP:** `PUT /zones/{origin}` создаёт пустую зону и не генерирует apex
+  `SOA`/`NS`; поля `nameservers`/`soa` пока не принимаются. Зона остаётся в
+  `Initializing` (DNS `REFUSED`), пока `SOA` и `NS` не добавлены RRset API.
+  В целевой схеме эти записи генерируются из `nameservers`/`soa` (INV-4).
 - `nameservers` без `glue` допустимы; glue добавляется вручную RRset'ами.
 - `PATCH` зоны позволяет менять только `default_ttl`, `kind` (primary↔forward только при пустой зоне), `nameservers` (перегенерирует apex NS). Serial меняется **только** через `/serial` или транзакционно при правках.
 - `DELETE` для secondary разрешён (удаление подписки), для primary — требует `?confirm_origin=<origin>` (защита от опечатки), иначе `400 validation-failed`.
@@ -503,10 +535,15 @@ POST /api/v1/zones
 | POST | `/api/v1/zones/{origin}/rrsets` | `zones:write` | | `201`, `409 rrset-exists`, `422` |
 | PUT | `/api/v1/zones/{origin}/rrsets/{owner}/{type}` | `zones:write` | | `200`, `404`, `412`, `422` |
 | PATCH | `/api/v1/zones/{origin}/rrsets/{owner}/{type}` | `zones:write` | | `200`, `404`, `409`, `412`, `422` |
-| DELETE | `/api/v1/zones/{origin}/rrsets/{owner}/{type}` | `zones:write` | | `204`, `404`, `409` (apex SOA/NS) |
+| DELETE | `/api/v1/zones/{origin}/rrsets/{owner}/{type}` | `zones:write` | | `204`, `404`, `412` |
 
 `{owner}`: FQDN (`www.example.com.`) или `@` для apex; `{type}` — `UPPER_CASE`.
-`{type}` `SOA`: разрешён только в apex; изменение `SOA.serial` через этот эндпоинт **запрещено** (`422`, `errors[].code = serial-managed`) — serial меняется через `/serial` или автоматически.
+`{type}` `SOA`: разрешён только в apex, ровно одна запись. **MVP-отклонение
+от будущей схемы serial:** `SOA.serial` задаётся явно в RDATA через этот
+эндпоинт (`/serial` и автоматический serial scheme ещё не реализованы);
+сравнение версий идёт по ETag/`version`, а не по SOA serial. `DELETE` apex
+`SOA`/`NS` в MVP разрешён и переводит зону в `Initializing`: DNS отвечает
+`REFUSED`, пока apex `SOA` и `NS` не будут восстановлены.
 
 Объект RRset:
 ```json
@@ -552,14 +589,17 @@ If-Match: "rr_8f3a2b"
   "type": "https://pulse-dns.dev/problems/precondition-failed", "code": "precondition-failed",
   "status": 412, "title": "ETag mismatch",
   "detail": "The RRset was modified. Re-read and retry.",
-  "current_etag": "\"rr_9c11d4\"", "instance": "/api/v1/zones/example.com./rrsets/www.example.com./A",
+  "current_etag": "\"rr_9c11d4\"", "current_version": 119,
+  "instance": "/api/v1/zones/example.com./rrsets/www.example.com./A",
   "request_id": "req_..."
 }
 ```
 
 Замечания:
 - Правки в secondary/forward-зоне → `409 zone-read-only`.
-- Правки во время активного AXFR/IXFR *в эту* зону → `409 zone-busy` (кроме `serial`/`reload`, которые сами меняют снапшот).
+- Правки во время активного AXFR/IXFR *в эту* зону → `409 zone-busy` (кроме `serial`/`reload`, которые сами меняют снапшот). Правки **других** зон в это время проходят: параллельность — по зонам (§5.4).
+- `If-Match` проверяется в той же транзакции, что и запись (`Edit.precondition`): при конкурентной правке того же RRset второй запрос получает `412`, а не «потерянную запись». `current_etag`/`current_version` в теле — актуальные на момент отказа.
+- Правка RRset не меняет ETag других RRset той же зоны: RRset-ETag — хеш содержимого набора, а не версии зоны.
 - DNSSEC-подписи (`RRSIG`, `NSEC`/`NSEC3`) **не редактируются вручную**: попытка → `422` с `code=managed-by-signer`. Они генерируются подписантом.
 - `CNAME` нельзя создать, если у owner есть другие типы (кроме DNSSEC-метаданных), и наоборот → `422 cname-conflict`.
 

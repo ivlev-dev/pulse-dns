@@ -30,6 +30,7 @@
 | `Origin` | VO (валидированный `Name`) | `pulse-zonefile::domain::zone` | Zone Store |
 | `Zone`, `ZoneKind` | aggregate root / enum | `pulse-zonefile::domain::zone` | Zone Store |
 | `ZoneMeta` | VO | `pulse-zonefile::domain::zone` | Zone Store |
+| `Epoch`, `ZoneVersion`, `SnapshotId` | VO (newtype `u64`) | `pulse-zonefile::domain::zone` | Zone Store |
 | `ZoneSnapshot` | immutable view (opaque) | `pulse-zonefile::domain::snapshot` | Zone Store |
 | `Edit`, `EditId`, `EditOp`, `WriteIntent`, `ApplyOutcome`, `ApplyCounts`, `Normalization`, `EditWarning`, `CommitOutcome` | VO / команды | `pulse-zonefile::domain::edit` | Zone Store |
 | `Question`, `Query` | VO | `pulse-dns::domain::question` | Shared kernel |
@@ -61,7 +62,8 @@ pub struct Name { /* private */ }
 
 - Хранит **каноническую форму**: ASCII, lower-case, метки без точек внутри, абсолютное имя с завершающей точкой в презентации.
 - Инварианты: суммарная длина wire-формы ≤ 255 октетов; каждая метка 1..=63 октетов; пустая метка допустима только как терминатор (корень — `Name::root()`).
-- Не хранит указатели на сжатие. Сжатие — деталь wire-codec, разворачивается при разборе.
+- Не хранит указатели на сжатие. Сжатие — деталь wire-codec, разворачивается при разборе. Wire-парсер (`pulse-dns::wire`) **отвергает** compression pointer, указывающий в заголовок сообщения или в **середину метки** (RFC 1035 §4.1.4: указатель обязан указывать на начало метки), а также вперёд и по циклу; домен сжатие не моделирует — `Name` всегда развёрнутая каноническая форма.
+- **Эхо 0x20 (SEC-DNS-011, M3).** `Name` канонически lower-case, поэтому исходный регистр QNAME не восстановим. Сервер (`pulse-server`) обязан сохранять **сырые байты QNAME** запроса рядом с разобранным `Name` и копировать их в question-секцию ответа байт-в-байт; сравнение имён остаётся case-insensitive. Тип `Name` не меняется: хранение сырого QNAME — обязанность транспорта/сборки ответа, не домена.
 - API: `labels()`, `is_subdomain_of(&Origin)`, `parent()`, `to_wire_uncompressed()`, `Display` (каноническая презентация), `cmp_canonical()` (RFC 4034 §6.1 — для DNSSEC-сортировки), `Hash` (по канонической форме).
 - `Name::parse(&str)` — единственный вход извне; ошибки `NameError::{TooLong, LabelTooLong, BadCharacter, EmptyLabel}`.
 - **Не реализует `Ord`** (лексикографический `Ord` не равен каноническому DNSSEC-порядку и провоцирует ошибки). Только `cmp_canonical`.
@@ -85,7 +87,7 @@ pub enum Rdata {
     Soa(SoaData),
     Ptr(Name),
     Mx { preference: u16, exchange: Name },
-    Txt(TxtData),                    // Vec<Vec<u8>>, каждый сегмент 1..=255
+    Txt(TxtData),                    // segments: Vec<Vec<u8>>, каждый 0..=255 (пустая строка легальна)
     Srv { priority: u16, weight: u16, port: u16, target: Name },
     Caa { flags: u8, tag: CaaTag, value: Vec<u8> },
     Dname(Name),
@@ -101,11 +103,19 @@ pub enum Rdata {
     Unknown { rr_type: RrType, rdata: Vec<u8> }, // RFC 3597, непрозрачно
 }
 ```
-- `SoaData { mname: Name, rname: Name, serial: Serial, refresh: Ttl, retry: Ttl, expire: Ttl, minimum: Ttl }`.
+- `SoaData { mname: Name, rname: Name, serial: Serial, refresh: u32, retry: u32, expire: u32, minimum: u32 }` — таймеры **полные `u32`**, не `Ttl` (§2.3.1).
 - Все `Name` внутри `Rdata` — канонические абсолютные.
 - `Unknown` используется для типов, которые сервер не интерпретирует; пересылается байт-в-байт (RFC 3597). В зоне `Unknown` не участвует в семантических правилах, кроме CNAME-эксклюзивности.
 - `Rdata::rr_type()` — детерминированное отображение варианта в `RrType`.
 - Equality/Hash — по канонической байтовой форме (важно для дедупликации в `Rrset`).
+
+#### 2.3.1. Wire-точность отдельных RDATA
+
+- **TXT (`TxtData`).** `TxtData { segments: Vec<Vec<u8>> }`, `1..=N` сегментов; каждый — character-string `0..=255` октетов, **пустая строка (длина 0) легальна** (RFC 1035 §3.3.14). Суммарная длина RDATA `Σ(1 + len) ≤ 65535`. `TxtData::new([b""])` — валидная запись с одной пустой строкой; `RDLENGTH = 0` (ноль сегментов) — `BadRdata`/`FormErr`, а не «пустой TXT». `""`, `[""]` и `["", ""]` — разные байтовые формы (дедупликация — по форме).
+- **SOA-таймеры (`SoaData`).** `refresh/retry/expire/minimum` — полные `u32` (RFC 1035 §3.3.13), **без clamp и без маскирования**. Проверки домена: `refresh ≥ 1`, `retry ≥ 1`, `expire > refresh + retry` (сложение в `u64`, чтобы `0xFFFF_FFFF` не переполнял). `Ttl` применяется **только** к TTL самой RR (`Record.ttl`/`Rrset.ttl`), не к таймерам. `SoaTimers { refresh: u32, retry: u32, expire: u32, minimum: u32 }` — те же поля/валидация для настроек зоны (§5.2.5); тип не наследует `Ttl`.
+- **CAA (`CaaTag`).** `tag` — opaque-байты `1..=255` (RFC 8659 §4.1), регистр **сохраняется** в wire, файле и `Hash`. Сравнение тегов case-insensitive — отдельная семантика (`CaaTag::eq_ignore_ascii_case`), используется для проверок вида «два `issue` с разным регистром в одном RRset — семантический конфликт»; нормализации при разборе и сериализации нет. Пустой тег или > 255 октетов → `BadRdata`.
+- **NSEC / NSEC3.** `NsecData.type_bitmap` **непуст** (RFC 4034 §4.1.2; для authoritative-данных как минимум `NSEC` и `RRSIG`, это проверяет домен при подписи). `Nsec3Data.type_bitmap` **может быть пустым** — empty non-terminal (RFC 5155 §8.5); пустой NSEC3-bitmap — валидная запись, не `BadRdata`.
+- **RRSIG (`RrsigData.original_ttl`).** Поле — полный `u32` («signed data»): **не clamp’ится и не нормализуется**, даже при значении `> 2^31−1`, иначе подпись перестанет проверяться. Clamp применяется только к TTL RRset (`Ttl`) при приёме; при переподписи `original_ttl` берётся из TTL подписываемого набора (уже `≤ 2^31−1`).
 
 ### 2.4. `Record`
 
@@ -146,6 +156,7 @@ pub struct Serial(u32);
   - **wire (DNS-пакет, AXFR/IXFR-RDATA):** `Ttl::from_wire` **clamp** к `0x7FFF_FFFF`, флаг `TTL_NORMALIZED`, `Normalization::TtlClamped`/warning, метрика `ttl_clamped_total`. Маскирования нет: `0x8000_0001` → `0x7FFF_FFFF`, **не** `1`.
   - **бинарный файл зон:** значение > `0x7FFF_FFFF` — порча данных → `Corrupt(BadTtl)`, не clamp и не маскирование (файл пишется только писателем, который clamp'ит при приёме).
   - **текстовый zone-файл (import):** TTL-токен > максимума clamp'ится с `ttl_clamped`-warning (политика `WriteIntent::Import`, §5.2.1).
+- **`Ttl` — только TTL RR.** SOA-таймеры (`refresh`/`retry`/`expire`/`minimum`) и `RRSIG.original_ttl` — полные `u32` и этому clamp не подвержены (§2.3.1). Для negative caching используется `min(Ttl(SOA), SOA.minimum)`, что ограничено TTL RR.
 - `Serial` — полное 32-битное пространство, арифметика **только** по RFC 1982:
   - `s1 < s2` ⟺ `(s2 − s1) mod 2^32 ∈ [1, 2^31 − 1]`;
   - `s1 == s2` при равенстве;
@@ -159,15 +170,20 @@ pub struct Serial(u32);
 
 ```rust
 pub struct ZoneId(u32);                 // opaque, stable, never reused
+pub struct Epoch(u64);                  // глобальный номер коммита (ADR 0005)
+pub struct ZoneVersion(u64);            // версия зоны = Epoch её последнего коммита
 pub struct ZoneMeta { id: ZoneId, origin: Origin, kind: ZoneKind, state: ZoneState,
-                      serial: Serial, deleted_txn: Option<Txn> }   // настройки — через ZoneStore::meta()
+                      serial: Serial, version: ZoneVersion,
+                      deleted_txn: Option<Txn> }   // настройки — через ZoneStore::meta()
 pub enum ZoneKind { Primary, Secondary, Forward }
 pub enum ZoneState { Initializing, Serving, Tombstone }
 pub struct ZoneSettings { default_ttl: Ttl, denial: Denial, soa_timers: SoaTimers,
                           forward_upstreams: Vec<UpstreamSpec> /* ≤16; формат допускает 32 */ }
 ```
+
+- **`Epoch`, `ZoneVersion`, `SnapshotId` (ADR 0005).** `Epoch` — доменное имя глобального `txn` формата (§25.2 спецификации; в файле и ADR — `txn`); глобально монотонный номер коммита. `ZoneVersion` — версия конкретной зоны, равная `Epoch` её последнего коммита; `Txn` в документе означает `ZoneVersion`. Типы разделены, чтобы нельзя было случайно сравнить `Epoch` чужой зоны с `ZoneVersion` этой. `SnapshotId` — значение глобального `txn` на момент `snapshot()`; только аудит/диагностика, **не** ceiling и не версия глобального состояния (PW-L8): состояние — набор per-zone версий, а `zone_snapshot` всегда читает последнюю. `ZoneMeta.version` — то, что клиент видит как `ETag`/`zone_version` и что используется в `If-Match` (`docs/api/rest-v1.md` §5.2).
 - `ZoneId` выдаётся Zone Store монотонно, сохраняется в файле, **никогда не переиспользуется** (даже после удаления зоны). Исчерпание u32 — фатальная ошибка открытия (`StoreError::IdSpaceExhausted`), не тихая перезапись.
-- **`ZoneId` — логическая идентичность, а не физический адрес.** `ZoneId` = стабильный `zone_seq` (принято автором формата); корень B+tree/`PageId`/offset идентификатором больше не является. `compact_zone` и перестройка страниц **не меняют** `ZoneId`: читательский порт `ZoneStore` переживает компакцию без смены идентификатора (меняется только `SnapshotHandle`). Домен, API (`id`), аудит, метрики и `TransferState`/`Key` ссылаются только на стабильный `ZoneId`.
+- **`ZoneId` — логическая идентичность, а не физический адрес.** `ZoneId` = стабильный `zone_seq` (принято автором формата); корень B+tree/`PageId`/offset идентификатором больше не является. `compact_zone` и перестройка страниц **не меняют** `ZoneId`: читательский порт `ZoneStore` переживает компакцию без смены идентификатора (меняется только `ZoneSnapshot`/`ZoneVersion`). Домен, API (`id`), аудит, метрики и `TransferState`/`Key` ссылаются только на стабильный `ZoneId`.
 - `Zone` — aggregate root: `origin`, `id`, `kind`, `default_ttl`, `soa: Option<SoaData>` (у secondary до первого трансфера — `None`), `dnssec_policy`, `transfer: TransferState` (только для `Secondary`/`Forward`).
 - Зона **не материализуется в память целиком**: чтение — через примитивы `ZoneStore`, запись — через `ZoneFacts` (ограниченный снимок затронутых узлов) и чистые `plan_*`-функции. Загрузка зоны на 5M RRset ради одной правки запрещена.
 - `ZoneFacts` — VO для write-path: `meta`, `apex: ApexFacts { soa: Option<SoaData>, ns: Option<Rrset> }`, `affected: BTreeMap<Name, Vec<Rrset>>` (owner, его предки до apex и, при необходимости, ближайшие потомки; жёсткий лимит 64 записи), `delegation: Option<Name>`. Собирается application-слоем через `node`/`lookup`; домен работает только с ним.
@@ -177,7 +193,7 @@ pub struct ZoneSettings { default_ttl: Ttl, denial: Denial, soa_timers: SoaTimer
 - **Жизненный цикл:** `create_zone` → `Initializing`; после атомарного коммита apex `SOA`+`NS` → `Serving`; `delete_zone` → `Tombstone`. `ZoneState` входит в `ZoneMeta`; tombstones не возвращаются `zones()`/`find_zone()`. В `Initializing` допустима любая валидная RR-нагрузка без `SOA`/`NS` (W-11, golden «одна A-запись»); INV-4 применяется только при переходе в `Serving`.
 - **Пустая зона (согласовано с автором формата):** `ZoneEntry.tree_root = 0`, в `ZoneEntry` выставлен `APEX`-маркер, per-zone metadata — `meta_root` (§5.2.5). В `Initializing` зона не авторитативна (нет `SOA`): DNS-ответ — `REFUSED`; API-операции, требующие `Serving`, → `409 invalid-zone-state`.
 - **Apex-only (`Serving`, только `SOA`+`NS`):** запрос в apex → `NODATA` + `SOA` в authority; любой qname ниже apex → `NXDOMAIN` + `SOA`; wildcard/referral отсутствуют. Это корректные ответы, а не `REFUSED`.
-- **Tombstone:** зона сразу исчезает из поиска (DNS → `REFUSED`, API → `404 zone_not_found`); `ZoneId` не переиспользуется; новая зона с тем же origin получает новый `ZoneId`. `ZoneEntry.deleted_txn = Some(txn)` фиксирует момент удаления (в файле — 0-сентинел: `None ↔ 0`, `Some(t) ↔ t`, `t ≥ 1`; см. §5.2.3); страницы и metadata освобождаются **только** когда `oldest_reader_txn ≥ deleted_txn` (см. §5.2.4).
+- **Tombstone:** зона сразу исчезает из поиска (DNS → `REFUSED`, API → `404 zone_not_found`); `ZoneId` не переиспользуется; новая зона с тем же origin получает новый `ZoneId`. `ZoneEntry.deleted_txn = Some(txn)` фиксирует момент удаления (в записи корня v2 — `deleted_txn`, 0-сентинел: `None ↔ 0`, `Some(t) ↔ t`, `t ≥ 1`; см. §5.2.3); страницы и metadata освобождаются **только** когда `deleted_txn ≤ MP(z)` (см. §5.2.4).
 
 ### 2.8. `TransferState` (Replication)
 
@@ -194,7 +210,7 @@ pub enum TransferState {
 pub enum TransferMode { Axfr, Ixfr { from: Serial } }
 ```
 - Переходы только по разрешённым рёбрам (см. INV-13), реализуется `TransferState::transition(...)` — единственная точка мутации.
-- Таймеры (`refresh`, `retry`, `expire`) берутся из SOA зоны, а не из конфига; `Failed::next_attempt_at = now + retry * backoff(attempts)`.
+- Таймеры (`refresh`, `retry`, `expire`) берутся из SOA зоны, а не из конфига (полные `u32`, INV-21); `Failed::next_attempt_at = now + saturating(retry * backoff(attempts))` — вычисление в `u64` с насыщением: огромный `retry` (например, `0xFFFF_FFFF`) означает «никогда в обозримом будущем», а не переполнение `Timestamp`.
 - `Expired` — терминальное для обслуживания состояние: authoritative **обязан** отвечать `SERVFAIL` на запросы в эту зону, но продолжать попытки трансфера (RFC 1034 §4.3.5).
 - Перед публикацией принятой зоны обязательна валидация (формат/границы, монотонность SOA serial, DNSSEC-подписи, если зона подписана). Провал → `Failed { kind: Validation }`, зона остаётся на предыдущем валидном снапшоте (карантин, ADR 0004 SEC-REP-003); частично применённая зона не публикуется никогда.
 - **Персистентность:** `TransferState`, `Peer`, история NOTIFY и публичные части ключей сохраняются в **state-файле процесса в state-dir** (JSON + обязательный `schema_version`, temp+`fsync`+rename, отказ при неизвестной/более новой версии, последовательные миграции, лимит 32 MiB), а не в зонном файле (ADR 0002 §5). Домен от способа хранения не зависит: получает/отдаёт значения через application-порт `ServerStateRepository`.
@@ -289,7 +305,7 @@ pub struct Key {
 |---|---|---|---|
 | INV-1 | `Rrset` однороден: один owner, один `RrType`, один `Class`, один `Ttl` | `Rrset::new`, `merge`, `subtract`, десериализация из зоны | unit + proptest |
 | INV-2 | В `Rrset` нет дубликатов `Rdata`; порядок канонический | `BTreeSet` + `Rdata: Ord` по канонической форме | unit |
-| INV-3 | `0 ≤ TTL ≤ 2^31−1`; wire/import — clamp к `0x7FFF_FFFF` + `TTL_NORMALIZED` (без маскирования); в бинарном файле > максимума → `Corrupt(BadTtl)` | `Ttl::new`, `Ttl::from_wire`, reader | proptest |
+| INV-3 | `0 ≤ TTL ≤ 2^31−1` **для TTL RR**; wire/import — clamp к `0x7FFF_FFFF` + `TTL_NORMALIZED` (без маскирования); в бинарном файле > максимума → `Corrupt(BadTtl)`. SOA-таймеры и `RRSIG.original_ttl` — не TTL и не clamp’ятся (INV-21/INV-24) | `Ttl::new`, `Ttl::from_wire`, reader | proptest |
 | INV-4 | В зоне ровно один `SOA`, только в apex; в apex есть ≥1 `NS` (для `Serving`; у `Secondary` — после первого успешного трансфера). **Исключение (W-11):** для `Initializing` SOA/NS могут отсутствовать; обязательны при переходе в `Serving` и у любой `Serving`-зоны | `validate_zone_facts` (apex) при `state == Serving`/переходе в `Serving`; `plan_commit` | unit + golden |
 | INV-5 | Владелец `CNAME` не имеет других типов, кроме `RRSIG`/`NSEC`/`NSEC3` (DNSSEC-метаданные); `CNAME` не в apex | `plan_rrset_change` | unit |
 | INV-6 | `DNAME` не в apex и не сосуществует с `CNAME` в том же owner | `plan_rrset_change` | unit |
@@ -303,10 +319,14 @@ pub struct Key {
 | INV-14 | Negative-ответ содержит SOA с TTL `= min(SOA.ttl, SOA.minimum) ≤ 10_800` | `CacheEntry::negative` | unit |
 | INV-15 | Окна `Key` монотонны; `Removed` — терминальное состояние | `Key::rotate_to` | state-machine test |
 | INV-16 | `ZoneId` неизменяем и не переиспользуется | Zone Store (аллокатор id) | integration |
-| INV-17 | TXT: каждый сегмент 1..=255 октетов, суммарно ≤ 65535 | `TxtData::new` | proptest |
+| INV-17 | TXT: `1..=N` сегментов, каждый `0..=255` октетов (**пустая строка легальна**), `Σ(1+len) ≤ 65535`; `RDLENGTH = 0` запрещён | `TxtData::new` | proptest |
 | INV-18 | `RRSIG` inception/expiration сравниваются по RFC 1982 (секунды, 32 бита) | `RrsigData::is_valid_at` | unit |
 | INV-19 | Policy: приоритеты уникальны; `Allow` доминирует над `Block` | `PolicySet::insert` | unit |
 | INV-20 | Любая зона, отдаваемая authoritative, имеет либо `UpToDate`/`Idle` (primary), либо `Expired` → `SERVFAIL`; `Transferring` не отдаёт частичных данных | `TransferState::serving_policy` | unit |
+| INV-21 | SOA-таймеры — полные `u32` без clamp; `refresh ≥ 1`, `retry ≥ 1`, `expire > refresh + retry` (u64-арифметика) | `SoaData::validate` | unit + proptest |
+| INV-22 | NSEC `type_bitmap` непуст; NSEC3 `type_bitmap` может быть пустым (ENT, RFC 5155 §8.5) | `NsecData::new`, `Nsec3Data::new` | unit |
+| INV-23 | CAA `tag` — 1..=255 opaque-байт, регистр сохраняется; семантическое сравнение case-insensitive; пустой/длиннее 255 → `BadRdata` | `CaaTag::new`, `CaaTag::eq_ignore_ascii_case` | unit + proptest |
+| INV-24 | `RRSIG.original_ttl` — полный `u32`, не clamp’ится и не нормализуется | `RrsigData::new` | unit + round-trip |
 
 ### 3.1. Разрешённые переходы `TransferState`
 
@@ -338,7 +358,7 @@ Expired         -> Transferring(retry) | Expired
 
 Инвариант результата: `LookupResult` содержит ровно один из `Answer`, `Referral`, `NxDomain`, `NoData`, `PartialAnswer`; `aa=true` для всех, кроме `PartialAnswer`/`Referral`.
 
-Поиск — **zero-copy**: `LookupResult<'a>` ссылается на данные снапшота, время жизни привязано к `SnapshotHandle`. Копирование (`to_owned`) выполняется только на границе отправки пакета.
+Поиск — **zero-copy**: `LookupResult<'a>` ссылается на данные снапшота, время жизни привязано к `ZoneSnapshot` (v2 — пин версии зоны, ADR 0005). Копирование (`to_owned`) выполняется только на границе отправки пакета.
 
 ### 4.2. `SerialArithmetic`
 
@@ -359,7 +379,7 @@ Expired         -> Transferring(retry) | Expired
 **Решение по NSEC/NSEC3 (v1):**
 - домен моделирует `denial: Nsec | Nsec3` (`Zone.dnssec_policy`), валидатор (`pulseresolved`, M5) обязан поддерживать **оба** типа;
 - **подпись в v1 — только NSEC**; NSEC3-подпись — v1.1. `SigningPlan` с `denial = Nsec3` возвращает `SignError::NotImplemented` (API → `501`, см. `docs/api/rest-v1.md` §7.6);
-- импорт/secondary могут содержать NSEC3-подписанные зоны — они валидируются и обслуживаются как есть (без переподписи).
+- импорт/secondary могут содержать NSEC3-подписанные зоны — они валидируются и обслуживаются как есть (без переподписи); валидатор обязан принимать **пустой type bitmap** в NSEC3 (empty non-terminal, RFC 5155 §8.5), тогда как пустой bitmap в NSEC — `BadRdata` (INV-22).
 
 ### 4.5. Прикладывание `RRSIG` к ответу (политика домена)
 
@@ -377,7 +397,7 @@ Expired         -> Transferring(retry) | Expired
 ## 5. Порты (driven ports)
 
 Общие требования ко всем портам:
-- `Send + Sync` (кроме `ZoneWriter`, требующего `Send` и эксклюзивного владения).
+- `Send + Sync` (кроме `ZoneWriter`: `Send`, не `Sync`; один экземпляр = аренда одной зоны, экземпляров может быть много — по одному на зону в разных потоках).
 - Реализации **не паникуют** на ожидаемых ошибках; всё — через `Result`.
 - Ошибки порта типизированы и конвертируются в `ApplicationError` в одном месте (`From`-impl).
 - Порты не логируют бизнес-события; логирование — в адаптере на уровне `tracing` с `trace_id`.
@@ -386,8 +406,21 @@ Expired         -> Transferring(retry) | Expired
 
 ```rust
 pub trait ZoneStore: Send + Sync + 'static {
-    /// O(1), lock-free. Возвращает текущий опубликованный снапшот.
+    /// O(1), lock-free. Снимок каталога + `SnapshotId` (аудит/диагностика).
+    /// НЕ ограничивает версию зоны (ceiling = ∞) и НЕ пинит страницы:
+    /// согласованный срез нескольких зон даёт только `freeze()`.
     fn snapshot(&self) -> SnapshotHandle;
+
+    /// O(1), lock-free. Берёт ПОСЛЕДНЮЮ опубликованную версию зоны и ПИНИТ её:
+    /// все срезы защищены от переиспользования до Drop. Обязателен для любого
+    /// чтения данных зоны (zero-copy). `StaleRoot` — валидной версии нет вовсе
+    /// (ring+chain биты) или зона пересоздана (retryable после нового snapshot()).
+    fn zone_snapshot(&self, snap: &SnapshotHandle, zone: ZoneId)
+        -> Result<ZoneSnapshot, StoreError>;
+
+    /// То же по origin (longest-suffix уже разрешён вызывающим).
+    fn zone_snapshot_by_origin(&self, snap: &SnapshotHandle, origin: &Origin)
+        -> Result<ZoneSnapshot, StoreError>;
 
     /// Метаданные зон (только живые).
     fn zones(&self, snap: &SnapshotHandle) -> Vec<ZoneMeta>;
@@ -398,20 +431,19 @@ pub trait ZoneStore: Send + Sync + 'static {
     /// Самая специфичная (longest-suffix) зона для qname. O(labels), без аллокаций.
     fn find_zone(&self, snap: &SnapshotHandle, qname: &Name) -> Option<ZoneMeta>;
 
-    /// Serial зоны без разбора SOA-RDATA.
-    fn serial(&self, snap: &SnapshotHandle, zone: ZoneId) -> Result<Serial, StoreError>;
+    /// Serial зоны без разбора SOA-RDATA. Читается из записи корня версии зоны.
+    fn serial(&self, zs: &ZoneSnapshot) -> Serial;
 
-    /// Per-zone metadata из meta-блока (`ZoneEntry.meta_root`): default_ttl, denial,
-    /// SOA-таймеры, forward-upstreams. Zero-copy, lifetime = snapshot.
-    fn meta<'a>(&self, snap: &'a SnapshotHandle, zone: ZoneId) -> Result<ZoneSettingsRef<'a>, StoreError>;
+    /// Per-zone metadata из meta-блока (`head.meta_root`): default_ttl, denial,
+    /// SOA-таймеры, forward-upstreams. Zero-copy, lifetime = `ZoneSnapshot`.
+    fn meta<'a>(&self, zs: &'a ZoneSnapshot) -> Result<ZoneSettingsRef<'a>, StoreError>;
 
     /// Точное чтение RRset по (qname, qtype): zero-copy, результат живёт не дольше снапшота.
     /// НЕ выполняет DNS-композицию (wildcard/CNAME/referral/NXDOMAIN) — это домен.
     /// Для `RRSIG` возвращает `WrongAccessor` — используйте `lookup_all`.
     fn lookup<'a>(
         &self,
-        snap: &'a SnapshotHandle,
-        origin: &Origin,
+        zs: &'a ZoneSnapshot,
         qname: &Name,
         qtype: RrType,
     ) -> Result<Option<RrsetRef<'a>>, StoreError>;
@@ -422,8 +454,7 @@ pub trait ZoneStore: Send + Sync + 'static {
     /// не может вернуть все подписи имени.
     fn lookup_all<'a>(
         &self,
-        snap: &'a SnapshotHandle,
-        origin: &Origin,
+        zs: &'a ZoneSnapshot,
         qname: &Name,
         qtype: RrType,
     ) -> Result<RrsetsRef<'a>, StoreError>;
@@ -432,16 +463,14 @@ pub trait ZoneStore: Send + Sync + 'static {
     /// без чтения всех RRset — для closest-encloser/wildcard/referral.
     fn node<'a>(
         &self,
-        snap: &'a SnapshotHandle,
-        origin: &Origin,
+        zs: &'a ZoneSnapshot,
         name: &Name,
     ) -> Result<Option<NodeRef<'a>>, StoreError>;
 
     /// Следующее имя в каноническом порядке (RFC 4034 §6.1) — для NSEC и потокового обхода.
     fn next_name<'a>(
         &self,
-        snap: &'a SnapshotHandle,
-        origin: &Origin,
+        zs: &'a ZoneSnapshot,
         after: Option<&Name>,
     ) -> Result<Option<NameRef<'a>>, StoreError>;
 
@@ -451,8 +480,7 @@ pub trait ZoneStore: Send + Sync + 'static {
     /// возвращается курсор для продолжения (`enumerate(..., from: Some(cursor), ...)`).
     fn enumerate<'a>(
         &'a self,
-        snap: &'a SnapshotHandle,
-        zone: ZoneId,
+        zs: &'a ZoneSnapshot,
         from: Option<&Name>,
         visitor: &mut dyn FnMut(RrsetRef<'a>) -> std::ops::ControlFlow<()>,
     ) -> Result<Option<Name>, StoreError>;
@@ -521,7 +549,8 @@ impl<'a> NameRef<'a> {
 Пример AXFR-потока (нулевое копирование RRset, максимум — один RR при `copy_into`):
 
 ```rust
-store.enumerate(&snap, zone, from, &mut |rrset| {
+let zs = store.zone_snapshot(&snap, zone)?;   // пин версии зоны на весь трансфер
+store.enumerate(&zs, from, &mut |rrset| {
     for rr in rrset.iter() {
         out.put_u16(rr.len() as u16);                 // RDLENGTH
         match rr.as_slice() {
@@ -536,11 +565,28 @@ store.enumerate(&snap, zone, from, &mut |rrset| {
 ```
 - Домен не парсит RDATA, которые не участвуют в семантике: для A/AAAA/TXT/MX и т.п. сегменты `Rr` копируются в ответ как есть. Для CNAME/NS/DNAME/SOA разбор — on-demand (`NameRef::to_name()`), только по этим типам.
 - Owner (имя) не копируется в `Name`: энкодер пишет метки из `NameRef::write_wire` прямо в выходной буфер; `Name` создаётся только когда нужен владелец (ключ кеша, ответ API).
-- Владение (`Rrset`, `Record`, `Name`) появляется только при выходе за границу снапшота: API-ответ, экспорт, запись в трансфер. Внутри обработки запроса — заимствование, lifetime = `SnapshotHandle`.
+- Владение (`Rrset`, `Record`, `Name`) появляется только при выходе за границу снапшота: API-ответ, экспорт, запись в трансфер. Внутри обработки запроса — заимствование, lifetime = `ZoneSnapshot`.
+
+**Снапшоты: две ступени (ADR 0005).**
+
+| Ступень | Что это | Что гарантирует | Цена |
+|---|---|---|---|
+| `SnapshotHandle` | каталог + `SnapshotId` (диагностика) | «какие зоны есть»; **не** ограничивает версию зоны (ceiling = ∞), **не** удерживает страницы и **не** даёт согласованный срез | 1 acquire-load |
+| `ZoneSnapshot` | последняя опубликованная версия `V` + пин в reader table | атомарный набор данных одной зоны: `lookup`/`node`/`next_name`/`enumerate` видят ровно версию `V`; срезы защищены от переиспользования до `Drop`; `version()`/`zone()` — accessor'ы | 2 атомарных store/load + `fence(SeqCst)` + refcount |
+
+Правила:
+
+1. **Любое чтение данных зоны идёт через `ZoneSnapshot`.** `lookup`/`node`/`next_name`/`enumerate`/`meta` принимают `&ZoneSnapshot`, а не `&SnapshotHandle`; иначе срез `mmap` может быть переиспользован writer'ом (в v1 это закрывалось единым пином файла, в v2 пин — зоно-локальный).
+2. `ZoneSnapshot` — `Send + Sync`, клонируется как `Arc`-refcount без повторного пина; `unpin` — на `Drop` последнего держателя.
+3. Зона живёт независимо: `ZoneSnapshot` остаётся валидным, даже если зону удалили (tombstone) — читатель дочитывает свою версию, страницы освобождаются GC только после снятия пина (A-11 ADR 0005).
+3a. **Ceiling = ∞:** `snapshot()` не фиксирует «версию мира». Снапшот зоны всегда отражает последнюю опубликованную версию на момент `zone_snapshot()`; повторный `zone_snapshot` той же зоны в том же батче может дать более новую версию. Если нужен стабильный срез многих зон — `freeze()` (maintenance), не `SnapshotHandle`.
+4. Кросс-зонная согласованность **не гарантируется**. Для «среза всех зон» — административная `freeze()` (maintenance, не порт) или offline-копия; см. `docs/adr/0005-parallel-writers.md` §7.3.
+5. `StaleRoot { zone, requested: ZoneVersion, oldest_retained: ZoneVersion }` — не штатная ошибка чтения: в ring+chain нет ни одной валидной версии (порча/исчерпание history) либо зона пересоздана и `version` начались заново. Retryable после `fsck`/нового `snapshot()`; при исчерпании ring писатель уходит в chain (ADR 0005 §3.2), а не возвращает ошибку читателю.
 
 **Гарантии:**
 - `snapshot()` — Acquire-load атомарного указателя; не блокирует писателя и других читателей. Может вызываться из любого потока, включая hot-path DNS-обработчика.
-- `SnapshotHandle` — дешёвая копия (`Arc`-подобная), удерживает ресурсы (mmap-регион / буфер) живыми до дропа. Клонирование ≤ 20 ns, без syscall.
+- `zone_snapshot()` — двухфазный per-zone пин: структура протокола — `docs/spec/zonefile-v1.md` §6.3, v2-детали (seqlock, `fence(SeqCst)`, 6 пинов × 16 Б) — `docs/spec/parallel-writes-v2.md` §5.2–5.3; ≤ 40 ns, без syscall и без аллокаций; при переполнении слотов/пинов — `ReaderContended`, при > `MAX_PINNED_ZONES_PER_SNAPSHOT` (64) зон — широкий EPOCH-пин (`PIN_OVERFLOW`, консервативная деградация, данные целы).
+- `SnapshotHandle`/`ZoneSnapshot` — дешёвые копии (`Arc`-подобные), клонирование ≤ 20 ns, без syscall. `SnapshotHandle` не является retention-барьером: держать его долго безопасно, но он не гарантирует «старый мир» (ceiling = ∞).
 - `lookup`/`node`/`next_name` детерминированы: два вызова с одним снапшотом дают идентичный результат; снапшот иммутабелен. Все три — O(log n) и без аллокаций.
 - `lookup_all` для `RRSIG` возвращает до `MAX_RRSIG_SUBTYPES = 64` групп; превышение — `Corrupt` (формат не должен допускать такого имени). Для не-RRSIG типов результат — 0 или 1 элемент.
 - `meta()` — O(1) чтение meta-блока, не зависит от числа RRset; не парсит содержимое зоны.
@@ -548,17 +594,33 @@ store.enumerate(&snap, zone, from, &mut |rrset| {
 - `enumerate` возвращает `Some(cursor)`, если visitor вернул `Break`; продолжение — `enumerate(from: Some(cursor))` даёт ровно те же записи, начиная со следующей. Ошибка посреди обхода → `Err`; полученный до ошибки поток **не является полным обходом зоны** — AXFR обязан прервать трансфер (без `End`/commit), а не отдавать частичную зону как целую.
 - `find_zone` — longest-suffix по меткам, O(labels) (≤ 127), без аллокаций; при нескольких зонах с перекрытием выбирается самая специфичная.
 - `enumerate` даёт стабильный порядок (канонический по `(owner, type)`) — нужен для AXFR, NSEC и детерминированных тестов/экспорта.
-- Читатель может удерживать снапшот неограниченно долго; писатель обязан не переиспользовать освобождённые области, пока есть держатели (см. ADR 0003 §5.3 — таблица читателей и `oldest_reader_txn`).
+- Читатель может удерживать `ZoneSnapshot` неограниченно долго; writer не переиспользует освобождённые области, пока пин этой версии жив (см. ADR 0005 §6, `docs/spec/zonefile-v1.md` §25.11). Следствие: долгоживущий читатель задерживает рекламацию **только своей зоны**, а не файла.
 
-**Ошибки:** `StoreError::{Io { source }, Corrupt { kind: CorruptKind, page: Option<u32> }, UnsupportedVersion { found: u16, supported: u16 }, ZoneNotFound, WrongAccessor { rrtype: RrType }, IdSpaceExhausted, MapFull, NoSpace, TooManyReaders, Internal}`. `MapFull`/`NoSpace`/`IdSpaceExhausted` на чистом чтении не возникают, но входят в общий тип для единого ACL-маппинга ошибок формата (см. §6); `CorruptKind` — структурированная причина (`NoValidMeta`, `PageChecksum`, `TreeOrder`, `Bounds`, `FreelistCycle`, `BadTtl`, `BadZoneMeta`, `BadRdata`, `BadName`, …), не строка.
-**Конкурентность:** много читателей / один писатель; `ZoneStore` сам по себе read-only фасад.
+**Ошибки:** `StoreError::{Io { source }, Corrupt { kind: CorruptKind, zone: Option<ZoneId>, page: Option<u32> }, UnsupportedVersion { found: u16, supported: u16 }, ZoneNotFound, WrongAccessor { rrtype: RrType }, StaleRoot { zone: ZoneId, requested: ZoneVersion, oldest_retained: ZoneVersion }, ZoneDegraded { zone: ZoneId, epoch: Epoch }, ReaderContended, IdSpaceExhausted, MapFull, NoSpace, TooManyReaders, Internal}`. `MapFull`/`NoSpace`/`IdSpaceExhausted` на чистом чтении не возникают, но входят в общий тип для единого ACL-маппинга ошибок формата (см. §6); `CorruptKind` — структурированная причина (`NoValidMeta`, `PageChecksum`, `TreeOrder`, `Bounds`, `FreelistCycle`, `BadTtl`, `BadZoneMeta`, `BadRdata`, `BadName`, `BadZoneHead`), не строка. `Corrupt` теперь несёт `zone`, если порча локализована зоной (ADR-0006 PW-C24/§7): остальные зоны продолжают обслуживаться. `zone_snapshot()` после `PIN_ATTEMPTS = 8` различает причины: застрявший `zone_guard` → `ZoneDegraded` (зона read-only + `NEEDS_FSCK`, не retryable в этом вызове), churn публикаций (`e0`/версия сменились) → `ReaderContended` (retryable с backoff).
+**Конкурентность:** много читателей / много писателей по разным зонам; `ZoneStore` сам по себе read-only фасад.
 **Производительность (цель):** `lookup` p50 ≤ 300 ns; полный авторитетный ответ (доменная композиция + адаптер) p50 ≤ 500 ns, p99 ≤ 2 µs на зону 1M RRset в горячем кеше CPU; `snapshot()` не аллоцирует.
 
 ### 5.2. `ZoneWriter` — транзакционная запись
 
-#### 5.2.1. Модель транзакции
+#### 5.2.1. Модель транзакции и аренда зоны
 
-Транзакция **неявная**: первый `apply(zone, intent, edit)` открывает её, последующие `apply` накапливают правки, `commit(zone, Commit(d) | Abort)` завершает. **Одна транзакция = ровно один `commit`**; между `apply` изменения не видны читателям (COW-страницы, публикация только meta при `commit`). Несколько `apply` допустимы (батчинг импорта/трансфера), но каждый `Edit` — атомарная единица валидации. Явных `begin`/`abort` в порте нет: откат — `CommitPolicy::Abort`; при этом API §5.2.6 — источник истины для §20.3 спеки формата.
+Транзакция **неявная и зоно-локальная**: первый `apply(intent, edit)` на `ZoneWriter` открывает её, последующие `apply` накапливают правки, `commit(CommitPolicy)` завершает. **Одна транзакция = ровно один `commit`**; между `apply` изменения не видны читателям (COW-страницы, публикация версии корня зоны при `commit`). Несколько `apply` допустимы (батчинг импорта/трансфера), но каждый `Edit` — атомарная единица валидации. Явных `begin`/`abort` нет: откат — `CommitPolicy::Abort`; API §5.2.6 — источник истины для §20.3 спеки формата.
+
+**`ZoneWriter` — handle на одну зону, а не на файл.** Экземпляр создаётся `ZoneStore::writer(zone)` / `writer_by_origin(origin)` и удерживает **аренду (lease)** этой зоны до `Drop`. Пока аренда удерживается, никакой другой `ZoneWriter` этой зоны существовать не может; другие зоны пишутся параллельно.
+
+| Свойство | Правило |
+|---|---|
+| Сколько писателей | `N` экземпляров `ZoneWriter` на разные зоны — одновременно, без общего лока; на одну зону — ровно один (аренда) |
+| `Send`/`Sync` | `ZoneWriter: Send`, **не** `Sync` (мутация — из одного потока); `ZoneStore: Send + Sync` |
+| Получение аренды | `writer()` — `Busy` сразу, если зона занята; `writer_timeout(d)` — ждёт до `d`, затем `Busy`; `try_writer()` — не блокирует |
+| Активная транзакция | одна на экземпляр; `apply` с другим `intent` → `Busy`; `Drop` без `commit` = `Abort` |
+| Долгая операция | `compact_zone`/импорт держат аренду только своей зоны: остальные зоны пишутся (PR-3 ADR 0005) |
+| Кросс-зонные операции | `create_zone`/`delete_zone` — не через `ZoneWriter`; см. §5.2.4 |
+| Порядок | правки одной зоны сериализованы арендой; между зонами общего порядка нет |
+
+**Атомарность и видимость.** `commit` атомарен в области **одной зоны**: либо вся транзакция видна читателям зоны, либо ничего. Кросс-зонная атомарность не предоставляется и не требуется (`docs/adr/0005-parallel-writers.md` §7).
+
+**Precondition внутри транзакции.** `Edit` может нести `precondition: Option<Precondition>` (`IfZoneVersion(ZoneVersion)` / `IfRrsetEtag(hash)`). Проверка выполняется адаптером **внутри** аренды, против версии, на которой построен `Edit`, — этим закрывается TOCTOU между `GET` (ETag) и записью: несовпадение → `WriteError::PreconditionFailed { current: ZoneVersion, current_etag }` (HTTP `412`), файл не меняется. Без precondition поведение прежнее (`ZoneStore`-чтение снаружи транзакции).
 
 `WriteIntent` задаёт **политику инвариантов и нормализации**. Это единственное место, где TTL-политика различается (ср. §2.5):
 
@@ -635,20 +697,32 @@ pub struct CommitOutcome {
     pub zone: ZoneId,
     pub old_serial: Serial,
     pub new_serial: Serial,
-    pub commit_id: CommitId,
-    pub snapshot: SnapshotHandle,          // единственная точка публикации
+    pub commit_id: CommitId,               // (zone_seq, epoch)
+    pub epoch: Epoch,                      // глобальный номер коммита
+    pub zone_version: ZoneVersion,         // = epoch; то, что уходит в ETag/If-Match
+    pub snapshot: ZoneSnapshot,            // единственная точка публикации
 }
 ```
 
+- `snapshot` — **`ZoneSnapshot`** (пин версии этой зоны), а не глобальный `SnapshotHandle`: публикуется именно версия зоны, и держатель обязан видеть её целиком. Глобальная эпоха доступна как `CommitOutcome.epoch`.
+- `zone_version` — монотонная версия зоны; используется для `ETag`, `If-Match` и идемпотентной проверки «применил ли я свою правку».
+- `commit_id` = `(zone_seq, epoch)`; строковое представление для API — `z<zone_seq>-e<epoch>`.
 - `snapshot` появляется **только** в `CommitOutcome` (`CommitResult::Committed`): до `commit` снапшота не существует (§5.1 «apply не виден читателям»); `CommitResult::Aborted` не публикует ничего (отчётность — по ранее возвращённым `ApplyOutcome`).
-- **`deleted_txn` (унификация с форматом):** хранимая `ZoneMeta`/`ZoneEntry` — `Option<Txn>`; в файле 0-сентинел. Маппинг: `None ↔ 0`, `Some(t) ↔ t`, допустимы только `t ≥ 1`; `Some(0)` запрещён (`InvalidEdit` при записи, `Corrupt(BadZoneMeta)` при чтении). У live-зоны `None`; у tombstone — txn удаления. В `DeleteOutcome` — **всегда `Txn`** (не `Option`): `delete_zone` сам является коммитом, момент удаления существует всегда (`t ≥ 1`); `None` в результате невозможен.
+- **`deleted_txn` (унификация с форматом):** хранимая `ZoneMeta` — `Option<Txn>`; в записи корня (v2) — `deleted_txn: u64`, 0-сентинел. Маппинг: `None ↔ 0`, `Some(t) ↔ t`, допустимы только `t ≥ 1`; `Some(0)` запрещён (`InvalidEdit` при записи, `Corrupt(BadZoneHead)` при чтении). `deleted_txn` зоны равен `version(zone)` коммита удаления, поэтому сравнение с `MP(z)` корректно. У live-зоны `None`; у tombstone — версия удаления. В `DeleteOutcome` — **всегда `Txn`** (не `Option`): `delete_zone` сам является коммитом, момент удаления существует всегда (`t ≥ 1`); `None` в результате невозможен.
 - `commit` атомарно переписывает apex `SOA` (serial = `old_serial.succ()` либо serial из `ReplaceRrset`/`UpsertRrset` SOA, если он новее — RFC 1982) и публикует снапшот; серийный номер и содержимое SOA меняются одной транзакцией (INV-9).
-- Гарантия «всё или ничего»: ошибка любой операции → `ApplyOutcome` не возвращается, транзакция переходит в failed; `CommitPolicy::Abort` (или Drop `ZoneWriter`) не оставляет в файле ни одной страницы транзакции. Повторный `commit`/`apply` после ошибки → `UnknownTxn`.
-- `MapFull` — исчерпано **адресное пространство файла** (`high_water == page_count_max`): нужен больший `map_size`/пересоздание файла; `NoSpace` — свободных страниц нет, но все они «молодые» и не могут быть выданы в текущей транзакции (retryable: повтор после `sync`/освобождения читателями). Оба — ошибка `commit`, файл остаётся консистентным на предыдущем снапшоте; частичных изменений нет.
+- Гарантия «всё или ничего»: ошибка любой операции → `ApplyOutcome` не возвращается, транзакция переходит в failed; `CommitPolicy::Abort` (или Drop `ZoneWriter`) не оставляет в файле ни одной **опубликованной** страницы транзакции — неопубликованные страницы немедленно возвращаются в per-zone free pool (ADR 0005 A-10), запись корня не меняется. Повторный `commit`/`apply` после ошибки → `UnknownTxn`.
+- `MapFull` — исчерпано **адресное пространство файла** (`high_water == page_count_max`): нужен больший `map_size`/пересоздание файла. `NoSpace { zone }` — у **этой зоны** нет выдаваемых страниц: свободные есть, но «молодые» (`drop_txn ≥ D_z` или `> MP(z)`) или их нет вовсе (retryable: повтор после `sync()`/освобождения читателей/`donation`). Оба — ошибка `commit`, файл консистентен на предыдущей версии зоны; частичных изменений нет. Важно: `NoSpace` одной зоны **не** блокирует запись в другие (они берут страницы из bump-фронтира или своих пулов).
 
 #### 5.2.4. Жизненный цикл зоны (`create_zone` / `delete_zone`)
 
-`create_zone` и `delete_zone` — самостоятельные операции порта (внутри неявная транзакция + `commit`); активная транзакция в момент вызова → `Busy`.
+`create_zone` и `delete_zone` — самостоятельные операции **`ZoneStore`** (не `ZoneWriter`): каждая выполняет внутренний коммит, возвращает опубликованное состояние. Активная транзакция в `ZoneWriter` на ту же зону в момент вызова → `Busy` (аренда занята); на другие зоны — не влияет.
+
+| Операция | Что пишет | Сериализация | Ошибки |
+|---|---|---|---|
+| `create_zone` | каталог (идентичность) + новая запись корня + `root_entry_index` + `next_zone_seq` | каталог-writer (единый) | `Conflict{ZoneExists}`, `IdSpaceExhausted`, `TooManyZones`, `Busy { scope: Catalog }` |
+| `delete_zone` | **только запись корня** зоны (tombstone) | аренда зоны | `ZoneNotFound`, `Busy { zone }`, `ReadOnly` |
+
+Это следствие ADR 0005 §3.3/§7.2: мутируемые поля зоны не живут в каталоге, поэтому удаление не требует каталог-коммита и не сериализуется с другими зонами.
 
 ```rust
 pub struct ZoneOptions {
@@ -668,10 +742,10 @@ pub struct DeleteOutcome { pub zone: ZoneId, pub deleted_txn: Txn, pub reclaim_a
 - **Состояние после создания:** с `initial_soa`+`initial_ns` та же транзакция пишет apex `SOA`/`NS`, после commit зона `Serving` (apex-only семантика — §2.7). Без них (`Secondary`, ожидающая AXFR; `Primary` без данных) — `Initializing` (DNS `REFUSED`). `Forward` — сразу `Serving` (нужен ≥1 upstream), собственных RRset нет.
 - **Идемпотентность:** повторный `create_zone` с теми же параметрами — не идемпотентен по контракту; вызывающий использует `Idempotency-Key` на уровне API.
 - **`delete_zone`:** выставляет `Tombstone`, зона немедленно исчезает из `find_zone`/`zones`, DNS → `REFUSED`, API → `404 zone_not_found`; `ZoneId` не переиспользуется. Повторный `delete_zone` → `ZoneNotFound` (не идемпотентен; API идемпотентен на уровне HTTP-семантики `DELETE`). Для `Secondary` отменяет запланированные/идущие трансферы (in-flight `commit` получит `ZoneNotFound`/`UnknownTxn`); для `Forward` удаляет upstream-конфигурацию; для `Primary` — разрешено (API требует `confirm_origin`).
-- **Освобождение (N-7):** страницы RRset и meta-блок освобождаются **только** при `oldest_reader_txn ≥ deleted_txn`; никакого вытеснения живого читателя по таймауту нет (SEC-ZF-007). До выполнения условия старые снапшоты читаются без изменений. `reclaim_after` (= `deleted_txn`) — порог условия, не дедлайн и не оценка времени.
-- **Кто запускает reclaim:** (а) **оппортунистически на каждом `commit`** — writer возвращает в freelist всё, чей `retire_txn ≤ oldest_reader_txn`, включая tombstone-зоны; (б) при `compact_zone` — полный проход; (в) фоновая maintenance-задача `pulse-server` (**интервал 1 ч**; спека формата приводится к этому значению) может инициировать пустой commit/compact, если `oldest_reader_txn` продвинулся. Отдельного «force GC» нет.
-- **Ограничение работы на коммит:** opportunistic GC обрабатывает не более `MAX_RECLAIM_ZONES_PER_COMMIT = 16` tombstone-зон и не более `MAX_RECLAIM_PAGES_PER_COMMIT = 8192` страниц (≈32 MiB при `page_size=4096`) — бюджет latency обычного `commit`, чтобы она не росла O(число tombstones). Остаток не теряется: он остаётся в очереди tombstone'ов и обрабатывается следующим коммитом или maintenance/`compact_zone` (FIFO, метрика `reclaim_deferred_total`). Проверка — бенчмарк `commit_p99` при 10k tombstones.
-- **Диагностика утечки читателя:** если живой процесс держит старый `txn`, `oldest_reader_txn` не растёт → tombstones и страницы не освобождаются → со временем `NoSpace`/`MapFull`. Это наблюдаемое состояние: метрики `tombstones_pending`, `oldest_reader_age_seconds`, `readers_active`; оператор устраняет застрявший процесс/баг, а не «выдавливает» его. Автоматического eviction нет.
+- **Освобождение (N-7):** страницы RRset, meta-блок и сама запись корня освобождаются **только** при `deleted_txn ≤ MP(z)` (для tombstone `deleted_txn == version` зоны, ADR 0005 A-11); никакого вытеснения живого читателя по таймауту нет (SEC-ZF-007). До выполнения условия старые `ZoneSnapshot` читаются без изменений. `reclaim_after` (= `deleted_txn`) — порог условия, не дедлайн и не оценка времени.
+- **Кто запускает reclaim:** (а) **GC-проход** (ADR 0005 §6.1) пересчитывает `MP(z)` и возвращает страницы в per-zone free pool; (б) tombstone-зоны освобождаются, когда `deleted_txn ≤ MP(z)`, — тем же проходом; (в) `compact_zone` — полный проход по зоне; (г) `donation` — передача полностью реклеймленных страниц зоны в глобальный пул (GC-проход или maintenance). Отдельного «force GC» нет; проход по требованию инициируется при `NoSpace`.
+- **Ограничение работы на коммит:** обычный `commit` не выполняет GC и не сканирует reader table (A-12 ADR 0005); он лишь читает `MP(z)`. Бюджет `MAX_GC_ZONES_PER_GROUP`/`MAX_GC_PAGES_PER_GROUP` относится к maintenance-проходу, а не к коммиту, и не влияет на latency `commit`.
+- **Диагностика утечки читателя:** если живой процесс держит пины старой версии, `MP(z)` не растёт → страницы этой зоны и её tombstones не освобождаются → со временем `NoSpace` **только у этой зоны** (другие зоны живут). Это наблюдаемое состояние: метрики `pw_zone_min_pinned{zone}`, `pw_free_pool_starved_total{zone}`, `readers_active`, `no_space_total{zone}`; оператор устраняет застрявший процесс/баг, а не «выдавливает» его. Автоматического eviction нет.
 - **Повторное создание origin:** после tombstone разрешено; получает новый `ZoneId`; старый `ZoneId` навсегда `ZoneNotFound`.
 
 #### 5.2.5. Метаданные зоны (`ZoneSettings` / `meta_root`)
@@ -688,7 +762,7 @@ pub struct ZoneSettingsPatch {
 ```
 
 - **Формат:** ≤ 4 KiB **всего**; inline — по ёмкости страницы (4016 байт при `page_size=4096`), иначе overflow-страницы; суммарный лимит `MAX_ZONE_META = 256 KiB` (подтверждается вместе с форматом); превышение → `InvalidEdit`/`EditTooLarge`. `ZoneId`, `origin`, `kind`, `SOA.serial` в meta-блок не входят (kind/origin — в `ZoneEntry`, serial — в apex `SOA`).
-- **Валидация:** `default_ttl` ≤ `MAX_TTL`; `soa_timers`: `refresh ≥ 1`, `retry ≥ 1`, `expire > refresh + retry`, все ≤ `MAX_TTL`; `forward_upstreams` ≤ 16 и только для `Forward`; `denial = Nsec3` допустим для импортированных/secondary зон, но не включает NSEC3-подпись (§4.4).
+- **Валидация:** `default_ttl` ≤ `MAX_TTL`; `soa_timers`: `refresh ≥ 1`, `retry ≥ 1`, `expire > refresh + retry` (u64), полные `u32` без clamp (INV-21); `forward_upstreams` ≤ 16 и только для `Forward`; `denial = Nsec3` допустим для импортированных/secondary зон, но не включает NSEC3-подпись (§4.4).
 - **Атомарность:** `SetZoneMeta` в одном `Edit`/транзакции с RRset-правками — либо применяются все, либо ни одной; читатели видят старую или новую meta целиком (в рамках снапшота). `commit` не публикует meta и RRset раздельно.
 - **Чтение:** `ZoneStore::meta(snap, zone) -> ZoneSettingsRef<'a>` — O(1), zero-copy; серверу не нужно разбирать `SOA`-RDATA и обходить зону, чтобы получить `default_ttl`/`denial`/таймеры.
 - **Смена `denial`** сохраняется как настройка; переподпись NSEC→NSEC3 (когда появится в v1.1) выполняет application-job, writer её не инициирует.
@@ -699,72 +773,113 @@ pub struct ZoneSettingsPatch {
 ```rust
 pub struct CompactOptions { pub durability: Durability }
 pub struct CompactOutcome { pub zone: ZoneId, pub pages_before: u32, pub pages_after: u32,
-                            pub commit_id: CommitId, pub snapshot: SnapshotHandle }
+                            pub commit_id: CommitId, pub zone_version: ZoneVersion,
+                            pub snapshot: ZoneSnapshot }
+pub struct SyncOutcome { pub txn: Epoch, pub durable_zones: u32, pub txn_limit: u64 }
 ```
 
-- **`sync()`** — `fdatasync` данных и meta, без изменения содержимого; обязателен для гарантий после `Durability::Memory`; идемпотентен; ошибки `Io`/`Corrupt`; при открытой транзакции → `Busy`.
-- **`compact_zone()`** — одна транзакция (`Sync`/`Flush` по `opts.durability`), атомарно публикует новый снапшот: переупаковывает дерево зоны, возвращает «мёртвые» байты, перестраивает freelist, обновляет `tree_root`/`meta_root` в `ZoneEntry`. `ZoneId`/`zone_seq` не меняются, `serial` не меняется (содержимое эквивалентно — клиенты не видят новый serial), подписи остаются валидными.
-- Читатели во время компакции держат старый снапшот; освобождение старых страниц — по общему правилу `retire_txn ≤ oldest_reader_txn` (N-7).
-- Ошибки: `Busy` (открыта транзакция), `ZoneNotFound`, `NoSpace`/`MapFull`, `Corrupt`, `Io`. Компакция блокирующая и может быть длительной — вызывать из maintenance-задачи, не с async reactor-потока.
-- `compact_zone` — единственный полный GC-проход; оппортунистическое возвращение страниц выполняется на обычных `commit` (§5.2.4).
+- **`sync()`** (на `ZoneStore`, глобальный) — `fdatasync` данных, `ALLOC_RECORD` и ring'ов всех зон, затем `D_z = version[z]` для всех; без изменения содержимого. Обязателен для гарантий после `Durability::Memory` и для прогресса per-zone free pool в `Flush`/`Memory`; идемпотентен; ошибки `Io`/`Corrupt`; **не** возвращает `Busy` за транзакции других зон (он их не отменяет и не ждёт: ring'ы читаются на момент вызова).
+- **`compact_zone()`** — одна транзакция зоны (`Sync`/`Flush` по `opts.durability`), атомарно публикует новую версию: переупаковывает дерево зоны, возвращает «мёртвые» байты, перестраивает per-zone free-цепочку, обновляет `tree_root`/`meta_root`/`free_head` **в записи корня зоны**. `ZoneId`/`zone_seq` не меняются, `serial` не меняется (содержимое эквивалентно — клиенты не видят новый serial), подписи остаются валидными. Другие зоны не блокируются (PR-3).
+- Читатели во время компакции держат `ZoneSnapshot` старой версии; освобождение старых страниц — по общему правилу `drop_txn ≤ MP(z)` (N-7, ADR 0005 §6.2).
+- Ошибки: `Busy { zone }` (аренда занята/активная транзакция), `ZoneNotFound`, `NoSpace { zone }`/`MapFull`, `Corrupt`, `Io`. Компакция блокирующая и может быть длительной — вызывать из maintenance-задачи, не с async reactor-потока.
+- `compact_zone` — единственный полный GC-проход **по зоне**; рекламация страниц выполняется GC-проходом (§5.2.4), а не на обычном `commit`.
 
 ```rust
 pub enum CommitPolicy { Commit(Durability), Abort }
 pub enum CommitResult { Committed(CommitOutcome), Aborted }
 
-pub trait ZoneWriter: Send {
-    /// Создаёт зону (самостоятельный внутренний commit). `Conflict{ZoneExists}`, `IdSpaceExhausted`.
-    fn create_zone(&mut self, origin: Origin, class: Class, options: ZoneOptions)
+/// Параметры group commit. Store-уровневые, не на каждый вызов.
+pub struct CommitConfig {
+    pub max_batch_zones: u16,          // <= MAX_BATCH_ZONES (256)
+    pub max_batch_bytes: u32,          // <= MAX_BATCH_BYTES (1 MiB)
+    pub max_batch_delay: Duration,     // 0 = публиковать без ожидания (дороже по fsync)
+}
+/// BusyScope: Zone (аренда зоны), Catalog (create/GC), File (flock, M1).
+pub struct WriterOptions {
+    pub lease_timeout: Option<Duration>,   // None = Busy сразу
+    pub commit_timeout: Duration,          // дефолт 5 s; иначе CommitTimeout
+}
+
+/// Фабрика writer'ов и редкие (кросс-зонные) операции. `&self`, `Send + Sync`.
+pub trait ZoneStore {
+    /// Аренда зоны. Занята → `Busy { zone }` (или ожидание до `lease_timeout`).
+    fn writer(&self, zone: ZoneId) -> Result<ZoneWriter, WriteError>;
+    fn writer_by_origin(&self, origin: &Origin) -> Result<ZoneWriter, WriteError>;
+    fn writer_with(&self, zone: ZoneId, opts: WriterOptions) -> Result<ZoneWriter, WriteError>;
+
+    /// Создание зоны (каталог-коммит). `Conflict{ZoneExists}`, `IdSpaceExhausted`.
+    fn create_zone(&self, origin: Origin, class: Class, options: ZoneOptions)
         -> Result<ZoneId, WriteError>;
 
-    /// Удаляет зону (tombstone, внутренний commit). Повтор → `ZoneNotFound`.
-    fn delete_zone(&mut self, zone: ZoneId) -> Result<DeleteOutcome, WriteError>;
+    /// Удаление зоны (tombstone-коммит записи корня). Повтор → `ZoneNotFound`.
+    fn delete_zone(&self, zone: ZoneId) -> Result<DeleteOutcome, WriteError>;
 
-    /// Применяет `Edit`. Первый вызов для зоны неявно открывает транзакцию с `intent`;
-    /// последующие должны совпадать по `(zone, intent)`, иначе `Busy`.
-    fn apply(&mut self, zone: ZoneId, intent: WriteIntent, edit: Edit)
+    /// Глобальный чекпойнт: fdatasync данных + корней, поднять D_z всех зон.
+    /// Обязателен после серии `Memory`; липко переводит файл в `Sync`.
+    fn sync(&self) -> Result<SyncOutcome, WriteError>;
+
+    fn commit_config(&self) -> CommitConfig;
+    fn set_commit_config(&self, cfg: CommitConfig) -> Result<(), WriteError>;
+}
+
+/// Один экземпляр = аренда одной зоны. `Send`, не `Sync`, не `Clone`.
+/// Drop без `commit` = `Abort` + освобождение аренды.
+pub trait ZoneWriter: Send {
+    fn zone(&self) -> ZoneId;
+    /// Версия зоны, от которой открыта (или была открыта) транзакция.
+    fn base_version(&self) -> ZoneVersion;
+
+    /// Применяет `Edit`. Первый вызов открывает неявную транзакцию с `intent`;
+    /// последующие должны совпадать по `intent`, иначе `Busy`.
+    fn apply(&mut self, intent: WriteIntent, edit: Edit)
         -> Result<ApplyOutcome, WriteError>;
 
     /// Завершает неявную транзакцию: `Commit(durability)` или `Abort`.
     /// Нет активной транзакции → `UnknownTxn`.
-    fn commit(&mut self, zone: ZoneId, policy: CommitPolicy)
+    fn commit(&mut self, policy: CommitPolicy)
         -> Result<CommitResult, WriteError>;
 
-    /// Явный fsync (данные + meta); обязателен после серии `Memory`; не транзакция.
-    fn sync(&mut self) -> Result<(), WriteError>;
-
     /// Полный GC/дефрагментация зоны (одна транзакция; `ZoneId`/serial не меняются).
-    fn compact_zone(&mut self, zone: ZoneId, opts: CompactOptions)
+    fn compact_zone(&mut self, opts: CompactOptions)
         -> Result<CompactOutcome, WriteError>;
 }
 ```
 
-Правила неявной транзакции: одновременно активна максимум одна; `create_zone`/`delete_zone`/`compact_zone`/`sync` при активной транзакции → `Busy`; drop `ZoneWriter` отбрасывает неприменённые изменения; `apply` после `Abort`/`Commit` начинает новую транзакцию.
+Правила:
+1. **Аренда.** `writer(zone)` либо даёт эксклюзивную аренду, либо `Busy { zone }`; аренда снимается на `Drop` (в т.ч. после паники — через `DropGuard`) и при завершении процесса. Один экземпляр `ZoneWriter` — одна зона; параллельная запись в разные зоны — это `N` экземпляров в `N` потоках.
+2. `create_zone`/`delete_zone`/`sync` — на `ZoneStore`, не на `ZoneWriter`: они не являются транзакцией одной зоны (`delete_zone` берёт аренду внутри себя).
+3. Одновременно у экземпляра активна максимум одна неявная транзакция; `compact_zone` при активной транзакции → `Busy`; `apply` после `Abort`/`Commit` начинает новую.
+4. Владение на уровне архитектуры: пул writer-потоков (`pulse-server`) + один maintenance-поток для `sync()`/GC/`freeze()` (см. ADR 0005 §4, §12 и `io-uring-runtime` §2.1). Отдельного «глобального писателя» больше нет.
 
 ```rust
 pub enum Durability { Memory, Flush, Sync }
 // Конкретные режимы (ADR 0003 §5.2); msync на пути коммита не используется.
 ```
 
-| Режим | Что делает | Durability | Карта режима |
+| Режим | Что делает (group commit) | Durability | Карта режима |
 |---|---|---|---|
-| `Sync` | `fdatasync` данных → запись meta → `fdatasync` meta | подтверждённый коммит переживает power loss | `MODE_SYNC` |
-| `Flush` | `fdatasync` данных → запись meta **без** отдельного fsync | данные на диске; метаданные коммита не форсируются отдельным шагом — durability достигается на **следующем `Sync`** | `MODE_NOMETASYNC` |
+| `Sync` | `fdatasync` данных пачки + `ALLOC_RECORD` → запись ring'ов пачки → `fdatasync` корней | подтверждённый коммит переживает power loss | `MODE_SYNC` |
+| `Flush` | `fdatasync` данных + `ALLOC_RECORD` → запись корней **без** отдельного fsync | данные на диске; корни коммита не форсируются — durability достигается на **следующем `Sync`**; переживает рестарт процесса | `MODE_NOMETASYNC` |
 | `Memory` | только запись в page cache | виден читателям процесса; ничего не гарантируется на диске | `MODE_NOSYNC` |
 
-> **Предупреждения.** `Memory` теряет **подтверждённые** коммиты при падении процесса (не только при потере питания). `Flush` переживает падение процесса, но при потере питания/сбое ОС последние коммиты (meta) могут откатиться к предыдущей валидной meta.
+> **Предупреждения.** `Memory` теряет **подтверждённые** коммиты при падении процесса (не только при потере питания). `Flush` переживает падение процесса, но при потере питания/сбое ОС корни могут откатиться к предыдущей валидной версии **по каждой зоне независимо** — файл останется валидным, «откат» будет неравномерным по зонам. После первого `sync()` файл навсегда `Sync` (ADR 0005 §5.2).
 
 **Гарантии:**
-- Один писатель: экземпляр `ZoneWriter` не `Clone`; активная неявная транзакция одна; новый `apply` с другой зоной/intent или `create/delete/compact/sync` при активной транзакции → `WriteError::Busy`. Владение на уровне архитектуры — единственная maintenance-задача (см. ADR 0001 §3.4).
-- `apply` не виден читателям до `commit`.
-- `commit` **атомарен и crash-safe** по протоколу формата: COW-страницы по новым номерам, публикация — запись второй meta-страницы с CRC и `txnid`; либо новый снапшот виден целиком, либо старый. WAL/журнала в v1 нет (см. ADR 0003 §5.1–5.2, §8.5).
-- `commit` с `Durability::Sync` возвращается только после гарантии сохранности на диске; `Flush` — после `fdatasync` данных (meta может откатиться при потере питания; durability — на следующем `Sync`); `Memory` — только публикация в памяти (потеря подтверждённых коммитов при падении процесса).
-- После успешного `commit` любой последующий `ZoneStore::snapshot()` возвращает снапшот, включающий изменение (happens-before через atomic release/acquire).
-- `apply`/`commit` **блокирующие** (mmap I/O + `fdatasync` в режиме `Sync`). Application обязан вызывать их в blocking-контексте (`spawn_blocking` или выделенный поток); вызов на async reactor-потоке — ошибка реализации.
-- `Edit` содержит `EditId`; повторное применение того же `EditId` в рамках транзакции → `WriteError::DuplicateEdit` (защита от ретраев).
+- **Изоляция зон — производительная, не security** (PW-L2): любой writer в процессе технически может записать любую страницу; `owner_zone` ловит аварию, не атаку. Реальная изоляция — отдельные процессы/uid (roadmap).
+- **Много писателей по разным зонам, один — на зону.** `ZoneWriter` не `Clone`/не `Sync`; эксклюзивность обеспечивает аренда (`Busy` только по той же зоне). `apply` с другим `intent` → `WriteError::Busy`. Параллельные правки разных зон не сериализуются (нет общего лоcка, общего meta-слота, общего freelist).
+- `apply` не виден читателям до `commit`; чтение страницы с чужим `owner_zone` → `Corrupt` (кросс-зонный ABA закрыт).
+- `commit` **атомарен и crash-safe в области одной зоны**: COW-страницы по новым номерам, публикация — запись версии корня зоны (`version` + CRC) после fsync данных; либо версия `V` видна целиком, либо `V-1`. Кросс-зонная атомарность не предоставляется. WAL/журнала нет (ADR 0003 §5.1–5.2, §8.5; ADR 0005 §5).
+- `commit` с `Durability::Sync` возвращается только после гарантии сохранности на диске (в составе пачки group commit — латентность включает ожидание пачки ≤ `max_batch_delay`); `Flush` — после `fdatasync` данных; `Memory` — только публикация в памяти.
+- После успешного `commit` любой последующий `zone_snapshot(zone)` возвращает версию `≥ zone_version` этой транзакции (happens-before через release/acquire). Глобальный `snapshot()` не обязан видеть все зоны одной эпохи — это осознанно (ADR 0005 §7).
+- В M1 (один процесс) писатели берут `flock(LOCK_EX)` на `<zonefile>.lock` — второй **процесс** получает `Busy { scope: File }`; в M3 (SEC-PW-009) — `LOCK_SH` для набора писателей + recovery `LOCK_EX`, и `Busy` на файл исчезает (PW-L6). Аренда зоны (in-memory) действует в обоих режимах.
+- `apply`/`commit` **блокирующие** (mmap I/O + `fdatasync` в режиме `Sync` + ожидание пачки). Application обязан вызывать их в blocking-контексте (`spawn_blocking` или выделенный поток); вызов на async reactor-потоке — ошибка реализации.
+- `Edit` содержит `EditId`; повторное применение того же `EditId` в рамках транзакции → `WriteError::DuplicateEdit` (защита от ретраев). `Edit.precondition` проверяется внутри аренды до применения (TOCTOU закрыт).
+- `commit` может вернуть `CommitTimeout` (координатор не ответил) — файл не изменён, транзакция завершена как aborted, повтор допустим с новым `Edit`.
 
-**Ошибки:** `WriteError::{Busy, UnknownTxn, ReadOnly, ZoneNotFound, NotFound, Conflict { kind }, InvariantViolation { id, detail }, EditEmpty, EditTooLarge, DuplicateTarget, InvalidEdit, IntentForbidden, SerialConflict, IdSpaceExhausted, MapFull, NoSpace, DuplicateEdit, Io { source }, Corrupt { kind: CorruptKind, page: Option<u32> }}` — семантика: `InvariantViolation` (нарушен INV-1..12), `ZoneNotFound` (зоны нет/Tombstone), `UnknownTxn` (`commit` без активной неявной транзакции), `Conflict` (`ZoneExists`, ожидаемое состояние не совпало), `IdSpaceExhausted` (исчерпан `zone_seq`), `MapFull` (`high_water == page_count_max`, нужно расширение файла), `NoSpace` (нет выдаваемых «молодых» страниц; retryable), `Corrupt` — структурированная причина, не строка.
-**Отмена:** незавершённая транзакция отбрасывается `CommitPolicy::Abort` или Drop `ZoneWriter` (метрика `dangling_txn_total`); частичных изменений в файле не остаётся.
+**Ошибки:** `WriteError::{Busy { zone: Option<ZoneId>, scope: BusyScope }, UnknownTxn, ReadOnly { reason: ReadOnlyReason }, ZoneNotFound, NotFound, Conflict { kind }, InvariantViolation { id, detail }, EditEmpty, EditTooLarge, DuplicateTarget, InvalidEdit, IntentForbidden, SerialConflict, PreconditionFailed { current: ZoneVersion, current_etag }, IdSpaceExhausted, MapFull, NoSpace { zone: ZoneId }, CommitTimeout { waited_ms: u32 }, ZoneWriterStalled { zone: ZoneId }, EpochPinned { epoch: u64, holders: u16 }, TooManyZones, ZoneQuotaExceeded, CommitAborted, DuplicateEdit, Io { source }, Corrupt { kind: CorruptKind, zone: Option<ZoneId>, page: Option<u32> }}`.
+
+Семантика: `Busy` — аренда зоны занята (`scope = Zone`) или каталог занят create/GC (`scope = Catalog`), retryable; `ReadOnly` — файл открыт только для чтения, `reason = ConvertRequired` для v1-файла; `InvariantViolation` — нарушен INV-1..12; `ZoneNotFound` — зоны нет/Tombstone; `UnknownTxn` — `commit` без активной неявной транзакции; `Conflict` — `ZoneExists`, ожидаемое состояние не совпало; `PreconditionFailed` — `Edit.precondition` не совпал (HTTP 412), файл не изменён; `IdSpaceExhausted` — исчерпан `zone_seq`; `MapFull` — `high_water == page_count_max`, нужно расширение файла; `NoSpace` — у **этой** зоны нет выдаваемых страниц (retryable после `sync()`/GC/donation); `CommitTimeout` — координатор group commit не ответил за `commit_timeout`; `ZoneWriterStalled` — ring корней зоны исчерпан живыми пинами (все 4 версии `≥ MP(z)`), retryable и **только для этой зоны**; `TooManyZones` — исчерпана ёмкость root directory/ring (`max_zones`), нужен offline compact; `ZoneQuotaExceeded` — зона превысила `ZONE_PAGE_QUOTA_RATIO × page_count_max` (нужен `compact_zone`, другие зоны пишутся); `CommitAborted` — группа не опубликована (смерть/смена лидера, не пройден барьер `DP`/`DT`), retryable; `EpochPinned` — операция требует глобального среза, а пины держат эпоху (только `freeze`/checkpoint/reshape; обычный `commit` его не возвращает); `Corrupt` — структурированная причина с опциональной зоной.
+**Отмена:** незавершённая транзакция отбрасывается `CommitPolicy::Abort` или Drop `ZoneWriter` (метрика `dangling_txn_total`); неопубликованные страницы немедленно возвращаются в per-zone free pool, частичных изменений в файле не остаётся.
 
 ### 5.3. `UpstreamClient` — сетевой DNS-клиент (резолвер и secondary)
 
@@ -893,15 +1008,21 @@ pub struct ZoneChanged { pub zone: ZoneId, pub origin: Origin, pub old: Serial, 
 
 | Ошибка `pulse-zonefile` | Доменная ошибка |
 |---|---|
-| `CorruptNoValidMeta`, `PageChecksum`, `TreeOrder`, `Bounds`, `FreelistCycle`, `BadTtl`, `BadZoneMeta`, `BadRdata`, `BadName` | `StoreError::Corrupt { kind, page }` |
+| `CorruptNoValidMeta`, `PageChecksum`, `TreeOrder`, `Bounds`, `FreelistCycle`, `BadTtl`, `BadZoneMeta`, `BadRdata`, `BadName`, `BadZoneHead` | `StoreError::Corrupt { kind, zone, page }` |
 | `UnsupportedVersion { found }` | `StoreError::UnsupportedVersion { found, supported }` |
-| `ENOSPC` / все свободные страницы «молодые» и не выдаются в текущей txn | `WriteError::NoSpace` (retryable после `sync`/reclaim; файл консистентен) |
+| `ENOSPC` / все свободные страницы зоны «молодые» и не выдаются в текущей txn | `WriteError::NoSpace { zone }` (retryable после `sync`/GC/donation; файл консистентен, другие зоны пишутся) |
 | `high_water == page_count_max` (адресное пространство исчерпано) | `WriteError::MapFull` (нужно расширение `map_size`/пересоздание) |
-| `flock(LOCK_EX)` занят другим писателем | `WriteError::Busy` (читатели flock не берут) |
+| `flock(LOCK_EX)` занят другим процессом-писателем | `WriteError::Busy { scope: File }` (читатели flock не берут) |
+| Аренда зоны занята другим `ZoneWriter` | `WriteError::Busy { zone: Some(z), scope: Zone }` (retryable) |
+| Каталог занят `create_zone`/GC | `WriteError::Busy { scope: Catalog }` |
+| В ring+chain нет валидной версии (порча/пересоздание зоны) | `StoreError::StaleRoot { zone, requested, oldest_retained }` (retryable после `fsck`/нового `snapshot()`) |
+| Файл v1 открыт для записи | `WriteError::ReadOnly { reason: ConvertRequired }` |
+| `page_limit`/`txn_limit` понизились при open | `StoreError::Corrupt { kind: Bounds }` + `NEEDS_FSCK` + read-only (метрика `pw_alloc_watermark_regression_total`) |
+| `PageHeader.owner_zone ≠ zone_seq` при чтении | `StoreError::Corrupt { kind: BadZoneHead, zone, page }` |
 | Исчерпана reader table | `StoreError::TooManyReaders` |
 | Исчерпан `zone_seq` | `IdSpaceExhausted` |
 | `io::Error` | `Io { source }` (source сохраняется, наружу не отдаётся) |
-| Прочее внутреннее | `Internal` + `tracing::error` с контекстом (страница, txn) |
+| Прочее внутреннее | `Internal` + `tracing::error` с контекстом (зона, версия, страница) |
 
 Причина сохраняется структурированно (`kind`, `page`, `found/supported`, `source()`), строки ошибок не парсятся; HTTP-слой отдаёт generic `problem+json` без деталей (ADR 0004 SEC-API-011).
 
@@ -918,6 +1039,7 @@ pub struct ZoneChanged { pub zone: ZoneId, pub origin: Origin, pub old: Serial, 
 | `BadZoneMeta` | `BadZoneMeta` | meta-блок битый/неизвестная версия |
 | `BadRdata` | `BadRdata` | RDATA/overflow-цепочка некорректны |
 | `BadName` | `BadName` | RLE-имя/метки некорректны |
+| `BadZoneHead` | `BadZoneHead` | обе версии записи корня невалидны или корень не соответствует каталогу (порча локализована зоной) |
 
 ---
 
@@ -936,7 +1058,15 @@ pub struct ZoneChanged { pub zone: ZoneId, pub origin: Origin, pub old: Serial, 
 | `Policy` | `Allow` доминирует, приоритеты, regex-таймаут (не более 1 ms на правило) |
 | Lifecycle | `create_zone` без SOA → `Initializing`/`REFUSED`; apex-only → `NODATA`/`NXDOMAIN`; `delete_zone` → `REFUSED`/404; повторное создание origin → новый `ZoneId`; `IdSpaceExhausted` |
 | TTL | wire `0x8000_0001` → `0x7FFF_FFFF` + `TTL_NORMALIZED` (не `1`); бинарный файл `0x8000_0001` → `Corrupt(BadTtl)`; import — clamp + warning |
+| RDATA-wire | TXT `[""]`/`["",""]`/256-байтный сегмент/`RDLENGTH=0`; SOA `minimum=0xFFFF_FFFF` не clamp’ится; CAA тег `iSSue` сохраняет регистр и сравнивается case-insensitive; NSEC3 пустой bitmap валиден, NSEC пустой — `BadRdata`; RRSIG `original_ttl=0x8000_0001` round-trip без clamp |
+| 0x20 | ответ эхом повторяет сырые байты QNAME (регистр), сравнение case-insensitive; `Name` остаётся lower-case (M3, SEC-DNS-011) |
+| Compression | указатель в заголовок / в середину метки / вперёд / цикл → `FORMERR`, без паники и без чтения за границей |
 | Meta | `SetZoneMeta` ≤4 KiB всего (inline 4016 при page_size=4096) → overflow; >256 KiB → `EditTooLarge`; атомарность с RRset; `forward_upstreams` только Forward |
 | Space | все страницы «молодые» → `NoSpace` (retryable); `high_water == page_count_max` → `MapFull`; различие сохраняется в маппинге |
 | RRSIG | `lookup_all` фильтр по `subtype`; DO=0 не добавляет; signed+DO без подписи → `SERVFAIL`; expired — отдаётся + метрика |
 | `enumerate` | zero-copy (нет аллокаций RDATA), `Break`→cursor→продолжение без потерь/дублей, ошибка посреди → `Err` без частичной зоны |
+| Параллельные писатели | 8 зон × 8 потоков одновременно: все коммиты успешны, ни одна зона не видит чужую правку, кросс-зонной блокировки нет; 8 потоков на одну зону → 7 × `Busy`; `loom`-модель пина/рекламации и публикации корня |
+| Аренда | `writer()` → `Busy` при занятой зоне; Drop освобождает; после паники аренда снимается (`DropGuard`); `compact_zone` держит аренду только своей зоны (другие пишутся) |
+| Снапшоты | `zone_snapshot` берёт последнюю версию и держит её: страницы не переиспользуются до Drop; `StaleRoot` только при отсутствии валидной версии/пересоздании; `ZoneSnapshot` переживает удаление зоны; ceiling = ∞ (кросс-зонная согласованность не обещана, для среза — `freeze()`); 8 отказов пина: guard → `ZoneDegraded`, churn → `ReaderContended` |
+| Precondition | `IfZoneVersion`/`IfRrsetEtag` проверяются внутри аренды: конкурентная правка → `PreconditionFailed` (412), файл не изменён; TOCTOU-окно отсутствует |
+| Group commit | несколько зон в одной пачке: `txn` уникальны и возрастают, порядок корней внутри пачки не важен, при `kill -9` координатора каждая зона на своей max-valid версии (F2-9 ADR 0005) |
