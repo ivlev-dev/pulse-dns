@@ -75,6 +75,7 @@ pub mod node;
 pub mod overflow;
 mod page;
 mod pager;
+pub mod parallel;
 pub mod readers;
 mod recovery;
 mod store;
