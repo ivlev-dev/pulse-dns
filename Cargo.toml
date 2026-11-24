@@ -4,6 +4,7 @@ members = [
     "crates/pulse-dnssec",
     "crates/pulse-runtime",
     "crates/pulse-server",
+    "crates/pulse-resolver",
     "crates/pulse-zonefile",
     "crates/pulse-api",
     "crates/pulsed",

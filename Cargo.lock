@@ -732,6 +732,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulse-resolver"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "getrandom",
+ "proptest",
+ "pulse-dns",
+ "pulse-dnssec",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "pulse-runtime"
 version = "0.1.0"
 dependencies = [
@@ -791,6 +804,7 @@ dependencies = [
  "pulse-master",
  "pulse-runtime",
  "pulse-server",
+ "pulse-transfer",
  "pulse-zonefile",
  "serde",
  "serde_json",

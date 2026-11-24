@@ -1,0 +1,27 @@
+[package]
+name = "pulse-resolver"
+description = "Caching DNS resolver for pulse-dns: iterative/forward resolution, cache, blocklist and overrides"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+getrandom = "0.4"
+pulse-dns = { path = "../pulse-dns" }
+pulse-dnssec = { path = "../pulse-dnssec" }
+thiserror = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1"
+tempfile = "3"
+
+[[bench]]
+name = "resolver"
+harness = false
+
+[lints]
+workspace = true

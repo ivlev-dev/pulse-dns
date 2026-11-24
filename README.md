@@ -1,5 +1,7 @@
 # pulse-dns
 
+![CI](https://github.com/ivlev-dev/pulse-dns/actions/workflows/ci.yml/badge.svg)
+
 Модульный высокопроизводительный DNS-сервер на Rust. Linux-first, edition 2024
 (stable). Текущее состояние — **authoritative MVP**: рабочий авторитетный сервер
 (`pulsed`) с UDP/TCP, REST API и опциональной write-through persistence в
@@ -124,6 +126,12 @@ cargo test --workspace
 Полный набор workspace-тестов (включая doctests) проходит. Также проходят
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` и
 rustdoc без warnings.
+
+Проверка зависимостей:
+
+```bash
+cargo deny check
+```
 
 ## Производительность
 

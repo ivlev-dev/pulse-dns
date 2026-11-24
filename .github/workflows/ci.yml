@@ -16,30 +16,30 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
-        run: |
-          if cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -q '"workspace_members":\[\]'; then
-            echo "Workspace is empty; skipping cargo fmt"
-          else
-            cargo fmt --all --check
-          fi
+        run: cargo fmt --all --check
       - name: Clippy
-        run: |
-          if cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -q '"workspace_members":\[\]'; then
-            echo "Workspace is empty; skipping cargo clippy"
-          else
-            cargo clippy --workspace --all-targets -- -D warnings
-          fi
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Tests
-        run: |
-          if cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -q '"workspace_members":\[\]'; then
-            echo "Workspace is empty; skipping cargo test"
-          else
-            cargo test --workspace
-          fi
+        run: cargo test --workspace --all-features
       - name: Docs
-        run: |
-          if cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -q '"workspace_members":\[\]'; then
-            echo "Workspace is empty; skipping cargo doc"
-          else
-            cargo doc --workspace --no-deps
-          fi
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+      - name: Build
+        run: cargo build --workspace --release
+
+  test-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests (release)
+        run: cargo test --workspace --release
+
+  deny:
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
