@@ -164,6 +164,24 @@ impl Allocator {
             pages_len: Cell::new(0),
             txn_start: Cell::new(0),
             txn_len: Cell::new(0),
+            exact: false,
+        }
+    }
+
+    /// Создаёт handle без локального кеша: каждая страница/`txn` резервируется
+    /// ровно на запрос.
+    ///
+    /// Нужен короткоживущим writer'ам (например, REST-запросу), которые не
+    /// успевают использовать батч из 64 страниц и иначе теряли бы его.
+    #[must_use]
+    pub fn handle_exact(&self) -> AllocHandle<'_> {
+        AllocHandle {
+            allocator: self,
+            pages_start: Cell::new(0),
+            pages_len: Cell::new(0),
+            txn_start: Cell::new(0),
+            txn_len: Cell::new(0),
+            exact: true,
         }
     }
 
@@ -270,6 +288,7 @@ pub struct AllocHandle<'a> {
     pages_len: Cell<u32>,
     txn_start: Cell<u64>,
     txn_len: Cell<u64>,
+    exact: bool,
 }
 
 impl AllocHandle<'_> {
@@ -281,6 +300,9 @@ impl AllocHandle<'_> {
     pub fn reserve(&self, pages: u32) -> Result<AllocTicket, ParallelError> {
         if pages == 0 {
             return Err(ParallelError::InvalidArgument { field: "pages" });
+        }
+        if self.exact {
+            return self.allocator.reserve_exact(pages);
         }
         if self.pages_len.get() < pages {
             let (start, batch) = self.allocator.reserve_batch(pages)?;
@@ -312,6 +334,9 @@ impl AllocHandle<'_> {
     ///
     /// `InvalidArgument` — `txn` переполнен.
     pub fn next_txn(&self) -> Result<u64, ParallelError> {
+        if self.exact {
+            return self.allocator.next_txn_exact();
+        }
         if self.txn_len.get() == 0 {
             self.txn_start.set(self.allocator.reserve_txn_batch()?);
             self.txn_len.set(TXN_BATCH);

@@ -24,21 +24,23 @@ DNSCrypt v2 (авторитетный сервер) реализованы.
 - Рантайм (`pulse-runtime`): io_uring UDP (ring на ядро, multishot recv +
   provided buffers, IP_PKTINFO, проверка NODROP, backpressure, graceful
   shutdown, изоляция паник) + epoll-фолбэк.
-- Формат зон (`pulse-zonefile`): один mmap-файл, pager, superblock/meta A/B,
-  CRC32C, reader table с RAII-снапшотами, recovery (durable_watermark,
-  torn-мета, sticky sync_mode), B+tree (RLE-ключи, канонический компаратор,
-  split, ENT), overflow-цепочки, кеш валидированных страниц, zone index.
+- Формат зон (`pulse-zonefile`): v2 `ParallelStore` — один mmap-файл,
+  lock-free аллокатор страниц, ring-головы версий A/B, chain, per-zone пулы и
+  GC, in-process пины читателей, group commit (2 `fdatasync` на группу зон),
+  `Flush`/`Memory`/`Sync`, recovery и `fsck`; v1-файлы читаются для
+  `pulsed convert`.
 - REST API (`pulse-api`): health/ready/metrics/OpenAPI, zones CRUD, RRset
   CRUD/PATCH, settings, bearer-auth + scopes + per-zone allowlist (404 вне
   allowlist), ETag/If-Match, RFC 9457 problem+json, Idempotency-Key,
   пагинация, лимиты тела/rate limit.
-- Бинарник `pulsed`: UDP+TCP, зоны только в `pulse-zonefile` (`--data`; DNS
-  отвечает из mmap, без полной in-memory копии), импорт RFC 1035 master-файлов
-  командой `pulsed import` (`.zone`, `$ORIGIN`/`$TTL`/`$INCLUDE`), REST,
-  коммитящий правки в тот же файл (`sync`/`flush`/`memory`, один writer),
-  graceful shutdown, AXFR/IXFR-out по TCP с TSIG/ACL, IXFR-история,
-  NOTIFY-out/in и secondary-зоны (AXFR/IXFR-in, bootstrap, SOA-refresh,
-  expire → SERVFAIL), DNSSEC-подпись в zonefile, Dockerfile.
+- Бинарник `pulsed`: UDP+TCP, зоны только в `pulse-zonefile` v2 (`--data`;
+  DNS отвечает из mmap, без полной in-memory копии), импорт RFC 1035
+  master-файлов командой `pulsed import` (`.zone`, `$ORIGIN`/`$TTL`/`$INCLUDE`),
+  конвертация legacy v1-файлов `pulsed convert`, REST с per-zone writer'ами
+  (разные зоны коммитятся параллельно; `--commit-mode per-zone|group`,
+  `sync`/`flush`/`memory`), graceful shutdown, AXFR/IXFR-out по TCP с TSIG/ACL,
+  IXFR-история, NOTIFY-out/in и secondary-зоны (AXFR/IXFR-in, bootstrap,
+  SOA-refresh, expire → SERVFAIL), DNSSEC-подпись в zonefile, Dockerfile.
 - Защищённые транспорты `pulsed`: DoT (`dot_listen`, RFC 7858), DoH/1.1
   (`doh_listen`, RFC 8484, ALPN `http/1.1`, только HTTP/1.1) и DNSCrypt v2 по
   UDP (`dnscrypt_listen`), общий путь `decode → QueryEngine (mmap) → encode`,
@@ -155,7 +157,7 @@ CLI: `--config`, `--listen-udp`, `--listen-tcp`, `--metrics-listen`,
 `--forward` (repeatable), `--workers`, `--log-level`, `--blocklist`
 (repeatable), `--no-dnssec`.
 
-Зоны в `pulse-zonefile`:
+Зоны в `pulse-zonefile` v2:
 
 ```bash
 # импорт (повторный --replace; опционально --sign с --dnssec-key)
@@ -164,8 +166,12 @@ cargo run -p pulsed -- import \
   --origin example.com. \
   examples/example.com.zone
 
+# legacy v1 → v2 (без потери зон/записей/настроек)
+cargo run -p pulsed -- convert --from /tmp/old.v1 --to /tmp/pulse-dns.zonefile
+
 cargo run -p pulsed -- --config examples/pulsed.json \
-  --data /tmp/pulse-dns.zonefile --durability flush --map-size 268435456
+  --data /tmp/pulse-dns.zonefile --durability flush \
+  --commit-mode per-zone --map-size 268435456
 ```
 
 JSON-поля `zones`/`zones_files` больше не принимаются: конфигурация завершится

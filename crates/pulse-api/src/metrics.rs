@@ -113,8 +113,78 @@ impl Metrics {
                 "zonefile_commit_errors {}\n",
                 zonefile.commit_errors
             ));
+            append_v2(&mut out, &zonefile);
         }
         out
+    }
+}
+
+/// Метрики v2-стора (`ParallelStore`): alloc, commit, GC, cache, pins.
+fn append_v2(out: &mut String, zonefile: &crate::port::ZoneFileMetrics) {
+    for (name, help, kind, value) in [
+        (
+            "zonefile_v2_alloc_pages",
+            "Data pages handed out by the v2 allocator.",
+            "gauge",
+            zonefile.v2_alloc_pages,
+        ),
+        (
+            "zonefile_v2_alloc_cas_retries_total",
+            "Allocator CAS retries.",
+            "counter",
+            zonefile.v2_alloc_cas_retries,
+        ),
+        (
+            "zonefile_v2_page_cache_hits_total",
+            "Validated page cache hits.",
+            "counter",
+            zonefile.v2_page_cache_hits,
+        ),
+        (
+            "zonefile_v2_page_cache_misses_total",
+            "Validated page cache misses.",
+            "counter",
+            zonefile.v2_page_cache_misses,
+        ),
+        (
+            "zonefile_v2_node_cache_hits_total",
+            "B+tree node cache hits.",
+            "counter",
+            zonefile.v2_node_cache_hits,
+        ),
+        (
+            "zonefile_v2_node_cache_misses_total",
+            "B+tree node cache misses.",
+            "counter",
+            zonefile.v2_node_cache_misses,
+        ),
+        (
+            "zonefile_v2_reclaimed_pages_total",
+            "Pages reclaimed by GC or the free pool.",
+            "counter",
+            zonefile.v2_reclaimed_pages,
+        ),
+        (
+            "zonefile_v2_group_commits_total",
+            "Group commits executed by the coordinator.",
+            "counter",
+            zonefile.v2_group_commits,
+        ),
+        (
+            "zonefile_v2_group_fsyncs_total",
+            "fdatasync calls made by group commit.",
+            "counter",
+            zonefile.v2_group_fsyncs,
+        ),
+        (
+            "zonefile_v2_pins",
+            "Active reader pins.",
+            "gauge",
+            zonefile.v2_pins,
+        ),
+    ] {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+        out.push_str(&format!("{name} {value}\n"));
     }
 }
 

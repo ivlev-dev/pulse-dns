@@ -41,6 +41,9 @@ use crate::parallel::recovery::{
 use crate::parallel::ring::Ring;
 use crate::parallel::root::{RootEntry, RootFlags};
 
+/// Сколько guard должен оставаться нечётным, чтобы зона считалась застрявшей.
+const GUARD_STUCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Конфигурация создания v2-файла.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreConfig {
@@ -734,6 +737,12 @@ impl ParallelStore {
         self.allocator.handle()
     }
 
+    /// Handle без локального кеша (короткоживущие writer'ы).
+    #[must_use]
+    pub fn alloc_handle_exact(&self) -> AllocHandle<'_> {
+        self.allocator.handle_exact()
+    }
+
     /// Резервирует ровно `pages` страниц.
     ///
     /// # Errors
@@ -872,6 +881,26 @@ impl ParallelStore {
     #[must_use]
     pub fn high_water(&self) -> u64 {
         self.allocator.cursor()
+    }
+
+    /// Число страниц данных, выданных аллокатором (без пролога геометрии).
+    #[must_use]
+    pub fn allocated_data_pages(&self) -> u64 {
+        self.allocator
+            .cursor()
+            .saturating_sub(u64::from(self.geometry.page_data_first()))
+    }
+
+    /// Опубликованная голова зоны (включая tombstone).
+    #[must_use]
+    pub fn zone_head(&self, zone: u32) -> Option<RootEntry> {
+        self.head_entry(zone)
+    }
+
+    /// Число активных in-process пинов (диагностика/метрики).
+    #[must_use]
+    pub fn active_pins(&self) -> usize {
+        self.pins.snapshot_pins().len()
     }
 
     /// Число страниц в per-zone пулах (durable + in-memory).
@@ -1987,8 +2016,7 @@ impl ParallelStore {
         zone: u32,
     ) -> Result<ZoneSnapshot<'a>, ParallelError> {
         let e0 = self.published_txn.load(Ordering::Acquire);
-        let mut stuck_odd: Option<u32> = None;
-        let mut stuck_attempts = 0_u32;
+        let mut stuck_odd: Option<(u32, std::time::Instant)> = None;
         for attempt in 0..PIN_ATTEMPTS {
             let head = match self.head_read(zone) {
                 HeadRead::Stable(entry) => entry,
@@ -2025,28 +2053,33 @@ impl ParallelStore {
                     _not_send: std::marker::PhantomData,
                 });
             }
+            // Деградация — только если guard застрял надолго (F-11). Счётчик
+            // попыток непригоден: писатель может быть вытеснен планировщиком
+            // внутри короткой критической секции, и 8 попыток с backoff
+            // складываются в единицы миллисекунд.
             if !c1.is_multiple_of(2) && c1 == c2 {
-                if stuck_odd == Some(c1) {
-                    stuck_attempts = stuck_attempts.saturating_add(1);
-                } else {
-                    stuck_odd = Some(c1);
-                    stuck_attempts = 1;
+                let since = match stuck_odd {
+                    Some((value, since)) if value == c1 => since,
+                    _ => {
+                        let now = std::time::Instant::now();
+                        stuck_odd = Some((c1, now));
+                        now
+                    }
+                };
+                if since.elapsed() >= GUARD_STUCK_TIMEOUT {
+                    self.degrade_zone(zone);
+                    return Err(ParallelError::ZoneDegraded {
+                        zone,
+                        epoch: self.load_guard(zone),
+                    });
                 }
             } else {
                 stuck_odd = None;
-                stuck_attempts = 0;
             }
             drop(pin);
             self.gc.mark_dirty(zone);
             self.stats.reader_contended.fetch_add(1, Ordering::Relaxed);
             backoff(attempt);
-        }
-        if stuck_attempts >= PIN_ATTEMPTS {
-            self.degrade_zone(zone);
-            return Err(ParallelError::ZoneDegraded {
-                zone,
-                epoch: self.load_guard(zone),
-            });
         }
         Err(ParallelError::ReaderContended)
     }

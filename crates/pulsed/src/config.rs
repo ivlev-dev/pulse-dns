@@ -29,6 +29,7 @@ use base64::engine::general_purpose::STANDARD;
 use pulse_dns::Name;
 use pulse_transfer::TsigAlgorithm;
 use pulse_zonefile::SyncMode;
+use pulse_zonefile::parallel::SyncModeV2;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -96,13 +97,23 @@ pub enum Durability {
 }
 
 impl Durability {
-    /// Режим `pulse-zonefile`.
+    /// Режим `pulse-zonefile` v1.
     #[must_use]
     pub const fn sync_mode(self) -> SyncMode {
         match self {
             Self::Sync => SyncMode::Sync,
             Self::Flush => SyncMode::MetaNoSync,
             Self::Memory => SyncMode::NoSync,
+        }
+    }
+
+    /// Режим durability v2.
+    #[must_use]
+    pub const fn sync_mode_v2(self) -> SyncModeV2 {
+        match self {
+            Self::Sync => SyncModeV2::Sync,
+            Self::Flush => SyncModeV2::Flush,
+            Self::Memory => SyncModeV2::Memory,
         }
     }
 }
@@ -127,6 +138,48 @@ impl FromStr for Durability {
             "memory" => Ok(Self::Memory),
             other => Err(format!(
                 "unknown durability {other:?}; expected sync, flush or memory"
+            )),
+        }
+    }
+}
+
+/// Режим коммита v2-стора.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommitMode {
+    /// Каждая зона коммитится своим writer'ом (2 fsync на коммит в `Sync`).
+    #[default]
+    PerZone,
+    /// Коммиты зон батчатся координатором: 2 fsync на группу зон.
+    Group,
+}
+
+impl CommitMode {
+    /// Строковое представление для CLI/логов.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PerZone => "per-zone",
+            Self::Group => "group",
+        }
+    }
+}
+
+impl fmt::Display for CommitMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CommitMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "per-zone" | "per_zone" | "zone" => Ok(Self::PerZone),
+            "group" | "group-commit" => Ok(Self::Group),
+            other => Err(format!(
+                "unknown commit mode {other:?}; expected per-zone or group"
             )),
         }
     }
@@ -485,6 +538,8 @@ pub struct Config {
     pub zonefile: Option<PathBuf>,
     /// Режим durability коммитов.
     pub durability: Durability,
+    /// Режим коммита v2: per-zone или group.
+    pub commit_mode: CommitMode,
     /// Размер map zonefile в байтах.
     pub map_size: u64,
     /// Устаревшее поле миграции: JSON-зоны больше не принимаются.
@@ -530,6 +585,7 @@ impl Default for Config {
             tcp: TcpConfig::default(),
             zonefile: None,
             durability: Durability::Flush,
+            commit_mode: CommitMode::PerZone,
             map_size: DEFAULT_MAP_SIZE,
             zones: None,
             zones_files: None,
@@ -917,6 +973,9 @@ impl Config {
         if let Some(durability) = overrides.durability {
             self.durability = durability;
         }
+        if let Some(commit_mode) = overrides.commit_mode {
+            self.commit_mode = commit_mode;
+        }
         if let Some(map_size) = overrides.map_size {
             self.map_size = map_size;
         }
@@ -960,6 +1019,8 @@ pub struct Overrides {
     pub zonefile: Option<PathBuf>,
     /// Режим durability.
     pub durability: Option<Durability>,
+    /// Режим коммита v2.
+    pub commit_mode: Option<CommitMode>,
     /// Размер map zonefile.
     pub map_size: Option<u64>,
 }
@@ -1044,6 +1105,7 @@ mod tests {
             log_level: Some(LogLevel::Debug),
             zonefile: None,
             durability: Some(Durability::Sync),
+            commit_mode: Some(CommitMode::Group),
             map_size: Some(64 * 1024 * 1024),
         });
         assert_eq!(config.listen_udp, Some(addr));

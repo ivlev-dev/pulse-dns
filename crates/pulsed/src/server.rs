@@ -94,7 +94,8 @@ impl Server {
                     crate::zonefile::ZoneStore::open_or_create(
                         path,
                         config.map_size,
-                        config.durability.sync_mode(),
+                        config.durability.sync_mode_v2(),
+                        config.commit_mode,
                     )
                     .map_err(|error| ServerError::Store(error.to_string()))?,
                 );

@@ -1,11 +1,12 @@
 //! Адаптер `pulse-api::ZoneAdmin` и `pulse-server::ZoneView` поверх
-//! `pulse-zonefile`.
+//! `pulse-zonefile` v2 (`ParallelStore`).
 //!
 //! Единственный источник истины — mmap-файл зон. DNS-ответы читают его через
-//! [`crate::zonefile::FileZoneView`]; REST-мутации выполняют writer-транзакцию
-//! и коммит, после чего движок пересобирается. Полной in-memory копии зон нет.
+//! [`FileZoneView`]; REST-мутации открывают per-zone writer, применяют правку и
+//! коммитят. Разные зоны пишутся параллельно (lease у зоны один), а view зоны
+//! после коммита перечитывает apex SOA/NS; полной in-memory копии зон нет.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Instant, SystemTime};
 
@@ -15,9 +16,9 @@ use pulse_api::{
     ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView,
 };
 use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype, Serial, Ttl};
-use pulse_server::{QueryEngine, QueryStats};
+use pulse_server::{QueryEngine, QueryStats, ZoneState as ServerZoneState, ZoneView};
 use pulse_transfer::ZoneSnapshot;
-use pulse_zonefile::{ZoneMetaBlock, ZoneWriter};
+use pulse_zonefile::parallel::{ParallelZone, RootState};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -27,7 +28,7 @@ use crate::logging;
 use crate::secondary::{SecondaryError, SecondaryManager, SecondaryUpdate, rrsets_from_snapshot};
 use crate::transfer::{NotifyDispatcher, TransferState};
 use crate::zonefile::{
-    ZoneFileStats, ZoneStore, denial_from_u8, denial_to_u8, kind_flags, kind_from_flags,
+    FileZoneView, ZoneEntry, ZoneFileStats, ZoneStore, denial_from_u8, kind_from_flags,
     name_from_rle, name_to_rle, system_time_from_unix_ns, write_rrset,
 };
 
@@ -39,10 +40,13 @@ pub(crate) struct StoreError(String);
 /// Общий администратор: zonefile, DNS-движок, transfer и secondary.
 pub(crate) struct SharedZoneAdmin {
     store: Option<Arc<ZoneStore>>,
+    /// `origin → view`; движок собирается из этих view.
+    views: RwLock<HashMap<Name, Arc<FileZoneView>>>,
     engine: RwLock<Arc<QueryEngine>>,
     query_stats: Arc<QueryStats>,
     file_stats: Arc<ZoneFileStats>,
-    mutation: Mutex<()>,
+    /// Сериализует операции с каталогом (create/delete/replace), не RRset-правки.
+    catalog: Mutex<()>,
     dnssec: DnssecSigners,
     transfer: TransferState,
     secondary: SecondaryManager,
@@ -59,30 +63,20 @@ impl SharedZoneAdmin {
         let file_stats = store
             .as_ref()
             .map_or_else(|| Arc::new(ZoneFileStats::default()), |store| store.stats());
-        let source = match &store {
-            Some(store) => Some(
-                store
-                    .source()
-                    .map_err(|error| StoreError(error.to_string()))?,
-            ),
-            None => None,
+        let zones = match &store {
+            Some(store) => store.list_zones().map_err(StoreError)?,
+            None => Vec::new(),
         };
-        let zones_meta = source
-            .as_ref()
-            .map(|source| {
-                source
-                    .zones()
-                    .iter()
-                    .map(|zone| {
-                        (
-                            zone.origin.clone(),
-                            kind_from_flags(zone.entry.flags),
-                            soa_serial(zone.soa.as_ref()),
-                        )
-                    })
-                    .collect()
+        let zones_meta = zones
+            .iter()
+            .map(|zone| {
+                (
+                    zone.origin.clone(),
+                    kind_from_flags(zone.flags),
+                    (zone.soa_serial != 0).then(|| Serial::new(zone.soa_serial)),
+                )
             })
-            .unwrap_or_default();
+            .collect();
         let transfer = TransferState::from_config(
             &config.transfer,
             &config.tsig_keys,
@@ -92,17 +86,11 @@ impl SharedZoneAdmin {
             notify,
         )
         .map_err(|error| StoreError(format!("cannot initialise transfer: {error}")))?;
-        let existing_secondary: HashSet<Name> = source
-            .as_ref()
-            .map(|source| {
-                source
-                    .zones()
-                    .iter()
-                    .filter(|zone| kind_from_flags(zone.entry.flags) == ZoneKind::Secondary)
-                    .map(|zone| zone.origin.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let existing_secondary: HashSet<Name> = zones
+            .iter()
+            .filter(|zone| kind_from_flags(zone.flags) == ZoneKind::Secondary)
+            .map(|zone| zone.origin.clone())
+            .collect();
         let secondary = SecondaryManager::from_config(
             config,
             &existing_secondary,
@@ -111,17 +99,23 @@ impl SharedZoneAdmin {
         )
         .map_err(|error| StoreError(format!("cannot initialise secondary zones: {error}")))?;
         let expired = secondary.expired_origins();
-        let views = source
-            .as_ref()
-            .map(|source| source.views(&expired))
-            .unwrap_or_default();
-        let engine = QueryEngine::with_stats(views, Arc::clone(&query_stats));
+        let mut views = HashMap::with_capacity(zones.len());
+        for entry in &zones {
+            let Some(store) = &store else {
+                continue;
+            };
+            let view = FileZoneView::new(Arc::clone(store), entry, server_state(entry, &expired))
+                .map_err(StoreError)?;
+            views.insert(entry.origin.clone(), Arc::new(view));
+        }
+        let engine = build_engine(&views, &query_stats);
         Ok(Self {
             store,
-            engine: RwLock::new(Arc::new(engine)),
+            views: RwLock::new(views),
+            engine: RwLock::new(engine),
             query_stats,
             file_stats,
-            mutation: Mutex::new(()),
+            catalog: Mutex::new(()),
             dnssec,
             transfer,
             secondary,
@@ -159,7 +153,7 @@ impl SharedZoneAdmin {
 
     pub(crate) fn secondary_tick(&self, now: Instant) {
         if self.secondary.expire_due(now)
-            && let Err(error) = self.rebuild_engine()
+            && let Err(error) = self.rebuild_all_views()
         {
             logging::error(
                 "secondary",
@@ -195,7 +189,7 @@ impl SharedZoneAdmin {
         match result {
             Ok(update @ SecondaryUpdate::UpToDate { .. }) => {
                 let was_expired = zone.note_success(update.soa(), now);
-                if was_expired && let Err(error) = self.rebuild_engine() {
+                if was_expired && let Err(error) = self.rebuild_all_views() {
                     logging::error(
                         "secondary",
                         &format!("zone {origin}: cannot rebuild engine: {error:?}"),
@@ -219,7 +213,7 @@ impl SharedZoneAdmin {
                             &format!("zone {origin}: cannot apply transfer: {error}"),
                         );
                         let was_expired = zone.note_failure(error.to_string(), now);
-                        if was_expired && let Err(error) = self.rebuild_engine() {
+                        if was_expired && let Err(error) = self.rebuild_all_views() {
                             logging::error(
                                 "secondary",
                                 &format!("zone {origin}: cannot rebuild engine: {error:?}"),
@@ -234,7 +228,7 @@ impl SharedZoneAdmin {
                     &format!("zone {origin}: refresh failed: {error}"),
                 );
                 let was_expired = zone.note_failure(error.to_string(), now);
-                if was_expired && let Err(error) = self.rebuild_engine() {
+                if was_expired && let Err(error) = self.rebuild_all_views() {
                     logging::error(
                         "secondary",
                         &format!("zone {origin}: cannot rebuild engine: {error:?}"),
@@ -258,11 +252,8 @@ impl SharedZoneAdmin {
                 "secondary zones require --data <zonefile>".to_owned(),
             ));
         };
-        let _guard = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
-        let existing = store
-            .zone_meta_block(origin)
-            .map_err(SecondaryError::Store)?;
-        if let Some((_apex, entry, _meta)) = &existing
+        let existing = store.zone_entry(origin).map_err(SecondaryError::Store)?;
+        if let Some(entry) = &existing
             && kind_from_flags(entry.flags) != ZoneKind::Secondary
         {
             return Err(SecondaryError::Store(format!(
@@ -272,7 +263,7 @@ impl SharedZoneAdmin {
         let rrsets = rrsets_from_snapshot(snapshot)?;
         let default_ttl = existing
             .as_ref()
-            .and_then(|(_apex, _entry, meta)| Ttl::new(meta.default_ttl).ok())
+            .and_then(|entry| Ttl::new(entry.default_ttl).ok())
             .unwrap_or_else(|| soa_default_ttl(snapshot));
         replace_zone_in_file(
             store,
@@ -284,51 +275,82 @@ impl SharedZoneAdmin {
             &[],
         )
         .map_err(SecondaryError::Store)?;
-        self.file_stats.commit_ok();
         self.after_commit(origin, previous);
         Ok(())
     }
 
+    /// Перечитывает view одной зоны и публикует новый движок.
     fn after_commit(&self, origin: &Name, previous: Option<&ZoneSnapshot>) {
-        let current = self
-            .store
-            .as_ref()
-            .and_then(|store| store.zone_snapshot(origin).ok().flatten());
-        let notify = self
-            .store
-            .as_ref()
-            .and_then(|store| store.zone_entry(origin).ok().flatten())
-            .is_some_and(|(_apex, entry)| kind_from_flags(entry.flags) == ZoneKind::Primary);
-        self.transfer
-            .record_change(origin, previous, current.as_ref(), notify);
-        if let Err(error) = self.rebuild_engine() {
+        let current = if self.transfer.needs_snapshot() {
+            self.store
+                .as_ref()
+                .and_then(|store| store.zone_snapshot(origin).ok().flatten())
+        } else {
+            None
+        };
+        if self.transfer.needs_snapshot() {
+            let notify = self
+                .store
+                .as_ref()
+                .and_then(|store| store.zone_entry(origin).ok().flatten())
+                .is_some_and(|entry| kind_from_flags(entry.flags) == ZoneKind::Primary);
+            self.transfer
+                .record_change(origin, previous, current.as_ref(), notify);
+        }
+        if let Err(error) = self.refresh_view(origin) {
             logging::error(
                 "zone_store",
-                &format!("cannot rebuild DNS engine after commit: {error:?}"),
+                &format!("cannot refresh DNS view after commit: {error:?}"),
             );
         }
     }
 
-    fn rebuild_engine(&self) -> Result<(), AdminError> {
+    fn refresh_view(&self, origin: &Name) -> Result<(), AdminError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let entry = store.zone_entry(origin).map_err(AdminError::Storage)?;
+        let expired = self.secondary.expired_origins();
+        let mut views = self.views.write().unwrap_or_else(PoisonError::into_inner);
+        match entry {
+            Some(entry) => {
+                let view =
+                    FileZoneView::new(Arc::clone(store), &entry, server_state(&entry, &expired))
+                        .map_err(|error| {
+                            logging::error("zone_store", &error);
+                            AdminError::Internal
+                        })?;
+                views.insert(origin.clone(), Arc::new(view));
+            }
+            None => {
+                views.remove(origin);
+            }
+        }
+        let engine = build_engine(&views, &self.query_stats);
+        *self.engine.write().unwrap_or_else(PoisonError::into_inner) = engine;
+        Ok(())
+    }
+
+    fn rebuild_all_views(&self) -> Result<(), AdminError> {
         let Some(store) = &self.store else {
             let empty = QueryEngine::with_stats(Vec::new(), Arc::clone(&self.query_stats));
             *self.engine.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(empty);
             return Ok(());
         };
-        let store = Arc::clone(store);
-        // Снапшот строится на отдельном потоке: reader-table ограничивает
-        // число пинов на поток, а старые движки могут ещё обслуживать запросы.
-        let built = std::thread::spawn(move || store.source())
-            .join()
-            .map_err(|_| AdminError::Internal)?;
-        let source = built.map_err(|error| {
-            logging::error("zone_store", &error.to_string());
-            AdminError::Internal
-        })?;
+        let zones = store.list_zones().map_err(AdminError::Storage)?;
         let expired = self.secondary.expired_origins();
-        let views = source.views(&expired);
-        let engine = QueryEngine::with_stats(views, Arc::clone(&self.query_stats));
-        *self.engine.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(engine);
+        let mut views = HashMap::with_capacity(zones.len());
+        for entry in &zones {
+            let view = FileZoneView::new(Arc::clone(store), entry, server_state(entry, &expired))
+                .map_err(|error| {
+                logging::error("zone_store", &error);
+                AdminError::Internal
+            })?;
+            views.insert(entry.origin.clone(), Arc::new(view));
+        }
+        let engine = build_engine(&views, &self.query_stats);
+        *self.views.write().unwrap_or_else(PoisonError::into_inner) = views;
+        *self.engine.write().unwrap_or_else(PoisonError::into_inner) = engine;
         Ok(())
     }
 
@@ -339,7 +361,6 @@ impl SharedZoneAdmin {
     }
 
     pub(crate) fn sync_persistence(&self) -> Result<(), String> {
-        let _guard = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(store) = &self.store {
             store.sync().map_err(|error| error.to_string())?;
         }
@@ -351,6 +372,38 @@ impl SharedZoneAdmin {
             AdminError::Storage("zonefile is not configured (use --data)".to_owned())
         })
     }
+
+    fn previous_snapshot(&self, origin: &Name, store: &ZoneStore) -> Option<ZoneSnapshot> {
+        if !self.transfer.needs_snapshot() {
+            return None;
+        }
+        store.zone_snapshot(origin).ok().flatten()
+    }
+}
+
+fn build_engine(
+    views: &HashMap<Name, Arc<FileZoneView>>,
+    query_stats: &Arc<QueryStats>,
+) -> Arc<QueryEngine> {
+    let views: Vec<Arc<dyn ZoneView>> = views
+        .values()
+        .map(|view| Arc::clone(view) as Arc<dyn ZoneView>)
+        .collect();
+    Arc::new(QueryEngine::with_stats(views, Arc::clone(query_stats)))
+}
+
+fn server_state(entry: &ZoneEntry, expired: &HashSet<Name>) -> ServerZoneState {
+    match entry.state {
+        RootState::Serving => {
+            if expired.contains(&entry.origin) {
+                ServerZoneState::Expired
+            } else {
+                ServerZoneState::Serving
+            }
+        }
+        RootState::Init => ServerZoneState::Initializing,
+        RootState::Tombstone => ServerZoneState::Tombstone,
+    }
 }
 
 /// Подписывает зоны, для которых настроены DNSSEC-ключи, и коммитит результат
@@ -361,7 +414,7 @@ pub(crate) fn sign_configured_zones(
 ) -> Result<usize, String> {
     let mut signed_count = 0_usize;
     for origin in dnssec.origins() {
-        let Some((_apex, entry, meta)) = store.zone_meta_block(origin)? else {
+        let Some(entry) = store.zone_entry(origin)? else {
             return Err(format!(
                 "DNSSEC is configured for zone {origin}, but the zone is not loaded"
             ));
@@ -374,8 +427,8 @@ pub(crate) fn sign_configured_zones(
             .sign_zone(origin, &rrsets, dnssec::now_unix())
             .map_err(|error| format!("cannot sign zone {origin}: {error}"))?;
         let kind = kind_from_flags(entry.flags);
-        let default_ttl = Ttl::new(meta.default_ttl).unwrap_or(Ttl::from_wire(3600));
-        let denial = denial_from_u8(meta.denial).unwrap_or(Denial::Nsec);
+        let default_ttl = Ttl::new(entry.default_ttl).unwrap_or(Ttl::from_wire(3600));
+        let denial = denial_from_u8(entry.denial).unwrap_or(Denial::Nsec);
         replace_zone_in_file(
             store,
             origin,
@@ -415,30 +468,6 @@ fn soa_serial(soa: Option<&Rrset>) -> Option<Serial> {
     })
 }
 
-/// Выполняет действие внутри транзакции и коммитит.
-fn commit_action<T>(
-    store: &ZoneStore,
-    action: impl FnOnce(&mut ZoneWriter<'_>) -> Result<T, String>,
-) -> Result<T, String> {
-    let mode = store.commit_mode();
-    let mut file = store.file().write().unwrap_or_else(PoisonError::into_inner);
-    let mut writer = file.write().map_err(|error| {
-        store.stats().commit_failed();
-        store.error("begin transaction", &error)
-    })?;
-    let value = action(&mut writer)?;
-    match writer.commit(mode) {
-        Ok(_) => {
-            store.stats().commit_ok();
-            Ok(value)
-        }
-        Err(error) => {
-            store.stats().commit_failed();
-            Err(store.error("commit", &error))
-        }
-    }
-}
-
 /// Импортирует master-файл в zonefile (`pulsed import`).
 pub(crate) fn import_loaded_zone(
     store: &ZoneStore,
@@ -446,7 +475,7 @@ pub(crate) fn import_loaded_zone(
     replace: bool,
     dnssec: &DnssecSigners,
 ) -> Result<(), String> {
-    let exists = store.zone_meta_block(&loaded.origin)?.is_some();
+    let exists = store.zone_entry(&loaded.origin)?.is_some();
     if exists && !replace {
         return Err(format!(
             "zone {} already exists; pass --replace to overwrite it",
@@ -483,39 +512,11 @@ pub(crate) fn replace_zone_in_file(
     rrsets: &[Rrset],
     nodes: &[Name],
 ) -> Result<(), String> {
-    let apex = name_to_rle(origin).map_err(|error| error.to_string())?;
-    let meta = ZoneMetaBlock {
-        default_ttl: default_ttl.as_u32(),
-        denial: denial_to_u8(denial),
-        ..ZoneMetaBlock::default()
-    };
-    commit_action(store, move |writer| {
-        writer
-            .delete_zone(&apex)
-            .map_err(|error| format!("replace: tombstone old zone: {error}"))?;
-        writer
-            .create_zone_with_meta(&apex, kind_flags(kind), &meta)
-            .map_err(|error| format!("replace: create zone: {error}"))?;
-        for rrset in rrsets {
-            write_rrset(writer, &apex, rrset)?;
-        }
-        let owners: HashSet<&Name> = rrsets.iter().map(Rrset::owner).collect();
-        for node in nodes {
-            if owners.contains(node) {
-                continue;
-            }
-            let node_rle = name_to_rle(node).map_err(|error| error.to_string())?;
-            writer
-                .ensure_empty_node(&apex, &node_rle)
-                .map_err(|error| format!("replace: write empty node: {error}"))?;
-        }
-        Ok(())
-    })
+    store.replace_zone(origin, kind, default_ttl, denial, rrsets, nodes)
 }
 
 fn zone_view(store: &ZoneStore, origin: &Name) -> Result<pulse_api::ZoneView, AdminError> {
-    let Some((_apex, entry, meta)) = store.zone_meta_block(origin).map_err(AdminError::Storage)?
-    else {
+    let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? else {
         return Err(AdminError::zone_not_found());
     };
     let soa = store
@@ -527,8 +528,8 @@ fn zone_view(store: &ZoneStore, origin: &Name) -> Result<pulse_api::ZoneView, Ad
         })
         .transpose()?;
     let serial = soa_serial(soa.as_ref()).unwrap_or_else(|| Serial::new(entry.soa_serial.max(1)));
-    let version = entry.last_commit_txn.max(1);
-    let txn = entry.last_commit_txn;
+    let version = entry.version.max(1);
+    let txn = entry.version;
     Ok(pulse_api::ZoneView {
         id: pulse_api::ZoneId::new(entry.zone_seq),
         origin: origin.clone(),
@@ -536,12 +537,12 @@ fn zone_view(store: &ZoneStore, origin: &Name) -> Result<pulse_api::ZoneView, Ad
         serial,
         version,
         txn,
-        default_ttl: Ttl::new(meta.default_ttl).unwrap_or(Ttl::from_wire(3600)),
-        denial: denial_from_u8(meta.denial).unwrap_or(Denial::Nsec),
+        default_ttl: Ttl::new(entry.default_ttl).unwrap_or(Ttl::from_wire(3600)),
+        denial: denial_from_u8(entry.denial).unwrap_or(Denial::Nsec),
         rrset_count: entry.rrset_count,
         etag: zone_etag(entry.zone_seq, version, txn),
-        created_at: system_time_from_unix_ns(entry.last_change_unix_ns),
-        updated_at: system_time_from_unix_ns(entry.last_change_unix_ns),
+        created_at: system_time_from_unix_ns(entry.created_unix_ns),
+        updated_at: system_time_from_unix_ns(entry.updated_unix_ns),
     })
 }
 
@@ -673,28 +674,32 @@ fn validate_type(origin: &Name, owner: &Name, rr_type: Rtype) -> Result<(), Admi
     Ok(())
 }
 
-fn bumped_soa(
-    store: &ZoneStore,
-    origin: &Name,
-    kind: ZoneKind,
-) -> Result<Option<Rrset>, AdminError> {
+fn bumped_soa(writer: &ParallelZone<'_>, kind: ZoneKind) -> Result<Option<Rrset>, AdminError> {
     if kind != ZoneKind::Primary {
         return Ok(None);
     }
-    let Some(soa) = store
-        .lookup(origin, origin, Rtype::SOA)
-        .map_err(AdminError::Storage)?
+    let origin = *writer.origin();
+    let origin_name =
+        name_from_rle(&origin).map_err(|error| AdminError::Storage(error.to_string()))?;
+    let Some(soa) = writer
+        .lookup(&origin, Rtype::SOA.as_u16(), 0)
+        .map_err(|error| AdminError::Storage(error.to_string()))?
     else {
         return Ok(None);
     };
-    let mut rrset = crate::zonefile::rrset_from_stored(origin, Rtype::SOA, &soa)
+    let view = pulse_zonefile::RrsetView {
+        ttl: soa.ttl,
+        flags: soa.flags,
+        rdata: soa.rdata,
+    };
+    let mut rrset = crate::zonefile::rrset_from_stored(&origin_name, Rtype::SOA, &view)
         .map_err(|error| AdminError::Storage(error.to_string()))?;
     let Some(Rdata::Soa(mut data)) = rrset.rdatas().first().cloned() else {
         return Ok(None);
     };
     data.serial = data.serial.succ();
     rrset = Rrset::new(
-        origin.clone(),
+        origin_name,
         Rtype::SOA,
         Rclass::IN,
         rrset.ttl(),
@@ -704,19 +709,66 @@ fn bumped_soa(
     Ok(Some(rrset))
 }
 
-fn owner_types(store: &ZoneStore, origin: &Name, owner: &Name) -> Result<Vec<Rtype>, String> {
-    let mut types = BTreeSet::new();
-    store.with_zone_items(origin, |_file, _txn, _apex, items| {
-        for item in items {
-            let item = item.map_err(|error| error.to_string())?;
-            let item_owner = name_from_rle(&item.name).map_err(|error| error.to_string())?;
-            if &item_owner == owner && item.rr_type != 0 {
-                types.insert(Rtype::from_u16(item.rr_type));
-            }
+fn soa_serial_of(rrset: &Rrset) -> Option<u32> {
+    match rrset.rdatas().first() {
+        Some(Rdata::Soa(soa)) => Some(soa.serial.as_u32()),
+        _ => None,
+    }
+}
+
+fn check_owner_conflicts(
+    store: &ZoneStore,
+    origin: &Name,
+    owner: &Name,
+    rr_type: Rtype,
+) -> Result<(), AdminError> {
+    let types = store
+        .owner_types(origin, owner)
+        .map_err(AdminError::Storage)?;
+    let has_cname = types.contains(&Rtype::CNAME);
+    let has_other = types
+        .iter()
+        .any(|kind| *kind != rr_type && *kind != Rtype::CNAME);
+    if rr_type == Rtype::CNAME {
+        if owner == origin {
+            return Err(AdminError::invariant(
+                "/owner",
+                "cname-conflict",
+                "CNAME is not allowed at the zone apex",
+            ));
         }
-        Ok(())
-    })?;
-    Ok(types.into_iter().collect())
+        if has_other {
+            return Err(AdminError::invariant(
+                "/owner",
+                "cname-conflict",
+                "CNAME cannot coexist with other types at the same owner",
+            ));
+        }
+    }
+    if rr_type == Rtype::DNAME {
+        if owner == origin {
+            return Err(AdminError::invariant(
+                "/owner",
+                "dname-conflict",
+                "DNAME is not allowed at the zone apex",
+            ));
+        }
+        if has_cname {
+            return Err(AdminError::invariant(
+                "/owner",
+                "dname-conflict",
+                "DNAME cannot coexist with CNAME at the same owner",
+            ));
+        }
+    }
+    if has_cname && rr_type != Rtype::CNAME {
+        return Err(AdminError::invariant(
+            "/owner",
+            "cname-conflict",
+            "owner with CNAME cannot have other types",
+        ));
+    }
+    Ok(())
 }
 
 impl ZoneAdmin for SharedZoneAdmin {
@@ -725,7 +777,10 @@ impl ZoneAdmin for SharedZoneAdmin {
     }
 
     fn zonefile_metrics(&self) -> Option<ZoneFileMetrics> {
-        Some(self.file_stats.metrics())
+        Some(match &self.store {
+            Some(store) => store.metrics(),
+            None => self.file_stats.metrics(None),
+        })
     }
 
     fn list_zones(&self, query: &ListZones, allow: &dyn ZoneAllow) -> Result<ZonePage, AdminError> {
@@ -746,15 +801,14 @@ impl ZoneAdmin for SharedZoneAdmin {
             .as_deref()
             .map(decode_zone_cursor)
             .transpose()?;
-        let mut zones = store.zone_list().map_err(AdminError::Storage)?;
-        zones.sort_by_key(|(_origin, entry)| entry.zone_seq);
+        let zones = store.list_zones().map_err(AdminError::Storage)?;
         let mut items = Vec::new();
         let mut has_more = false;
-        for (origin, entry) in zones {
+        for entry in zones {
             if cursor.is_some_and(|cursor| entry.zone_seq <= cursor) {
                 continue;
             }
-            if !allow.allows(&origin) {
+            if !allow.allows(&entry.origin) {
                 continue;
             }
             let kind = kind_from_flags(entry.flags);
@@ -765,7 +819,7 @@ impl ZoneAdmin for SharedZoneAdmin {
                 has_more = true;
                 break;
             }
-            items.push(zone_view(store, &origin)?);
+            items.push(zone_view(store, &entry.origin)?);
         }
         let next_cursor = if has_more {
             items
@@ -799,9 +853,9 @@ impl ZoneAdmin for SharedZoneAdmin {
             ));
         }
         let store = self.require_store()?;
-        let _guard = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
-        let existing = store.zone_meta_block(origin).map_err(AdminError::Storage)?;
-        let (created, old_snapshot) = if let Some((_apex, entry, old_meta)) = &existing {
+        let _guard = self.catalog.lock().unwrap_or_else(PoisonError::into_inner);
+        let existing = store.zone_entry(origin).map_err(AdminError::Storage)?;
+        let created = if let Some(entry) = &existing {
             let view = zone_view(store, origin)?;
             check_existing(preconditions, &view.etag, view.version)?;
             let current_kind = kind_from_flags(entry.flags);
@@ -812,44 +866,18 @@ impl ZoneAdmin for SharedZoneAdmin {
                     "zone must be empty before changing kind",
                 ));
             }
-            let apex =
-                name_to_rle(origin).map_err(|error| AdminError::Storage(error.to_string()))?;
-            let block = ZoneMetaBlock {
-                default_ttl: meta.default_ttl.as_u32(),
-                denial: denial_to_u8(meta.denial),
-                ..*old_meta
-            };
-            let old = store.zone_snapshot(origin).map_err(AdminError::Storage)?;
-            commit_action(store, move |writer| {
-                writer
-                    .set_zone_flags(&apex, kind_flags(meta.kind))
-                    .map_err(|error| format!("update zone flags: {error}"))?;
-                writer
-                    .update_zone_meta(&apex, &block)
-                    .map_err(|error| format!("update zone metadata: {error}"))?;
-                Ok(())
-            })
-            .map_err(AdminError::Storage)?;
-            (false, old)
+            store
+                .update_zone_meta(origin, meta.kind, meta.default_ttl, meta.denial)
+                .map_err(AdminError::Storage)?;
+            false
         } else {
             check_create(preconditions)?;
-            let apex =
-                name_to_rle(origin).map_err(|error| AdminError::Storage(error.to_string()))?;
-            let block = ZoneMetaBlock {
-                default_ttl: meta.default_ttl.as_u32(),
-                denial: denial_to_u8(meta.denial),
-                ..ZoneMetaBlock::default()
-            };
-            commit_action(store, move |writer| {
-                writer
-                    .create_zone_with_meta(&apex, kind_flags(meta.kind), &block)
-                    .map_err(|error| format!("create zone: {error}"))?;
-                Ok(())
-            })
-            .map_err(AdminError::Storage)?;
-            (true, None)
+            store
+                .create_zone(origin, meta.kind, meta.default_ttl, meta.denial)
+                .map_err(AdminError::Storage)?;
+            true
         };
-        self.after_commit(origin, old_snapshot.as_ref());
+        self.after_commit(origin, None);
         let view = zone_view(store, origin)?;
         Ok(if created {
             WriteOutcome::Created(view)
@@ -860,19 +888,12 @@ impl ZoneAdmin for SharedZoneAdmin {
 
     fn delete_zone(&self, origin: &Name, preconditions: &Preconditions) -> Result<(), AdminError> {
         let store = self.require_store()?;
-        let _guard = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
+        let _guard = self.catalog.lock().unwrap_or_else(PoisonError::into_inner);
         let view = zone_view(store, origin)?;
         check_existing(preconditions, &view.etag, view.version)?;
-        let apex = name_to_rle(origin).map_err(|error| AdminError::Storage(error.to_string()))?;
-        let old = store.zone_snapshot(origin).map_err(AdminError::Storage)?;
-        commit_action(store, move |writer| {
-            writer
-                .delete_zone(&apex)
-                .map_err(|error| format!("delete zone: {error}"))?;
-            Ok(())
-        })
-        .map_err(AdminError::Storage)?;
-        self.after_commit(origin, old.as_ref());
+        let previous = self.previous_snapshot(origin, store);
+        store.delete_zone(origin).map_err(AdminError::Storage)?;
+        self.after_commit(origin, previous.as_ref());
         Ok(())
     }
 
@@ -966,10 +987,7 @@ impl ZoneAdmin for SharedZoneAdmin {
         preconditions: &Preconditions,
     ) -> Result<WriteOutcome<RrsetView>, AdminError> {
         let store = self.require_store()?;
-        let _guard = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some((_apex, entry, _meta)) =
-            store.zone_meta_block(origin).map_err(AdminError::Storage)?
-        else {
+        let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? else {
             return Err(AdminError::zone_not_found());
         };
         let kind = kind_from_flags(entry.flags);
@@ -977,17 +995,25 @@ impl ZoneAdmin for SharedZoneAdmin {
             return Err(AdminError::Conflict(Conflict::ZoneReadOnly));
         }
         validate_type(origin, owner, rr_type)?;
-        let current = store
-            .lookup(origin, owner, rr_type)
-            .map_err(AdminError::Storage)?;
-        let existed = if let Some(view) = current {
+        let owner_rle =
+            name_to_rle(owner).map_err(|error| AdminError::Storage(error.to_string()))?;
+        // Lease зоны сериализует писателей одной зоны; разные зоны пишут
+        // параллельно. Предыдущий снапшот читается под lease, иначе IXFR-дельта
+        // считалась бы от устаревшей версии.
+        let mut writer = store.open_writer(origin).map_err(AdminError::Storage)?;
+        let previous = self.previous_snapshot(origin, store);
+        let current = writer
+            .lookup(&owner_rle, rr_type.as_u16(), 0)
+            .map_err(|error| AdminError::Storage(error.to_string()))?;
+        let existed = if let Some(record) = current {
+            let view = pulse_zonefile::RrsetView {
+                ttl: record.ttl,
+                flags: record.flags,
+                rdata: record.rdata,
+            };
             let rrset = crate::zonefile::rrset_from_stored(owner, rr_type, &view)
                 .map_err(|error| AdminError::Storage(error.to_string()))?;
-            check_existing(
-                preconditions,
-                &rrset_etag(&rrset),
-                entry.last_commit_txn.max(1),
-            )?;
+            check_existing(preconditions, &rrset_etag(&rrset), writer.version().max(1))?;
             true
         } else {
             check_create(preconditions)?;
@@ -1009,23 +1035,30 @@ impl ZoneAdmin for SharedZoneAdmin {
                 "apex SOA must contain exactly one record",
             ));
         }
-        let apex = name_to_rle(origin).map_err(|error| AdminError::Storage(error.to_string()))?;
         let soa = if rr_type == Rtype::SOA {
             None
         } else {
-            bumped_soa(store, origin, kind)?
+            bumped_soa(&writer, kind)?
         };
-        let old = store.zone_snapshot(origin).map_err(AdminError::Storage)?;
-        let stored = rrset.clone();
-        commit_action(store, move |writer| {
-            write_rrset(writer, &apex, &rrset)?;
-            if let Some(soa) = &soa {
-                write_rrset(writer, &apex, soa)?;
-            }
-            Ok(())
-        })
-        .map_err(AdminError::Storage)?;
-        self.after_commit(origin, old.as_ref());
+        write_rrset(&mut writer, &rrset).map_err(AdminError::Storage)?;
+        if let Some(soa) = &soa {
+            write_rrset(&mut writer, soa).map_err(AdminError::Storage)?;
+        }
+        if let Some(serial) = soa
+            .as_ref()
+            .and_then(soa_serial_of)
+            .or_else(|| soa_serial_of(&rrset))
+        {
+            writer.set_soa_serial(serial);
+        }
+        store
+            .commit_writer(&mut writer)
+            .map_err(AdminError::Storage)?;
+        // Lease удерживается до конца after_commit: IXFR-история и view
+        // обновляются в порядке коммитов одной зоны.
+        self.after_commit(origin, previous.as_ref());
+        drop(writer);
+        let stored = rrset;
         let view = rrset_view(origin, &stored);
         Ok(if existed {
             WriteOutcome::Updated(view)
@@ -1034,6 +1067,7 @@ impl ZoneAdmin for SharedZoneAdmin {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn patch_rrset(
         &self,
         origin: &Name,
@@ -1043,26 +1077,32 @@ impl ZoneAdmin for SharedZoneAdmin {
         preconditions: &Preconditions,
     ) -> Result<RrsetPatchOutcome, AdminError> {
         let store = self.require_store()?;
-        let _guard = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some((_apex, entry, _meta)) =
-            store.zone_meta_block(origin).map_err(AdminError::Storage)?
-        else {
+        let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? else {
             return Err(AdminError::zone_not_found());
         };
         let kind = kind_from_flags(entry.flags);
         if !kind.is_writable() {
             return Err(AdminError::Conflict(Conflict::ZoneReadOnly));
         }
-        let current = store
-            .lookup(origin, owner, rr_type)
-            .map_err(AdminError::Storage)?
+        let owner_rle =
+            name_to_rle(owner).map_err(|error| AdminError::Storage(error.to_string()))?;
+        let mut writer = store.open_writer(origin).map_err(AdminError::Storage)?;
+        let previous = self.previous_snapshot(origin, store);
+        let current = writer
+            .lookup(&owner_rle, rr_type.as_u16(), 0)
+            .map_err(|error| AdminError::Storage(error.to_string()))?
             .ok_or_else(AdminError::rrset_not_found)?;
-        let current = crate::zonefile::rrset_from_stored(owner, rr_type, &current)
+        let current_view = pulse_zonefile::RrsetView {
+            ttl: current.ttl,
+            flags: current.flags,
+            rdata: current.rdata,
+        };
+        let current = crate::zonefile::rrset_from_stored(owner, rr_type, &current_view)
             .map_err(|error| AdminError::Storage(error.to_string()))?;
         check_existing(
             preconditions,
             &rrset_etag(&current),
-            entry.last_commit_txn.max(1),
+            writer.version().max(1),
         )?;
         let ttl = patch.ttl.unwrap_or(current.ttl());
         let current_set: BTreeSet<Rdata> = current.rdatas().iter().cloned().collect();
@@ -1083,30 +1123,29 @@ impl ZoneAdmin for SharedZoneAdmin {
         for record in &add_set {
             next_set.insert(record.clone());
         }
-        let apex = name_to_rle(origin).map_err(|error| AdminError::Storage(error.to_string()))?;
-        let owner_rle =
-            name_to_rle(owner).map_err(|error| AdminError::Storage(error.to_string()))?;
         let soa = if rr_type == Rtype::SOA {
             None
         } else {
-            bumped_soa(store, origin, kind)?
+            bumped_soa(&writer, kind)?
         };
-        let old = store.zone_snapshot(origin).map_err(AdminError::Storage)?;
         if next_set.is_empty() {
-            commit_action(store, move |writer| {
-                writer
-                    .delete_rrset(&apex, &owner_rle, rr_type.as_u16(), 0)
-                    .map_err(|error| format!("delete RRset: {error}"))?;
-                writer
-                    .ensure_empty_node(&apex, &owner_rle)
-                    .map_err(|error| format!("preserve empty node: {error}"))?;
-                if let Some(soa) = &soa {
-                    write_rrset(writer, &apex, soa)?;
+            writer
+                .delete_rrset(&owner_rle, rr_type.as_u16(), 0)
+                .map_err(|error| AdminError::Storage(error.to_string()))?;
+            writer
+                .ensure_empty_node(&owner_rle)
+                .map_err(|error| AdminError::Storage(error.to_string()))?;
+            if let Some(soa) = &soa {
+                write_rrset(&mut writer, soa).map_err(AdminError::Storage)?;
+                if let Some(serial) = soa_serial_of(soa) {
+                    writer.set_soa_serial(serial);
                 }
-                Ok(())
-            })
-            .map_err(AdminError::Storage)?;
-            self.after_commit(origin, old.as_ref());
+            }
+            store
+                .commit_writer(&mut writer)
+                .map_err(AdminError::Storage)?;
+            self.after_commit(origin, previous.as_ref());
+            drop(writer);
             return Ok(RrsetPatchOutcome::Deleted {
                 removed: u32::try_from(removed).unwrap_or(u32::MAX),
             });
@@ -1120,18 +1159,22 @@ impl ZoneAdmin for SharedZoneAdmin {
                 "apex SOA must contain exactly one record",
             ));
         }
-        let stored = rrset.clone();
-        commit_action(store, move |writer| {
-            write_rrset(writer, &apex, &rrset)?;
-            if let Some(soa) = &soa {
-                write_rrset(writer, &apex, soa)?;
+        write_rrset(&mut writer, &rrset).map_err(AdminError::Storage)?;
+        if let Some(soa) = &soa {
+            write_rrset(&mut writer, soa).map_err(AdminError::Storage)?;
+            if let Some(serial) = soa_serial_of(soa) {
+                writer.set_soa_serial(serial);
             }
-            Ok(())
-        })
-        .map_err(AdminError::Storage)?;
-        self.after_commit(origin, old.as_ref());
+        } else if let Some(serial) = soa_serial_of(&rrset) {
+            writer.set_soa_serial(serial);
+        }
+        store
+            .commit_writer(&mut writer)
+            .map_err(AdminError::Storage)?;
+        self.after_commit(origin, previous.as_ref());
+        drop(writer);
         Ok(RrsetPatchOutcome::Updated {
-            rrset: rrset_view(origin, &stored),
+            rrset: rrset_view(origin, &rrset),
             added: u32::try_from(added).unwrap_or(u32::MAX),
             removed: u32::try_from(removed).unwrap_or(u32::MAX),
         })
@@ -1145,66 +1188,69 @@ impl ZoneAdmin for SharedZoneAdmin {
         preconditions: &Preconditions,
     ) -> Result<(), AdminError> {
         let store = self.require_store()?;
-        let _guard = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some((_apex, entry, _meta)) =
-            store.zone_meta_block(origin).map_err(AdminError::Storage)?
-        else {
+        let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? else {
             return Err(AdminError::zone_not_found());
         };
         let kind = kind_from_flags(entry.flags);
         if !kind.is_writable() {
             return Err(AdminError::Conflict(Conflict::ZoneReadOnly));
         }
-        let current = store
-            .lookup(origin, owner, rr_type)
-            .map_err(AdminError::Storage)?
+        let owner_rle =
+            name_to_rle(owner).map_err(|error| AdminError::Storage(error.to_string()))?;
+        let mut writer = store.open_writer(origin).map_err(AdminError::Storage)?;
+        let previous = self.previous_snapshot(origin, store);
+        let current = writer
+            .lookup(&owner_rle, rr_type.as_u16(), 0)
+            .map_err(|error| AdminError::Storage(error.to_string()))?
             .ok_or_else(AdminError::rrset_not_found)?;
-        let current = crate::zonefile::rrset_from_stored(owner, rr_type, &current)
+        let current_view = pulse_zonefile::RrsetView {
+            ttl: current.ttl,
+            flags: current.flags,
+            rdata: current.rdata,
+        };
+        let current = crate::zonefile::rrset_from_stored(owner, rr_type, &current_view)
             .map_err(|error| AdminError::Storage(error.to_string()))?;
         check_existing(
             preconditions,
             &rrset_etag(&current),
-            entry.last_commit_txn.max(1),
+            writer.version().max(1),
         )?;
-        let apex = name_to_rle(origin).map_err(|error| AdminError::Storage(error.to_string()))?;
-        let owner_rle =
-            name_to_rle(owner).map_err(|error| AdminError::Storage(error.to_string()))?;
-        let soa = bumped_soa(store, origin, kind)?;
-        let old = store.zone_snapshot(origin).map_err(AdminError::Storage)?;
-        commit_action(store, move |writer| {
-            writer
-                .delete_rrset(&apex, &owner_rle, rr_type.as_u16(), 0)
-                .map_err(|error| format!("delete RRset: {error}"))?;
-            writer
-                .ensure_empty_node(&apex, &owner_rle)
-                .map_err(|error| format!("preserve empty node: {error}"))?;
-            if let Some(soa) = &soa {
-                write_rrset(writer, &apex, soa)?;
+        let soa = bumped_soa(&writer, kind)?;
+        writer
+            .delete_rrset(&owner_rle, rr_type.as_u16(), 0)
+            .map_err(|error| AdminError::Storage(error.to_string()))?;
+        writer
+            .ensure_empty_node(&owner_rle)
+            .map_err(|error| AdminError::Storage(error.to_string()))?;
+        if let Some(soa) = &soa {
+            write_rrset(&mut writer, soa).map_err(AdminError::Storage)?;
+            if let Some(serial) = soa_serial_of(soa) {
+                writer.set_soa_serial(serial);
             }
-            Ok(())
-        })
-        .map_err(AdminError::Storage)?;
-        self.after_commit(origin, old.as_ref());
+        }
+        store
+            .commit_writer(&mut writer)
+            .map_err(AdminError::Storage)?;
+        self.after_commit(origin, previous.as_ref());
+        drop(writer);
         Ok(())
     }
 
     fn get_settings(&self, origin: &Name) -> Result<ZoneSettingsView, AdminError> {
         let store = self.require_store()?;
-        let Some((_apex, entry, meta)) =
-            store.zone_meta_block(origin).map_err(AdminError::Storage)?
-        else {
+        let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? else {
             return Err(AdminError::zone_not_found());
         };
-        let version = entry.last_commit_txn.max(1);
+        let version = entry.version.max(1);
         Ok(ZoneSettingsView {
             zone: origin.clone(),
             settings: ZoneSettings {
-                default_ttl: Ttl::new(meta.default_ttl).unwrap_or(Ttl::from_wire(3600)),
-                denial: denial_from_u8(meta.denial).unwrap_or(Denial::Nsec),
+                default_ttl: Ttl::new(entry.default_ttl).unwrap_or(Ttl::from_wire(3600)),
+                denial: denial_from_u8(entry.denial).unwrap_or(Denial::Nsec),
             },
             version,
-            etag: zone_etag(entry.zone_seq, version, entry.last_commit_txn),
-            updated_at: system_time_from_unix_ns(entry.last_change_unix_ns),
+            etag: zone_etag(entry.zone_seq, version, entry.version),
+            updated_at: system_time_from_unix_ns(entry.updated_unix_ns),
         })
     }
 
@@ -1222,36 +1268,32 @@ impl ZoneAdmin for SharedZoneAdmin {
             ));
         }
         let store = self.require_store()?;
-        let _guard = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some((apex, entry, meta)) =
-            store.zone_meta_block(origin).map_err(AdminError::Storage)?
-        else {
+        let _guard = self.catalog.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? else {
             return Err(AdminError::zone_not_found());
         };
-        let version = entry.last_commit_txn.max(1);
+        let version = entry.version.max(1);
         check_existing(
             preconditions,
-            &zone_etag(entry.zone_seq, version, entry.last_commit_txn),
+            &zone_etag(entry.zone_seq, version, entry.version),
             version,
         )?;
-        let block = ZoneMetaBlock {
-            default_ttl: patch.default_ttl.map_or(meta.default_ttl, Ttl::as_u32),
-            denial: patch.denial.map_or(meta.denial, denial_to_u8),
-            ..meta
-        };
-        commit_action(store, move |writer| {
-            writer
-                .update_zone_meta(&apex, &block)
-                .map_err(|error| format!("update zone metadata: {error}"))?;
-            Ok(())
-        })
-        .map_err(AdminError::Storage)?;
+        let kind = kind_from_flags(entry.flags);
+        let default_ttl = patch
+            .default_ttl
+            .unwrap_or_else(|| Ttl::new(entry.default_ttl).unwrap_or(Ttl::from_wire(3600)));
+        let denial = patch
+            .denial
+            .unwrap_or_else(|| denial_from_u8(entry.denial).unwrap_or(Denial::Nsec));
+        store
+            .update_zone_meta(origin, kind, default_ttl, denial)
+            .map_err(AdminError::Storage)?;
+        self.after_commit(origin, None);
         self.get_settings(origin)
     }
 
     fn sign_zone(&self, origin: &Name) -> Result<pulse_api::ZoneView, AdminError> {
         let store = self.require_store()?;
-        let _guard = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
         let signer = self.dnssec.signer(origin).ok_or_else(|| {
             AdminError::invariant(
                 "/zone",
@@ -1259,13 +1301,12 @@ impl ZoneAdmin for SharedZoneAdmin {
                 "zone has no DNSSEC keys configured",
             )
         })?;
-        let Some((_apex, entry, meta)) =
-            store.zone_meta_block(origin).map_err(AdminError::Storage)?
-        else {
+        let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? else {
             return Err(AdminError::zone_not_found());
         };
+        let _guard = self.catalog.lock().unwrap_or_else(PoisonError::into_inner);
         let rrsets = store.zone_rrsets(origin).map_err(AdminError::Storage)?;
-        let old = store.zone_snapshot(origin).map_err(AdminError::Storage)?;
+        let previous = self.previous_snapshot(origin, store);
         let signed_zone = signer
             .sign_zone(origin, &rrsets, dnssec::now_unix())
             .map_err(|error| {
@@ -1276,7 +1317,7 @@ impl ZoneAdmin for SharedZoneAdmin {
                 AdminError::Internal
             })?;
         let kind = kind_from_flags(entry.flags);
-        let default_ttl = Ttl::new(meta.default_ttl).unwrap_or(Ttl::from_wire(3600));
+        let default_ttl = Ttl::new(entry.default_ttl).unwrap_or(Ttl::from_wire(3600));
         replace_zone_in_file(
             store,
             origin,
@@ -1287,62 +1328,9 @@ impl ZoneAdmin for SharedZoneAdmin {
             &[],
         )
         .map_err(AdminError::Storage)?;
-        self.after_commit(origin, old.as_ref());
+        self.after_commit(origin, previous.as_ref());
         zone_view(store, origin)
     }
-}
-
-fn check_owner_conflicts(
-    store: &ZoneStore,
-    origin: &Name,
-    owner: &Name,
-    rr_type: Rtype,
-) -> Result<(), AdminError> {
-    let types = owner_types(store, origin, owner).map_err(AdminError::Storage)?;
-    let has_cname = types.contains(&Rtype::CNAME);
-    let has_other = types
-        .iter()
-        .any(|kind| *kind != rr_type && *kind != Rtype::CNAME);
-    if rr_type == Rtype::CNAME {
-        if owner == origin {
-            return Err(AdminError::invariant(
-                "/owner",
-                "cname-conflict",
-                "CNAME is not allowed at the zone apex",
-            ));
-        }
-        if has_other {
-            return Err(AdminError::invariant(
-                "/owner",
-                "cname-conflict",
-                "CNAME cannot coexist with other types at the same owner",
-            ));
-        }
-    }
-    if rr_type == Rtype::DNAME {
-        if owner == origin {
-            return Err(AdminError::invariant(
-                "/owner",
-                "dname-conflict",
-                "DNAME is not allowed at the zone apex",
-            ));
-        }
-        if has_cname {
-            return Err(AdminError::invariant(
-                "/owner",
-                "dname-conflict",
-                "DNAME cannot coexist with CNAME at the same owner",
-            ));
-        }
-    }
-    if has_cname && rr_type != Rtype::CNAME {
-        return Err(AdminError::invariant(
-            "/owner",
-            "cname-conflict",
-            "owner with CNAME cannot have other types",
-        ));
-    }
-    Ok(())
 }
 
 fn encode_zone_cursor(id: u32) -> String {

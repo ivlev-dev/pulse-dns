@@ -243,6 +243,14 @@ impl TransferState {
             .map(|zone| zone.notify)
     }
 
+    /// Нужны ли снапшоты зон при коммитах.
+    ///
+    /// Снапшот — полная материализация зоны; при выключенном transfer и без
+    /// NOTIFY-out он не нужен, и REST-правки не платят за IXFR-историю.
+    pub(crate) fn needs_snapshot(&self) -> bool {
+        self.settings.enabled || self.notify.is_some()
+    }
+
     /// Помечает зону к обновлению после входящего NOTIFY.
     pub(crate) fn mark_pending(&self, zone: &Name, serial: Option<Serial>) {
         self.pending

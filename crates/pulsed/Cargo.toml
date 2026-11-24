@@ -41,5 +41,9 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc
 rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 tempfile = "3"
 
+[[bench]]
+name = "zone_writes"
+harness = false
+
 [lints]
 workspace = true

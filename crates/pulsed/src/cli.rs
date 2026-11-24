@@ -11,7 +11,7 @@ use pulse_dns::Name;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::config::{Config, DnssecKeyRole, Durability, LogLevel, Overrides};
+use crate::config::{CommitMode, Config, DnssecKeyRole, Durability, LogLevel, Overrides};
 use crate::dnscrypt::{GenCertOptions, generate_certificate};
 use crate::logging;
 use crate::server::{ApiOptions, Server, ServerError};
@@ -24,6 +24,7 @@ pub(crate) fn run() -> ExitCode {
     let matches = command().get_matches();
     match matches.subcommand() {
         Some(("import", matches)) => return import_zone(matches),
+        Some(("convert", matches)) => return convert_zonefile(matches),
         Some(("dnscrypt-gencert", matches)) => return dnscrypt_gencert(matches),
         _ => {}
     }
@@ -52,6 +53,7 @@ pub(crate) fn run() -> ExitCode {
         log_level: matches.get_one::<LogLevel>("log-level").copied(),
         zonefile: matches.get_one::<PathBuf>("data").cloned(),
         durability: matches.get_one::<Durability>("durability").copied(),
+        commit_mode: matches.get_one::<CommitMode>("commit-mode").copied(),
         map_size: matches.get_one::<u64>("map-size").copied(),
     };
 
@@ -370,14 +372,18 @@ fn import_zone(matches: &ArgMatches) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let store =
-        match crate::zonefile::ZoneStore::open_or_create(&data, map_size, durability.sync_mode()) {
-            Ok(store) => store,
-            Err(error) => {
-                logging::error("import", &error.to_string());
-                return ExitCode::from(1);
-            }
-        };
+    let store = match crate::zonefile::ZoneStore::open_or_create(
+        &data,
+        map_size,
+        durability.sync_mode_v2(),
+        CommitMode::PerZone,
+    ) {
+        Ok(store) => store,
+        Err(error) => {
+            logging::error("import", &error.to_string());
+            return ExitCode::from(1);
+        }
+    };
     match crate::store::import_loaded_zone(&store, &loaded, replace, &dnssec) {
         Ok(()) => {
             logging::info(
@@ -394,6 +400,55 @@ fn import_zone(matches: &ArgMatches) -> ExitCode {
         }
         Err(error) => {
             logging::error("import", &error);
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn convert_zonefile(matches: &ArgMatches) -> ExitCode {
+    logging::init(LogLevel::Info);
+    let Some(from) = matches.get_one::<PathBuf>("from").cloned() else {
+        logging::error("convert", "--from is required");
+        return ExitCode::from(2);
+    };
+    let Some(to) = matches.get_one::<PathBuf>("to").cloned() else {
+        logging::error("convert", "--to is required");
+        return ExitCode::from(2);
+    };
+    if from == to {
+        logging::error("convert", "--from and --to must differ");
+        return ExitCode::from(2);
+    }
+    let durability = matches
+        .get_one::<Durability>("durability")
+        .copied()
+        .unwrap_or_default();
+    let map_size = matches
+        .get_one::<u64>("map-size")
+        .copied()
+        .unwrap_or(crate::config::DEFAULT_MAP_SIZE);
+    match crate::zonefile::ZoneStore::convert_from_v1(
+        &from,
+        &to,
+        map_size,
+        durability.sync_mode_v2(),
+    ) {
+        Ok((zones, records)) => {
+            logging::info(
+                "convert",
+                &format!(
+                    "converted {} zone(s), {} RRset(s) from {} to {}",
+                    zones,
+                    records,
+                    from.display(),
+                    to.display()
+                ),
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            logging::error("convert", &error.to_string());
             ExitCode::from(1)
         }
     }
@@ -696,6 +751,13 @@ fn command() -> Command {
                 .help("Zonefile durability: sync, flush (default) or memory"),
         )
         .arg(
+            Arg::new("commit-mode")
+                .long("commit-mode")
+                .value_name("MODE")
+                .value_parser(value_parser!(CommitMode))
+                .help("Commit mode for zone writes: per-zone (default) or group"),
+        )
+        .arg(
             Arg::new("map-size")
                 .long("map-size")
                 .value_name("BYTES")
@@ -735,6 +797,40 @@ fn command() -> Command {
                 .value_name("ORIGIN")
                 .action(ArgAction::Append)
                 .help("Per-zone API allowlist (exact origin or *.suffix.); repeatable"),
+        )
+        .subcommand(
+            Command::new("convert")
+                .about("Convert a pulse-zonefile v1 file into the v2 format")
+                .arg(
+                    Arg::new("from")
+                        .long("from")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(PathBuf))
+                        .help("Source pulse-zonefile v1 file"),
+                )
+                .arg(
+                    Arg::new("to")
+                        .long("to")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(PathBuf))
+                        .help("Destination v2 file (must not exist or be empty)"),
+                )
+                .arg(
+                    Arg::new("durability")
+                        .long("durability")
+                        .value_name("MODE")
+                        .value_parser(value_parser!(Durability))
+                        .help("Durability of the destination file: sync, flush (default) or memory"),
+                )
+                .arg(
+                    Arg::new("map-size")
+                        .long("map-size")
+                        .value_name("BYTES")
+                        .value_parser(value_parser!(u64))
+                        .help("Destination map size in bytes (default 4 GiB, sparse)"),
+                ),
         )
         .subcommand(
             Command::new("dnscrypt-gencert")

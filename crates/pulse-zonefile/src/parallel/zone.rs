@@ -50,12 +50,61 @@ const CATALOG_OFF_SEQ: usize = 4;
 const CATALOG_OFF_SERIAL: usize = 8;
 const CATALOG_OFF_ORIGIN_LEN: usize = 12;
 const CATALOG_OFF_CREATED_TXN: usize = 16;
+// B3: пользовательские метаданные зоны в хвосте значения каталога. Старые
+// файлы имеют нули в этих байтах, поэтому раскладка обратно совместима.
+const CATALOG_OFF_KIND_FLAGS: usize = 20;
+const CATALOG_OFF_DEFAULT_TTL: usize = 24;
+const CATALOG_OFF_DENIAL: usize = 28;
+const CATALOG_OFF_CREATED_NS: usize = 32;
+const CATALOG_OFF_UPDATED_NS: usize = 40;
+
+/// Флаги вида зоны (`ZONE_FLAG_*` из v1 `zone_meta`).
+pub const ZONE_KIND_FLAG_SECONDARY: u16 = 1;
+/// Зона получена трансфером (forward-зона).
+pub const ZONE_KIND_FLAG_FORWARD: u16 = 2;
+const ZONE_KIND_FLAGS_KNOWN: u16 = ZONE_KIND_FLAG_SECONDARY | ZONE_KIND_FLAG_FORWARD;
 
 /// Метаданные создания зоны (B1: только SOA serial; блок `ZoneMeta` — B2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ZoneCreateMeta {
     /// SOA serial зоны (RFC 1982, ≤ `0x7FFF_FFFF`).
     pub soa_serial: u32,
+}
+
+/// Пользовательские метаданные зоны, хранимые в записи каталога (B3).
+///
+/// Значения по умолчанию (`0`) означают «не задано»: адаптеры подставляют
+/// собственные значения по умолчанию. Все поля входят в durable запись
+/// каталога, поэтому смена настроек зоны — отдельный коммит каталога.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ZoneMetaV2 {
+    /// Флаги вида зоны ([`ZONE_KIND_FLAG_SECONDARY`], [`ZONE_KIND_FLAG_FORWARD`]).
+    pub kind_flags: u16,
+    /// TTL по умолчанию (`0` — не задано).
+    pub default_ttl: u32,
+    /// Denial: `0` — NSEC, `1` — NSEC3 (`2+` — не задано).
+    pub denial: u8,
+    /// Время создания зоны (unix ns, `0` — не задано).
+    pub created_unix_ns: u64,
+    /// Время последнего изменения (unix ns, `0` — не задано).
+    pub updated_unix_ns: u64,
+}
+
+impl ZoneMetaV2 {
+    /// Проверяет диапазоны полей.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` — зарезервированные флаги/TTL/denial.
+    pub fn validate(&self) -> Result<(), ParallelError> {
+        if self.kind_flags & !ZONE_KIND_FLAGS_KNOWN != 0
+            || self.default_ttl > 0x7FFF_FFFF
+            || self.denial > 1
+        {
+            return Err(ParallelError::InvalidArgument { field: "zone_meta" });
+        }
+        Ok(())
+    }
 }
 
 /// Информация о зоне из каталога и головы.
@@ -77,6 +126,8 @@ pub struct ZoneInfo {
     pub root_page: u32,
     /// Уровень корня.
     pub tree_level: u16,
+    /// Пользовательские метаданные из каталога.
+    pub meta: ZoneMetaV2,
 }
 
 /// Итог коммита зоны.
@@ -151,6 +202,7 @@ struct CatalogValue {
     soa_serial: u32,
     origin_len: u32,
     created_txn: u64,
+    meta: ZoneMetaV2,
 }
 
 impl CatalogValue {
@@ -161,6 +213,15 @@ impl CatalogValue {
         let _ = wire::write_u32(&mut raw, CATALOG_OFF_SERIAL, self.soa_serial);
         let _ = wire::write_u32(&mut raw, CATALOG_OFF_ORIGIN_LEN, self.origin_len);
         let _ = wire::write_u64(&mut raw, CATALOG_OFF_CREATED_TXN, self.created_txn);
+        let _ = wire::write_u32(
+            &mut raw,
+            CATALOG_OFF_KIND_FLAGS,
+            u32::from(self.meta.kind_flags),
+        );
+        let _ = wire::write_u32(&mut raw, CATALOG_OFF_DEFAULT_TTL, self.meta.default_ttl);
+        let _ = wire::write_u32(&mut raw, CATALOG_OFF_DENIAL, u32::from(self.meta.denial));
+        let _ = wire::write_u64(&mut raw, CATALOG_OFF_CREATED_NS, self.meta.created_unix_ns);
+        let _ = wire::write_u64(&mut raw, CATALOG_OFF_UPDATED_NS, self.meta.updated_unix_ns);
         raw
     }
 
@@ -174,10 +235,20 @@ impl CatalogValue {
             soa_serial: wire::read_u32(raw, CATALOG_OFF_SERIAL)?,
             origin_len: wire::read_u32(raw, CATALOG_OFF_ORIGIN_LEN)?,
             created_txn: wire::read_u64(raw, CATALOG_OFF_CREATED_TXN)?,
+            meta: ZoneMetaV2 {
+                kind_flags: u16::try_from(wire::read_u32(raw, CATALOG_OFF_KIND_FLAGS)?).ok()?,
+                default_ttl: wire::read_u32(raw, CATALOG_OFF_DEFAULT_TTL)?,
+                denial: u8::try_from(wire::read_u32(raw, CATALOG_OFF_DENIAL)?).ok()?,
+                created_unix_ns: wire::read_u64(raw, CATALOG_OFF_CREATED_NS)?,
+                updated_unix_ns: wire::read_u64(raw, CATALOG_OFF_UPDATED_NS)?,
+            },
         };
         if value.zone_seq == 0
             || value.soa_serial > 0x7FFF_FFFF
             || usize::try_from(value.origin_len).ok()? != origin.as_rle().len()
+            || value.meta.kind_flags & !ZONE_KIND_FLAGS_KNOWN != 0
+            || value.meta.default_ttl > 0x7FFF_FFFF
+            || value.meta.denial > 1
         {
             return None;
         }
@@ -291,6 +362,47 @@ impl<'a> ParallelZones<'a> {
         self.origins.get(&zone).copied()
     }
 
+    /// Пользовательские метаданные зоны из каталога.
+    #[must_use]
+    pub fn zone_meta(&self, origin: &NameRle) -> Option<ZoneMetaV2> {
+        self.entries.get(origin).map(|value| value.meta)
+    }
+
+    /// Пользовательские метаданные по `zone_seq`.
+    #[must_use]
+    pub fn zone_meta_by_seq(&self, zone: u32) -> Option<ZoneMetaV2> {
+        self.origin(zone)
+            .and_then(|origin| self.entries.get(&origin))
+            .map(|value| value.meta)
+    }
+
+    /// Заменяет пользовательские метаданные зоны (отдельный коммит каталога).
+    ///
+    /// Возвращает `true`, если запись изменилась (идемпотентный вызов с теми
+    /// же полями не пишет каталог).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` — зоны нет/метаданные вне диапазонов;
+    /// `Io`/`Corrupt`/`MapFull` — коммит каталога.
+    pub fn set_zone_meta(
+        &mut self,
+        origin: &NameRle,
+        meta: ZoneMetaV2,
+    ) -> Result<bool, ParallelError> {
+        meta.validate()?;
+        let Some(mut value) = self.entries.get(origin).copied() else {
+            return Err(ParallelError::InvalidArgument { field: "origin" });
+        };
+        if value.meta == meta {
+            return Ok(false);
+        }
+        value.meta = meta;
+        self.write_catalog_edit(CatalogEdit::Upsert(origin, value))?;
+        self.entries.insert(*origin, value);
+        Ok(true)
+    }
+
     /// Живые зоны (голова есть, не tombstone).
     #[must_use]
     pub fn zones(&self) -> Vec<ZoneInfo> {
@@ -311,6 +423,7 @@ impl<'a> ParallelZones<'a> {
                 state: head.state,
                 root_page: head.root_page,
                 tree_level: head.tree_level,
+                meta: value.meta,
             });
         }
         zones
@@ -333,6 +446,27 @@ impl<'a> ParallelZones<'a> {
         origin: &NameRle,
         meta: ZoneCreateMeta,
     ) -> Result<u32, ParallelError> {
+        self.create_zone_with_meta(origin, meta, ZoneMetaV2::default())
+    }
+
+    /// Создаёт зону вместе с пользовательскими метаданными каталога.
+    ///
+    /// Пользовательские поля (вид зоны, TTL по умолчанию, denial) пишутся в ту
+    /// же запись каталога, что и `origin → zone_seq`, поэтому зона и её
+    /// настройки появляются атомарно.
+    ///
+    /// # Errors
+    ///
+    /// См. [`ParallelZones::create_zone`]; `InvalidArgument` — метаданные вне
+    /// допустимых диапазонов.
+    #[allow(clippy::too_many_lines)]
+    pub fn create_zone_with_meta(
+        &mut self,
+        origin: &NameRle,
+        meta: ZoneCreateMeta,
+        zone_meta: ZoneMetaV2,
+    ) -> Result<u32, ParallelError> {
+        zone_meta.validate()?;
         if self.entries.contains_key(origin) {
             return Err(ParallelError::InvalidArgument { field: "origin" });
         }
@@ -365,6 +499,7 @@ impl<'a> ParallelZones<'a> {
             soa_serial: meta.soa_serial,
             origin_len: u32::try_from(origin.as_rle().len()).unwrap_or(u32::MAX),
             created_txn: outcome.version,
+            meta: zone_meta,
         };
         self.write_catalog_edit(CatalogEdit::Upsert(origin, value))?;
         self.origins.insert(zone_seq, *origin);
@@ -620,7 +755,47 @@ impl std::fmt::Debug for ParallelZone<'_> {
 }
 
 impl<'a> ParallelZone<'a> {
-    fn open(store: &'a ParallelStore, origin: NameRle, zone: u32) -> Result<Self, ParallelError> {
+    /// Открывает writer зоны по `zone_seq` (lease удерживается до `Drop`).
+    ///
+    /// Позволяет писать зону без загрузки каталога: `origin`/`zone_seq` берутся
+    /// из кэша вызывающего. Между открытием writer'а и коммитом другой процесс
+    /// писать не может (writer-лок), а другой поток этого процесса ждёт lease.
+    ///
+    /// # Errors
+    ///
+    /// `NoZoneVersion` — зоны нет/tombstone; `Corrupt`/`Io` — голова/дерево;
+    /// `Busy` — файл занят другим writer'ом.
+    pub fn open(
+        store: &'a ParallelStore,
+        origin: NameRle,
+        zone: u32,
+    ) -> Result<Self, ParallelError> {
+        Self::open_impl(store, origin, zone, true)
+    }
+
+    /// Открывает writer без per-handle кеша страниц (`REST`/короткие правки).
+    ///
+    /// Обычный [`ParallelZone::open`] резервирует батч из 64 страниц на handle;
+    /// короткоживущий writer не успевает его использовать, поэтому такой режим
+    /// тратил бы место файла. Семантика lease/коммита идентична.
+    ///
+    /// # Errors
+    ///
+    /// См. [`ParallelZone::open`].
+    pub fn open_uncached(
+        store: &'a ParallelStore,
+        origin: NameRle,
+        zone: u32,
+    ) -> Result<Self, ParallelError> {
+        Self::open_impl(store, origin, zone, false)
+    }
+
+    fn open_impl(
+        store: &'a ParallelStore,
+        origin: NameRle,
+        zone: u32,
+        cached: bool,
+    ) -> Result<Self, ParallelError> {
         let lease = store.lease_guard(zone);
         let head = store
             .head_entry(zone)
@@ -629,7 +804,11 @@ impl<'a> ParallelZone<'a> {
             return Err(ParallelError::NoZoneVersion { zone });
         }
         let tree = ZoneTree::new(origin, head.root_page, head.tree_level)?;
-        let io = WriteIo::new(store, zone, head.version);
+        let io = if cached {
+            WriteIo::new(store, zone, head.version)
+        } else {
+            WriteIo::new_exact(store, zone, head.version)
+        };
         Ok(Self {
             store,
             origin,
@@ -658,7 +837,7 @@ impl<'a> ParallelZone<'a> {
             Some(_) => return Err(ParallelError::InvalidArgument { field: "zone_seq" }),
         };
         let tree = ZoneTree::empty(origin);
-        let io = WriteIo::new(store, zone, base_version);
+        let io = WriteIo::new_exact(store, zone, base_version);
         Ok(Self {
             store,
             origin,
@@ -841,6 +1020,39 @@ impl<'a> ParallelZone<'a> {
                 Err(error)
             }
         }
+    }
+
+    /// Создаёт пустой `T_NODE` имени (ENT) в незакоммиченном дереве.
+    ///
+    /// Нужен, чтобы после удаления последнего `RRset` имя продолжало
+    /// существовать (NODATA вместо NXDOMAIN).
+    ///
+    /// # Errors
+    ///
+    /// `Tree`/`Corrupt`/`Io`; `NameOutsideZone` — имя вне зоны.
+    pub fn ensure_empty_node(&mut self, name: &NameRle) -> Result<bool, ParallelError> {
+        self.ensure_txn()?;
+        let txn = self.txn.unwrap_or(self.base_version);
+        match self.tree.ensure_empty_node(&mut self.io, txn, name) {
+            Ok(changed) => Ok(changed),
+            Err(error) => {
+                let error = writer_error(&self.io, error);
+                self.rollback();
+                Err(error)
+            }
+        }
+    }
+
+    /// Задаёт SOA serial, публикуемый в голове зоны.
+    ///
+    /// Значение хранится в `RootEntry.soa_serial` (≤ `0x7FFF_FFFF`); старший
+    /// бит отбрасывается, полный serial всегда доступен в самом `SOA` `RRset`.
+    ///
+    /// # Errors
+    ///
+    /// Нет: значение маскируется до допустимого диапазона.
+    pub fn set_soa_serial(&mut self, serial: u32) {
+        self.soa_serial = serial & 0x7FFF_FFFF;
     }
 
     /// Точный `lookup` в незакоммиченном дереве (read-your-writes).
@@ -1457,6 +1669,34 @@ impl std::fmt::Debug for ZoneReader<'_> {
             .field("origin", &self.origin)
             .field("version", &self.snapshot.version())
             .finish_non_exhaustive()
+    }
+}
+
+impl<'a> ZoneReader<'a> {
+    /// Открывает read snapshot зоны по `zone_seq` без загрузки каталога.
+    ///
+    /// `reader` должен жить не меньше снапшота; пин снимается при `Drop`.
+    ///
+    /// # Errors
+    ///
+    /// `NoZoneVersion`, `ZoneDegraded`, `ReaderContended`, `Corrupt`.
+    pub fn open(
+        store: &'a ParallelStore,
+        reader: &'a Reader<'a>,
+        origin: NameRle,
+        zone: u32,
+    ) -> Result<Self, ParallelError> {
+        let snapshot = store.zone_snapshot(reader, zone)?;
+        let root = *snapshot.root();
+        let tree = ZoneTree::new(origin, root.root_page, root.tree_level)?;
+        let io = ReaderIo::new(store, zone, snapshot.version());
+        Ok(Self {
+            store,
+            snapshot,
+            tree,
+            io,
+            origin,
+        })
     }
 }
 

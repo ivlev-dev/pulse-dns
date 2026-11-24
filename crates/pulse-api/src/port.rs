@@ -394,6 +394,26 @@ pub struct ZoneFileMetrics {
     pub commits: u64,
     /// Ошибок коммита zonefile.
     pub commit_errors: u64,
+    /// Выданных страниц данных v2 (alloc).
+    pub v2_alloc_pages: u64,
+    /// CAS-повторов аллокатора v2.
+    pub v2_alloc_cas_retries: u64,
+    /// Попаданий в кеш валидированных страниц v2.
+    pub v2_page_cache_hits: u64,
+    /// Промахов кеша валидированных страниц v2.
+    pub v2_page_cache_misses: u64,
+    /// Попаданий в кеш узлов B+tree.
+    pub v2_node_cache_hits: u64,
+    /// Промахов кеша узлов B+tree.
+    pub v2_node_cache_misses: u64,
+    /// Страниц, возвращённых GC/пулом v2.
+    pub v2_reclaimed_pages: u64,
+    /// Групповых коммитов v2.
+    pub v2_group_commits: u64,
+    /// `fdatasync` group commit v2.
+    pub v2_group_fsyncs: u64,
+    /// Активных пинов на момент сбора метрик.
+    pub v2_pins: u64,
 }
 
 /// Порт администрирования зон.

@@ -17,7 +17,10 @@
 //! публикации; `Flush`/`Memory` и липкий `Sync`; tombstone-GC каталога
 //! ([`ParallelZones::gc_catalog`]); sweep утечек ([`ParallelStore::leak_report`],
 //! [`ParallelStore::repair_leaks`], [`fsck_repair`]). Межпроцессная запись —
-//! вне M1. v1-модули и `pulsed` не затронуты.
+//! вне M1. B3: `pulsed` работает поверх v2 (`--data`), а пользовательские
+//! метаданные зоны (вид, TTL по умолчанию, denial) хранятся в записи каталога
+//! ([`ZoneMetaV2`]); v1-модули остаются для чтения legacy-файлов и
+//! `pulsed convert`.
 //!
 //! # Пример
 //!
@@ -83,8 +86,8 @@ pub use store::{
 };
 pub use verify::GraphReport;
 pub use zone::{
-    CommitOutcome, ParallelZone, ParallelZones, RrsetRecord, RrsetRef, ZoneCreateMeta, ZoneInfo,
-    ZoneReader,
+    CommitOutcome, ParallelZone, ParallelZones, RrsetRecord, RrsetRef, ZONE_KIND_FLAG_FORWARD,
+    ZONE_KIND_FLAG_SECONDARY, ZoneCreateMeta, ZoneInfo, ZoneMetaV2, ZoneReader,
 };
 
 /// Алиас режима durability v2: `Durability::Sync`/`Flush`/`Memory` (§7.2).

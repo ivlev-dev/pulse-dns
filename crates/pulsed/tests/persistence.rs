@@ -343,6 +343,102 @@ fn api_mutations_survive_reopen() {
 }
 
 #[test]
+fn zone_can_be_recreated_after_delete_and_reopen() {
+    let dir = TempDir::new("recreate");
+    let data = dir.path().join("pulse.zonefile");
+    let config = base_config(&data);
+    let mut server = Server::start_with_api(&config, Some(api_options())).expect("start");
+    let api = server.api_addr().expect("api");
+
+    assert_eq!(create_zone(api).status, 201);
+    let soa = "ns1.persist.test. hostmaster.persist.test. 1 3600 600 604800 300";
+    assert_eq!(
+        put(
+            api,
+            &format!("{ZONE_PATH}/records/@/SOA"),
+            &format!(r#"{{"ttl":3600,"records":["{soa}"]}}"#),
+            None
+        )
+        .status,
+        201
+    );
+    assert_eq!(
+        put(
+            api,
+            &format!("{ZONE_PATH}/records/@/NS"),
+            r#"{"ttl":3600,"records":["ns1.persist.test."]}"#,
+            None
+        )
+        .status,
+        201
+    );
+    assert_eq!(
+        put(
+            api,
+            &format!("{ZONE_PATH}/records/www.persist.test./A"),
+            r#"{"ttl":60,"records":["192.0.2.1"]}"#,
+            None
+        )
+        .status,
+        201
+    );
+
+    let zone_etag = get_etag(api, ZONE_PATH);
+    let deleted = http(
+        api,
+        "DELETE",
+        ZONE_PATH,
+        &[("Authorization", &auth()), ("If-Match", &zone_etag)],
+        None,
+    );
+    assert_eq!(deleted.status, 204);
+    assert_eq!(
+        dns_query(&server, "www.persist.test.", Rtype::A).rcode(),
+        Rcode::REFUSED
+    );
+
+    // Повторное создание того же origin после tombstone+GC.
+    assert_eq!(create_zone(api).status, 201);
+    assert_eq!(
+        put(
+            api,
+            &format!("{ZONE_PATH}/records/@/SOA"),
+            &format!(r#"{{"ttl":3600,"records":["{soa}"]}}"#),
+            None
+        )
+        .status,
+        201
+    );
+    assert_eq!(
+        put(
+            api,
+            &format!("{ZONE_PATH}/records/@/NS"),
+            r#"{"ttl":3600,"records":["ns1.persist.test."]}"#,
+            None
+        )
+        .status,
+        201
+    );
+    assert_eq!(
+        put(
+            api,
+            &format!("{ZONE_PATH}/records/www.persist.test./A"),
+            r#"{"ttl":120,"records":["192.0.2.2"]}"#,
+            None
+        )
+        .status,
+        201
+    );
+    assert_a(&server, "192.0.2.2", 120);
+    server.shutdown().expect("shutdown");
+    drop(server);
+
+    let mut reopened = Server::start(&config).expect("reopen recreated zone");
+    assert_a(&reopened, "192.0.2.2", 120);
+    reopened.shutdown().expect("shutdown");
+}
+
+#[test]
 fn second_writer_gets_busy() {
     let dir = TempDir::new("busy");
     let data = dir.path().join("pulse.zonefile");

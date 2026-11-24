@@ -276,11 +276,25 @@ pub(crate) struct WriteIo<'a> {
 
 impl<'a> WriteIo<'a> {
     pub(crate) fn new(store: &'a ParallelStore, zone: u32, version: u64) -> Self {
+        Self::with_handle(store, zone, version, store.alloc_handle())
+    }
+
+    /// COW-слой без per-handle кеша страниц (короткоживущий writer).
+    pub(crate) fn new_exact(store: &'a ParallelStore, zone: u32, version: u64) -> Self {
+        Self::with_handle(store, zone, version, store.alloc_handle_exact())
+    }
+
+    fn with_handle(
+        store: &'a ParallelStore,
+        zone: u32,
+        version: u64,
+        alloc: crate::parallel::AllocHandle<'a>,
+    ) -> Self {
         Self {
             store,
             zone,
             version: Cell::new(version),
-            alloc: store.alloc_handle(),
+            alloc,
             dirty: RefCell::new(BTreeMap::new()),
             allocated: RefCell::new(BTreeSet::new()),
             freed: RefCell::new(BTreeSet::new()),
