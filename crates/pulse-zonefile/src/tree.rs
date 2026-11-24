@@ -2272,6 +2272,25 @@ impl ZoneTree {
         })
     }
 
+    /// Число `RRset` имени (без `T_NODE`/`T_ZONE_ENTRY`).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево.
+    pub fn owner_rrset_count<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        txn: u64,
+        name: &NameRle,
+    ) -> Result<u32, ZoneFileError> {
+        let keys = self.collect_owner_keys(io, txn, name)?;
+        let count = keys
+            .iter()
+            .filter(|key| key.rr_type() != T_NODE && key.rr_type() != T_ZONE_ENTRY)
+            .count();
+        u32::try_from(count).map_err(|_| bounds(None, CorruptDetail::OffsetOutOfRange))
+    }
+
     /// Удаляет `RRset` и выполняет `T_NODE`/ENT-каскад (§13.4).
     ///
     /// Возвращает `true`, если ключ существовал. Overflow-цепочка значения

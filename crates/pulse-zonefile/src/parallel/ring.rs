@@ -135,6 +135,15 @@ impl<'a> Ring<'a> {
     /// Читает все 4 ячейки зоны из обеих копий.
     pub(crate) fn read_slot(&self, zone: u32) -> Result<SlotView, ParallelError> {
         let slot = self.geometry.zone_slot(zone)?;
+        self.read_slot_at(slot, zone)
+    }
+
+    /// Читает слот по готовым координатам (нужно каталогу `zone = 0`).
+    pub(crate) fn read_slot_at(
+        &self,
+        slot: ZoneSlot,
+        zone: u32,
+    ) -> Result<SlotView, ParallelError> {
         let page_a = self.read_page(slot.page_a)?;
         let page_b = self.read_page(slot.page_b)?;
         let mut cells = [CellView::new(None, None); ROOT_VERSIONS as usize];

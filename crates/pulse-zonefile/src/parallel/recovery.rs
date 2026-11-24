@@ -424,7 +424,7 @@ pub(crate) fn scan_roots(ring: &Ring<'_>, geometry: &Geometry) -> Result<RootSca
         let page_b = ring.read_dir_page(geometry.page_root_dir_b_first() + page_index)?;
         for index_in_page in 0..ZONES_PER_DIR_PAGE {
             let zone = page_index * ZONES_PER_DIR_PAGE + index_in_page;
-            if zone == 0 || zone >= max_zones {
+            if zone >= max_zones {
                 continue;
             }
             let block = (index_in_page * crate::parallel::consts::ROOT_BLOCK_SIZE) as usize;

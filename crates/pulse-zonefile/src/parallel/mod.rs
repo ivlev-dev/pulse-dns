@@ -1,14 +1,14 @@
 //! Фаза A параллельной записи v2.0 (`ParallelStore`).
 //!
-//! Модуль реализует нормативную раскладку
-//! [`docs/spec/parallel-writes-v2.md`](../../../../docs/spec/parallel-writes-v2.md):
-//! `LayoutHead` A/B, `ALLOC_RECORD` A/B, root ring 4×2, chain-страницы,
-//! `RootEntry` 64 Б, lock-free аллокатор (`reserve_cursor`/`reserve_txn` в
-//! памяти), in-process пины читателей с `EpochGuard`/`MP`/`RV`, recovery и
-//! `fsck`-lite.
+//! Фаза A: нормативная раскладка
+//! [`docs/spec/parallel-writes-v2.md`](../../../../docs/spec/parallel-writes-v2.md)
+//! (`LayoutHead` A/B, `ALLOC_RECORD` A/B, root ring 4×2, chain-страницы,
+//! `RootEntry` 64 Б, lock-free аллокатор, пины с `EpochGuard`/`MP`/`RV`,
+//! recovery и `fsck`-lite). Фаза B1: B+tree поверх стора (`pageio`), per-zone
+//! writer/commit (`zone`), каталог зон в слоте 0 и read snapshots.
 //!
-//! B+tree, per-zone пулы, donation, group commit, `Flush`/`Memory` и
-//! межпроцессная запись — фаза B. v1-модули и `pulsed` не затронуты.
+//! Per-zone пулы/donation, group commit, `Flush`/`Memory` и межпроцессная
+//! запись — фаза B2. v1-модули и `pulsed` не затронуты.
 //!
 //! # Пример
 //!
@@ -40,11 +40,13 @@ pub mod consts;
 pub mod error;
 pub mod geometry;
 pub mod layout;
+mod pageio;
 pub mod pins;
 pub mod recovery;
 pub mod ring;
 pub mod root;
 pub mod store;
+pub mod zone;
 
 pub use alloc::{AllocHandle, AllocTicket, Allocator};
 pub use error::{CopySource, FatalKind, ParallelError, V2CorruptKind};
@@ -53,6 +55,7 @@ pub use layout::{
     AllocRecord, ChainPage, FilePin, FileReaderSlot, LayoutHead, SuperblockV2, SyncModeV2,
     WriterRegistry,
 };
+pub use pageio::V2_PAGE_BYTES;
 pub use pins::{EpochGuard, FreezeGuard, GcState, PinGuard, PinTable, Reader};
 pub use recovery::{FsckLiteReport, OpenConfigV2, RecoveryReport};
 pub use ring::{CellView, CopyState, SlotView};
@@ -61,3 +64,10 @@ pub use store::{
     CrashHook, CrashPoint, ParallelStore, PublishOutcome, StoreConfig, StoreStats, ZoneSnapshot,
     open_read_only,
 };
+pub use zone::{
+    CommitOutcome, ParallelZone, ParallelZones, RrsetRecord, RrsetRef, ZoneCreateMeta, ZoneInfo,
+    ZoneReader,
+};
+
+// v1-типы, с которыми работает B1-API зон (переиспользование, не копия).
+pub use crate::tree::{RrsetData, UpsertOutcome};

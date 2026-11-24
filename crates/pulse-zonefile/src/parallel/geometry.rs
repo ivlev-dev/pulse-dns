@@ -283,6 +283,31 @@ impl Geometry {
         Ok(u64::from(page) * u64::from(self.page_size))
     }
 
+    /// Координаты каталога зон (слот `0`, `owner_zone = 0`).
+    ///
+    /// `zone_slot(0)` намеренно ошибочен (v1-контракт): каталог занимает блок
+    /// `0` в первой странице root directory и не является зоной.
+    #[must_use]
+    pub const fn catalog_slot(self) -> ZoneSlot {
+        ZoneSlot {
+            page_a: self.page_root_dir_a_first,
+            page_b: self.page_root_dir_b_first,
+            block_offset: 0,
+        }
+    }
+
+    /// Координаты зоны или каталога (`zone == 0`).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` — `zone >= max_zones`.
+    pub fn head_slot(self, zone: u32) -> Result<ZoneSlot, ParallelError> {
+        if zone == 0 {
+            return Ok(self.catalog_slot());
+        }
+        self.zone_slot(zone)
+    }
+
     /// Координаты зоны в root directory.
     ///
     /// # Errors

@@ -127,7 +127,7 @@ impl PageHeader {
     ///
     /// Возвращает `None` для типов, которые не используют общий заголовок
     /// (meta, reader table) или неизвестны.
-    const fn payload_limit(page_type: u32, page_size: u32) -> Option<(u32, u32)> {
+    pub(crate) const fn payload_limit(page_type: u32, page_size: u32) -> Option<(u32, u32)> {
         match page_type {
             PAGE_TYPE_BRANCH | PAGE_TYPE_LEAF => Some((page_size, page_size)),
             PAGE_TYPE_OVERFLOW => Some((OVERFLOW_HEADER_SIZE, page_size)),
@@ -137,6 +137,30 @@ impl PageHeader {
             _ => None,
         }
     }
+}
+
+/// Проставляет `owner_zone` в `reserved1` страницы формата v2.
+///
+/// CRC v2-страницы считается по `reserved1 = 0` (так его вычисляет
+/// [`crate::node::encode_leaf`]/[`crate::node::encode_branch`]); `owner_zone`
+/// аутентифицируется отдельной проверкой владельца при чтении
+/// (`docs/spec/parallel-writes-v2.md` §4.7). Поэтому CRC здесь не
+/// пересчитывается.
+pub(crate) fn seal_parallel_owner(page: &mut [u8], owner_zone: u32) {
+    let _ = wire::write_u32(page, PAGE_OFF_RESERVED1, owner_zone);
+}
+
+/// Возвращает страницу к виду v1: `reserved1 = 0`.
+///
+/// После этого работает обычный [`PageHeader::decode`] (CRC уже посчитан по
+/// `reserved1 = 0`).
+pub(crate) fn clear_parallel_owner(page: &mut [u8]) {
+    let _ = wire::write_u32(page, PAGE_OFF_RESERVED1, 0);
+}
+
+/// Читает `owner_zone` из `reserved1` без валидации остального заголовка.
+pub(crate) fn parallel_owner(page: &[u8]) -> Option<u32> {
+    wire::read_u32(page, PAGE_OFF_RESERVED1)
 }
 
 #[cfg(test)]

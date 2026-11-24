@@ -38,3 +38,7 @@ harness = false
 [[bench]]
 name = "v2"
 harness = false
+
+[[bench]]
+name = "v2_zones"
+harness = false

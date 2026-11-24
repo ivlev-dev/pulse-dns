@@ -1,10 +1,66 @@
-# `pulse-zonefile::parallel` — фаза A параллельной записи v2.0
+# `pulse-zonefile::parallel` — параллельная запись v2.0 (фазы A и B1)
 
 Модуль реализует **фазу A** нормативной раскладки
 [`docs/spec/parallel-writes-v2.md`](../../../../docs/spec/parallel-writes-v2.md) и
-решений ADR-0005 (D-A, D-C, F-8, F-9) / ADR-0006 (PW-I*, §9.2). v1-модули,
-их публичный API и поведение не изменены: v2 — отдельный тип
-[`ParallelStore`] и отдельный файловый формат 2.0.
+решений ADR-0005 (D-A, D-C, F-8, F-9) / ADR-0006 (PW-I*, §9.2), а также
+**фазу B1** — B+tree поверх `ParallelStore`, per-zone commit и read snapshots.
+v1-модули, их публичный API и поведение не изменены: v2 — отдельные типы
+[`ParallelStore`], [`ParallelZones`], [`ParallelZone`], [`ZoneReader`] и
+отдельный файловый формат 2.0.
+
+## Что реализовано (фаза B1)
+
+| Раздел спеки | Реализация |
+|---|---|
+| §4.7 `PageHeader.owner_zone` | `pageio`: `reserved1` (+12) = `owner_zone`, CRC считается по `reserved1 = 0`; `WriteIo` проставляет владельца, `ReaderIo`/`WriteIo` проверяют `owner_zone` и `page.txn ≤ version` до v1-декодера, затем обнуляют `reserved1` |
+| §10.2 B+tree | `WriteIo`/`ReaderIo` реализуют v1 [`crate::tree::PageIo`]; COW-дерево (`ZoneTree`) переиспользовано без копирования; overflow-цепочки — v1 |
+| §3.2 alloc | страницы — из `AllocHandle` (батч 64), `txn` — из `TXN_BATCH`-блока; каждый коммит пишет только dirty-страницы |
+| §4.5 commit | dirty → `pwrite`, `ALLOC_RECORD` + chain → `fdatasync`, две копии `RootEntry` → `fdatasync`, публикация головы; ошибка → rollback (дерево перечитывается от опубликованной головы). `Durability::Sync`; `Flush`/`Memory` → `Unsupported` |
+| §5.1–5.3 read | `zones.read(&Reader, origin)` → `ZoneReader`: `ZoneSnapshot` держит пин, дерево читается по версии головы, writer не блокируется; `lookup`, `lookup_ref` (zero-alloc inline), `lookup_all`, `node`, `next_name`, `records` |
+| каталог зон | слот `0` root directory (`owner_zone = 0`, `RootFlags::CATALOG`): B+tree `RLE(origin) || T_ZONE_ENTRY` → 72 Б `{magic, zone_seq, soa_serial, origin_len, created_txn}`; `create_zone`/`delete_zone`/`zones`/`writer` |
+| writer lease | lease зоны (256 шардов) удерживается на весь `ParallelZone`; один writer на зону, разные зоны пишутся параллельно; same-zone writer ждёт (сериализация), порчи/потерь нет |
+| §9.2 file-fatal | чужая `owner_zone` → `Corrupt{ForeignOwner}`, `page.txn > version` → `Corrupt{PageTxn}` (класс file-fatal) |
+
+### B1 API
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use pulse_zonefile::key::NameRle;
+use pulse_zonefile::parallel::{
+    ParallelStore, ParallelZones, RrsetData, StoreConfig, ZoneCreateMeta,
+};
+
+let dir = tempfile::tempdir()?;
+let path = dir.path().join("zones.v2");
+let store = ParallelStore::create(&path, StoreConfig::small(32, 65536))?;
+let apex = NameRle::from_ascii("example.com")?;
+let mut zones = ParallelZones::open(&store)?;
+let zone_seq = zones.create_zone(&apex, ZoneCreateMeta { soa_serial: 1 })?;
+
+let mut writer = zones.writer(&apex)?;              // lease зоны
+let www = NameRle::from_ascii("www.example.com")?;
+writer.upsert_rrset(&www, 1, 0, &RrsetData::from_slices(300, 0, &[&[192, 0, 2, 1]])?)?;
+let outcome = writer.commit()?;                     // 2 fdatasync, публикация головы
+drop(writer);
+
+let reader = store.reader()?;                       // один слот на поток
+let view = zones.read(&reader, &apex)?;             // пин + версия головы
+assert!(view.lookup(&www, 1, 0)?.is_some());
+assert_eq!(view.version(), outcome.version);
+# Ok(())
+# }
+```
+
+- `create_zone` — два коммита (пустой `RootEntry` зоны, затем каталог); крах
+  между ними оставляет недостижимую зону (PW-L7), не порчу.
+- `ParallelZone` — `!Send` (lease + `AllocHandle`): writer открывается в том
+  потоке, который пишет; `ParallelZones` — `Sync` для параллельных writers.
+  Lease — `std::sync::Mutex`: повторное открытие writer'а той же зоны в том же
+  потоке заблокируется (берите один writer на зону).
+- `ZoneReader` держит `ZoneSnapshot`: пока он жив, версия и её страницы не
+  рекламируются; после `Drop` — `gc_pass`/`MP` (B2).
+- Каталог и `zone_seq` восстанавливаются при `ParallelStore::open` из
+  встроенного сканирования root directory (включая слот `0`).
 
 ## Что реализовано (фаза A)
 
@@ -96,7 +152,10 @@ cargo test -p pulse-zonefile --test v2_pins     # пины/MP/RV/ZoneDegraded
 cargo test -p pulse-zonefile --test v2_recovery # DP/DT/регрессии/file-fatal
 cargo test -p pulse-zonefile --test v2_prop     # proptest: encode/decode, мусор
 cargo test -p pulse-zonefile --test v2_crash    # fork/kill -9 harness (100+)
+cargo test -p pulse-zonefile --test v2_zone     # B1: 8 зон × 4 потока, snapshots, reopen
+cargo test -p pulse-zonefile --test v2_commit_crash # B1: kill -9 на фазах коммита
 cargo bench -p pulse-zonefile --bench v2        # reserve/publish/pin/select
+cargo bench -p pulse-zonefile --bench v2_zones  # B1: commit ops/s 1/4/8 потоков, read ns
 ```
 
 `v2_crash` переиспользует собственный test-binary как child (без `unsafe`):
@@ -106,16 +165,18 @@ ack-лог с `sync_data`, родитель убивает его `SIGKILL` (с�
 `DP ≥ max acked page_limit`, `head.version ≥ max acked version`, отсутствие
 `Corrupt`/`fatal` и монотонность `DP` между итерациями.
 
-## Остаток для фазы B
+## Остаток для фазы B2
 
-1. B+tree/ключи/overflow-страницы, `owner_zone` в `PageHeader`, проверка
-   `page.txn ≤ version` на чтении.
-2. Per-zone bucket/donation, `is_reclaimable`, `free_head`, `MP`/`RV`-гейт
-   выдачи; chain-GC; возврат утёкших страниц `< DP`.
-3. Group commit: batching зон, ровно два fsync на группу, backpressure-очередь,
-   `Flush`/`Memory` и sticky-`Sync`.
-4. Каталог зон 24 Б (слот 0/`zones()`/`find_zone`), tombstone-GC, слоты
-   reader table в файле (межпроцессные пины, M3), writer registry/`LOCK_SH`.
+1. Per-zone bucket/donation, `is_reclaimable`, `free_head`, `MP`/`RV`-гейт
+   выдачи; chain-GC; возврат утёкших страниц `< DP`. Сейчас `free_page` — no-op,
+   `RootEntry.free_head = 0`.
+2. Group commit: batching зон, ровно два fsync на группу, backpressure-очередь,
+   `Flush`/`Memory` и sticky-`Sync`. Сейчас каждый `commit` — своя группа.
+3. `PageCache` для v2-read: повторная валидация CRC страницы на каждый lookup
+   (без кэша версий) — цена `lookup` ≈ 4 мкс на 4 КиБ-страницу; кэш снимет CRC
+   с горячего пути.
+4. Каталог: tombstone-GC, слоты reader table в файле (межпроцессные пины, M3),
+   writer registry/`LOCK_SH`.
 5. `fsck --repair`, `fsck --at-epoch`, дизъюнктность множеств страниц битсетом,
    `MAX_LEAK_RATIO`, метрики/алерты.
 6. Страницы 8192/16384 (геометрия ring = 16 зон зафиксирована для 4096).
@@ -148,3 +209,12 @@ ack-лог с `sync_data`, родитель убивает его `SIGKILL` (с�
 - Leak-accounting `fsck` ограничен `cursor − DP`: без B+tree/pools полный
   обход достижимости невозможен, поэтому отчёт честно называет метрику
   оценкой.
+- **B1:** каталог — B+tree в слоте `0`, а не 24-Б записи `§5.6`; `meta_root` и
+  `free_head` всегда `0` (per-zone meta/bucket — B2).
+- **B1:** CRC v2-страницы не покрывает `owner_zone` (`reserved1`): владелец
+  аутентифицируется сравнением с зоной, поэтому CRC остаётся совместимым с
+  v1-энкодерами без пересчёта.
+- **B1:** каждый `commit` — отдельная группа (2 `fdatasync`); группировка зон —
+  B2. `free_page` — no-op (COW-мусор рекламируется в B2).
+- **B1:** `ZoneReader` перечитывает страницы с диска при первом обращении и
+  валидирует CRC на каждый `lookup` (v1 `PageCache` для v2 не подключён).

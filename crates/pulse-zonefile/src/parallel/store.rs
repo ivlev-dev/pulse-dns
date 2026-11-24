@@ -604,9 +604,22 @@ impl ParallelStore {
     /// с пином (публикация не выполнена); `MapFull`/`Io`/`InvalidArgument`.
     #[allow(clippy::too_many_lines)]
     pub fn publish_root(&self, entry: RootEntry) -> Result<PublishOutcome, ParallelError> {
+        let _lease = lock_unpoison(self.lease(entry.owner_zone));
+        self.publish_root_locked(entry)
+    }
+
+    /// Публикация без захвата lease: вызывающий уже держит lease зоны.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn publish_root_locked(
+        &self,
+        entry: RootEntry,
+    ) -> Result<PublishOutcome, ParallelError> {
         self.ensure_writable()?;
-        self.ensure_zone_writable(entry.owner_zone)?;
         let zone = entry.owner_zone;
+        let is_catalog = zone == 0;
+        if !is_catalog {
+            self.ensure_zone_writable(zone)?;
+        }
         if entry.version < 2 {
             return Err(ParallelError::InvalidArgument { field: "version" });
         }
@@ -620,18 +633,17 @@ impl ParallelStore {
                 field: "root entry",
             });
         }
-        let _lease = lock_unpoison(self.lease(zone));
         let head = self.head(zone);
         if let Some(current) = head
             && entry.version <= current.version
         {
             return Err(ParallelError::InvalidArgument { field: "version" });
         }
-        let slot = self.geometry.zone_slot(zone)?;
+        let slot = self.geometry.head_slot(zone)?;
         let group = usize::try_from(entry.version % u64::from(ROOT_VERSIONS))
             .map_err(|_| ParallelError::InvalidArgument { field: "version" })?;
         let ring = Ring::new(&self.file, &self.geometry);
-        let view = ring.read_slot(zone)?;
+        let view = ring.read_slot_at(slot, zone)?;
         let old = view.cell(group);
         let mut chain_write = None;
         let mut max_allocated = self.allocator.cursor().saturating_sub(1);
@@ -1163,6 +1175,45 @@ impl ParallelStore {
             Some(lease) => lease,
             None => self.leases.first().unwrap_or(&FALLBACK_LEASE),
         }
+    }
+
+    /// Берёт writer-lease зоны (или каталога `0`).
+    ///
+    /// Разные зоны пишутся параллельно; коллизия шардов лишь сериализует
+    /// открытие/коммит. Lease удерживается пока жив `MutexGuard`.
+    pub(crate) fn lease_guard(&self, zone: u32) -> MutexGuard<'_, ()> {
+        lock_unpoison(self.lease(zone))
+    }
+
+    /// Голова зоны без проверки читаемости (включая каталог `0`).
+    #[must_use]
+    pub(crate) fn head_entry(&self, zone: u32) -> Option<RootEntry> {
+        self.head(zone)
+    }
+
+    /// Голова каталога зон (`owner_zone = 0`) из памяти.
+    #[must_use]
+    pub(crate) fn catalog_head(&self) -> Option<RootEntry> {
+        self.head(0)
+    }
+
+    /// Читает страницу данных в готовый буфер (zero-alloc read-path v2).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` — страница вне data-региона; `Io` — ошибка чтения.
+    pub(crate) fn read_page_into(&self, page: u32, buffer: &mut [u8]) -> Result<(), ParallelError> {
+        if page < self.geometry.page_data_first() || page >= self.geometry.page_count_max() {
+            return Err(ParallelError::InvalidArgument { field: "page_id" });
+        }
+        if buffer.len() != PAGE_SIZE_V2 as usize {
+            return Err(ParallelError::InvalidArgument {
+                field: "page_buffer",
+            });
+        }
+        let offset = self.geometry.page_offset(page)?;
+        self.file.read_exact_at(buffer, offset)?;
+        Ok(())
     }
 
     fn fire(&self, point: CrashPoint) {

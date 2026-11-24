@@ -25,6 +25,9 @@ pub enum V2CorruptKind {
     RingSlotMismatch,
     /// Нарушена монотонность `version`/`page_limit`/`txn`.
     WatermarkRegression,
+    /// `page.txn` достижимой страницы больше `version` снапшота/головы
+    /// (кросс-зонный ABA, §9.2).
+    PageTxn,
     /// Chain: цикл, нарушение порядка или превышение лимита переходов.
     RootChain,
     /// Номер страницы/смещение вне файла.
@@ -46,6 +49,7 @@ impl V2CorruptKind {
                 | Self::ForeignOwner
                 | Self::RingSlotMismatch
                 | Self::WatermarkRegression
+                | Self::PageTxn
         )
     }
 }
@@ -180,6 +184,10 @@ pub enum ParallelError {
         /// Зона.
         zone: u32,
     },
+
+    /// Ошибка B+tree/страницы (формат v1, переиспользованный v2).
+    #[error("v2 tree: {0}")]
+    Tree(#[from] crate::ZoneFileError),
 
     /// Аллокатор упёрся в `page_count_max`.
     #[error("v2 map full: high water {high_water}, limit {page_count_max}")]
