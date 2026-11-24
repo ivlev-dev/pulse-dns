@@ -1,0 +1,28 @@
+[package]
+name = "pulse-tls"
+description = "DNS over TLS (RFC 7858) and DNS over HTTPS/1.1 (RFC 8484) servers for pulse-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64 = "0.22"
+httparse = "1.10"
+pulse-dns = { path = "../pulse-dns" }
+rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+rustls-pemfile = "2.2"
+thiserror = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
+
+[[bench]]
+name = "tls"
+harness = false
+
+[lints]
+workspace = true
