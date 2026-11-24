@@ -24,6 +24,8 @@ pub struct OpenConfigV2 {
     pub read_only: bool,
     /// Брать `LOCK_EX` на lock-файл (M1: обязателен для writer'а).
     pub writer_lock: bool,
+    /// Ёмкость кеша валидированных страниц (0 — кеш отключён).
+    pub page_cache_entries: usize,
 }
 
 impl Default for OpenConfigV2 {
@@ -31,6 +33,7 @@ impl Default for OpenConfigV2 {
         Self {
             read_only: false,
             writer_lock: true,
+            page_cache_entries: crate::parallel::pagecache::DEFAULT_PAGE_CACHE_V2_ENTRIES,
         }
     }
 }

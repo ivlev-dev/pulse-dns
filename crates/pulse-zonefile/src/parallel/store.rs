@@ -7,6 +7,7 @@
 //!
 //! B+tree, per-zone пулы, group commit и межпроцессная запись — фаза B.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use rustix::fs::{FileType, Mode, OFlags, fdatasync, fstat, fsync, ftruncate, open as fs_open};
 
+use crate::cache::PageCache;
 use crate::consts::MAX_TREE_DEPTH;
 use crate::lock::WriterLock;
 use crate::parallel::alloc::{AllocHandle, AllocTicket, Allocator};
@@ -25,10 +27,12 @@ use crate::parallel::consts::{
     PIN_ATTEMPTS, READER_SLOTS_V2, ROOT_ENTRY_SIZE, ROOT_VERSIONS,
 };
 use crate::parallel::error::{FatalKind, ParallelError, V2CorruptKind};
+use crate::parallel::freepool::{BucketImages, FreeChain};
 use crate::parallel::geometry::Geometry;
 use crate::parallel::layout::{
     AllocRecord, LayoutHead, SuperblockV2, SyncModeV2, WriterRegistry, new_instance_uuid,
 };
+use crate::parallel::pagecache::{DEFAULT_PAGE_CACHE_V2_ENTRIES, PageCacheV2, PageCacheV2Stats};
 use crate::parallel::pins::{EpochGuard, FreezeGuard, GcState, PinGuard, PinTable, Reader};
 use crate::parallel::recovery::{
     FsckLiteReport, OpenConfigV2, RecoveryReport, merge_fatal, read_at, recover, scan_roots,
@@ -47,6 +51,8 @@ pub struct StoreConfig {
     pub max_root_chain_pages: u32,
     /// Число in-process слотов читателей.
     pub reader_slots: u32,
+    /// Ёмкость кеша валидированных страниц (0 — кеш отключён).
+    pub page_cache_entries: usize,
     /// Режим durability; фаза A поддерживает только [`SyncModeV2::Sync`].
     pub sync_mode: SyncModeV2,
 }
@@ -58,6 +64,7 @@ impl Default for StoreConfig {
             max_zones: DEFAULT_MAX_ZONES,
             max_root_chain_pages: MAX_ROOT_CHAIN_PAGES,
             reader_slots: READER_SLOTS_V2,
+            page_cache_entries: DEFAULT_PAGE_CACHE_V2_ENTRIES,
             sync_mode: SyncModeV2::Sync,
         }
     }
@@ -137,6 +144,16 @@ pub struct StoreStats {
     pub reader_contended: u64,
     /// Деградации зон.
     pub zone_degraded: u64,
+    /// Страниц выдано из пула (включая never-published).
+    pub reclaimed_pages: u64,
+    /// Страниц chain освобождено GC.
+    pub chain_freed_pages: u64,
+    /// Страниц передано donation-пулу.
+    pub donated_pages: u64,
+    /// Попаданий в кеш валидированных страниц.
+    pub page_cache_hits: u64,
+    /// Промахов кеша валидированных страниц.
+    pub page_cache_misses: u64,
 }
 
 /// Открытый v2-стор.
@@ -161,6 +178,10 @@ pub struct ParallelStore {
     pins: PinTable,
     gc: GcState,
     leases: Box<[Mutex<()>]>,
+    raw_cache: Option<PageCacheV2>,
+    node_cache: Option<PageCache>,
+    pools: Box<[Mutex<FreePoolShard>]>,
+    donation: Mutex<Vec<DonationEntry>>,
     fatal: Mutex<Option<FatalKind>>,
     read_only: bool,
     crash_hook: Option<Box<dyn CrashHook>>,
@@ -174,19 +195,58 @@ struct AllocDurable {
     txn_limit: u64,
 }
 
+/// Per-zone состояние рекламации (под шардированным `Mutex`).
+#[derive(Debug, Clone, Default)]
+struct ZoneFreePool {
+    chain: FreeChain,
+    immediate: Vec<u32>,
+    loaded: bool,
+    dirty: bool,
+}
+
+/// Шард пулов: разные зоны в одном шарде сериализуют только писателей.
+#[derive(Debug, Default)]
+struct FreePoolShard {
+    zones: HashMap<u32, ZoneFreePool>,
+}
+
+/// Страница donation-пула (`owner_zone` освобождается при выдаче).
+#[derive(Debug, Clone, Copy)]
+struct DonationEntry {
+    page: u32,
+    donated_at: u64,
+}
+
+/// Подготовленная рекламация: образы bucket-страниц и новый `free_head`.
+struct ReclaimPrep {
+    pool: Option<ZoneFreePool>,
+    free_head: u32,
+    images: BucketImages,
+    chain_page: Option<u32>,
+    /// Максимальный номер страницы, упомянутой bucket'ами/free-списком.
+    max_page: u32,
+}
+
 #[derive(Default)]
 struct StatsCounters {
     publications: AtomicU64,
     chain_evictions: AtomicU64,
     reader_contended: AtomicU64,
     zone_degraded: AtomicU64,
+    reclaimed_pages: AtomicU64,
+    chain_freed_pages: AtomicU64,
+    donated_pages: AtomicU64,
 }
 
 const ZONE_DEGRADED: u8 = 1 << 0;
 const ZONE_NEEDS_FSCK: u8 = 1 << 1;
 const CHAIN_UNKNOWN: u32 = u32::MAX;
 const LEASE_SHARDS: usize = 256;
+const FREE_POOL_SHARDS: usize = 256;
 static FALLBACK_LEASE: Mutex<()> = Mutex::new(());
+/// Запасной шард пула (используется только при нарушении индексации).
+static FALLBACK_POOL: std::sync::LazyLock<Mutex<FreePoolShard>> =
+    std::sync::LazyLock::new(|| Mutex::new(FreePoolShard::default()));
 
 impl std::fmt::Debug for ParallelStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -222,7 +282,7 @@ impl ParallelStore {
         let lock = acquire_lock(path)?;
         let file = open_file(path, OFlags::CREATE | OFlags::EXCL)?;
         let lock_path = WriterLock::path_for(path);
-        let result = Self::create_locked(path, geometry, file, lock);
+        let result = Self::create_locked(path, geometry, file, lock, config.page_cache_entries);
         match result {
             Ok(store) => Ok(store),
             Err(error) => {
@@ -239,6 +299,7 @@ impl ParallelStore {
         geometry: Geometry,
         file: File,
         lock: WriterLock,
+        page_cache_entries: usize,
     ) -> Result<Self, ParallelError> {
         ftruncate(&file, geometry.file_size()).map_err(std::io::Error::from)?;
         let uuid = new_instance_uuid();
@@ -293,6 +354,7 @@ impl ParallelStore {
         let pins = PinTable::new(geometry.reader_slots().min(READER_SLOTS_V2))?;
         let gc = GcState::new(geometry.max_zones())?;
         let leases = allocate_leases()?;
+        let (raw_cache, node_cache) = make_caches(page_cache_entries);
         let dp = u64::from(geometry.page_data_first());
         let allocator = Allocator::new(dp, 2, geometry.page_count_max())?;
         let report = RecoveryReport {
@@ -336,6 +398,10 @@ impl ParallelStore {
             pins,
             gc,
             leases,
+            raw_cache,
+            node_cache,
+            pools: allocate_pools()?,
+            donation: Mutex::new(Vec::new()),
             fatal: Mutex::new(None),
             read_only: false,
             crash_hook: None,
@@ -388,6 +454,7 @@ impl ParallelStore {
         let pins = PinTable::new(geometry.reader_slots().min(READER_SLOTS_V2))?;
         let gc = GcState::new(geometry.max_zones())?;
         let leases = allocate_leases()?;
+        let (raw_cache, node_cache) = make_caches(config.page_cache_entries);
         let allocator = Allocator::new(
             recovered.durable_page_limit,
             recovered.next_txn,
@@ -418,6 +485,10 @@ impl ParallelStore {
             pins,
             gc,
             leases,
+            raw_cache,
+            node_cache,
+            pools: allocate_pools()?,
+            donation: Mutex::new(Vec::new()),
             fatal: Mutex::new(fatal),
             read_only: config.read_only,
             crash_hook: None,
@@ -518,6 +589,11 @@ impl ParallelStore {
     /// Счётчики.
     #[must_use]
     pub fn stats(&self) -> StoreStats {
+        let (page_cache_hits, page_cache_misses) =
+            self.raw_cache.as_ref().map_or((0, 0), |cache| {
+                let stats = cache.stats();
+                (stats.hits, stats.misses)
+            });
         StoreStats {
             alloc_cas_retries: self.allocator.cas_retries(),
             txn_cas_retries: self.allocator.txn_cas_retries(),
@@ -526,7 +602,191 @@ impl ParallelStore {
             chain_evictions: self.stats.chain_evictions.load(Ordering::Relaxed),
             reader_contended: self.stats.reader_contended.load(Ordering::Relaxed),
             zone_degraded: self.stats.zone_degraded.load(Ordering::Relaxed),
+            reclaimed_pages: self.stats.reclaimed_pages.load(Ordering::Relaxed),
+            chain_freed_pages: self.stats.chain_freed_pages.load(Ordering::Relaxed),
+            donated_pages: self.stats.donated_pages.load(Ordering::Relaxed),
+            page_cache_hits,
+            page_cache_misses,
         }
+    }
+
+    /// Метрики кеша валидированных страниц (v2).
+    #[must_use]
+    pub fn page_cache_stats(&self) -> PageCacheV2Stats {
+        self.raw_cache
+            .as_ref()
+            .map_or(PageCacheV2Stats::default(), PageCacheV2::stats)
+    }
+
+    /// Метрики кеша узлов B+tree (v1 `PageCache`).
+    #[must_use]
+    pub fn node_cache_stats(&self) -> crate::cache::CacheStats {
+        self.node_cache.as_ref().map_or(
+            crate::cache::CacheStats {
+                hits: 0,
+                misses: 0,
+                entries: 0,
+                capacity: 0,
+            },
+            crate::cache::PageCache::stats,
+        )
+    }
+
+    /// Кеш валидированных страниц v2 (для `ReaderIo`/`WriteIo`).
+    pub(crate) const fn raw_page_cache(&self) -> Option<&PageCacheV2> {
+        self.raw_cache.as_ref()
+    }
+
+    /// Кеш валидированных узлов (горячий read-path `ZoneReader`).
+    #[must_use]
+    pub const fn node_cache(&self) -> Option<&PageCache> {
+        self.node_cache.as_ref()
+    }
+
+    /// Текущий `high_water` (первая невыданная страница).
+    #[must_use]
+    pub fn high_water(&self) -> u64 {
+        self.allocator.cursor()
+    }
+
+    /// Число страниц в per-zone пулах (durable + in-memory).
+    #[must_use]
+    pub fn free_pool_pages(&self) -> u64 {
+        let mut total = 0_u64;
+        for shard in &self.pools {
+            let guard = lock_unpoison(shard);
+            for pool in guard.zones.values() {
+                total = total.saturating_add(
+                    u64::try_from(pool.chain.page_count().saturating_add(pool.immediate.len()))
+                        .unwrap_or(u64::MAX),
+                );
+            }
+        }
+        total
+    }
+
+    /// Число страниц в donation-пуле.
+    #[must_use]
+    pub fn donation_pages(&self) -> u64 {
+        let guard = lock_unpoison(&self.donation);
+        u64::try_from(guard.len()).unwrap_or(u64::MAX)
+    }
+
+    fn pool_shard(&self, zone: u32) -> &Mutex<FreePoolShard> {
+        let index = (zone as usize) % FREE_POOL_SHARDS;
+        self.pools.get(index).unwrap_or(&FALLBACK_POOL)
+    }
+
+    fn load_zone_chain(&self, zone: u32) -> Result<FreeChain, ParallelError> {
+        match self.head(zone) {
+            Some(head) if head.free_head != 0 => {
+                FreeChain::load(&self.file, &self.geometry, zone, &head)
+            }
+            _ => Ok(FreeChain::empty()),
+        }
+    }
+
+    /// Берёт страницу из per-zone пула (или donation), если она выдаваема.
+    ///
+    /// `current_version` — версия планируемого коммита (`drop_txn < V`).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — битая durable-цепочка bucket'ов.
+    pub(crate) fn take_pool_page(
+        &self,
+        zone: u32,
+        current_version: u64,
+    ) -> Result<Option<u32>, ParallelError> {
+        let durable = self.head(zone).map_or(0, |head| head.version);
+        let rv = self.gc.reclaim_version(zone, durable);
+        {
+            let mut shard = lock_unpoison(self.pool_shard(zone));
+            let entry = shard.zones.entry(zone).or_default();
+            if !entry.loaded {
+                entry.chain = self.load_zone_chain(zone)?;
+                entry.loaded = true;
+            }
+            if let Some(page) = entry.immediate.pop() {
+                self.stats.reclaimed_pages.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(page));
+            }
+            if let Some(page) = entry.chain.take_eligible(durable, rv, current_version) {
+                entry.dirty = true;
+                self.stats.reclaimed_pages.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(page));
+            }
+        }
+        Ok(self.take_donation_page())
+    }
+
+    /// Забирает eligible-страницы пула зоны под donation (без гейта выдачи).
+    pub(crate) fn take_zone_pool_pages(
+        &self,
+        zone: u32,
+        current_version: u64,
+        max_pages: u32,
+    ) -> Result<Vec<u32>, ParallelError> {
+        let durable = self.head(zone).map_or(0, |head| head.version);
+        let rv = self.gc.reclaim_version(zone, durable);
+        let mut pages = Vec::new();
+        let mut shard = lock_unpoison(self.pool_shard(zone));
+        let entry = shard.zones.entry(zone).or_default();
+        if !entry.loaded {
+            entry.chain = self.load_zone_chain(zone)?;
+            entry.loaded = true;
+        }
+        while u32::try_from(pages.len()).unwrap_or(u32::MAX) < max_pages {
+            let page = entry
+                .immediate
+                .pop()
+                .or_else(|| entry.chain.take_eligible(durable, rv, current_version));
+            match page {
+                Some(page) => pages.push(page),
+                None => break,
+            }
+        }
+        if !pages.is_empty() {
+            entry.dirty = true;
+        }
+        Ok(pages)
+    }
+
+    /// Возвращает страницы в пул зоны как `NEVER_PUBLISHED`.
+    pub(crate) fn return_pages(&self, zone: u32, pages: &[u32]) {
+        if pages.is_empty() {
+            return;
+        }
+        let mut shard = lock_unpoison(self.pool_shard(zone));
+        let entry = shard.zones.entry(zone).or_default();
+        entry.immediate.extend_from_slice(pages);
+    }
+
+    /// Переносит durable-освобождённые страницы в donation-пул.
+    pub(crate) fn donate_pages(&self, pages: &[u32], donated_at: u64) {
+        if pages.is_empty() {
+            return;
+        }
+        let mut donation = lock_unpoison(&self.donation);
+        donation.extend(pages.iter().map(|page| DonationEntry {
+            page: *page,
+            donated_at,
+        }));
+        self.stats.donated_pages.fetch_add(
+            u64::try_from(pages.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn take_donation_page(&self) -> Option<u32> {
+        let durable_txn = self.durable_txn_limit();
+        let mut donation = lock_unpoison(&self.donation);
+        let index = donation
+            .iter()
+            .position(|entry| entry.donated_at < durable_txn)?;
+        let entry = donation.swap_remove(index);
+        self.stats.reclaimed_pages.fetch_add(1, Ordering::Relaxed);
+        Some(entry.page)
     }
 
     /// `MP(z)` (минимум пинов; `u64::MAX` — пинов не было).
@@ -551,8 +811,88 @@ impl ParallelStore {
         let zones = self.gc.dirty_zones();
         for zone in &zones {
             self.gc.refresh(*zone, &self.pins, &self.zone_guard)?;
+            if !self.read_only
+                && self.fatal().is_none()
+                && *zone != 0
+                && self.geometry.zone_slot(*zone).is_ok()
+            {
+                let _lease = lock_unpoison(self.lease(*zone));
+                self.reclaim_chain_pages(*zone)?;
+            }
         }
         u32::try_from(zones.len()).map_err(|_| ParallelError::InvalidArgument { field: "gc" })
+    }
+
+    /// Освобождает chain-страницы ниже `floor = min(MP, freeze)` (§4.4).
+    ///
+    /// Страницы попадают в bucket-группу `drop_txn = head.version` и выдаются
+    /// не раньше, чем durable станет следующая версия (гейт `drop_txn < D_z`).
+    fn reclaim_chain_pages(&self, zone: u32) -> Result<u32, ParallelError> {
+        let Some(head) = self.head(zone) else {
+            return Ok(0);
+        };
+        if head.prev_record == 0 {
+            return Ok(0);
+        }
+        let guard_ref = self
+            .zone_guard
+            .get(zone as usize)
+            .ok_or(ParallelError::InvalidArgument { field: "zone_seq" })?;
+        let floor = {
+            let _guard = EpochGuard::enter(guard_ref);
+            self.gc.chain_floor(zone)
+        };
+        let ring = Ring::new(&self.file, &self.geometry);
+        let mut page = head.prev_record;
+        let mut upper = head.version;
+        let mut hops = 0_u32;
+        let mut collected = Vec::new();
+        while page != 0 {
+            hops = hops.saturating_add(1);
+            if hops > MAX_ROOT_CHAIN_HOPS || page >= head.page_limit_at_commit {
+                break;
+            }
+            let Some(chain) = ring.read_chain(page)? else {
+                break;
+            };
+            if chain.owner_zone != zone || chain.entry.version >= upper {
+                break;
+            }
+            upper = chain.entry.version;
+            if chain.entry.version < head.version && chain.entry.version < floor {
+                collected.push(page);
+            }
+            page = chain.entry.prev_record;
+        }
+        if collected.is_empty() {
+            return Ok(0);
+        }
+        {
+            let mut shard = lock_unpoison(self.pool_shard(zone));
+            let entry = shard.zones.entry(zone).or_default();
+            if !entry.loaded {
+                entry.chain = self.load_zone_chain(zone)?;
+                entry.loaded = true;
+            }
+            entry
+                .chain
+                .push_group(head.version, &collected, self.geometry.page_data_first())?;
+            entry.dirty = true;
+        }
+        let freed = u32::try_from(collected.len()).unwrap_or(u32::MAX);
+        self.stats
+            .chain_freed_pages
+            .fetch_add(u64::from(freed), Ordering::Relaxed);
+        if let Some(depth) = self.chain_depth.get(zone as usize) {
+            let current = depth.load(Ordering::Acquire);
+            let value = if current == CHAIN_UNKNOWN {
+                0
+            } else {
+                current.saturating_sub(freed)
+            };
+            depth.store(value, Ordering::Release);
+        }
+        Ok(freed)
     }
 
     /// Включает retention-барьер `freeze_epoch = published_txn`.
@@ -609,10 +949,32 @@ impl ParallelStore {
     }
 
     /// Публикация без захвата lease: вызывающий уже держит lease зоны.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// # Errors
+    ///
+    /// См. [`ParallelStore::publish_root`].
     pub(crate) fn publish_root_locked(
         &self,
         entry: RootEntry,
+    ) -> Result<PublishOutcome, ParallelError> {
+        self.publish_root_with_drops(entry, &[])
+    }
+
+    /// Публикация с явным набором страниц, освобождённых в этом коммите.
+    ///
+    /// `drops` попадают в bucket-группу `drop_txn = version` и пишутся в фазе 1
+    /// вместе с данными и chain (§4.5, §6.3). Вызывающий уже держит lease зоны.
+    ///
+    /// # Errors
+    ///
+    /// `ReadOnly` — `write_locked`; `ZoneDegraded` — зона деградирована;
+    /// `ZoneWriterStalled` — лимит chain; `ReaderContended` — retryable гонка
+    /// с пином (публикация не выполнена); `MapFull`/`Io`/`InvalidArgument`.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn publish_root_with_drops(
+        &self,
+        entry: RootEntry,
+        drops: &[u32],
     ) -> Result<PublishOutcome, ParallelError> {
         self.ensure_writable()?;
         let zone = entry.owner_zone;
@@ -645,33 +1007,50 @@ impl ParallelStore {
         let ring = Ring::new(&self.file, &self.geometry);
         let view = ring.read_slot_at(slot, zone)?;
         let old = view.cell(group);
-        let mut chain_write = None;
         let mut max_allocated = self.allocator.cursor().saturating_sub(1);
+        let mut needs_chain = None;
         if let Some(previous) = old {
             let mp = self.gc.mp(zone);
-            let needs_chain = previous.version >= mp;
-            if needs_chain {
+            if previous.version >= mp {
                 let depth = self.chain_depth(zone)?;
                 if depth >= self.geometry.max_root_chain_pages() {
                     return Err(ParallelError::ZoneWriterStalled { zone });
                 }
-                let ticket = self.allocator.reserve_exact(1)?;
-                max_allocated = max_allocated.max(u64::from(ticket.first_page));
-                chain_write = Some((ticket.first_page, previous, entry.version));
+                needs_chain = Some(previous);
             }
         }
+        let reclaim = self.prepare_reclaim(
+            zone,
+            entry.version,
+            drops,
+            needs_chain.is_some(),
+            &mut max_allocated,
+        )?;
+        let chain_write = match (needs_chain, reclaim.chain_page) {
+            (Some(previous), Some(page)) => Some((page, previous, entry.version)),
+            (Some(_), None) => {
+                return Err(ParallelError::Corrupt {
+                    kind: V2CorruptKind::RootChain,
+                    page: None,
+                });
+            }
+            (None, _) => None,
+        };
         let prev_record = chain_write.as_ref().map_or_else(
             || head.map_or(0, |current| current.prev_record),
             |(page, _, _)| *page,
         );
         let mut record = entry;
         record.prev_record = prev_record;
+        record.free_head = reclaim.free_head;
         let minimum_limit = [
             record.page_limit_at_commit,
+            head.map_or(0, |current| current.page_limit_at_commit),
             record.root_page.saturating_add(1),
             record.meta_root.saturating_add(1),
             record.free_head.saturating_add(1),
             record.prev_record.saturating_add(1),
+            reclaim.max_page.saturating_add(1),
             self.geometry.page_data_first(),
         ]
         .into_iter()
@@ -690,7 +1069,7 @@ impl ParallelStore {
                 field: "root entry",
             })?;
 
-        // ФАЗА 1: ALLOC_RECORD + chain-страницы, затем fdatasync.
+        // ФАЗА 1: ALLOC_RECORD + chain-страницы + bucket'ы, затем fdatasync.
         let page_limit;
         {
             let mut durable = lock_unpoison(&self.alloc_durable);
@@ -717,9 +1096,19 @@ impl ParallelStore {
                     entry: previous,
                 };
                 ring.write_chain(&chain)?;
+                if let Some(cache) = self.raw_cache.as_ref() {
+                    cache.invalidate(page);
+                }
+            }
+            for (page, image) in &reclaim.images {
+                self.write_page_bytes(*page, image)?;
             }
             self.fire(CrashPoint::AfterPhase1Writes);
-            retry_eintr(|| fdatasync(&self.file)).map_err(std::io::Error::from)?;
+            let synced = retry_eintr(|| fdatasync(&self.file)).map_err(std::io::Error::from);
+            if let Err(error) = synced {
+                self.mark_fatal(FatalKind::CommitUncertain);
+                return Err(ParallelError::Io(error));
+            }
             self.fire(CrashPoint::AfterPhase1Fsync);
             durable.seq = seq;
             durable.page_limit = candidate;
@@ -742,15 +1131,32 @@ impl ParallelStore {
             return Err(ParallelError::ReaderContended);
         }
         self.fire(CrashPoint::BeforeRootWrite);
-        ring.write_cell(slot.page_a, slot.cell_offset(record.version), &record)?;
-        self.fire(CrashPoint::AfterRootCopyA);
-        ring.write_cell(slot.page_b, slot.cell_offset(record.version), &record)?;
-        self.fire(CrashPoint::AfterRootCopyB);
-        drop(guard);
-        retry_eintr(|| fdatasync(&self.file)).map_err(std::io::Error::from)?;
+        let written = ring
+            .write_cell(slot.page_a, slot.cell_offset(record.version), &record)
+            .and_then(|()| {
+                self.fire(CrashPoint::AfterRootCopyA);
+                ring.write_cell(slot.page_b, slot.cell_offset(record.version), &record)
+            })
+            .and_then(|()| {
+                self.fire(CrashPoint::AfterRootCopyB);
+                drop(guard);
+                retry_eintr(|| fdatasync(&self.file)).map_err(std::io::Error::from)?;
+                Ok(())
+            });
+        if let Err(error) = written {
+            // Исход фазы 2 не определён: запись могла долететь. Дальнейшая
+            // запись запрещена до `fsck` (иначе рекламация могла бы отдать
+            // страницу опубликованной версии).
+            self.mark_fatal(FatalKind::CommitUncertain);
+            return Err(error);
+        }
         self.fire(CrashPoint::AfterPhase2Fsync);
 
-        // Публикация в памяти после durable-фазы.
+        // Публикация в памяти после durable-фазы: только теперь пул
+        // фиксируется (иначе повторная попытка удвоила бы `dropped(V)`).
+        if let Some(pool) = reclaim.pool {
+            self.commit_free_pool(zone, pool);
+        }
         self.fire(CrashPoint::BeforeHeadPublish);
         if let Some(block) = self.heads.get(zone as usize) {
             block.store(&record);
@@ -763,7 +1169,7 @@ impl ParallelStore {
         self.published_txn
             .fetch_max(record.version, Ordering::Release);
         self.stats.publications.fetch_add(1, Ordering::Relaxed);
-        if let Some((page, _, _)) = chain_write {
+        let evicted_page = chain_write.map(|(page, _, _)| {
             self.stats.chain_evictions.fetch_add(1, Ordering::Relaxed);
             if let Some(depth) = self.chain_depth.get(zone as usize) {
                 let current = depth.load(Ordering::Acquire);
@@ -771,23 +1177,221 @@ impl ParallelStore {
                     depth.store(current.saturating_add(1), Ordering::Release);
                 }
             }
-            self.fire(CrashPoint::AfterHeadPublish);
-            return Ok(PublishOutcome {
-                zone,
-                version: record.version,
-                page_limit,
-                prev_record,
-                evicted_page: Some(page),
-            });
-        }
+            page
+        });
         self.fire(CrashPoint::AfterHeadPublish);
         Ok(PublishOutcome {
             zone,
             version: record.version,
             page_limit,
             prev_record,
-            evicted_page: None,
+            evicted_page,
         })
+    }
+
+    /// Готовит bucket-образы, `free_head` и (при необходимости) chain-страницу.
+    ///
+    /// Все страницы выдаются из staging-копии пула или bump-курсора; durable
+    /// пул не меняется, пока коммит не опубликован. Поэтому retry после
+    /// `ReaderContended` не удваивает `dropped(V)` и не теряет страницы.
+    #[allow(clippy::too_many_lines)]
+    fn prepare_reclaim(
+        &self,
+        zone: u32,
+        version: u64,
+        drops: &[u32],
+        needs_chain: bool,
+        max_allocated: &mut u64,
+    ) -> Result<ReclaimPrep, ParallelError> {
+        let durable = self.head(zone).map_or(0, |head| head.version);
+        let rv = self.gc.reclaim_version(zone, durable);
+        let data_first = self.geometry.page_data_first();
+        let mut pool = {
+            let mut shard = lock_unpoison(self.pool_shard(zone));
+            let entry = shard.zones.entry(zone).or_default();
+            if !entry.loaded {
+                entry.chain = self.load_zone_chain(zone)?;
+                entry.loaded = true;
+            }
+            if !needs_chain && !entry.dirty && drops.is_empty() && entry.immediate.is_empty() {
+                let free_head = if entry.loaded {
+                    entry.chain.head()
+                } else {
+                    self.head(zone).map_or(0, |head| head.free_head)
+                };
+                return Ok(ReclaimPrep {
+                    pool: None,
+                    free_head,
+                    images: Vec::new(),
+                    chain_page: None,
+                    max_page: free_head,
+                });
+            }
+            entry.clone()
+        };
+
+        let mut chain_page = None;
+        if needs_chain {
+            chain_page = Some(Self::allocate_from_pool(
+                self,
+                &mut pool.chain,
+                durable,
+                rv,
+                version,
+                max_allocated,
+            )?);
+        }
+        let rebuild = pool.dirty || !drops.is_empty() || !pool.immediate.is_empty() || needs_chain;
+        if !rebuild {
+            let free_head = pool.chain.head();
+            let max_page = Self::chain_max_page(&pool.chain);
+            return Ok(ReclaimPrep {
+                pool: Some(pool),
+                free_head,
+                images: Vec::new(),
+                chain_page,
+                max_page,
+            });
+        }
+
+        let mut freed: Vec<u32> = Vec::new();
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut push = |page: u32| -> Result<(), ParallelError> {
+            if page == 0 || !seen.insert(page) {
+                return Err(ParallelError::Corrupt {
+                    kind: V2CorruptKind::WatermarkRegression,
+                    page: Some(page),
+                });
+            }
+            freed.push(page);
+            Ok(())
+        };
+        for bucket in pool.chain.buckets() {
+            // Страница 0 — группа, созданная GC и ещё не закодированная.
+            if bucket.page != 0 {
+                push(bucket.page)?;
+            }
+        }
+        for page in drops {
+            push(*page)?;
+        }
+        for page in std::mem::take(&mut pool.immediate) {
+            push(page)?;
+        }
+        pool.chain.push_group(version, &freed, data_first)?;
+
+        let mut pages: Vec<u32> = Vec::new();
+        let mut assigned: HashSet<u32> = HashSet::new();
+        let mut iterations = 0_u32;
+        loop {
+            let needed = pool.chain.needed_images();
+            if pages.len() == needed {
+                break;
+            }
+            iterations = iterations.saturating_add(1);
+            if iterations > 4096 {
+                return Err(ParallelError::Corrupt {
+                    kind: V2CorruptKind::WatermarkRegression,
+                    page: None,
+                });
+            }
+            if pages.len() < needed {
+                let page = Self::allocate_from_pool(
+                    self,
+                    &mut pool.chain,
+                    durable,
+                    rv,
+                    version,
+                    max_allocated,
+                )?;
+                if !assigned.insert(page) || page == chain_page.unwrap_or(0) {
+                    return Err(ParallelError::Corrupt {
+                        kind: V2CorruptKind::WatermarkRegression,
+                        page: Some(page),
+                    });
+                }
+                pages.push(page);
+            } else if let Some(extra) = pages.pop() {
+                pool.chain.push_group(version, &[extra], data_first)?;
+            }
+        }
+        let (free_head, images) = pool.chain.encode_images(zone, &pages)?;
+        pool.dirty = false;
+        let max_page = Self::chain_max_page(&pool.chain);
+        Ok(ReclaimPrep {
+            pool: Some(pool),
+            free_head,
+            images,
+            chain_page,
+            max_page,
+        })
+    }
+
+    fn chain_max_page(chain: &FreeChain) -> u32 {
+        let mut max_page = 0_u32;
+        for bucket in chain.buckets() {
+            max_page = max_page.max(bucket.page);
+            for page in &bucket.pages {
+                max_page = max_page.max(*page);
+            }
+        }
+        max_page
+    }
+
+    fn allocate_from_pool(
+        &self,
+        chain: &mut FreeChain,
+        durable: u64,
+        rv: u64,
+        version: u64,
+        max_allocated: &mut u64,
+    ) -> Result<u32, ParallelError> {
+        if let Some(page) = chain.take_eligible(durable, rv, version) {
+            return Ok(page);
+        }
+        let ticket = self.allocator.reserve_exact(1)?;
+        *max_allocated = (*max_allocated).max(u64::from(ticket.first_page));
+        Ok(ticket.first_page)
+    }
+
+    fn commit_free_pool(&self, zone: u32, pool: ZoneFreePool) {
+        let mut shard = lock_unpoison(self.pool_shard(zone));
+        shard.zones.insert(zone, pool);
+    }
+
+    fn mark_fatal(&self, kind: FatalKind) {
+        let mut fatal = lock_unpoison(&self.fatal);
+        merge_fatal(&mut fatal, Some(kind));
+    }
+
+    pub(crate) fn note_fatal(&self, kind: FatalKind) {
+        self.mark_fatal(kind);
+    }
+
+    /// Читает durable-цепочку bucket'ов головы (для `fsck`).
+    pub(crate) fn load_free_chain(
+        &self,
+        zone: u32,
+        head: &RootEntry,
+    ) -> Result<FreeChain, ParallelError> {
+        if head.free_head == 0 {
+            return Ok(FreeChain::empty());
+        }
+        FreeChain::load(&self.file, &self.geometry, zone, head)
+    }
+
+    fn write_page_bytes(&self, page: u32, data: &[u8]) -> Result<(), ParallelError> {
+        if data.len() != PAGE_SIZE_V2 as usize {
+            return Err(ParallelError::InvalidArgument {
+                field: "page payload",
+            });
+        }
+        let offset = self.geometry.page_offset(page)?;
+        self.file.write_all_at(data, offset)?;
+        if let Some(cache) = self.raw_cache.as_ref() {
+            cache.invalidate(page);
+        }
+        Ok(())
     }
 
     /// Выбирает запись версии `≤ ceiling` (ring → chain).
@@ -927,9 +1531,7 @@ impl ParallelStore {
         if let Some(span) = page_buffer.get_mut(..data.len()) {
             span.copy_from_slice(data);
         }
-        let offset = self.geometry.page_offset(page)?;
-        self.file.write_all_at(&page_buffer, offset)?;
-        Ok(())
+        self.write_page_bytes(page, &page_buffer)
     }
 
     /// Читает страницу данных.
@@ -1058,6 +1660,9 @@ impl ParallelStore {
             chain_torn = chain_torn.saturating_add(stats.torn);
             chain_max_depth = chain_max_depth.max(stats.depth);
             issues.extend(stats.issues);
+            if let Err(error) = self.load_free_chain(zone, head) {
+                issues.push(format!("zone {zone}: free chain: {error}"));
+            }
         }
         if self.durable_page_limit() < scan.max_page_limit {
             merge_fatal(&mut fatal, Some(FatalKind::AllocWatermarkRegression));
@@ -1092,6 +1697,22 @@ impl ParallelStore {
             leaked_pages_estimate: leaked,
             issues,
         })
+    }
+
+    /// Структурный `fsck`: дерево/overflow/chain/пулы, пересечения и утечки.
+    ///
+    /// Пересечение множеств страниц помечается file-fatal
+    /// ([`FatalKind::PageOverlap`]) и блокирует запись до offline `fsck`.
+    ///
+    /// # Errors
+    ///
+    /// `Io` — ошибка чтения; `Corrupt`/`Tree` — нечитаемая страница.
+    pub fn fsck_graph(&self) -> Result<crate::parallel::verify::GraphReport, ParallelError> {
+        let report = crate::parallel::verify::verify(self)?;
+        if let Some(kind) = report.fatal {
+            self.note_fatal(kind);
+        }
+        Ok(report)
     }
 
     fn ensure_writable(&self) -> Result<(), ParallelError> {
@@ -1301,16 +1922,13 @@ impl ParallelStore {
                 break;
             };
             if chain.owner_zone != zone {
-                return Err(ParallelError::Corrupt {
-                    kind: V2CorruptKind::ForeignOwner,
-                    page: Some(page),
-                });
+                // Освобождённый/переиспользованный хвост chain — конец истории,
+                // а не порча (§4.4 п. 3).
+                break;
             }
             if chain.entry.version >= upper {
-                return Err(ParallelError::Corrupt {
-                    kind: V2CorruptKind::RootChain,
-                    page: Some(page),
-                });
+                // Страница переиспользована после освобождения хвоста.
+                break;
             }
             oldest = chain.entry.version;
             if chain.entry.version <= ceiling {
@@ -1353,15 +1971,11 @@ impl ParallelStore {
                 return Ok(stats);
             };
             if chain.owner_zone != zone {
-                stats
-                    .issues
-                    .push(format!("zone {zone}: chain page {page} foreign owner"));
+                // Освобождённый хвост: конец chain, не ошибка (§4.4).
                 return Ok(stats);
             }
             if chain.entry.version >= upper {
-                stats
-                    .issues
-                    .push(format!("zone {zone}: chain version not decreasing"));
+                // Хвост переиспользован после GC — конец chain.
                 return Ok(stats);
             }
             upper = chain.entry.version;
@@ -1549,6 +2163,28 @@ fn allocate_leases() -> Result<Box<[Mutex<()>]>, ParallelError> {
     Ok(leases.into_boxed_slice())
 }
 
+fn allocate_pools() -> Result<Box<[Mutex<FreePoolShard>]>, ParallelError> {
+    let mut pools = Vec::new();
+    pools
+        .try_reserve_exact(FREE_POOL_SHARDS)
+        .map_err(|_| ParallelError::MapFull {
+            high_water: FREE_POOL_SHARDS as u64,
+            page_count_max: u32::try_from(FREE_POOL_SHARDS).unwrap_or(u32::MAX),
+        })?;
+    pools.resize_with(FREE_POOL_SHARDS, || Mutex::new(FreePoolShard::default()));
+    Ok(pools.into_boxed_slice())
+}
+
+fn make_caches(entries: usize) -> (Option<PageCacheV2>, Option<PageCache>) {
+    if entries == 0 {
+        return (None, None);
+    }
+    (
+        Some(PageCacheV2::with_capacity(entries)),
+        Some(PageCache::with_capacity(PAGE_SIZE_V2, entries)),
+    )
+}
+
 fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -1648,6 +2284,7 @@ pub fn open_read_only(path: &Path) -> Result<ParallelStore, ParallelError> {
         OpenConfigV2 {
             read_only: true,
             writer_lock: false,
+            page_cache_entries: DEFAULT_PAGE_CACHE_V2_ENTRIES,
         },
     )
 }

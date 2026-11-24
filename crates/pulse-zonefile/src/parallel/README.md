@@ -1,4 +1,4 @@
-# `pulse-zonefile::parallel` — параллельная запись v2.0 (фазы A и B1)
+# `pulse-zonefile::parallel` — параллельная запись v2.0 (фазы A, B1 и B2a)
 
 Модуль реализует **фазу A** нормативной раскладки
 [`docs/spec/parallel-writes-v2.md`](../../../../docs/spec/parallel-writes-v2.md) и
@@ -7,6 +7,22 @@
 v1-модули, их публичный API и поведение не изменены: v2 — отдельные типы
 [`ParallelStore`], [`ParallelZones`], [`ParallelZone`], [`ZoneReader`] и
 отдельный файловый формат 2.0.
+
+## Что реализовано (фаза B2a): кеш и рекламация
+
+| Раздел спеки | Реализация |
+|---|---|
+| §5.7/§8.1 `PageCache` | `PageCacheV2` (лимит 1024, 16 шардов × 4 way, метка recency при вставке): страница валидируется один раз на `page_no` (CRC, `owner_zone`, `page.txn ≤ snapshot.version`, структура) и отдаётся `Arc<[u8]>`; warm lookup — без syscall/CRC/аллокаций. Второй уровень — v1 `PageCache` узлов (`store.node_cache()`), поэтому `ZoneReader::lookup/lookup_ref` не декодирует страницу повторно. Метрики: `store.page_cache_stats()`, `store.node_cache_stats()`, `StoreStats::{page_cache_hits, page_cache_misses}` |
+| §6.1 bucket | `PAGE_TYPE_FREELIST = 5`: `next_bucket`, `owner_zone`, `drop_txn`, `count`, `flags`, `page_ids[]` (1008 @ 4096); цепочка отсортирована по `drop_txn`, COW-пересборка в коммите; `RootEntry.free_head` |
+| §6.2 `is_reclaimable` | `parallel::is_reclaimable(drop_txn, D_z, RV_z, current_version)`; `RV_z = min(D_z−1, MP, freeze)`; выдача только после durable `D_z > drop_txn` |
+| §6.3 порядок | bucket `dropped(V)` + старые bucket-образы пишутся в фазе 1; `free_head` — в `RootEntry V`; коммит фиксирует пул в памяти только после fsync фазы 2 (retry `ReaderContended` не удваивает `dropped(V)`) |
+| §4.4 chain-GC | `gc_pass` освобождает chain-страницы с `version < min(MP, freeze)` в группу `drop_txn = head.version`; переиспользованный хвост читается как конец chain (`StaleRoot`), не порча |
+| overflow/tombstone | `ParallelZone::delete_zone` собирает leaf/branch/overflow-страницы удаляемой зоны в bucket; `free_page` больше не no-op |
+| §6.4 donation | `ParallelZone::donate(max_pages)`: durable-коммит с уменьшенным `free_head`, затем перенос в donation-пул; пул любой зоны при отсутствии своих страниц берёт donation (`owner_zone` переписывается при записи) |
+| §9.2 | `fsck_lite` валидирует durable free-chain; `fsck_graph` проверяет дерево/overflow/chain/bucket/free, пересечения (`FatalKind::PageOverlap`) и утечки; ошибка фазы 2 → `CommitUncertain` (запись запрещена) |
+
+`fsck_graph()` — структурная проверка (тесты B2a); `fsck_lite()` сохранён
+для фазы A, где `root_page` может быть произвольным.
 
 ## Что реализовано (фаза B1)
 
@@ -153,9 +169,14 @@ cargo test -p pulse-zonefile --test v2_recovery # DP/DT/регрессии/file-
 cargo test -p pulse-zonefile --test v2_prop     # proptest: encode/decode, мусор
 cargo test -p pulse-zonefile --test v2_crash    # fork/kill -9 harness (100+)
 cargo test -p pulse-zonefile --test v2_zone     # B1: 8 зон × 4 потока, snapshots, reopen
-cargo test -p pulse-zonefile --test v2_commit_crash # B1: kill -9 на фазах коммита
+cargo test -p pulse-zonefile --test v2_commit_crash # B1/B2a: kill -9 на фазах коммита
+cargo test -p pulse-zonefile --test v2_cache    # B2a: общий кеш, COW, лимит
+cargo test -p pulse-zonefile --test v2_cache_alloc # B2a: 0 аллокаций warm lookup
+cargo test -p pulse-zonefile --test v2_reclaim  # B2a: пул/пины/GC/donation/10k
+cargo test -p pulse-zonefile --test v2_reclaim -- --ignored --nocapture # 10k+10k
 cargo bench -p pulse-zonefile --bench v2        # reserve/publish/pin/select
 cargo bench -p pulse-zonefile --bench v2_zones  # B1: commit ops/s 1/4/8 потоков, read ns
+cargo bench -p pulse-zonefile --bench v2_cache  # B2a: lookup ns, commit+GC, high_water
 ```
 
 `v2_crash` переиспользует собственный test-binary как child (без `unsafe`):
@@ -165,18 +186,13 @@ ack-лог с `sync_data`, родитель убивает его `SIGKILL` (с�
 `DP ≥ max acked page_limit`, `head.version ≥ max acked version`, отсутствие
 `Corrupt`/`fatal` и монотонность `DP` между итерациями.
 
-## Остаток для фазы B2
+## Остаток для фазы B2b
 
-1. Per-zone bucket/donation, `is_reclaimable`, `free_head`, `MP`/`RV`-гейт
-   выдачи; chain-GC; возврат утёкших страниц `< DP`. Сейчас `free_page` — no-op,
-   `RootEntry.free_head = 0`.
-2. Group commit: batching зон, ровно два fsync на группу, backpressure-очередь,
+1. Group commit: batching зон, ровно два fsync на группу, backpressure-очередь,
    `Flush`/`Memory` и sticky-`Sync`. Сейчас каждый `commit` — своя группа.
-3. `PageCache` для v2-read: повторная валидация CRC страницы на каждый lookup
-   (без кэша версий) — цена `lookup` ≈ 4 мкс на 4 КиБ-страницу; кэш снимет CRC
-   с горячего пути.
-4. Каталог: tombstone-GC, слоты reader table в файле (межпроцессные пины, M3),
-   writer registry/`LOCK_SH`.
+2. Каталог: tombstone-GC (запись каталога и слот `zone_seq`), `MAX_LEAK_RATIO`
+   alert, `fsck --repair`.
+3. Слоты reader table в файле (межпроцессные пины, M3), writer registry/`LOCK_SH`.
 5. `fsck --repair`, `fsck --at-epoch`, дизъюнктность множеств страниц битсетом,
    `MAX_LEAK_RATIO`, метрики/алерты.
 6. Страницы 8192/16384 (геометрия ring = 16 зон зафиксирована для 4096).
@@ -214,7 +230,12 @@ ack-лог с `sync_data`, родитель убивает его `SIGKILL` (с�
 - **B1:** CRC v2-страницы не покрывает `owner_zone` (`reserved1`): владелец
   аутентифицируется сравнением с зоной, поэтому CRC остаётся совместимым с
   v1-энкодерами без пересчёта.
-- **B1:** каждый `commit` — отдельная группа (2 `fdatasync`); группировка зон —
-  B2. `free_page` — no-op (COW-мусор рекламируется в B2).
-- **B1:** `ZoneReader` перечитывает страницы с диска при первом обращении и
-  валидирует CRC на каждый `lookup` (v1 `PageCache` для v2 не подключён).
+- **B2a:** каждый `commit` — отдельная группа (2 `fdatasync`); группировка зон —
+  B2b. `free_page` собирает страницы в bucket коммита (COW-мусор возвращается
+  через `is_reclaimable`).
+- **B2a:** `ZoneReader` берёт валидированные страницы из `PageCacheV2` и узлы из
+  v1 `PageCache`; холодный первый lookup читает с диска и валидирует CRC.
+- **B2a:** аллокатор сначала выдаёт durable-eligible страницы пула, затем
+  bump-курсор (спека §6.5 допускает bump-first; выбран пул-first ради
+  стабилизации `high_water`). Утечки `< DP` (batch slack/крах) считает
+  `fsck_graph`, порог-алерт — B2b.

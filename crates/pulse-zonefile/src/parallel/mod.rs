@@ -7,8 +7,11 @@
 //! recovery и `fsck`-lite). Фаза B1: B+tree поверх стора (`pageio`), per-zone
 //! writer/commit (`zone`), каталог зон в слоте 0 и read snapshots.
 //!
-//! Per-zone пулы/donation, group commit, `Flush`/`Memory` и межпроцессная
-//! запись — фаза B2. v1-модули и `pulsed` не затронуты.
+//! Фаза B2a: [`PageCacheV2`] (валидация страницы один раз на `(page_no, txn)`,
+//! zero-copy warm lookup) и рекламация — per-zone bucket'ы с `drop_txn`,
+//! `free_head` в `RootEntry`, `is_reclaimable`, chain-GC, освобождение
+//! overflow/tombstone и donation. Group commit, `Flush`/`Memory` и
+//! межпроцессная запись — фаза B2b. v1-модули и `pulsed` не затронуты.
 //!
 //! # Пример
 //!
@@ -38,23 +41,28 @@
 pub mod alloc;
 pub mod consts;
 pub mod error;
+pub mod freepool;
 pub mod geometry;
 pub mod layout;
+pub mod pagecache;
 mod pageio;
 pub mod pins;
 pub mod recovery;
 pub mod ring;
 pub mod root;
 pub mod store;
+pub mod verify;
 pub mod zone;
 
 pub use alloc::{AllocHandle, AllocTicket, Allocator};
 pub use error::{CopySource, FatalKind, ParallelError, V2CorruptKind};
+pub use freepool::is_reclaimable;
 pub use geometry::{Geometry, ZoneSlot};
 pub use layout::{
     AllocRecord, ChainPage, FilePin, FileReaderSlot, LayoutHead, SuperblockV2, SyncModeV2,
     WriterRegistry,
 };
+pub use pagecache::{DEFAULT_PAGE_CACHE_V2_ENTRIES, PageCacheV2, PageCacheV2Stats};
 pub use pageio::V2_PAGE_BYTES;
 pub use pins::{EpochGuard, FreezeGuard, GcState, PinGuard, PinTable, Reader};
 pub use recovery::{FsckLiteReport, OpenConfigV2, RecoveryReport};
@@ -64,6 +72,7 @@ pub use store::{
     CrashHook, CrashPoint, ParallelStore, PublishOutcome, StoreConfig, StoreStats, ZoneSnapshot,
     open_read_only,
 };
+pub use verify::GraphReport;
 pub use zone::{
     CommitOutcome, ParallelZone, ParallelZones, RrsetRecord, RrsetRef, ZoneCreateMeta, ZoneInfo,
     ZoneReader,

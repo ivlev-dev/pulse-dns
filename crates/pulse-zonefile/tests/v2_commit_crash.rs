@@ -310,6 +310,12 @@ fn run_iteration(
         "fsck не зелёный: fatal={:?} issues={:?}",
         report.fatal, report.issues
     );
+    let graph = store.fsck_graph().expect("graph fsck");
+    assert!(
+        graph.ok,
+        "graph fsck не зелёный: fatal={:?} issues={:?} (leaked {})",
+        graph.fatal, graph.issues, graph.leaked_pages
+    );
 
     // После recovery стор остаётся записываемым: следующий коммит проходит.
     let zones = ParallelZones::open(&store).expect("catalog rewrite");

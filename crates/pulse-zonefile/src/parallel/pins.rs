@@ -537,6 +537,20 @@ impl GcState {
         rv
     }
 
+    /// Пол для освобождения chain-страниц: `min(MP(z), freeze_epoch)`.
+    ///
+    /// `NO_VERSION` — пола нет (все chain-страницы старше головы доступны GC).
+    #[must_use]
+    pub fn chain_floor(&self, zone: u32) -> u64 {
+        let freeze = self.freeze_epoch.load(Ordering::Acquire);
+        let floor = self.mp(zone);
+        if freeze == 0 {
+            floor
+        } else {
+            floor.min(freeze)
+        }
+    }
+
     /// Активный `freeze_epoch` (0 — freeze нет).
     #[must_use]
     pub fn freeze_epoch(&self) -> u64 {

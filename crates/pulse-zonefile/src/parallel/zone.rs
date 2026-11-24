@@ -18,12 +18,16 @@
 //! `Durability::Sync` — единственный режим B1; `Flush`/`Memory` возвращают
 //! [`ParallelError::Unsupported`] (B2).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::MutexGuard;
 
+use crate::consts::{MAX_OVERFLOW_PAGES, PAGE_TYPE_OVERFLOW};
 use crate::errors::{CorruptDetail, CorruptKind, ZoneFileError};
 use crate::key::{Key, NameRle, T_ZONE_ENTRY};
-use crate::node::{DecodedValue, ItemValue, LeafItem, LeafValue, ValueKind};
+use crate::node::{
+    DecodedBranch, DecodedLeaf, DecodedValue, ItemValue, LeafItem, LeafValue, ValueKind,
+};
+use crate::page::PageHeader;
 use crate::parallel::error::ParallelError;
 use crate::parallel::layout::SyncModeV2;
 use crate::parallel::pageio::{ReaderIo, WriteIo};
@@ -395,6 +399,7 @@ impl<'a> ParallelZones<'a> {
         let tree = ZoneTree::new(*origin, root.root_page, root.tree_level)?;
         let io = ReaderIo::new(self.store, zone, snapshot.version());
         Ok(ZoneReader {
+            store: self.store,
             snapshot,
             tree,
             io,
@@ -436,6 +441,7 @@ impl<'a> ParallelZones<'a> {
         } else {
             u32::try_from(entries).unwrap_or(u32::MAX)
         };
+        let drops = io.take_freed();
         let entry = RootEntry {
             owner_zone: 0,
             version: txn,
@@ -448,10 +454,10 @@ impl<'a> ParallelZones<'a> {
         };
         let mut attempt = 0_u32;
         loop {
-            match self.store.publish_root_locked(entry) {
+            match self.store.publish_root_with_drops(entry, &drops) {
                 Ok(_) => {
                     self.version = txn;
-                    io.clear_cache();
+                    io.finish_commit();
                     return Ok(());
                 }
                 Err(ParallelError::ReaderContended) if attempt < PUBLISH_RETRIES => {
@@ -806,6 +812,7 @@ impl<'a> ParallelZone<'a> {
                 return Err(error);
             }
         }
+        let drops = self.io.take_freed();
         let entry = RootEntry {
             owner_zone: self.zone,
             version: txn,
@@ -818,11 +825,11 @@ impl<'a> ParallelZone<'a> {
         };
         let mut attempt = 0_u32;
         loop {
-            match self.store.publish_root_locked(entry) {
+            match self.store.publish_root_with_drops(entry, &drops) {
                 Ok(outcome) => {
                     self.base_version = txn;
                     self.txn = None;
-                    self.io.clear_cache();
+                    self.io.finish_commit();
                     return Ok(CommitOutcome {
                         zone: self.zone,
                         version: txn,
@@ -847,7 +854,23 @@ impl<'a> ParallelZone<'a> {
 
     fn commit_tombstone(&mut self) -> Result<CommitOutcome, ParallelError> {
         let txn = self.ensure_txn()?;
+        // Страницы удаляемой зоны становятся недостижимыми: собираем их в
+        // bucket `drop_txn = V`, чтобы GC вернул место.
+        let old_root = self.tree.root();
+        let old_level = self.tree.level();
+        let mut pages = Vec::new();
+        if old_root != 0 {
+            let io = ReaderIo::new(self.store, self.zone, self.base_version);
+            pages = collect_zone_pages(&io, old_root, old_level, self.base_version)
+                .map_err(|error| io.take_error().unwrap_or(error))?;
+        }
         self.io.clear();
+        for page in pages {
+            self.io
+                .free_page(page)
+                .map_err(|error| self.io.take_error().unwrap_or(ParallelError::Tree(error)))?;
+        }
+        let drops = self.io.take_freed();
         let entry = RootEntry {
             owner_zone: self.zone,
             version: txn,
@@ -861,12 +884,13 @@ impl<'a> ParallelZone<'a> {
         };
         let mut attempt = 0_u32;
         loop {
-            match self.store.publish_root_locked(entry) {
+            match self.store.publish_root_with_drops(entry, &drops) {
                 Ok(outcome) => {
                     self.base_version = txn;
                     self.txn = None;
                     self.rrset_count = 0;
                     self.tree = ZoneTree::empty(self.origin);
+                    self.io.finish_commit();
                     return Ok(CommitOutcome {
                         zone: self.zone,
                         version: txn,
@@ -887,6 +911,67 @@ impl<'a> ParallelZone<'a> {
                 }
             }
         }
+    }
+
+    /// Передаёт eligible-страницы пула зоны в donation-пул (§6.4).
+    ///
+    /// Сначала durable-коммит с уменьшенным `free_head`, затем перенос в
+    /// donation: только после fsync страницы считаются свободными для других
+    /// зон. Возвращает число страниц.
+    ///
+    /// # Errors
+    ///
+    /// `NoZoneVersion` — зоны нет; `MapFull`/`Io` — коммит; `ZoneDegraded`.
+    pub fn donate(&mut self, max_pages: u32) -> Result<u32, ParallelError> {
+        if max_pages == 0 {
+            return Ok(0);
+        }
+        let version = self.ensure_txn()?;
+        let pages = self
+            .store
+            .take_zone_pool_pages(self.zone, version, max_pages)?;
+        if pages.is_empty() {
+            self.txn = None;
+            return Ok(0);
+        }
+        let entry = RootEntry {
+            owner_zone: self.zone,
+            version,
+            root_page: self.tree.root(),
+            tree_level: self.tree.level(),
+            rrset_count: self.rrset_count,
+            soa_serial: self.soa_serial,
+            state: RootState::Serving,
+            ..RootEntry::default()
+        };
+        let mut attempt = 0_u32;
+        loop {
+            match self.store.publish_root_with_drops(entry, &[]) {
+                Ok(outcome) => {
+                    self.base_version = version;
+                    self.txn = None;
+                    self.io.finish_commit();
+                    self.store.donate_pages(&pages, outcome.version);
+                    return Ok(u32::try_from(pages.len()).unwrap_or(u32::MAX));
+                }
+                Err(ParallelError::ReaderContended) if attempt < PUBLISH_RETRIES => {
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(error) => {
+                    self.store.return_pages(self.zone, &pages);
+                    self.rollback();
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ParallelZone<'_> {
+    fn drop(&mut self) {
+        // Незакоммиченные страницы не достижимы ни из одной durable-головы:
+        // возвращаем их в пул (NEVER_PUBLISHED), чтобы не терять место.
+        self.io.clear();
     }
 }
 
@@ -1015,8 +1100,115 @@ fn collect_records<P: PageIo + ?Sized>(
     Ok(records)
 }
 
+/// Собирает все страницы дерева зоны (включая overflow-цепочки) для tombstone.
+///
+/// Читает через [`ReaderIo`], поэтому каждая страница уже проверена на
+/// `owner_zone`, `txn ≤ version` и CRC. Повтор/цикл — `Corrupt`.
+fn collect_zone_pages(
+    io: &ReaderIo<'_>,
+    root: u32,
+    level: u16,
+    version: u64,
+) -> Result<Vec<u32>, ParallelError> {
+    let mut pages = Vec::new();
+    let mut seen = HashSet::new();
+    let node_level = level.checked_sub(1).ok_or_else(|| {
+        ParallelError::Tree(ZoneFileError::corrupt(
+            CorruptKind::Bounds,
+            Some(root),
+            CorruptDetail::DepthExceeded,
+        ))
+    })?;
+    collect_node_pages(io, root, node_level, version, &mut pages, &mut seen)
+        .map_err(ParallelError::Tree)?;
+    Ok(pages)
+}
+
+fn collect_node_pages(
+    io: &ReaderIo<'_>,
+    page_no: u32,
+    level: u16,
+    version: u64,
+    pages: &mut Vec<u32>,
+    seen: &mut HashSet<u32>,
+) -> Result<(), ZoneFileError> {
+    if !seen.insert(page_no) {
+        return Err(ZoneFileError::corrupt(
+            CorruptKind::FreelistCycle,
+            Some(page_no),
+            CorruptDetail::Cycle,
+        ));
+    }
+    pages.push(page_no);
+    let raw = io.read_page(page_no)?;
+    let page_size = io.page_size();
+    if level == 0 {
+        let leaf = DecodedLeaf::decode(raw, page_no, version, page_size)?;
+        for index in 0..leaf.len() {
+            if let DecodedValue::Rrset { value, .. } = leaf.value(index)?
+                && value.kind == ValueKind::Overflow
+            {
+                collect_overflow_pages(io, value.val_u32, version, pages, seen)?;
+            }
+        }
+        return Ok(());
+    }
+    let branch = DecodedBranch::decode(raw, page_no, version, page_size)?;
+    if branch.level() != level {
+        return Err(ZoneFileError::corrupt(
+            CorruptKind::Bounds,
+            Some(page_no),
+            CorruptDetail::PageType,
+        ));
+    }
+    for index in 0..branch.len() {
+        collect_node_pages(io, branch.child(index)?, level - 1, version, pages, seen)?;
+    }
+    Ok(())
+}
+
+fn collect_overflow_pages(
+    io: &ReaderIo<'_>,
+    first: u32,
+    version: u64,
+    pages: &mut Vec<u32>,
+    seen: &mut HashSet<u32>,
+) -> Result<(), ZoneFileError> {
+    let mut page_no = first;
+    let mut hops = 0_u32;
+    while page_no != 0 {
+        hops = hops.saturating_add(1);
+        if hops > MAX_OVERFLOW_PAGES || !seen.insert(page_no) {
+            return Err(ZoneFileError::corrupt(
+                CorruptKind::BadRdata,
+                Some(page_no),
+                CorruptDetail::Cycle,
+            ));
+        }
+        pages.push(page_no);
+        let raw = io.read_page(page_no)?;
+        let header = PageHeader::decode(raw, page_no, version, io.page_size())?;
+        if header.page_type != PAGE_TYPE_OVERFLOW {
+            return Err(ZoneFileError::corrupt(
+                CorruptKind::BadRdata,
+                Some(page_no),
+                CorruptDetail::PageType,
+            ));
+        }
+        page_no = wire::read_u32(raw, 40).ok_or_else(|| {
+            ZoneFileError::corrupt(
+                CorruptKind::BadRdata,
+                Some(page_no),
+                CorruptDetail::Truncated,
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Read snapshot зоны: держит пин и читает B+tree по версии головы.
 pub struct ZoneReader<'a> {
+    store: &'a ParallelStore,
     snapshot: ZoneSnapshot<'a>,
     tree: ZoneTree,
     io: ReaderIo<'a>,
@@ -1074,11 +1266,17 @@ impl ZoneReader<'_> {
         rr_type: u16,
         subtype: u16,
     ) -> Result<Option<RrsetRecord>, ParallelError> {
-        let Some(entry) = self
-            .tree
-            .lookup(&self.io, self.version(), name, rr_type, subtype)
-            .map_err(|error| tree_error(&self.io, error))?
-        else {
+        let entry = match self.store.node_cache() {
+            Some(cache) => {
+                self.tree
+                    .lookup_cached(&self.io, cache, self.version(), name, rr_type, subtype)
+            }
+            None => self
+                .tree
+                .lookup(&self.io, self.version(), name, rr_type, subtype),
+        }
+        .map_err(|error| tree_error(&self.io, error))?;
+        let Some(entry) = entry else {
             return Ok(None);
         };
         record_from_value(
@@ -1105,11 +1303,17 @@ impl ZoneReader<'_> {
         rr_type: u16,
         subtype: u16,
     ) -> Result<Option<RrsetRef<'_>>, ParallelError> {
-        let Some(entry) = self
-            .tree
-            .lookup(&self.io, self.version(), name, rr_type, subtype)
-            .map_err(|error| tree_error(&self.io, error))?
-        else {
+        let entry = match self.store.node_cache() {
+            Some(cache) => {
+                self.tree
+                    .lookup_cached(&self.io, cache, self.version(), name, rr_type, subtype)
+            }
+            None => self
+                .tree
+                .lookup(&self.io, self.version(), name, rr_type, subtype),
+        }
+        .map_err(|error| tree_error(&self.io, error))?;
+        let Some(entry) = entry else {
             return Ok(None);
         };
         let DecodedValue::Rrset { value, payload } = entry.value else {
