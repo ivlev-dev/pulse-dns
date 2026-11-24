@@ -5,6 +5,7 @@ members = [
     "crates/pulse-runtime",
     "crates/pulse-server",
     "crates/pulse-resolver",
+    "crates/pulseresolved",
     "crates/pulse-zonefile",
     "crates/pulse-api",
     "crates/pulsed",

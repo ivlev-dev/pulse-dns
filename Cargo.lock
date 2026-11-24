@@ -814,6 +814,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulseresolved"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "pulse-dns",
+ "pulse-dnssec",
+ "pulse-resolver",
+ "pulse-runtime",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

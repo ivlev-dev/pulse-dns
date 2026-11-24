@@ -42,6 +42,17 @@
   (`--zone`/`zones_files`, `pulse-master`), единый store с REST, write-through
   persistence в `pulse-zonefile` (`--data`, durability, single-writer),
   graceful shutdown, Dockerfile.
+- `pulsed` replication: AXFR/IXFR-out по TCP (TSIG/ACL, лимиты, SOA first/last),
+  ограниченная in-memory IXFR-история, NOTIFY-out с фоновой очередью,
+  NOTIFY-in, secondary-зоны (bootstrap AXFR, периодический SOA-refresh,
+  IXFR-in/AXFR fallback, persist в zonefile, retry/expire → SERVFAIL,
+  read-only для REST).
+- `pulseresolved` — бинарник резолвера: JSON-конфиг, forward/iterative,
+  UDP на `pulse-runtime` (N worker) и TCP (length-prefix, idle timeout, лимит
+  соединений, graceful shutdown), EDNS/TC, REFUSED для AXFR/IXFR, FORMERR на
+  мусор, кеш, blocklist (несколько файлов, allowlist, NXDOMAIN/null),
+  overrides A/AAAA/CNAME, DNSSEC-валидация (AD, BOGUS → SERVFAIL), SIGHUP и
+  периодический reload, `GET /metrics`/`GET /healthz` на loopback.
 
 ## Проверено руками
 
@@ -53,6 +64,13 @@
   отказ на усечённом файле.
 - REST-сценарий: PUT зоны → SOA/NS/A → UDP отвечает → PATCH → ответ меняется →
   DELETE → NODATA/REFUSED.
+- Резолвер (`pulseresolved`): реальный прогон бинарника против mock upstream —
+  forward A-ответ, повторный запрос из кеша без upstream (TTL 300 → 299),
+  NXDOMAIN, blocklist → NXDOMAIN и `0.0.0.0`, override приоритетнее blocklist,
+  TCP-запрос, AXFR → REFUSED, SIGHUP-reload списка, `/metrics` + `/healthz`,
+  graceful shutdown по SIGTERM (exit 0). Интеграционные тесты дополнительно
+  покрывают DNSSEC AD и BOGUS → SERVFAIL, TC/EDNS, periodic reload и FORMERR
+  на мусор.
 - Производительность (loopback, хост нагружен, числа консервативные):
   UDP echo 220 117 qps (4 worker / 4 клиента, окно 16); epoll 230 352 qps;
   окно 1 — 89 036 qps, p50 35 µs, p99 182 µs; zone lookup 156–268 нс;
@@ -69,8 +87,7 @@
 
 **P1 (безопасность/транспорт/протокол):**
 - DNSSEC-крипто (подпись/валидация) и привязка RRSIG; DNSCrypt.
-- Рекурсивный резолвер.
-- AXFR/IXFR/NOTIFY/secondary.
+- Резолвер: нет RRL, DoT/DoH/DoQ-апстримов и RFC 5011 (anchors статические).
 - DoT/DoH/DoQ.
 - TLS для API (только loopback).
 - Полноценный RRL.

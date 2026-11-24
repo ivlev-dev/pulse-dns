@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pulse_dns::Name;
 use thiserror::Error;
@@ -126,33 +126,36 @@ impl Blocklist {
     ///
     /// [`BlocklistError::Io`] или [`BlocklistError::TooLarge`].
     pub fn load(path: impl AsRef<Path>, allowlist: &[String]) -> Result<Self, BlocklistError> {
-        let path = path.as_ref();
-        let metadata = fs::metadata(path)?;
-        if metadata.len() > MAX_BLOCKLIST_BYTES {
-            return Err(BlocklistError::TooLarge {
-                size: metadata.len(),
-            });
-        }
-        let text = fs::read_to_string(path)?;
+        let text = read_limited(path.as_ref())?;
         Ok(Self::parse(&text, allowlist))
+    }
+
+    /// Загружает и объединяет несколько файлов blocklist в один снимок.
+    ///
+    /// Файлы читаются по порядку; allowlist применяется один раз к
+    /// объединённому дереву. Дубликаты записей не увеличивают `stats`.
+    ///
+    /// # Errors
+    ///
+    /// [`BlocklistError::Io`] или [`BlocklistError::TooLarge`] для любого файла.
+    pub fn load_paths(paths: &[PathBuf], allowlist: &[String]) -> Result<Self, BlocklistError> {
+        let mut list = Self::empty(allowlist);
+        for path in paths {
+            let text = read_limited(path)?;
+            list.add_text(&text);
+        }
+        Ok(list)
     }
 
     /// Разбирает blocklist из текста.
     #[must_use]
     pub fn parse(text: &str, allowlist: &[String]) -> Self {
-        let mut block = Node::default();
-        let mut allow = Node::default();
-        let mut stats = BlocklistStats::default();
+        let mut list = Self::empty(allowlist);
+        list.add_text(text);
+        list
+    }
 
-        for entry in allowlist {
-            if let Some((labels, wildcard)) = parse_entry(entry) {
-                allow.insert(&labels, wildcard);
-                stats.allowed += 1;
-            } else {
-                stats.skipped += 1;
-            }
-        }
-
+    fn add_text(&mut self, text: &str) {
         for raw_line in text.lines() {
             let line = raw_line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -167,26 +170,20 @@ impl Blocklist {
             for token in domains_in_line(rest) {
                 if let Some((labels, wildcard)) = parse_entry(token) {
                     if is_allow {
-                        allow.insert(&labels, wildcard);
+                        self.allow.insert(&labels, wildcard);
                     } else {
-                        block.insert(&labels, wildcard);
+                        self.block.insert(&labels, wildcard);
                     }
                     accepted += 1;
                 }
             }
             if accepted == 0 {
-                stats.skipped += 1;
+                self.stats.skipped += 1;
             } else if is_allow {
-                stats.allowed += accepted;
+                self.stats.allowed += accepted;
             } else {
-                stats.blocked += accepted;
+                self.stats.blocked += accepted;
             }
-        }
-
-        Self {
-            block,
-            allow,
-            stats,
         }
     }
 
@@ -207,6 +204,16 @@ impl Default for Blocklist {
     fn default() -> Self {
         Self::empty(&[])
     }
+}
+
+fn read_limited(path: &Path) -> Result<String, BlocklistError> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_BLOCKLIST_BYTES {
+        return Err(BlocklistError::TooLarge {
+            size: metadata.len(),
+        });
+    }
+    Ok(fs::read_to_string(path)?)
 }
 
 fn domains_in_line(line: &str) -> Vec<&str> {
@@ -324,5 +331,25 @@ mod tests {
         let list = Blocklist::default();
         assert!(list.is_empty());
         assert!(!list.is_blocked(&name("example.com")));
+    }
+
+    #[test]
+    fn load_paths_merges_files_and_applies_allowlist_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        fs::write(&first, "one.test\nshared.test\n").unwrap();
+        fs::write(&second, "two.test\n@@allowed.two.test\n").unwrap();
+        let list = Blocklist::load_paths(
+            &[first, second],
+            &["safe.one.test".to_owned(), "shared.test".to_owned()],
+        )
+        .unwrap();
+        assert!(list.is_blocked(&name("one.test")));
+        assert!(list.is_blocked(&name("two.test")));
+        assert!(!list.is_blocked(&name("safe.one.test")));
+        assert!(!list.is_blocked(&name("allowed.two.test")));
+        assert!(!list.is_blocked(&name("shared.test")));
+        assert_eq!(list.stats().blocked, 3);
     }
 }

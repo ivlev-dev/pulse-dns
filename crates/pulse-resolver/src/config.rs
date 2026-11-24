@@ -199,6 +199,8 @@ impl BlockResponse {
 pub struct BlocklistConfig {
     /// Файл blocklist (домены или hosts-формат).
     pub path: Option<PathBuf>,
+    /// Дополнительные файлы blocklist. Все файлы объединяются в один снимок.
+    pub paths: Vec<PathBuf>,
     /// Домены-исключения (включая поддомены).
     pub allowlist: Vec<String>,
     /// Политика ответа на заблокированное имя.
@@ -209,9 +211,18 @@ impl Default for BlocklistConfig {
     fn default() -> Self {
         Self {
             path: None,
+            paths: Vec::new(),
             allowlist: Vec::new(),
             response: BlockResponse::NxDomain,
         }
+    }
+}
+
+impl BlocklistConfig {
+    /// Все файлы blocklist в порядке загрузки: `path`, затем `paths`.
+    #[must_use]
+    pub fn all_paths(&self) -> Vec<PathBuf> {
+        self.path.iter().chain(self.paths.iter()).cloned().collect()
     }
 }
 

@@ -238,3 +238,53 @@ curl -sS -X POST -H "Authorization: Bearer $PULSED_API_TOKEN" \
 Ограничения v1: только NSEC (NSEC3-подпись не генерируется); `NS` в точке
 делегирования и glue ниже cut не подписываются; после изменения зоны через
 REST вызовите `POST /sign`, иначе подписи/NSEC-цепочка устареют.
+
+## Primary + secondary (AXFR/IXFR, TSIG, NOTIFY)
+
+Пара конфигов:
+
+```bash
+cargo run -p pulsed -- --config examples/pair-primary.json
+cargo run -p pulsed -- --config examples/pair-secondary.json
+```
+
+- primary слушает `127.0.0.1:5353`, отдаёт AXFR/IXFR по TCP с TSIG и шлёт
+  NOTIFY на `127.0.0.1:5354`;
+- secondary слушает `127.0.0.1:5354`, при старте делает AXFR, затем обновляется
+  по NOTIFY и периодическому SOA-запросу, данные пишет в `secondary.pulse`;
+- `tsig_key` secondary ссылается на имя из общего `tsig_keys`;
+- `refresh`/`retry`/`expire` в `secondary_zones` переопределяют SOA-таймеры
+  (если не заданы — берутся из SOA после первого трансфера);
+- `bootstrap: false` отключает автоматический AXFR при отсутствии зоны:
+  зона появится после NOTIFY от master;
+- secondary read-only: REST PUT/PATCH/DELETE RRset возвращает `409`
+  `zone-read-only`; данные меняются только трансфером;
+- после `expire` без успешного обновления зона отвечает `SERVFAIL`, но
+  остаётся в zonefile и восстанавливается следующим успешным AXFR/IXFR.
+
+Проверка:
+
+```bash
+dig @127.0.0.1 -p 5354 example.com. SOA +norecurse
+dig @127.0.0.1 -p 5354 www.example.com. A +norecurse
+```
+
+## Резолвер `pulseresolved`
+
+`examples/resolver.json` — forward-режим на 1.1.1.1/9.9.9.9, встроенные
+корневые trust anchors, blocklist `examples/resolver-blocklist.txt` и три
+override-записи:
+
+```bash
+cargo run -p pulseresolved -- --config examples/resolver.json
+dig @127.0.0.1 -p 5353 example.com. A
+dig @127.0.0.1 -p 5353 ads.example. A    # blocklist → NXDOMAIN
+dig @127.0.0.1 -p 5353 router.home. A    # override → 192.168.1.1
+curl -sS http://127.0.0.1:9153/metrics
+kill -HUP "$(pgrep pulseresolved)"       # перечитать blocklist
+```
+
+Другие режимы: `mode: "iterative"` (root_hints/ns_port), `blocklist.response:
+"null"` (0.0.0.0/::), `blocklist.reload_secs` для периодического reload,
+`trust_anchor: {"path": "root.ds"}` для собственного DS-файла (по строке
+`owner. [TTL] [IN] DS <tag> <alg> <digest-type> <hex>`).

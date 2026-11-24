@@ -3,10 +3,11 @@
 ![CI](https://github.com/ivlev-dev/pulse-dns/actions/workflows/ci.yml/badge.svg)
 
 Модульный высокопроизводительный DNS-сервер на Rust. Linux-first, edition 2024
-(stable). Текущее состояние — **authoritative MVP**: рабочий авторитетный сервер
-(`pulsed`) с UDP/TCP, REST API и опциональной write-through persistence в
-`pulse-zonefile`; serving-путь остаётся in-memory. Это не полный продукт из ТЗ
-(нет рекурсии, DNSSEC-крипто, AXFR/IXFR, DoT/DoH/DoQ и т.д.).
+(stable). Текущее состояние — **authoritative MVP + кеширующий резолвер**:
+авторитетный сервер (`pulsed`) с UDP/TCP, REST API и опциональной write-through
+persistence в `pulse-zonefile`, а также резолвер (`pulseresolved`) с
+forward/iterative-резолюцией, кешем, blocklist, overrides и DNSSEC-валидацией.
+Это не полный продукт из ТЗ (нет DoT/DoH/DoQ, RRL и т.д.).
 
 ## Возможности
 
@@ -33,15 +34,21 @@
   (`.zone`, `$ORIGIN`/`$TTL`/`$INCLUDE`), единый store с REST (правки через
   API сразу видны в DNS), write-through persistence в `pulse-zonefile`
   (`--data`, `sync`/`flush`/`memory`, один writer), graceful shutdown,
-  Dockerfile.
+  AXFR/IXFR-out по TCP с TSIG/ACL, IXFR-история, NOTIFY-out/in и secondary-зоны
+  (AXFR/IXFR-in, bootstrap, SOA-refresh, expire → SERVFAIL), Dockerfile.
+- Бинарник `pulseresolved`: forward/iterative-резолюция через `pulse-resolver`,
+  UDP на `pulse-runtime` (N worker) и TCP с length-prefix, EDNS/TC, REFUSED
+  для AXFR/IXFR, кеш, blocklist + overrides, DNSSEC-валидация (AD/SERVFAIL),
+  SIGHUP/периодический reload, `GET /metrics` и `GET /healthz` на loopback,
+  graceful shutdown по SIGTERM/SIGINT.
 
 **Не реализовано (см. `STATUS.md`):** commit/allocator/GC и параллельная запись
 по зонам в коде (только дизайн, ADR 0005/0006, spec parallel-writes-v2);
 journal/outbox и параллельная запись в zonefile; зоны в памяти пересобираются
-полностью при мутации; DNSSEC-крипто (подпись/валидация) и привязка RRSIG; DNSCrypt;
-рекурсивный резолвер; AXFR/IXFR/NOTIFY/secondary; DoT/DoH/DoQ; 0x20 echo; TLS
-для API (только loopback); fuzz/Miri/loom в CI; полноценный RRL; REST —
-MVP-подмножество спецификации.
+полностью при мутации; DNSCrypt; DoT/DoH/DoQ; 0x20 echo; TLS
+для API и метрик (только loopback); fuzz/Miri/loom в CI; полноценный RRL; REST —
+MVP-подмножество спецификации. У резолвера нет RRL, DoT/DoH-апстримов и
+RFC 5011 (trust anchors статические).
 
 ## Архитектура
 
@@ -53,7 +60,9 @@ MVP-подмножество спецификации.
 | `pulse-runtime` | io_uring UDP-рантайм + epoll-фолбэк |
 | `pulse-server` | Авторитетный движок запросов |
 | `pulse-api` | REST API управления зонами |
+| `pulse-resolver` | Кеширующий резолвер: forward/iterative, кеш, blocklist, overrides, DNSSEC |
 | `pulsed` | Бинарник сервера (UDP+TCP+REST) |
+| `pulseresolved` | Бинарник резолвера (UDP+TCP+метрики) |
 
 Спецификации и решения: `docs/adr/`, `docs/spec/`, `docs/api/rest-v1.md`,
 `docs/bench/plan.md`, `docs/plan/roadmap.md`.
@@ -85,6 +94,24 @@ cargo run -p pulsed -- \
 dig @127.0.0.1 -p 5353 example.com. A +norecurse
 dig @127.0.0.1 -p 5353 example.com. MX +tcp +norecurse
 ```
+
+Запуск резолвера (forward на 1.1.1.1/9.9.9.9, blocklist и overrides из
+`examples/resolver.json`):
+
+```bash
+cargo run -p pulseresolved -- --config examples/resolver.json
+dig @127.0.0.1 -p 5353 example.com. A
+dig @127.0.0.1 -p 5353 ads.example. A          # blocklist → NXDOMAIN
+dig @127.0.0.1 -p 5353 router.home. A          # override → 192.168.1.1
+dig @127.0.0.1 -p 5353 example.com. A +tcp     # TCP length-prefix
+curl -sS http://127.0.0.1:9153/healthz
+curl -sS http://127.0.0.1:9153/metrics | head
+# После правки blocklist: kill -HUP <pid> (или blocklist.reload_secs > 0)
+```
+
+CLI: `--config`, `--listen-udp`, `--listen-tcp`, `--metrics-listen`,
+`--forward` (repeatable), `--workers`, `--log-level`, `--blocklist`
+(repeatable), `--no-dnssec`.
 
 Зона из RFC 1035 master-файла:
 

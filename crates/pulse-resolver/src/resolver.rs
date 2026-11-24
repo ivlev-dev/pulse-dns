@@ -202,9 +202,11 @@ impl Resolver {
     pub fn new(config: ResolverConfig) -> Result<Self, ResolverError> {
         config.validate()?;
 
-        let blocklist = match &config.blocklist.path {
-            Some(path) => Blocklist::load(path, &config.blocklist.allowlist)?,
-            None => Blocklist::empty(&config.blocklist.allowlist),
+        let blocklist_paths = config.blocklist.all_paths();
+        let blocklist = if blocklist_paths.is_empty() {
+            Blocklist::empty(&config.blocklist.allowlist)
+        } else {
+            Blocklist::load_paths(&blocklist_paths, &config.blocklist.allowlist)?
         };
         let overrides = Overrides::build(&config.overrides)?;
         let forwarders = match &config.mode {
@@ -315,6 +317,28 @@ impl Resolver {
         path: impl AsRef<Path>,
     ) -> Result<BlocklistStats, ResolverError> {
         let blocklist = Blocklist::load(path, &self.inner.config.blocklist.allowlist)?;
+        self.replace_blocklist(blocklist)
+    }
+
+    /// Перезагружает все файлы blocklist из конфигурации резолвера.
+    ///
+    /// Снимок подменяется атомарно; при ошибке чтения любого файла старый
+    /// список остаётся в силе. Если файлы не заданы, возвращается статистика
+    /// текущего (пустого) списка.
+    ///
+    /// # Errors
+    ///
+    /// [`ResolverError::Blocklist`] при ошибке чтения.
+    pub fn reload_blocklists(&self) -> Result<BlocklistStats, ResolverError> {
+        let paths = self.inner.config.blocklist.all_paths();
+        if paths.is_empty() {
+            return Ok(self.blocklist().stats());
+        }
+        let blocklist = Blocklist::load_paths(&paths, &self.inner.config.blocklist.allowlist)?;
+        self.replace_blocklist(blocklist)
+    }
+
+    fn replace_blocklist(&self, blocklist: Blocklist) -> Result<BlocklistStats, ResolverError> {
         let stats = blocklist.stats();
         let mut guard = self
             .inner

@@ -1,0 +1,38 @@
+{
+  "listen_udp": "127.0.0.1:5353",
+  "listen_tcp": "127.0.0.1:5353",
+  "metrics_listen": "127.0.0.1:9153",
+  "workers": 2,
+  "mode": "forward",
+  "forwarders": ["1.1.1.1:53", "9.9.9.9:53"],
+  "dnssec_validate": true,
+  "trust_anchor": "embedded",
+  "blocklist": {
+    "paths": ["examples/resolver-blocklist.txt"],
+    "allowlist": ["safe.ads.example"],
+    "response": "nxdomain",
+    "reload_secs": 0
+  },
+  "overrides": [
+    { "name": "router.home", "ttl": 60, "a": ["192.168.1.1"] },
+    { "name": "nas.home", "ttl": 60, "aaaa": ["fd00::10"] },
+    { "name": "printer.home", "ttl": 60, "cname": "router.home." }
+  ],
+  "cache": {
+    "max_entries": 32768,
+    "max_bytes": 16777216,
+    "min_ttl": 0,
+    "max_ttl": 86400,
+    "shards": 16
+  },
+  "tcp": {
+    "max_connections": 1024,
+    "idle_timeout_ms": 5000
+  },
+  "timeouts": {
+    "per_query_ms": 2000,
+    "tcp_ms": 3000,
+    "total_ms": 6000
+  },
+  "log_level": "info"
+}

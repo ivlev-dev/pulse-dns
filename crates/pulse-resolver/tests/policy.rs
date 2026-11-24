@@ -54,6 +54,7 @@ fn blocklist_exact_subdomain_wildcard_allowlist_and_hosts() {
     let mut config = config(server.address());
     config.blocklist = BlocklistConfig {
         path: Some(path),
+        paths: Vec::new(),
         allowlist: vec!["safe.exact.test".to_owned()],
         response: BlockResponse::NxDomain,
     };
@@ -92,6 +93,7 @@ fn null_policy_answers_sinkhole() {
     let mut config = config(server.address());
     config.blocklist = BlocklistConfig {
         path: Some(path),
+        paths: Vec::new(),
         allowlist: Vec::new(),
         response: BlockResponse::Null {
             ipv4: Ipv4Addr::UNSPECIFIED,
@@ -121,6 +123,7 @@ fn blocklist_reload_is_atomic() {
     let mut config = config(server.address());
     config.blocklist = BlocklistConfig {
         path: Some(path.clone()),
+        paths: Vec::new(),
         allowlist: Vec::new(),
         response: BlockResponse::NxDomain,
     };
@@ -154,6 +157,7 @@ fn overrides_take_priority_over_blocklist_and_upstream() {
     let mut config = config(server.address());
     config.blocklist = BlocklistConfig {
         path: Some(path),
+        paths: Vec::new(),
         allowlist: Vec::new(),
         response: BlockResponse::NxDomain,
     };
