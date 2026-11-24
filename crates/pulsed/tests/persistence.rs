@@ -1,5 +1,7 @@
 //! E2E persistence: `pulse-zonefile` write-through и reopen.
 
+mod common;
+
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
@@ -9,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use pulse_dns::{
     DecodeLimits, EncodeOptions, Message, Name, Question, Rclass, Rcode, Rdata, Rtype,
 };
-use pulsed::config::{Config, Durability, TcpConfig, ZoneFileConfig};
+use pulsed::config::{Config, Durability, TcpConfig};
 use pulsed::server::{ApiOptions, Server};
 
 const TOKEN: &str = "pd_live_persistence_0123456789abcdef";
@@ -42,10 +44,6 @@ impl Drop for TempDir {
     }
 }
 
-fn example_zone() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/example.com.zone")
-}
-
 fn base_config(data: &Path) -> Config {
     Config {
         listen_udp: Some("127.0.0.1:0".parse().expect("udp")),
@@ -58,8 +56,6 @@ fn base_config(data: &Path) -> Config {
         zonefile: Some(data.to_path_buf()),
         durability: Durability::Flush,
         map_size: 64 * 1024 * 1024,
-        zones: Vec::new(),
-        zones_files: Vec::new(),
         ..Config::default()
     }
 }
@@ -214,15 +210,12 @@ fn assert_a(server: &Server, address: &str, ttl: u32) {
 }
 
 #[test]
-fn empty_file_bootstraps_zone_and_survives_reopen() {
+fn imported_zone_survives_reopen() {
     let dir = TempDir::new("bootstrap");
     let data = dir.path().join("pulse.zonefile");
     std::fs::write(&data, b"").expect("empty file");
-    let mut config = base_config(&data);
-    config.zones_files.push(ZoneFileConfig {
-        origin: "example.com.".to_owned(),
-        path: example_zone(),
-    });
+    common::import(&data, "example.com.", &common::example_zone());
+    let config = base_config(&data);
 
     let mut server = Server::start(&config).expect("first start");
     let response = dns_query(&server, "www.example.com.", Rtype::A);
@@ -367,11 +360,8 @@ fn second_writer_gets_busy() {
 fn truncated_file_is_rejected() {
     let dir = TempDir::new("corrupt");
     let data = dir.path().join("pulse.zonefile");
-    let mut config = base_config(&data);
-    config.zones_files.push(ZoneFileConfig {
-        origin: "example.com.".to_owned(),
-        path: example_zone(),
-    });
+    let config = base_config(&data);
+    common::import(&data, "example.com.", &common::example_zone());
     let mut server = Server::start(&config).expect("create valid file");
     server.shutdown().expect("shutdown");
     drop(server);

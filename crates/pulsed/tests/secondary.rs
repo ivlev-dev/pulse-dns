@@ -1,5 +1,7 @@
 //! E2E: primary → secondary (AXFR/IXFR-in), NOTIFY, persistence и expire.
 
+mod common;
+
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
@@ -12,8 +14,7 @@ use pulse_dns::{
 };
 use pulse_transfer::{IxfrClient, IxfrOutcome, TransferLimits, TsigAlgorithm, TsigKey};
 use pulsed::config::{
-    Config, Durability, RecordConfig, SecondaryZoneConfig, TcpConfig, TransferSettings,
-    TsigKeyConfig, ZoneConfig,
+    Config, Durability, SecondaryZoneConfig, TcpConfig, TransferSettings, TsigKeyConfig,
 };
 use pulsed::server::{ApiOptions, Server};
 
@@ -50,57 +51,24 @@ fn key_config(secret: &str) -> TsigKeyConfig {
     }
 }
 
-fn soa_config(serial: u32) -> RecordConfig {
-    RecordConfig {
-        name: "@".to_owned(),
-        rr_type: "SOA".to_owned(),
-        ttl: Some(3600),
-        rdata: serde_json::json!({
-            "mname": "ns1.example.com.",
-            "rname": "hostmaster.example.com.",
-            "serial": serial,
-            "refresh": 1,
-            "retry": 1,
-            "expire": 60,
-            "minimum": 300
-        }),
-    }
+fn soa_config(serial: u32) -> String {
+    format!("@ 3600 IN SOA ns1.example.com. hostmaster.example.com. {serial} 1 1 60 300")
 }
 
-fn ns_config() -> RecordConfig {
-    RecordConfig {
-        name: "@".to_owned(),
-        rr_type: "NS".to_owned(),
-        ttl: Some(3600),
-        rdata: serde_json::json!("ns1.example.com."),
-    }
+fn ns_config() -> String {
+    "@ 3600 IN NS ns1.example.com.".to_owned()
 }
 
-fn a_config(address: &str) -> RecordConfig {
-    RecordConfig {
-        name: "www".to_owned(),
-        rr_type: "A".to_owned(),
-        ttl: Some(300),
-        rdata: serde_json::json!(address),
-    }
+fn a_config(address: &str) -> String {
+    format!("www 300 IN A {address}")
 }
 
-fn zone_config(serial: u32, address: &str) -> ZoneConfig {
+fn zone_config(serial: u32, address: &str) -> Vec<String> {
     let mut records = vec![soa_config(serial), ns_config(), a_config(address)];
     for index in 0..100_u32 {
-        records.push(RecordConfig {
-            name: format!("host{index}"),
-            rr_type: "A".to_owned(),
-            ttl: Some(300),
-            rdata: serde_json::json!(format!("10.0.0.{index}")),
-        });
+        records.push(format!("host{index} 300 IN A 10.0.0.{index}"));
     }
-    ZoneConfig {
-        origin: ORIGIN.to_owned(),
-        class: "IN".to_owned(),
-        default_ttl: 3600,
-        records,
-    }
+    records
 }
 
 fn transfer_settings(timeout_ms: u64, notify: Vec<SocketAddr>) -> TransferSettings {
@@ -116,20 +84,22 @@ fn transfer_settings(timeout_ms: u64, notify: Vec<SocketAddr>) -> TransferSettin
     }
 }
 
-fn primary_config(zone: ZoneConfig, notify: Vec<SocketAddr>) -> Config {
-    Config {
-        listen_udp: Some("127.0.0.1:0".parse().expect("udp")),
-        listen_tcp: Some("127.0.0.1:0".parse().expect("tcp")),
-        workers: 1,
-        tcp: TcpConfig {
-            idle_timeout_ms: 2000,
-            ..TcpConfig::default()
-        },
-        zones: vec![zone],
-        tsig_keys: vec![key_config("c2VjcmV0")],
-        transfer: transfer_settings(2_000, notify),
-        ..Config::default()
+fn primary_config(records: Vec<String>, notify: Vec<SocketAddr>) -> (common::TempZone, Config) {
+    let mut text = String::from("$ORIGIN example.com.\n$TTL 3600\n");
+    for line in records {
+        text.push_str(&line);
+        text.push('\n');
     }
+    let (_dir, path) = common::write_text("secondary-primary", "zone", &text);
+    let zone = common::TempZone::with_import("secondary-primary", ORIGIN, &path);
+    let mut config = common::base_config(zone.path());
+    config.tcp = TcpConfig {
+        idle_timeout_ms: 2000,
+        ..TcpConfig::default()
+    };
+    config.tsig_keys = vec![key_config("c2VjcmV0")];
+    config.transfer = transfer_settings(2_000, notify);
+    (zone, config)
 }
 
 fn secondary_config(
@@ -147,7 +117,6 @@ fn secondary_config(
             idle_timeout_ms: 2000,
             ..TcpConfig::default()
         },
-        zones: Vec::new(),
         zonefile,
         durability: Durability::Flush,
         map_size: 64 * 1024 * 1024,
@@ -383,11 +352,9 @@ fn primary_to_secondary_bootstrap_update_ixfr_and_reopen() {
     let dir = TempDir::new("full");
     let data = dir.path().join("secondary.pulse");
     let secondary_udp = free_udp_addr();
-    let mut primary = Server::start_with_api(
-        &primary_config(zone_config(1, "192.0.2.10"), vec![secondary_udp]),
-        Some(api_options()),
-    )
-    .expect("primary");
+    let (_primary_zone, primary_cfg) =
+        primary_config(zone_config(1, "192.0.2.10"), vec![secondary_udp]);
+    let mut primary = Server::start_with_api(&primary_cfg, Some(api_options())).expect("primary");
     let primary_tcp = primary.tcp_addr().expect("primary tcp");
     let primary_api = primary.api_addr().expect("primary api");
 
@@ -459,16 +426,15 @@ fn primary_to_secondary_bootstrap_update_ixfr_and_reopen() {
 #[test]
 fn secondary_retries_and_expires_when_master_is_down() {
     let secondary_udp = free_udp_addr();
-    let mut primary = Server::start(&primary_config(
-        zone_config(1, "192.0.2.10"),
-        vec![secondary_udp],
-    ))
-    .expect("primary");
+    let (_primary_zone, primary_cfg) =
+        primary_config(zone_config(1, "192.0.2.10"), vec![secondary_udp]);
+    let mut primary = Server::start(&primary_cfg).expect("primary");
     let primary_tcp = primary.tcp_addr().expect("primary tcp");
+    let secondary_zone = common::TempZone::empty("secondary-expire");
     let mut secondary = Server::start(&secondary_config(
         primary_tcp,
         secondary_udp,
-        None,
+        Some(secondary_zone.path().to_path_buf()),
         "c2VjcmV0",
         1,
     ))
@@ -492,13 +458,14 @@ fn secondary_retries_and_expires_when_master_is_down() {
 #[test]
 fn secondary_rejects_wrong_tsig() {
     let secondary_udp = free_udp_addr();
-    let mut primary =
-        Server::start(&primary_config(zone_config(1, "192.0.2.10"), Vec::new())).expect("primary");
+    let (_primary_zone, primary_cfg) = primary_config(zone_config(1, "192.0.2.10"), Vec::new());
+    let mut primary = Server::start(&primary_cfg).expect("primary");
     let primary_tcp = primary.tcp_addr().expect("primary tcp");
+    let secondary_zone = common::TempZone::empty("secondary-badtsig");
     let mut secondary = Server::start(&secondary_config(
         primary_tcp,
         secondary_udp,
-        None,
+        Some(secondary_zone.path().to_path_buf()),
         "d3Jvbmc=",
         60,
     ))
@@ -525,14 +492,19 @@ fn secondary_rejects_wrong_tsig() {
 #[test]
 fn bootstrap_false_waits_for_notify() {
     let secondary_udp = free_udp_addr();
-    let mut primary = Server::start_with_api(
-        &primary_config(zone_config(1, "192.0.2.10"), vec![secondary_udp]),
-        Some(api_options()),
-    )
-    .expect("primary");
+    let (_primary_zone, primary_cfg) =
+        primary_config(zone_config(1, "192.0.2.10"), vec![secondary_udp]);
+    let mut primary = Server::start_with_api(&primary_cfg, Some(api_options())).expect("primary");
     let primary_tcp = primary.tcp_addr().expect("primary tcp");
     let primary_api = primary.api_addr().expect("primary api");
-    let mut config = secondary_config(primary_tcp, secondary_udp, None, "c2VjcmV0", 60);
+    let secondary_zone = common::TempZone::empty("secondary-notify");
+    let mut config = secondary_config(
+        primary_tcp,
+        secondary_udp,
+        Some(secondary_zone.path().to_path_buf()),
+        "c2VjcmV0",
+        60,
+    );
     config.secondary_zones[0].bootstrap = false;
     let mut secondary = Server::start(&config).expect("secondary");
 

@@ -383,10 +383,28 @@ pub struct RrsetPage {
     pub has_more: bool,
 }
 
+/// Счётчики `pulse-zonefile` на пути ответа и записи.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZoneFileMetrics {
+    /// Взято пинов снапшота (новых снапшотов).
+    pub snapshot_pins: u64,
+    /// Поисков RRset в mmap.
+    pub lookups: u64,
+    /// Успешных коммитов zonefile.
+    pub commits: u64,
+    /// Ошибок коммита zonefile.
+    pub commit_errors: u64,
+}
+
 /// Порт администрирования зон.
 pub trait ZoneAdmin: Send + Sync + 'static {
     /// Готов ли store обслуживать запросы.
     fn ready(&self) -> bool;
+
+    /// Счётчики zonefile, если адаптер работает поверх `pulse-zonefile`.
+    fn zonefile_metrics(&self) -> Option<ZoneFileMetrics> {
+        None
+    }
 
     /// Список зон с keyset-пагинацией по `id`.
     fn list_zones(&self, query: &ListZones, allow: &dyn ZoneAllow) -> Result<ZonePage, AdminError>;

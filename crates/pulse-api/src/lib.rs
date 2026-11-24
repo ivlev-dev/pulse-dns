@@ -115,8 +115,8 @@ pub use config::{ApiConfig, ApiConfigError};
 pub use error::{AdminError, Conflict, FieldIssue, InvariantViolation, NotFound};
 pub use memory::{InMemoryZoneAdmin, StoreSnapshot, ZoneSnapshot};
 pub use port::{
-    Denial, ListRrsets, ListZones, Preconditions, RrsetInput, RrsetPage, RrsetPatch,
-    RrsetPatchOutcome, RrsetView, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneId, ZoneKind,
-    ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, ZoneView,
+    Denial, ListRrsets, ListZones, Precondition, Preconditions, RrsetInput, RrsetPage, RrsetPatch,
+    RrsetPatchOutcome, RrsetView, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneFileMetrics, ZoneId,
+    ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, ZoneView,
 };
 pub use server::{ApiServerError, RunningServer, serve};

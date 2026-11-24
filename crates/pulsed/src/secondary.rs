@@ -14,12 +14,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use pulse_api::StoreSnapshot;
 use pulse_dns::{
     DecodeLimits, EncodeOptions, Message, Name, Question, Rclass, Rcode, Rdata, Record, Rrset,
     Rtype, Serial, Ttl,
 };
-use pulse_server::ZoneState;
 use pulse_transfer::{
     AxfrClient, IxfrClient, IxfrOutcome, TransferError, TransferLimits, TsigKey, ZoneSnapshot,
     apply_ixfr, soa_serial,
@@ -329,7 +327,7 @@ impl SecondaryManager {
     /// Создаёт менеджер из конфигурации.
     pub(crate) fn from_config(
         config: &Config,
-        snapshot: &StoreSnapshot,
+        existing_secondary: &HashSet<Name>,
         key: impl Fn(&Name) -> Option<Arc<TsigKey>>,
         now: Instant,
     ) -> Result<Self, SecondaryError> {
@@ -358,10 +356,7 @@ impl SecondaryManager {
                     zone_config.origin
                 ))
             })?;
-            let exists = snapshot
-                .zones
-                .iter()
-                .any(|zone| zone.origin == origin && zone.kind == pulse_api::ZoneKind::Secondary);
+            let exists = existing_secondary.contains(&origin);
             let zone = Arc::new(SecondaryZone::new(zone_config, key, exists, now)?);
             zones.insert(origin, zone);
         }
@@ -786,19 +781,5 @@ impl SecondaryScheduler {
 impl Drop for SecondaryScheduler {
     fn drop(&mut self) {
         self.shutdown();
-    }
-}
-
-/// Истёкшие зоны и состояние `Serving`/`Expired` используются при построении
-/// `QueryEngine`; эта функция оставлена для явного тестирования политики.
-pub(crate) fn state_for(expired: bool, has_data: bool) -> ZoneState {
-    if has_data {
-        if expired {
-            ZoneState::Expired
-        } else {
-            ZoneState::Serving
-        }
-    } else {
-        ZoneState::Initializing
     }
 }

@@ -1,8 +1,9 @@
 # `pulsed`: DNS + REST API в одном процессе
 
-`pulsed` держит один `pulse-api::InMemoryZoneAdmin`: JSON-зоны загружаются в
-него при старте, REST API мутирует тот же store, а DNS отвечает по снапшоту,
-который перестраивается после каждой успешной мутации. Перезапуск не нужен.
+`pulsed` использует `pulse-zonefile` как единственный источник истины: DNS
+отвечает точечными чтениями из mmap (без полной in-memory копии зон), REST API
+пишет в тот же файл и коммитит транзакцию. После коммита новый снапшот сразу
+виден DNS — перезапуск не нужен.
 
 ## Запуск
 
@@ -10,7 +11,7 @@
 export PULSED_API_TOKEN="$(openssl rand -hex 32)"
 
 cargo run -p pulsed -- \
-  --config examples/zones.json \
+  --config examples/pulsed.json \
   --listen-udp 127.0.0.1:5353 \
   --listen-tcp 127.0.0.1:5353 \
   --api-listen 127.0.0.1:8080 \
@@ -24,65 +25,63 @@ cargo run -p pulsed -- \
   `*.internal.`. Без флагов токен видит все зоны.
 - Без TLS API разрешён только на loopback-адресе (политика `pulse-api`).
 
-## Зоны из master-файлов (.zone)
+## Импорт зон из master-файлов (.zone)
 
-Поддерживаются RFC 1035 master-файлы через `pulse-master`: `$ORIGIN`, `$TTL`,
-`$INCLUDE` (внутри каталога файла), относительные имена, `(...)`, комментарии.
-Источники можно смешивать; одинаковый origin в JSON/файлах/`--zone` — ошибка
-запуска. REST API правит тот же store.
-
-Через JSON (`zones_files`):
+В рантайме master-файлы не читаются: их импортирует отдельная команда
+`pulsed import`. Поддерживаются RFC 1035 master-файлы через `pulse-master`:
+`$ORIGIN`, `$TTL`, `$INCLUDE` (внутри каталога файла), относительные имена,
+`(...)`, комментарии.
 
 ```bash
-cargo run -p pulsed -- --config examples/master-files.json
-dig @127.0.0.1 -p 5353 www.example.com. A +norecurse
-dig @127.0.0.1 -p 5353 missing.example.com. A +norecurse   # NXDOMAIN
+cargo run -p pulsed -- import \
+  --data /tmp/pulse-dns.zonefile \
+  --origin example.com. \
+  examples/example.com.zone
+
+# повторный импорт существующей зоны — только с --replace
+cargo run -p pulsed -- import --replace \
+  --data /tmp/pulse-dns.zonefile \
+  --origin example.com. \
+  examples/example.com.zone
 ```
 
-Через CLI (`--zone` повторяемый; `empty.json` — конфиг без зон):
-
-```bash
-cargo run -p pulsed -- --config examples/empty.json \
-  --zone example.com.=examples/example.com.zone
-```
+Опции: `--durability sync|flush|memory`, `--map-size`, `--replace`.
+`--sign` подписывает зону перед записью; ключи задаются повторяемым
+`--dnssec-key <origin>=<role:path>`. Ошибки парсера печатаются как
+`path:line:column: причина`, процесс завершается с кодом `2`.
 
 Файл `examples/example.com.zone` содержит SOA/NS/A/AAAA/MX/TXT/CNAME/wildcard.
-`$ORIGIN` внутри файла допускается; owner'ы обязаны оставаться внутри origin
-из ключа `--zone`/`zones_files`. Относительные пути считаются от текущего
-каталога процесса. Ошибки парсера печатаются как `path:line:column: причина`,
-процесс завершается с кодом `2`.
+`$ORIGIN` внутри файла допускается; owner'ы обязаны оставаться внутри
+`--origin`. Относительные пути считаются от текущего каталога процесса.
 
-## Persistence (`pulse-zonefile`)
+JSON-поля `zones`/`zones_files` больше не принимаются — запуск завершается с
+инструкцией миграции.
 
-Включение файла зон:
+## Zonefile (`pulse-zonefile`)
+
+Запуск с файлом зон:
 
 ```bash
 cargo run -p pulsed -- \
   --config examples/persistent.json
 # или CLI:
 cargo run -p pulsed -- \
-  --config examples/master-files.json \
+  --config examples/empty.json \
   --data /tmp/pulse-dns.zonefile \
   --durability flush \
   --map-size 268435456
 ```
 
-Первый запуск при отсутствии (или пустом) файле импортирует JSON/master-зоны
-и делает `commit`. Последующие запуски читают зоны из файла; JSON/master
-источники **игнорируются** — файл является источником истины. Чтобы
-переимпортировать конфиг, удалите файл зон. Относительные пути (`zonefile`,
-`zones_files`, `--data`) считаются от текущего каталога процесса.
-
-Каждый успешный REST PUT/PATCH/DELETE пишется в `pulse-zonefile` и
-коммитится до обновления DNS-снапшота. При shutdown выполняется `sync()`.
-`durability`: `sync` (данные + meta), `flush` (по умолчанию: данные
-синхронизируются, meta — нет), `memory` (без fsync). После первого `sync`
-формат липко переходит в `sync`-режим для следующих коммитов.
+Все зоны живут в `--data`. Каждый успешный REST PUT/PATCH/DELETE коммитится
+до обновления DNS-снапшота; DNS-ответы читают тот же mmap. При shutdown
+выполняется `sync()`. `durability`: `sync` (данные + meta), `flush` (по
+умолчанию: данные синхронизируются, meta — нет), `memory` (без fsync). После
+первого `sync` формат липко переходит в `sync`-режим для следующих коммитов.
 
 Ограничения: один writer на файл (`LOCK_EX`; второй процесс получает `busy`),
-write-through без journal/outbox, при мутации пересобирается полный
-in-memory снапшот всех зон (не только изменённой), `map_size` — размер
-sparse-файла и задаётся при создании (по умолчанию 4 GiB). При ошибке
+нет journal/outbox; при мутации пересобирается только список зон и пин
+снапшота (данные не материализуются), `map_size` — размер sparse-файла и
+задаётся при создании (по умолчанию 4 GiB). При ошибке
 `MapFull`/повреждении/несовместимой версии API возвращает `500 storage-error`,
 а запуск завершается fail-closed.
 
@@ -177,9 +176,9 @@ apex и несколько SOA отклоняются с `422`/`invariant violat
 может сосуществовать с другими типами и не допускается в apex. TTL всех
 записей одного RRset должен совпадать.
 
-Зоны из `--config` при старте обязаны иметь apex SOA/NS (fail-fast, как и
-раньше); незавершённые зоны создаются через API. Serial внутри RDATA SOA
-задаётся явно пользователем; метаданные зоны ведут отдельный serial коммитов.
+Импортированные зоны обязаны иметь apex SOA/NS (state `Serving`);
+незавершённые зоны создаются через API. Serial внутри RDATA SOA задаётся явно
+пользователем; метаданные зоны ведут отдельный serial коммитов.
 
 ## DNSSEC (authoritative, NSEC)
 
@@ -189,11 +188,22 @@ apex и несколько SOA отклоняются с `422`/`invariant violat
 (каталог `0700`); более широкие права — ошибка запуска. Приватные ключи не
 логируются и не отдаются через API.
 
-JSON-конфигурация:
+Подпись при импорте:
+
+```bash
+cargo run -p pulsed -- import --sign \
+  --data /tmp/pulse-dns.zonefile \
+  --origin example.com. \
+  --dnssec-key example.com.=ksk:keys/ksk.private \
+  --dnssec-key example.com.=zsk:keys/zsk.private \
+  examples/example.com.zone
+```
+
+Подпись при старте (ключи в JSON-настройках сервера; сама зона уже в zonefile):
 
 ```json
 {
-  "zones_files": [{"origin": "example.com.", "path": "examples/example.com.zone"}],
+  "zonefile": "/tmp/pulse-dns.zonefile",
   "dnssec": {
     "example.com.": {
       "keys": [
@@ -207,14 +217,8 @@ JSON-конфигурация:
 }
 ```
 
-CLI (повторяемый; роль опциональна):
-
-```bash
-cargo run -p pulsed -- --config examples/empty.json \
-  --zone example.com.=examples/example.com.zone \
-  --dnssec-key example.com.=ksk:keys/ksk.private \
-  --dnssec-key example.com.=zsk:keys/zsk.private
-```
+Подписанные DNSKEY/NSEC/RRSIG коммитятся в zonefile, а DO=1 отдаёт их из
+mmap.
 
 Проверка (DO=1 — RRSIG/NSEC; DO=0 — без подписей):
 
@@ -240,6 +244,13 @@ curl -sS -X POST -H "Authorization: Bearer $PULSED_API_TOKEN" \
 REST вызовите `POST /sign`, иначе подписи/NSEC-цепочка устареют.
 
 ## Primary + secondary (AXFR/IXFR, TSIG, NOTIFY)
+
+Сначала импортируйте зону в файл primary (конфиг указывает `./primary.pulse`):
+
+```bash
+cargo run -p pulsed -- import --data ./primary.pulse \
+  --origin example.com. examples/example.com.zone
+```
 
 Пара конфигов:
 

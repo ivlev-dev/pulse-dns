@@ -284,7 +284,7 @@ impl Api {
                     Some(HttpResponse::text(
                         200,
                         "text/plain; version=0.0.4; charset=utf-8",
-                        self.metrics.render(),
+                        self.metrics.render_with(self.store.zonefile_metrics()),
                     ))
                 } else {
                     Some(method_not_allowed(&["GET"], instance, request_id).into_response())

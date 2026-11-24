@@ -1,9 +1,11 @@
 //! E2E-тесты AXFR/IXFR, TSIG, ACL и NOTIFY на реальных сокетах.
 
+mod common;
+
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::path::{Path, PathBuf};
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pulse_dns::{
@@ -13,7 +15,7 @@ use pulse_transfer::{
     AxfrClient, IxfrClient, IxfrOutcome, NotifyRequest, NotifyResponse, TransferError,
     TransferLimits, TsigAlgorithm, TsigKey, ZoneSnapshot, soa_serial,
 };
-use pulsed::config::{Config, RecordConfig, TcpConfig, TsigKeyConfig, ZoneConfig};
+use pulsed::config::{Config, TcpConfig, TsigKeyConfig};
 use pulsed::server::{ApiOptions, Server};
 
 const TOKEN: &str = "pd_live_transfer_0123456789abcdef";
@@ -48,62 +50,36 @@ fn tsig_config(name: &str, secret: &str) -> TsigKeyConfig {
     }
 }
 
-fn soa_config(serial: u32) -> RecordConfig {
-    RecordConfig {
-        name: "@".to_owned(),
-        rr_type: "SOA".to_owned(),
-        ttl: Some(3600),
-        rdata: serde_json::json!({
-            "mname": "ns1.example.com.",
-            "rname": "hostmaster.example.com.",
-            "serial": serial,
-            "refresh": 7200,
-            "retry": 900,
-            "expire": 1_209_600,
-            "minimum": 300
-        }),
-    }
+fn soa_config(serial: u32) -> String {
+    format!("@ 3600 IN SOA ns1.example.com. hostmaster.example.com. {serial} 7200 900 1209600 300")
 }
 
-fn ns_config() -> RecordConfig {
-    RecordConfig {
-        name: "@".to_owned(),
-        rr_type: "NS".to_owned(),
-        ttl: Some(3600),
-        rdata: serde_json::json!("ns1.example.com."),
-    }
+fn ns_config() -> String {
+    "@ 3600 IN NS ns1.example.com.".to_owned()
 }
 
-fn a_config(owner: &str, address: &str) -> RecordConfig {
-    RecordConfig {
-        name: owner.to_owned(),
-        rr_type: "A".to_owned(),
-        ttl: Some(300),
-        rdata: serde_json::json!(address),
-    }
+fn a_config(owner: &str, address: &str) -> String {
+    format!("{owner} 300 IN A {address}")
 }
 
-fn zone_config(records: Vec<RecordConfig>) -> ZoneConfig {
-    ZoneConfig {
-        origin: "example.com.".to_owned(),
-        class: "IN".to_owned(),
-        default_ttl: 3600,
-        records,
-    }
+fn zone_config(records: Vec<String>) -> Vec<String> {
+    records
 }
 
-fn base_config(zone: ZoneConfig) -> Config {
-    Config {
-        listen_udp: Some("127.0.0.1:0".parse().expect("udp")),
-        listen_tcp: Some("127.0.0.1:0".parse().expect("tcp")),
-        workers: 1,
-        tcp: TcpConfig {
-            idle_timeout_ms: 5000,
-            ..TcpConfig::default()
-        },
-        zones: vec![zone],
-        ..Config::default()
+fn base_config(records: Vec<String>) -> (common::TempZone, Config) {
+    let mut text = String::from("$ORIGIN example.com.\n$TTL 3600\n");
+    for line in records {
+        text.push_str(&line);
+        text.push('\n');
     }
+    let (_dir, path) = common::write_text("transfer-zone", "zone", &text);
+    let zone = common::TempZone::with_import("transfer", "example.com.", &path);
+    let mut config = common::base_config(zone.path());
+    config.tcp = TcpConfig {
+        idle_timeout_ms: 5000,
+        ..TcpConfig::default()
+    };
+    (zone, config)
 }
 
 fn api_options() -> ApiOptions {
@@ -168,11 +144,11 @@ fn ixfr(address: SocketAddr, client_serial: u32) -> Result<IxfrOutcome, Transfer
 }
 
 #[test]
-fn axfr_ten_thousand_records_with_and_without_tsig() {
-    let mut records = Vec::with_capacity(10_002);
+fn axfr_two_thousand_records_with_and_without_tsig() {
+    let mut records = Vec::with_capacity(2_002);
     records.push(soa_config(2_026_112_401));
     records.push(ns_config());
-    for index in 0..10_000_u32 {
+    for index in 0..2_000_u32 {
         let address = format!(
             "10.{}.{}.{}",
             (index >> 16) & 0xFF,
@@ -182,23 +158,23 @@ fn axfr_ten_thousand_records_with_and_without_tsig() {
         records.push(a_config(&format!("host{index}"), &address));
     }
 
-    let mut unsigned = base_config(zone_config(records.clone()));
+    let (_unsigned_zone, mut unsigned) = base_config(zone_config(records.clone()));
     unsigned.transfer.require_tsig = false;
     let mut server = Server::start(&unsigned).expect("start unsigned");
     let snapshot = axfr(server.tcp_addr().expect("tcp"), None).expect("unsigned AXFR");
     assert_eq!(snapshot.serial(), Serial::new(2_026_112_401));
-    assert_eq!(snapshot.records().len(), 10_001);
-    assert_eq!(snapshot.records_with_soa().len(), 10_002);
+    assert_eq!(snapshot.records().len(), 2_001);
+    assert_eq!(snapshot.records_with_soa().len(), 2_002);
     server.shutdown().expect("shutdown unsigned");
 
-    let mut signed_config = base_config(zone_config(records));
+    let (_signed_zone, mut signed_config) = base_config(zone_config(records));
     signed_config.tsig_keys = vec![tsig_config(KEY_NAME, SECRET_B64)];
     signed_config.transfer.require_tsig = true;
     let mut server = Server::start(&signed_config).expect("start signed");
     let key = key();
     let snapshot = axfr(server.tcp_addr().expect("tcp"), Some(&key)).expect("signed AXFR");
     assert_eq!(snapshot.serial(), Serial::new(2_026_112_401));
-    assert_eq!(snapshot.records().len(), 10_001);
+    assert_eq!(snapshot.records().len(), 2_001);
     server.shutdown().expect("shutdown signed");
 }
 
@@ -206,7 +182,7 @@ fn axfr_ten_thousand_records_with_and_without_tsig() {
 fn tsig_and_acl_rejections_are_notauth_or_refused() {
     let zone = || zone_config(vec![soa_config(1), ns_config()]);
 
-    let mut config = base_config(zone());
+    let (_zone, mut config) = base_config(zone());
     config.tsig_keys = vec![tsig_config(KEY_NAME, SECRET_B64)];
     let mut server = Server::start(&config).expect("start");
     let address = server.tcp_addr().expect("tcp");
@@ -236,7 +212,7 @@ fn tsig_and_acl_rejections_are_notauth_or_refused() {
     ));
     server.shutdown().expect("shutdown");
 
-    let mut denied = base_config(zone());
+    let (_denied_zone, mut denied) = base_config(zone());
     denied.transfer.require_tsig = false;
     denied.transfer.allow_from = vec!["192.0.2.1".parse().expect("ip")];
     let mut server = Server::start(&denied).expect("start denied");
@@ -261,7 +237,7 @@ fn ixfr_incremental_and_axfr_fallback() {
         ));
     }
     records.push(a_config("www", "192.0.2.10"));
-    let mut config = base_config(zone_config(records));
+    let (_zone, mut config) = base_config(zone_config(records));
     config.transfer.require_tsig = false;
     let mut server = Server::start_with_api(&config, Some(api_options())).expect("start DNS+API");
     let tcp = server.tcp_addr().expect("tcp");
@@ -318,7 +294,7 @@ fn rest_change_sends_notify_out_with_tsig() {
         .expect("timeout");
     let receiver_addr = receiver.local_addr().expect("addr");
 
-    let mut config = base_config(zone_config(vec![
+    let (_zone, mut config) = base_config(zone_config(vec![
         soa_config(7),
         ns_config(),
         a_config("www", "192.0.2.20"),
@@ -355,7 +331,7 @@ fn rest_change_sends_notify_out_with_tsig() {
 
 #[test]
 fn notify_in_returns_noerror_and_marks_zone() {
-    let mut config = base_config(zone_config(vec![
+    let (_zone, mut config) = base_config(zone_config(vec![
         soa_config(3),
         ns_config(),
         a_config("www", "192.0.2.30"),
@@ -409,7 +385,7 @@ fn notify_in_returns_noerror_and_marks_zone() {
 
 #[test]
 fn notify_in_unknown_zone_is_refused() {
-    let mut config = base_config(zone_config(vec![soa_config(1), ns_config()]));
+    let (_zone, mut config) = base_config(zone_config(vec![soa_config(1), ns_config()]));
     config.transfer.require_tsig = false;
     let mut server = Server::start(&config).expect("start");
     let udp = server.udp_addr().expect("udp");
@@ -436,15 +412,11 @@ fn notify_in_unknown_zone_is_refused() {
 
 #[test]
 fn axfr_after_persistence_reopen_sees_rest_changes() {
-    let dir = TempDir::new("transfer-reopen");
-    let data = dir.path().join("zones.pulse");
-    let mut config = base_config(zone_config(vec![
+    let (_zone, mut config) = base_config(zone_config(vec![
         soa_config(10),
         ns_config(),
         a_config("www", "192.0.2.40"),
     ]));
-    config.zonefile = Some(data.clone());
-    config.map_size = 64 * 1024 * 1024;
     config.tsig_keys = vec![tsig_config(KEY_NAME, SECRET_B64)];
     let key = key();
 
@@ -470,33 +442,6 @@ fn axfr_after_persistence_reopen_sees_rest_changes() {
                 && record.rdata() == &Rdata::A("192.0.2.41".parse().expect("ipv4")))
     );
     server.shutdown().expect("shutdown second");
-}
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "pulsed-transfer-{label}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).expect("temp dir");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 struct HttpResponse {

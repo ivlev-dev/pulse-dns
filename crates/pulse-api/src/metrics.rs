@@ -50,8 +50,8 @@ impl Metrics {
         inner.rate_limited = inner.rate_limited.saturating_add(1);
     }
 
-    /// Рендерит Prometheus text exposition 0.0.4.
-    pub(crate) fn render(&self) -> String {
+    /// Рендерит метрики вместе со счётчиками `pulse-zonefile`.
+    pub(crate) fn render_with(&self, zonefile: Option<crate::port::ZoneFileMetrics>) -> String {
         let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let mut out = String::new();
         out.push_str("# HELP pulse_api_requests_total Total HTTP requests served.\n");
@@ -94,6 +94,26 @@ impl Metrics {
             "pulse_api_rate_limited_total {}\n",
             inner.rate_limited
         ));
+        if let Some(zonefile) = zonefile {
+            out.push_str("# HELP zonefile_snapshot_pins Zonefile snapshot pins taken.\n");
+            out.push_str("# TYPE zonefile_snapshot_pins counter\n");
+            out.push_str(&format!(
+                "zonefile_snapshot_pins {}\n",
+                zonefile.snapshot_pins
+            ));
+            out.push_str("# HELP zonefile_lookups Zonefile RRset lookups.\n");
+            out.push_str("# TYPE zonefile_lookups counter\n");
+            out.push_str(&format!("zonefile_lookups {}\n", zonefile.lookups));
+            out.push_str("# HELP zonefile_commits Successful zonefile commits.\n");
+            out.push_str("# TYPE zonefile_commits counter\n");
+            out.push_str(&format!("zonefile_commits {}\n", zonefile.commits));
+            out.push_str("# HELP zonefile_commit_errors Failed zonefile commits.\n");
+            out.push_str("# TYPE zonefile_commit_errors counter\n");
+            out.push_str(&format!(
+                "zonefile_commit_errors {}\n",
+                zonefile.commit_errors
+            ));
+        }
         out
     }
 }
@@ -122,7 +142,7 @@ mod tests {
         metrics.record_request("GET", "/healthz", 200);
         metrics.record_error("zone_not_found");
         metrics.denied_zone_out_of_scope();
-        let text = metrics.render();
+        let text = metrics.render_with(None);
         assert!(text.contains(
             "pulse_api_requests_total{method=\"GET\",route=\"/healthz\",status=\"200\"} 2"
         ));

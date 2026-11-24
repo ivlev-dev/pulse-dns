@@ -1,6 +1,8 @@
 //! E2E: подпись `examples/example.com.zone`, отдача RRSIG/NSEC по UDP и
 //! независимая проверка ответа через `pulse-dnssec`.
 
+mod common;
+
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
@@ -38,6 +40,7 @@ fn name(text: &str) -> Name {
 
 struct Fixture {
     _dir: tempfile::TempDir,
+    _zone: common::TempZone,
     config: Config,
 }
 
@@ -53,11 +56,14 @@ fn fixture(with_api: bool) -> Fixture {
     let ksk_paths = write_key_pair(&key_dir, &origin(), &ksk, 257, &NoopAudit).expect("write ksk");
     let zsk_paths = write_key_pair(&key_dir, &origin(), &zsk, 256, &NoopAudit).expect("write zsk");
 
+    let zone = common::TempZone::with_import("dnssec", "example.com.", &zone_path);
     let config_value = json!({
         "listen_udp": "127.0.0.1:0",
         "listen_tcp": null,
         "workers": 1,
-        "zones_files": [{"origin": "example.com.", "path": zone_path}],
+        "zonefile": zone.path(),
+        "durability": "flush",
+        "map_size": 64 * 1024 * 1024,
         "dnssec": {
             "example.com.": {
                 "keys": [
@@ -71,8 +77,10 @@ fn fixture(with_api: bool) -> Fixture {
     });
     let _ = with_api;
     let config = Config::from_json_str(&config_value.to_string()).expect("DNSSEC config parses");
+    config.validate().expect("DNSSEC config validates");
     Fixture {
         _dir: directory,
+        _zone: zone,
         config,
     }
 }
@@ -366,5 +374,56 @@ fn keys_endpoint_and_resign() {
     let signatures = rrsigs_from(response.answers(), &origin(), Rtype::DNSKEY);
     assert!(verify_any(&rrset, &signatures, &dnskeys, at));
 
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn import_sign_writes_rrsig_to_zonefile() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let key_dir = directory.path().join("keys");
+    let ksk = PrivateKey::generate(Algorithm::ED25519).expect("ksk");
+    let zsk = PrivateKey::generate(Algorithm::ED25519).expect("zsk");
+    let ksk_paths = write_key_pair(&key_dir, &origin(), &ksk, 257, &NoopAudit).expect("ksk");
+    let zsk_paths = write_key_pair(&key_dir, &origin(), &zsk, 256, &NoopAudit).expect("zsk");
+    let zone = common::TempZone::empty("import-sign");
+    let zone_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("examples/example.com.zone");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pulsed"))
+        .arg("import")
+        .arg("--sign")
+        .arg("--data")
+        .arg(zone.path())
+        .arg("--origin")
+        .arg("example.com.")
+        .arg("--dnssec-key")
+        .arg(format!("example.com.=ksk:{}", ksk_paths.private.display()))
+        .arg("--dnssec-key")
+        .arg(format!("example.com.=zsk:{}", zsk_paths.private.display()))
+        .arg(&zone_path)
+        .env_remove("PULSED_API_TOKEN")
+        .output()
+        .expect("run import --sign");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Сервер запускается без dnssec-настроек: подписи уже лежат в zonefile.
+    let config = common::base_config(zone.path());
+    let mut server = Server::start(&config).expect("start signed zonefile");
+    let response = udp_query(&server, "www.example.com.", Rtype::A, true);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    assert!(
+        response
+            .answers()
+            .iter()
+            .any(|record| record.rr_type() == Rtype::RRSIG),
+        "import --sign must store RRSIG in the zonefile"
+    );
+    let response = udp_query(&server, "example.com.", Rtype::DNSKEY, true);
+    let dnskeys = dnskeys_from(response.answers(), &origin());
+    assert!(!dnskeys.is_empty(), "DNSKEY must be stored");
     server.shutdown().expect("shutdown");
 }

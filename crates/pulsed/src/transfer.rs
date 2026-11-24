@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use pulse_api::{StoreSnapshot, ZoneKind};
+use pulse_api::ZoneKind;
 use pulse_dns::{DecodeLimits, EncodeOptions, Message, Name, Opcode, Rcode, Record, Rtype, Serial};
 use pulse_transfer::{
     AxfrServer, IxfrServer, NotifyIgnoreReason, NotifyOutcome, NotifyPolicy, NotifyRequest,
@@ -84,9 +84,9 @@ pub(crate) enum NotifyAction {
     },
 }
 
-/// Одна зона в transfer-состоянии.
+/// Одна зона в transfer-состоянии. Текущий снапшот строится из zonefile по
+/// запросу, в памяти остаются только IXFR-дельты.
 struct ZoneTransfer {
-    snapshot: Arc<ZoneSnapshot>,
     history: Arc<ZoneHistory>,
     notify: bool,
 }
@@ -104,10 +104,11 @@ pub(crate) struct TransferState {
     replay: Mutex<ReplayCache>,
     pending: Mutex<HashMap<Name, Option<Serial>>>,
     notify: Option<Arc<NotifyDispatcher>>,
+    source: RwLock<Option<Arc<crate::zonefile::ZoneStore>>>,
 }
 
 impl TransferState {
-    /// Создаёт состояние из конфигурации и начального снапшота store.
+    /// Создаёт состояние из конфигурации и списка зон zonefile.
     ///
     /// Начальные зоны не порождают NOTIFY: уведомления отправляются только
     /// после мутаций.
@@ -115,7 +116,8 @@ impl TransferState {
         settings: &TransferSettings,
         keys: &[TsigKeyConfig],
         secondary: &[crate::config::SecondaryZoneConfig],
-        snapshot: &StoreSnapshot,
+        zones_meta: Vec<(Name, ZoneKind, Option<Serial>)>,
+        source: Option<Arc<crate::zonefile::ZoneStore>>,
         notify: Option<Arc<NotifyDispatcher>>,
     ) -> Result<Self, TransferSetupError> {
         let config = build_transfer_config(settings)?;
@@ -148,18 +150,19 @@ impl TransferState {
             notify_zones.insert(origin);
         }
 
-        let mut zones = HashMap::with_capacity(snapshot.zones.len());
-        for zone in &snapshot.zones {
-            if let Some(built) = build_zone(zone) {
-                zones.insert(
-                    zone.origin.clone(),
-                    Arc::new(ZoneTransfer {
-                        snapshot: Arc::new(built),
-                        history: Arc::new(ZoneHistory::new()),
-                        notify: zone.kind == ZoneKind::Primary,
-                    }),
-                );
+        let mut zones = HashMap::with_capacity(zones_meta.len());
+        for (origin, kind, serial) in zones_meta {
+            if !matches!(kind, ZoneKind::Primary | ZoneKind::Secondary) {
+                continue;
             }
+            let _ = serial;
+            zones.insert(
+                origin,
+                Arc::new(ZoneTransfer {
+                    history: Arc::new(ZoneHistory::new()),
+                    notify: kind == ZoneKind::Primary,
+                }),
+            );
         }
         Ok(Self {
             settings: settings.clone(),
@@ -173,57 +176,52 @@ impl TransferState {
             replay: Mutex::new(ReplayCache::new(16_384)),
             pending: Mutex::new(HashMap::new()),
             notify,
+            source: RwLock::new(source),
         })
     }
 
-    /// Перестраивает transfer-снапшоты после мутации store и ставит NOTIFY.
-    pub(crate) fn refresh(&self, snapshot: &StoreSnapshot) {
-        let built: Vec<(Name, bool, ZoneSnapshot)> = snapshot
-            .zones
-            .iter()
-            .filter_map(|zone| {
-                build_zone(zone)
-                    .map(|built| (zone.origin.clone(), zone.kind == ZoneKind::Primary, built))
-            })
-            .collect();
+    /// Фиксирует изменение зоны: обновляет IXFR-историю и ставит NOTIFY.
+    ///
+    /// `previous` — снапшот до коммита (если был), `current` — после.
+    pub(crate) fn record_change(
+        &self,
+        origin: &Name,
+        previous: Option<&ZoneSnapshot>,
+        current: Option<&ZoneSnapshot>,
+        notify: bool,
+    ) {
         let max_deltas = self.settings.history_deltas;
-        let mut next: HashMap<Name, Arc<ZoneTransfer>> = HashMap::with_capacity(built.len());
-        let mut notifications: Vec<NotifyJob> = Vec::new();
-        let mut current: HashSet<Name> = HashSet::with_capacity(built.len());
-
-        {
-            let zones = self.zones.read().unwrap_or_else(PoisonError::into_inner);
-            for (origin, notify, snapshot) in built {
-                current.insert(origin.clone());
-                let previous = zones.get(&origin);
-                let (history, changed) = match previous {
-                    Some(previous) => update_history(
-                        previous.snapshot.as_ref(),
-                        previous.history.as_ref(),
-                        &snapshot,
-                        max_deltas,
-                    ),
-                    None => (ZoneHistory::new(), true),
+        let mut jobs: Vec<NotifyJob> = Vec::new();
+        let mut zones = self.zones.write().unwrap_or_else(PoisonError::into_inner);
+        match current {
+            Some(snapshot) => {
+                let old = zones.get(origin);
+                let (history, changed) = match (previous, old) {
+                    (Some(previous), Some(old)) => {
+                        update_history(previous, old.history.as_ref(), snapshot, max_deltas)
+                    }
+                    _ => (ZoneHistory::new(), true),
                 };
                 if notify && changed {
-                    notifications.push(NotifyJob {
+                    jobs.push(NotifyJob {
                         id: next_notify_id(),
                         zone: origin.clone(),
                         soa: Some(snapshot.soa().clone()),
                     });
                 }
-                next.insert(
-                    origin,
+                zones.insert(
+                    origin.clone(),
                     Arc::new(ZoneTransfer {
-                        snapshot: Arc::new(snapshot),
                         history: Arc::new(history),
                         notify,
                     }),
                 );
             }
-            for (origin, previous) in zones.iter() {
-                if !current.contains(origin) && previous.notify {
-                    notifications.push(NotifyJob {
+            None => {
+                if let Some(old) = zones.remove(origin)
+                    && old.notify
+                {
+                    jobs.push(NotifyJob {
                         id: next_notify_id(),
                         zone: origin.clone(),
                         soa: None,
@@ -231,11 +229,18 @@ impl TransferState {
                 }
             }
         }
-        *self.zones.write().unwrap_or_else(PoisonError::into_inner) = next;
-
-        for job in notifications {
+        drop(zones);
+        for job in jobs {
             self.enqueue_notify(job);
         }
+    }
+
+    fn zone_kind(&self, origin: &Name) -> Option<bool> {
+        self.zones
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(origin)
+            .map(|zone| zone.notify)
     }
 
     /// Помечает зону к обновлению после входящего NOTIFY.
@@ -319,15 +324,35 @@ impl TransferState {
             );
             return send_refusal(stream, request, Rcode::REFUSED);
         }
-        let Some(zone) = self
+        let Some(notify) = self.zone_kind(origin) else {
+            return send_refusal(stream, request, Rcode::REFUSED);
+        };
+        let _ = notify;
+        let store_source = self
+            .source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let snapshot = match store_source {
+            Some(store) => match store.zone_snapshot(origin) {
+                Ok(Some(snapshot)) => Arc::new(snapshot),
+                Ok(None) => return send_refusal(stream, request, Rcode::REFUSED),
+                Err(error) => {
+                    logging::error("transfer", &format!("zone {origin}: {error}"));
+                    return send_refusal(stream, request, Rcode::SERVFAIL);
+                }
+            },
+            None => return send_refusal(stream, request, Rcode::REFUSED),
+        };
+        let history = self
             .zones
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(origin)
-            .cloned()
-        else {
-            return send_refusal(stream, request, Rcode::REFUSED);
-        };
+            .map_or_else(
+                || Arc::new(ZoneHistory::new()),
+                |zone| Arc::clone(&zone.history),
+            );
 
         let key = self.authenticate_transfer(request, raw, now, stream)?;
 
@@ -343,14 +368,14 @@ impl TransferState {
         let stats = match qtype {
             Rtype::AXFR => AxfrServer::new(self.config).serve(
                 &mut rewind,
-                zone.snapshot.as_ref(),
+                snapshot.as_ref(),
                 key.as_deref(),
                 now,
             )?,
             Rtype::IXFR => IxfrServer::new(self.config).serve(
                 &mut rewind,
-                zone.snapshot.as_ref(),
-                zone.history.as_ref(),
+                snapshot.as_ref(),
+                history.as_ref(),
                 key.as_deref(),
                 now,
             )?,
@@ -614,43 +639,6 @@ fn build_keys(keys: &[TsigKeyConfig]) -> Result<HashMap<Name, Arc<TsigKey>>, Tra
         map.insert(name, Arc::new(key));
     }
     Ok(map)
-}
-
-pub(crate) fn build_zone(zone: &pulse_api::ZoneSnapshot) -> Option<ZoneSnapshot> {
-    if !matches!(zone.kind, ZoneKind::Primary | ZoneKind::Secondary) {
-        return None;
-    }
-    let mut records = Vec::new();
-    for rrset in &zone.rrsets {
-        for rdata in rrset.rdatas() {
-            match Record::new(
-                rrset.owner().clone(),
-                rrset.rr_type(),
-                rrset.class(),
-                rrset.ttl(),
-                rdata.clone(),
-            ) {
-                Ok(record) => records.push(record),
-                Err(error) => {
-                    logging::error(
-                        "transfer",
-                        &format!("zone {}: cannot build record: {error}", zone.origin),
-                    );
-                    return None;
-                }
-            }
-        }
-    }
-    match ZoneSnapshot::new(zone.origin.clone(), records) {
-        Ok(snapshot) => Some(snapshot),
-        Err(error) => {
-            logging::error(
-                "transfer",
-                &format!("zone {} cannot be transferred: {error}", zone.origin),
-            );
-            None
-        }
-    }
 }
 
 fn update_history(

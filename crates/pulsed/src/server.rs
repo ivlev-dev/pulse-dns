@@ -7,21 +7,18 @@ use std::sync::Arc;
 
 use pulse_api::auth::TokenConfig;
 use pulse_api::config::ApiConfig;
-use pulse_api::memory::InMemoryZoneAdmin;
 use pulse_api::server::{ApiServerError, RunningServer, serve};
 use pulse_server::StatsSnapshot as QueryStatsSnapshot;
 use thiserror::Error;
 
 use crate::config::{Config, ConfigError};
 use crate::dnssec::{self, DnssecError};
-use crate::persist::{self, ZonePersistence};
 use crate::secondary::SecondaryScheduler;
 use crate::stats::{Stats, StatsSnapshot};
 use crate::store::{self, SharedZoneAdmin};
 use crate::tcp::TcpService;
 use crate::transfer::{self, NotifyDispatcher};
 use crate::udp::UdpService;
-use crate::zone::ZoneError;
 
 /// Параметры встроенного REST API.
 #[derive(Clone, PartialEq, Eq)]
@@ -70,69 +67,49 @@ impl Server {
 
     /// Запускает DNS-сервер и, если задан `api`, встроенный REST API.
     ///
-    /// JSON/master-зоны загружаются в [`InMemoryZoneAdmin`] — он является
-    /// источником истины для DNS и для API. API и DNS используют один store,
-    /// поэтому успешная мутация сразу подменяет снапшот `QueryEngine`.
-    ///
-    /// Если задан `config.zonefile`, при первом запуске store импортируется и
-    /// коммитится в `pulse-zonefile`, при последующих — загружается из файла
-    /// (конфигурационные зоны игнорируются). Мутации пишутся write-through.
+    /// Единственный источник истины — `pulse-zonefile` (`config.zonefile`,
+    /// CLI `--data`). DNS-ответы читаются из mmap, REST-мутации пишут в тот же
+    /// файл. Без zonefile сервер поднимается без зон и отвечает `REFUSED`.
     ///
     /// # Errors
     ///
-    /// [`ServerError::Config`] / [`ServerError::Zone`] при некорректной
-    /// конфигурации, [`ServerError::Store`] при загрузке зон в store,
+    /// [`ServerError::Config`] при некорректной конфигурации,
+    /// [`ServerError::Store`] при открытии zonefile/initial snapshot,
     /// [`ServerError::TcpStart`] / [`ServerError::Udp`] при ошибке транспорта,
     /// [`ServerError::Api`] при ошибке конфигурации или запуска API.
     #[allow(clippy::too_many_lines)]
     pub fn start_with_api(config: &Config, api: Option<ApiOptions>) -> Result<Self, ServerError> {
         config.validate()?;
-        let store = Arc::new(InMemoryZoneAdmin::new());
         let dnssec = dnssec::load(config).map_err(ServerError::Dnssec)?;
-        let persistence = if let Some(path) = &config.zonefile {
-            let (mut persistence, zones, fresh) = ZonePersistence::open_or_create(
-                path,
-                config.map_size,
-                config.durability.sync_mode(),
-            )
-            .map_err(|error| ServerError::Store(error.to_string()))?;
-            if fresh {
-                let prepared = store::load_config(&store, config, &dnssec).and_then(|()| {
-                    persistence
-                        .bootstrap(&store.snapshot())
-                        .map_err(|error| error.to_string())
-                });
-                if let Err(error) = prepared {
-                    // Не оставляем валидный пустой файл после неудачного
-                    // bootstrap: следующий запуск должен снова пройти
-                    // fail-fast по конфигурации.
-                    drop(persistence);
-                    let _ = std::fs::remove_file(path);
-                    return Err(ServerError::Store(error));
-                }
-                crate::logging::info(
-                    "persistence",
-                    &format!(
-                        "bootstrapped zone file {} from JSON/master sources",
-                        path.display()
-                    ),
+        let store = match &config.zonefile {
+            Some(path) => {
+                let store = Arc::new(
+                    crate::zonefile::ZoneStore::open_or_create(
+                        path,
+                        config.map_size,
+                        config.durability.sync_mode(),
+                    )
+                    .map_err(|error| ServerError::Store(error.to_string()))?,
                 );
-            } else {
-                let count = zones.len();
-                persist::load_into_store(&store, zones).map_err(ServerError::Store)?;
+                crate::logging::info("zonefile", &format!("opened zone file {}", path.display()));
+                Some(store)
+            }
+            None => None,
+        };
+        if let Some(store) = &store {
+            let signed =
+                store::sign_configured_zones(store, &dnssec).map_err(ServerError::Store)?;
+            if signed > 0 {
                 crate::logging::info(
-                    "persistence",
-                    &format!(
-                        "loaded {count} zone(s) from {}; JSON/master zones are ignored",
-                        path.display()
-                    ),
+                    "dnssec",
+                    &format!("{signed} zone(s) signed into zonefile at startup"),
                 );
             }
-            Some(persistence)
-        } else {
-            store::load_config(&store, config, &dnssec).map_err(ServerError::Store)?;
-            None
-        };
+        } else if dnssec.origins().next().is_some() {
+            return Err(ServerError::Store(
+                "dnssec zones require --data <zonefile>".to_owned(),
+            ));
+        }
         let notify = if config.transfer.notify.is_empty() {
             None
         } else {
@@ -142,11 +119,9 @@ impl Server {
                 NotifyDispatcher::start(&config.transfer, key).map_err(ServerError::Notify)?,
             ))
         };
-        let admin = Arc::new(
-            SharedZoneAdmin::new(store, dnssec, persistence, config, notify).map_err(|error| {
-                ServerError::Store(format!("cannot build initial DNS snapshot: {error}"))
-            })?,
-        );
+        let admin = Arc::new(SharedZoneAdmin::new(store, dnssec, config, notify).map_err(
+            |error| ServerError::Store(format!("cannot build initial DNS snapshot: {error}")),
+        )?);
         let secondary = if admin.has_secondary_zones() {
             Some(
                 SecondaryScheduler::start(Arc::downgrade(&admin))
@@ -316,9 +291,6 @@ pub enum ServerError {
     /// Некорректная конфигурация.
     #[error(transparent)]
     Config(#[from] ConfigError),
-    /// Некорректная зона.
-    #[error(transparent)]
-    Zone(#[from] ZoneError),
     /// Ошибка загрузки зон в store или построения DNS-снапшота.
     #[error("zone store error: {0}")]
     Store(String),

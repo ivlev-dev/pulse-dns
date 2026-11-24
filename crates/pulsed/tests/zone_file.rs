@@ -1,36 +1,20 @@
-//! Загрузка RFC 1035 master-файлов и совместная работа с REST/DNS.
+//! E2E импорта master-файлов, mmap-ответов и миграции конфигурации.
+
+mod common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use pulse_dns::{
     DecodeLimits, EncodeOptions, Message, Name, Question, Rclass, Rcode, Rdata, Rtype,
 };
-use pulsed::config::{Config, ZoneFileConfig};
+use pulsed::config::Config;
 use pulsed::server::{ApiOptions, Server};
 
 const TOKEN: &str = "pd_live_master_integration_0123456789abcdef";
-
-fn example_zone() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/example.com.zone")
-}
-
-fn test_config() -> Config {
-    Config {
-        listen_udp: Some("127.0.0.1:0".parse().expect("udp")),
-        listen_tcp: Some("127.0.0.1:0".parse().expect("tcp")),
-        workers: 1,
-        zones: Vec::new(),
-        zones_files: vec![ZoneFileConfig {
-            origin: "example.com.".to_owned(),
-            path: example_zone(),
-        }],
-        ..Config::default()
-    }
-}
 
 fn recv_from(socket: &UdpSocket, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
     loop {
@@ -81,18 +65,32 @@ fn put_a(api: SocketAddr, path: &str, record: &str) {
     );
 }
 
+const EXTRA_ZONE: &str = "$ORIGIN mmap.test.
+$TTL 3600
+@ IN SOA ns1.mmap.test. hostmaster.mmap.test. 1 3600 600 604800 300
+@ IN NS ns1.mmap.test.
+ns1 IN A 192.0.2.53
+www IN A 192.0.2.20
+www IN AAAA 2001:db8::20
+*.wild IN A 192.0.2.99
+deleg IN NS ns.deleg.mmap.test.
+ns.deleg IN A 192.0.2.80
+";
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn master_file_zone_is_served_and_mutable_via_api() {
+    let zone = common::TempZone::with_import("master", "example.com.", &common::example_zone());
+    let config = common::base_config(zone.path());
     let mut server = Server::start_with_api(
-        &test_config(),
+        &config,
         Some(ApiOptions {
             listen: "127.0.0.1:0".parse().expect("api"),
             token: TOKEN.to_owned(),
             scopes: Vec::new(),
         }),
     )
-    .expect("start DNS+API with master file");
+    .expect("start DNS+API with imported zone");
     let api = server.api_addr().expect("api enabled");
 
     let response = dns_query(&server, "www.example.com.", Rtype::A);
@@ -125,96 +123,111 @@ fn master_file_zone_is_served_and_mutable_via_api() {
     );
 
     server.shutdown().expect("shutdown");
+    drop(server);
+
+    // Рестарт без повторного импорта: данные и REST-правка на месте.
+    let mut reopened = Server::start(&config).expect("reopen zonefile");
+    let response = dns_query(&reopened, "www.example.com.", Rtype::A);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    assert_eq!(
+        response.answers()[0].rdata(),
+        &Rdata::A("192.0.2.55".parse().expect("ipv4"))
+    );
+    reopened.shutdown().expect("shutdown");
 }
 
 #[test]
-fn json_and_master_sources_share_one_store() {
-    let mut config = Config::from_json_str(
-        r#"{
-            "listen_udp": "127.0.0.1:0",
-            "listen_tcp": "127.0.0.1:0",
-            "workers": 1,
-            "zones": [{
-                "origin": "json.test.",
-                "records": [
-                    {"name": "@", "type": "SOA", "rdata": {
-                        "mname": "ns1.json.test.", "rname": "hostmaster.json.test.",
-                        "serial": 1, "refresh": 3600, "retry": 600,
-                        "expire": 604800, "minimum": 300
-                    }},
-                    {"name": "@", "type": "NS", "rdata": "ns1.json.test."},
-                    {"name": "host", "type": "A", "rdata": "192.0.2.77"}
-                ]
-            }]
-        }"#,
-    )
-    .expect("JSON config");
-    config.zones_files.push(ZoneFileConfig {
-        origin: "example.com.".to_owned(),
-        path: example_zone(),
-    });
-    let mut server = Server::start(&config).expect("start mixed sources");
-    let json = dns_query(&server, "host.json.test.", Rtype::A);
-    assert_eq!(json.rcode(), Rcode::NOERROR);
+fn mmap_serves_wildcard_delegation_aaaa_and_nxdomain() {
+    let (_dir, path) = common::write_text("mmap", "mmap.zone", EXTRA_ZONE);
+    let zone = common::TempZone::with_import("mmap-data", "mmap.test.", &path);
+    let config = common::base_config(zone.path());
+    let mut server = Server::start(&config).expect("start");
+
+    let response = dns_query(&server, "www.mmap.test.", Rtype::A);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
     assert_eq!(
-        json.answers()[0].rdata(),
-        &Rdata::A("192.0.2.77".parse().expect("ipv4"))
-    );
-    let master = dns_query(&server, "www.example.com.", Rtype::A);
-    assert_eq!(master.rcode(), Rcode::NOERROR);
-    assert_eq!(
-        master.answers()[0].rdata(),
+        response.answers()[0].rdata(),
         &Rdata::A("192.0.2.20".parse().expect("ipv4"))
     );
+
+    let response = dns_query(&server, "www.mmap.test.", Rtype::AAAA);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    assert!(matches!(response.answers()[0].rdata(), Rdata::Aaaa(_)));
+
+    let response = dns_query(&server, "host.wild.mmap.test.", Rtype::A);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    assert_eq!(
+        response.answers()[0].rdata(),
+        &Rdata::A("192.0.2.99".parse().expect("ipv4"))
+    );
+
+    let response = dns_query(&server, "x.deleg.mmap.test.", Rtype::A);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    assert!(!response.flags().aa());
+    assert!(
+        response
+            .authority()
+            .iter()
+            .any(|record| record.rr_type() == Rtype::NS)
+    );
+
+    let response = dns_query(&server, "missing.mmap.test.", Rtype::A);
+    assert_eq!(response.rcode(), Rcode::NXDOMAIN);
+
     server.shutdown().expect("shutdown");
 }
 
 #[test]
-fn conflicting_origin_fails_startup() {
-    let mut config =
-        Config::from_json_str(include_str!("../../../examples/zones.json")).expect("config");
-    config.listen_udp = Some("127.0.0.1:0".parse().expect("udp"));
-    config.listen_tcp = Some("127.0.0.1:0".parse().expect("tcp"));
-    config.zones_files.push(ZoneFileConfig {
-        origin: "example.com.".to_owned(),
-        path: example_zone(),
-    });
-    let Err(error) = Server::start(&config) else {
-        panic!("duplicate origin must fail");
-    };
+fn empty_zonefile_refuses_queries_without_panic() {
+    let zone = common::TempZone::empty("empty");
+    let config = common::base_config(zone.path());
+    let mut server = Server::start(&config).expect("start empty server");
+    let response = dns_query(&server, "www.example.com.", Rtype::A);
+    assert_eq!(response.rcode(), Rcode::REFUSED);
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn json_zones_config_fails_with_migration_hint() {
+    let zone = common::TempZone::empty("migration");
+    let mut config = common::base_config(zone.path());
+    let parsed = Config::from_json_str(
+        r#"{
+            "listen_udp": "127.0.0.1:0",
+            "listen_tcp": "127.0.0.1:0",
+            "zones": []
+        }"#,
+    )
+    .expect("schema allows migration fields");
+    config.zones = parsed.zones;
+    let error = config.validate().expect_err("JSON zones must be rejected");
     let message = error.to_string();
-    assert!(message.contains("declared more than once"), "{message}");
-    assert!(message.contains("example.com."), "{message}");
+    assert!(
+        message.contains("JSON zones are no longer supported"),
+        "{message}"
+    );
+    assert!(message.contains("pulsed import"), "{message}");
+    assert!(message.contains("--data"), "{message}");
 }
 
 #[test]
 fn broken_master_file_exits_with_code_two_and_location() {
-    let directory = std::env::temp_dir().join(format!(
-        "pulsed-master-test-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&directory).expect("temp dir");
-    let zone = directory.join("bad.zone");
+    let directory = tempfile::tempdir().expect("temp dir");
+    let zone = directory.path().join("bad.zone");
     std::fs::write(&zone, "$TTL 60\n@ IN A not-an-address\n").expect("write bad zone");
-    let empty_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/empty.json");
+    let data = directory.path().join("bad.pulse");
 
     let started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_pulsed"))
-        .arg("--config")
-        .arg(&empty_config)
-        .arg("--listen-udp")
-        .arg("127.0.0.1:0")
-        .arg("--listen-tcp")
-        .arg("127.0.0.1:0")
-        .arg("--zone")
-        .arg(format!("bad.test.={}", zone.display()))
+        .arg("import")
+        .arg("--data")
+        .arg(&data)
+        .arg("--origin")
+        .arg("bad.test.")
+        .arg(&zone)
         .env_remove("PULSED_API_TOKEN")
         .output()
-        .expect("run pulsed");
+        .expect("run pulsed import");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("bad.zone"), "stderr: {stderr}");
@@ -223,5 +236,5 @@ fn broken_master_file_exits_with_code_two_and_location() {
         started.elapsed() < Duration::from_secs(10),
         "fail-fast expected"
     );
-    let _ = std::fs::remove_dir_all(&directory);
+    assert!(!Path::new(&data).exists() || std::fs::metadata(&data).is_ok());
 }

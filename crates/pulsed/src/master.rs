@@ -5,23 +5,31 @@ use std::collections::HashMap;
 use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype, Ttl};
 use pulse_master::{Location, ParseError, ParseOptions, parse_zone_with_options};
 
-use crate::config::ZoneFileConfig;
 use crate::logging;
-use crate::zone::LoadedZone;
+
+/// Зона, прочитанная из master-файла.
+pub(crate) struct LoadedZone {
+    pub(crate) origin: Name,
+    pub(crate) default_ttl: Ttl,
+    pub(crate) rrsets: Vec<Rrset>,
+}
 
 type RrsetKey = (Name, Rtype);
 type PendingRrset = (Ttl, Vec<Rdata>);
 
 /// Читает и разбирает master-файл, переводя `Record` в RRset'ы.
-pub(crate) fn load_zone_file(config: &ZoneFileConfig) -> Result<LoadedZone, String> {
-    let origin = Name::parse(config.origin.trim()).map_err(|error| {
+pub(crate) fn load_zone_file(origin: &str, path: &std::path::Path) -> Result<LoadedZone, String> {
+    let origin = Name::parse(origin.trim()).map_err(|error| {
         format!(
-            "invalid origin {:?} for zone file {}: {error}",
-            config.origin,
-            config.path.display()
+            "invalid origin {origin:?} for zone file {}: {error}",
+            path.display()
         )
     })?;
-    let path = &config.path;
+    if origin == Name::root() || origin.labels().any(|label| label == b"*") {
+        return Err(format!(
+            "origin {origin} must be a non-root name without wildcards"
+        ));
+    }
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("cannot read zone file {}: {error}", path.display()))?;
     let include_root = path

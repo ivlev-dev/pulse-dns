@@ -5,12 +5,5 @@
   "log_level": "info",
   "zonefile": "/tmp/pulse-dns.zonefile",
   "durability": "flush",
-  "map_size": 268435456,
-  "zones": [],
-  "zones_files": [
-    {
-      "origin": "example.com.",
-      "path": "examples/example.com.zone"
-    }
-  ]
+  "map_size": 268435456
 }

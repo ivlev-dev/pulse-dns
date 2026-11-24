@@ -1,5 +1,7 @@
 //! Интеграция REST API и DNS: мутации через HTTP видны UDP-запросам сразу.
 
+mod common;
+
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
@@ -110,17 +112,10 @@ fn rrset_path(owner: &str, rr_type: &str) -> String {
     format!("{ZONE_PATH}/records/{owner}/{rr_type}")
 }
 
-fn test_config() -> Config {
-    Config {
-        listen_udp: Some("127.0.0.1:0".parse().expect("udp")),
-        listen_tcp: Some("127.0.0.1:0".parse().expect("tcp")),
-        workers: 1,
-        tcp: pulsed::config::TcpConfig {
-            idle_timeout_ms: 2000,
-            ..pulsed::config::TcpConfig::default()
-        },
-        ..Config::default()
-    }
+fn test_config() -> (common::TempZone, Config) {
+    let zone = common::TempZone::empty("api");
+    let config = common::base_config(zone.path());
+    (zone, config)
 }
 
 fn recv_from(socket: &UdpSocket, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -165,8 +160,9 @@ fn assert_a(server: &Server, expected: &str) {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn api_mutations_are_visible_to_dns() {
+    let (_zone, config) = test_config();
     let mut server = Server::start_with_api(
-        &test_config(),
+        &config,
         Some(ApiOptions {
             listen: "127.0.0.1:0".parse().expect("api"),
             token: TOKEN.to_owned(),
@@ -317,6 +313,18 @@ fn api_mutations_are_visible_to_dns() {
     // Удалённая зона не обслуживается: REFUSED.
     let response = dns_query(&server, "www.dynamic.test.", Rtype::A);
     assert_eq!(response.rcode(), Rcode::REFUSED);
+
+    let metrics = request(api, "GET", "/metrics", &[("Authorization", &bearer)], None);
+    assert_eq!(metrics.status, 200);
+    let body = String::from_utf8_lossy(&metrics.body);
+    assert!(body.contains("zonefile_snapshot_pins "), "{body}");
+    assert!(body.contains("zonefile_lookups "), "{body}");
+    assert!(body.contains("zonefile_commits "), "{body}");
+    assert!(body.contains("zonefile_commit_errors "), "{body}");
+    assert!(
+        !body.contains("zonefile_lookups 0\n"),
+        "DNS answers must use zonefile lookups: {body}"
+    );
 
     server.shutdown().expect("shutdown");
     assert!(TcpStream::connect(api).is_err(), "API listener must close");

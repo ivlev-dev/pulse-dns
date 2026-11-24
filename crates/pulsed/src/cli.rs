@@ -10,7 +10,7 @@ use pulse_dns::Name;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::config::{Config, DnssecKeyRole, Durability, LogLevel, Overrides, ZoneFileConfig};
+use crate::config::{Config, DnssecKeyRole, Durability, LogLevel, Overrides};
 use crate::logging;
 use crate::server::{ApiOptions, Server, ServerError};
 
@@ -18,6 +18,9 @@ use crate::server::{ApiOptions, Server, ServerError};
 pub(crate) fn run() -> ExitCode {
     logging::init(LogLevel::Info);
     let matches = command().get_matches();
+    if let Some(("import", matches)) = matches.subcommand() {
+        return import_zone(matches);
+    }
     let config_path = matches
         .get_one::<PathBuf>("config")
         .cloned()
@@ -40,13 +43,6 @@ pub(crate) fn run() -> ExitCode {
         }
     };
     config.apply_overrides(&overrides);
-    match zone_files(&matches) {
-        Ok(files) => config.zones_files.extend(files),
-        Err(error) => {
-            logging::error("config", &error);
-            return ExitCode::from(2);
-        }
-    }
     match dnssec_keys(&matches) {
         Ok(keys) => {
             for (origin, role, path) in keys {
@@ -182,33 +178,94 @@ pub(crate) fn run() -> ExitCode {
     }
 }
 
-fn zone_files(matches: &ArgMatches) -> Result<Vec<ZoneFileConfig>, String> {
-    let mut files = Vec::new();
-    let Some(values) = matches.get_many::<String>("zone") else {
-        return Ok(files);
+#[allow(clippy::too_many_lines)]
+fn import_zone(matches: &ArgMatches) -> ExitCode {
+    logging::init(LogLevel::Info);
+    let Some(data) = matches.get_one::<PathBuf>("data").cloned() else {
+        logging::error("import", "--data is required");
+        return ExitCode::from(2);
     };
-    for value in values {
-        let (origin, path) = value
-            .split_once('=')
-            .ok_or_else(|| format!("--zone expects <origin>=<path>, got {value:?}"))?;
-        let origin = origin.trim();
-        let path = path.trim();
-        if origin.is_empty() || path.is_empty() {
-            return Err(format!("--zone expects <origin>=<path>, got {value:?}"));
-        }
-        let name = Name::parse(origin)
-            .map_err(|error| format!("invalid --zone origin {origin:?}: {error}"))?;
-        if name == Name::root() || name.labels().any(|label| label == b"*") {
-            return Err(format!(
-                "--zone origin {origin:?} must be a non-root name without wildcards"
-            ));
-        }
-        files.push(ZoneFileConfig {
-            origin: name.to_string(),
-            path: PathBuf::from(path),
-        });
+    let Some(origin) = matches.get_one::<String>("origin").cloned() else {
+        logging::error("import", "--origin is required");
+        return ExitCode::from(2);
+    };
+    let Some(zone_file) = matches.get_one::<PathBuf>("zone-file").cloned() else {
+        logging::error("import", "zone file is required");
+        return ExitCode::from(2);
+    };
+    let replace = matches.get_flag("replace");
+    let sign = matches.get_flag("sign");
+    let durability = matches
+        .get_one::<Durability>("durability")
+        .copied()
+        .unwrap_or_default();
+    let map_size = matches
+        .get_one::<u64>("map-size")
+        .copied()
+        .unwrap_or(crate::config::DEFAULT_MAP_SIZE);
+    let mut config = Config {
+        zonefile: Some(data.clone()),
+        durability,
+        map_size,
+        ..Config::default()
+    };
+    if let Err(error) = dnssec_keys(matches) {
+        logging::error("import", &error);
+        return ExitCode::from(2);
     }
-    Ok(files)
+    if let Ok(keys) = dnssec_keys(matches) {
+        for (origin, role, path) in keys {
+            config.add_dnssec_key(&origin, role, path);
+        }
+    }
+    if sign && config.dnssec.is_empty() {
+        logging::error(
+            "import",
+            "--sign requires at least one --dnssec-key <origin>=<path>",
+        );
+        return ExitCode::from(2);
+    }
+    let dnssec = match crate::dnssec::load(&config) {
+        Ok(dnssec) => dnssec,
+        Err(error) => {
+            logging::error("import", &error.to_string());
+            return ExitCode::from(2);
+        }
+    };
+    let loaded = match crate::master::load_zone_file(&origin, &zone_file) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            logging::error("import", &error);
+            return ExitCode::from(2);
+        }
+    };
+    let store =
+        match crate::zonefile::ZoneStore::open_or_create(&data, map_size, durability.sync_mode()) {
+            Ok(store) => store,
+            Err(error) => {
+                logging::error("import", &error.to_string());
+                return ExitCode::from(1);
+            }
+        };
+    match crate::store::import_loaded_zone(&store, &loaded, replace, &dnssec) {
+        Ok(()) => {
+            logging::info(
+                "import",
+                &format!(
+                    "imported zone {} from {} into {} ({} RRset(s))",
+                    loaded.origin,
+                    zone_file.display(),
+                    data.display(),
+                    loaded.rrsets.len()
+                ),
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            logging::error("import", &error);
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn dnssec_keys(
@@ -321,10 +378,9 @@ fn api_options(matches: &ArgMatches) -> Result<Option<ApiOptions>, String> {
 
 fn server_exit_code(error: &ServerError) -> ExitCode {
     match error {
-        ServerError::Config(_)
-        | ServerError::Zone(_)
-        | ServerError::Store(_)
-        | ServerError::Dnssec(_) => ExitCode::from(2),
+        ServerError::Config(_) | ServerError::Store(_) | ServerError::Dnssec(_) => {
+            ExitCode::from(2)
+        }
         ServerError::Api(error) => match error {
             ApiServerError::Config(_) => ExitCode::from(2),
             _ => ExitCode::from(1),
@@ -341,12 +397,12 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
 fn command() -> Command {
     Command::new("pulsed")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("Authoritative DNS server (MVP): JSON zones, UDP/TCP")
+        .about("Authoritative DNS server (MVP): pulse-zonefile, UDP/TCP")
         .arg(
             Arg::new("config")
                 .long("config")
                 .value_name("PATH")
-                .default_value("examples/zones.json")
+                .default_value("pulsed.json")
                 .value_parser(value_parser!(PathBuf))
                 .help("Path to the JSON configuration file"),
         )
@@ -400,13 +456,6 @@ fn command() -> Command {
                 .help("Zonefile map size in bytes (default 4 GiB, sparse)"),
         )
         .arg(
-            Arg::new("zone")
-                .long("zone")
-                .value_name("ORIGIN=PATH")
-                .action(ArgAction::Append)
-                .help("Add a zone from an RFC 1035 master file; repeatable"),
-        )
-        .arg(
             Arg::new("dnssec-key")
                 .long("dnssec-key")
                 .value_name("ZONE=PATH")
@@ -439,6 +488,65 @@ fn command() -> Command {
                 .value_name("ORIGIN")
                 .action(ArgAction::Append)
                 .help("Per-zone API allowlist (exact origin or *.suffix.); repeatable"),
+        )
+        .subcommand(
+            Command::new("import")
+                .about("Import an RFC 1035 master file into the binary zonefile")
+                .arg(
+                    Arg::new("data")
+                        .long("data")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(PathBuf))
+                        .help("Zonefile to create or update"),
+                )
+                .arg(
+                    Arg::new("origin")
+                        .long("origin")
+                        .value_name("ORIGIN")
+                        .required(true)
+                        .help("Zone origin, e.g. example.com."),
+                )
+                .arg(
+                    Arg::new("replace")
+                        .long("replace")
+                        .action(ArgAction::SetTrue)
+                        .help("Replace an existing zone"),
+                )
+                .arg(
+                    Arg::new("sign")
+                        .long("sign")
+                        .action(ArgAction::SetTrue)
+                        .help("Sign the imported zone with configured DNSSEC keys"),
+                )
+                .arg(
+                    Arg::new("dnssec-key")
+                        .long("dnssec-key")
+                        .value_name("ZONE=PATH")
+                        .action(ArgAction::Append)
+                        .help("Signing key for --sign; repeatable"),
+                )
+                .arg(
+                    Arg::new("durability")
+                        .long("durability")
+                        .value_name("MODE")
+                        .value_parser(value_parser!(Durability))
+                        .help("Zonefile durability: sync, flush (default) or memory"),
+                )
+                .arg(
+                    Arg::new("map-size")
+                        .long("map-size")
+                        .value_name("BYTES")
+                        .value_parser(value_parser!(u64))
+                        .help("Zonefile map size in bytes (default 4 GiB, sparse)"),
+                )
+                .arg(
+                    Arg::new("zone-file")
+                        .value_name("ZONE-FILE")
+                        .required(true)
+                        .value_parser(value_parser!(PathBuf))
+                        .help("RFC 1035 master file to import"),
+                ),
         )
 }
 

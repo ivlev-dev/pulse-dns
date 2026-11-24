@@ -523,6 +523,19 @@ impl ZoneFile {
         self.catalog_entry_at(&self.meta, apex)
     }
 
+    /// Запись каталога, видимая в снапшоте `txnid`.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённый каталог/запись.
+    pub fn zone_entry_at(
+        &self,
+        txnid: u64,
+        apex: &NameRle,
+    ) -> Result<Option<ZoneEntry>, ZoneFileError> {
+        self.catalog_entry_at(self.snapshot_meta(txnid), apex)
+    }
+
     /// Ищет зону по точному apex; tombstone невидим.
     ///
     /// # Errors
@@ -579,14 +592,47 @@ impl ZoneFile {
         Ok(None)
     }
 
+    /// Longest-suffix поиск зоны по QNAME в снапшоте `txnid`.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённый каталог.
+    pub fn find_zone_suffix_at(
+        &self,
+        txnid: u64,
+        qname: &NameRle,
+    ) -> Result<Option<(NameRle, ZoneEntry)>, ZoneFileError> {
+        let meta = self.snapshot_meta(txnid);
+        let mut current = Some(*qname);
+        while let Some(name) = current {
+            if let Some(entry) = self.catalog_entry_at(meta, &name)?
+                && entry.is_live()
+            {
+                return Ok(Some((name, entry)));
+            }
+            current = name.parent();
+        }
+        Ok(None)
+    }
+
     /// Все живые зоны.
     ///
     /// # Errors
     ///
     /// `Corrupt` — повреждённый каталог.
     pub fn zones(&self) -> Result<Vec<(NameRle, ZoneEntry)>, ZoneFileError> {
-        let catalog = BTree::new(self.meta.zone_dir_root, self.meta.zone_dir_level)?;
-        let mut cursor = catalog.cursor(self, self.meta.txnid);
+        self.zones_at(self.meta.txnid)
+    }
+
+    /// Все живые зоны, видимые в снапшоте `txnid`.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённый каталог.
+    pub fn zones_at(&self, txnid: u64) -> Result<Vec<(NameRle, ZoneEntry)>, ZoneFileError> {
+        let meta = self.snapshot_meta(txnid);
+        let catalog = BTree::new(meta.zone_dir_root, meta.zone_dir_level)?;
+        let mut cursor = catalog.cursor(self, meta.txnid);
         let mut out = Vec::new();
         if !cursor.seek_first()? {
             return Ok(out);
@@ -625,20 +671,53 @@ impl ZoneFile {
     ///
     /// `Corrupt` — повреждённый каталог или страница настроек.
     pub fn zone_meta(&self, apex: &NameRle) -> Result<Option<ZoneMetaBlock>, ZoneFileError> {
-        let Some(entry) = self.catalog_entry_at(&self.meta, apex)? else {
+        self.zone_meta_at(self.meta.txnid, apex)
+    }
+
+    /// Per-zone metadata block, видимый в снапшоте `txnid`.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённый каталог или страница настроек.
+    pub fn zone_meta_at(
+        &self,
+        txnid: u64,
+        apex: &NameRle,
+    ) -> Result<Option<ZoneMetaBlock>, ZoneFileError> {
+        let meta = self.snapshot_meta(txnid);
+        let Some(entry) = self.catalog_entry_at(meta, apex)? else {
             return Ok(None);
         };
         if !entry.is_live() || entry.meta_root == 0 {
             return Ok(None);
         }
         let page = self.read_page(entry.meta_root)?;
-        ZoneMetaBlock::decode(
-            page,
-            entry.meta_root,
-            self.meta.txnid,
-            self.superblock.page_size,
-        )
-        .map(Some)
+        ZoneMetaBlock::decode(page, entry.meta_root, meta.txnid, self.superblock.page_size)
+            .map(Some)
+    }
+
+    /// Состояние узла имени в снапшоте `txnid`.
+    ///
+    /// Возвращает `None`, если зона отсутствует.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённый каталог/дерево.
+    pub fn node_at(
+        &self,
+        txnid: u64,
+        apex: &NameRle,
+        name: &NameRle,
+    ) -> Result<Option<crate::tree::NodeInfo>, ZoneFileError> {
+        let meta = self.snapshot_meta(txnid);
+        let Some(entry) = self.catalog_entry_at(meta, apex)? else {
+            return Ok(None);
+        };
+        if !entry.is_live() || entry.tree_root == 0 {
+            return Ok(None);
+        }
+        let tree = ZoneTree::new(*apex, entry.tree_root, entry.tree_level)?;
+        tree.node(self, meta.txnid, name).map(Some)
     }
 
     /// Итератор всех элементов живой зоны: `T_NODE` (apex/ENT), `RRset`,
@@ -651,30 +730,44 @@ impl ZoneFile {
     /// `Corrupt` — повреждённый каталог/дерево; `Corrupt(Bounds)` —
     /// несогласованные `tree_root`/`tree_level`.
     pub fn zone_items<'a>(&'a self, apex: &NameRle) -> Result<ZoneItems<'a>, ZoneFileError> {
-        let txnid = self.meta.txnid;
-        let Some(entry) = self.catalog_entry_at(&self.meta, apex)? else {
-            return Ok(self.empty_zone_items());
+        self.zone_items_at(self.meta.txnid, apex)
+    }
+
+    /// Итератор элементов зоны, видимых в снапшоте `txnid`.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённый каталог/дерево.
+    pub fn zone_items_at<'a>(
+        &'a self,
+        txnid: u64,
+        apex: &NameRle,
+    ) -> Result<ZoneItems<'a>, ZoneFileError> {
+        let meta = self.snapshot_meta(txnid);
+        let Some(entry) = self.catalog_entry_at(meta, apex)? else {
+            return Ok(self.empty_zone_items_at(txnid));
         };
         if !entry.is_live() || entry.tree_root == 0 {
-            return Ok(self.empty_zone_items());
+            return Ok(self.empty_zone_items_at(txnid));
         }
         let tree = ZoneTree::new(*apex, entry.tree_root, entry.tree_level)?;
-        let mut cursor = tree.btree().cursor(self, txnid);
+        let mut cursor = tree.btree().cursor(self, meta.txnid);
         let started = cursor.seek_first()?;
         Ok(ZoneItems {
             zonefile: self,
             cursor,
-            txnid,
+            txnid: meta.txnid,
             finished: !started,
         })
     }
 
-    fn empty_zone_items(&self) -> ZoneItems<'_> {
-        let cursor = BTree::empty().cursor(self, self.meta.txnid);
+    fn empty_zone_items_at(&self, txnid: u64) -> ZoneItems<'_> {
+        let txnid = self.snapshot_meta(txnid).txnid;
+        let cursor = BTree::empty().cursor(self, txnid);
         ZoneItems {
             zonefile: self,
             cursor,
-            txnid: self.meta.txnid,
+            txnid,
             finished: true,
         }
     }
@@ -758,6 +851,36 @@ impl ZoneFile {
         Ok(Some(
             self.rrset_view_from_value(meta.txnid, value, payload)?,
         ))
+    }
+
+    /// Все `RRset` `(name, rr_type)` по всем подтипам (`RRSIG`).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённый каталог/дерево.
+    pub fn lookup_all_rrset_at(
+        &self,
+        txnid: u64,
+        apex: &NameRle,
+        name: &NameRle,
+        rr_type: u16,
+    ) -> Result<Vec<RrsetView>, ZoneFileError> {
+        let meta = self.snapshot_meta(txnid);
+        let Some(entry) = self.catalog_entry_at(meta, apex)? else {
+            return Ok(Vec::new());
+        };
+        if !entry.is_live() || entry.tree_root == 0 {
+            return Ok(Vec::new());
+        }
+        let tree = ZoneTree::new(*apex, entry.tree_root, entry.tree_level)?;
+        let items = tree.lookup_all(self, meta.txnid, name, rr_type)?;
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            if let ItemValue::Leaf { value, payload } = item.value {
+                out.push(self.rrset_view_from_value(meta.txnid, value, &payload)?);
+            }
+        }
+        Ok(out)
     }
 
     /// Явный `fdatasync` + чекпойнт meta (`sync()`, §13.6).

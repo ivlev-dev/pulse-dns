@@ -1,27 +1,29 @@
 //! `pulsed` — авторитетный DNS-сервер (MVP).
 //!
 //! Крейт является **composition root** для авторитетного процесса: читает
-//! JSON-конфигурацию и RFC 1035 master-файлы, загружает зоны в общий
-//! `pulse-api::InMemoryZoneAdmin`, поднимает UDP (`pulse-runtime`, io_uring),
-//! TCP (std) и опциональный REST API (`pulse-api`) и обслуживает
+//! JSON-настройки сервера, открывает `pulse-zonefile` (`--data`) как
+//! единственный источник истины зон, поднимает UDP (`pulse-runtime`,
+//! io_uring), TCP (std) и опциональный REST API (`pulse-api`) и обслуживает
 //! `SIGTERM`/`SIGINT`.
 //!
-//! API и DNS используют один store: после каждой успешной мутации адаптер
-//! перестраивает снапшот `QueryEngine`, поэтому изменения видны сразу, а
-//! DNS-запрос не удерживает блокировки store.
+//! DNS-ответы читаются из mmap: движок держит один пин снапшота и выполняет
+//! точечные поиски RRset, не загружая зоны в память. REST-мутации выполняют
+//! writer-транзакцию и коммит в тот же файл; после коммита пересобирается
+//! только список зон и пин снапшота. Без `--data` сервер поднимается без зон
+//! и отвечает `REFUSED`.
 //!
-//! При заданном `zonefile`/`--data` успешные мутации дополнительно
-//! коммитятся в `pulse-zonefile` (write-through), а shutdown выполняет
-//! `sync()`. Без файла сервер работает только с in-memory store.
+//! Master-файлы импортируются отдельной командой `pulsed import --data ...`;
+//! в рантайме `.zone` не читаются, JSON-поля `zones`/`zones_files` отвергаются
+//! с инструкцией миграции.
 //!
 //! # Состав
 //!
-//! - [`config`] — JSON-конфигурация, master-файлы и CLI-overrides.
-//! - [`zone`] — загрузка JSON-зон и валидация инвариантов; master-файлы
-//!   разбирает `pulse-master` и импортирует тот же store.
-//! - `dnssec` — загрузка ключей и DNSSEC-подпись зон при старте.
-//! - `transfer` — AXFR/IXFR-out по TCP, TSIG/ACL, IXFR-история и NOTIFY.
-//! - [`server`] — запуск и остановка DNS/API, общий zone store.
+//! - [`config`] — JSON-настройки сервера и CLI-overrides.
+//! - `zonefile` — `ZoneView` поверх mmap и адаптер записи в `pulse-zonefile`.
+//! - `master` — импорт RFC 1035 master-файлов (`pulsed import`).
+//! - `dnssec` — загрузка ключей и DNSSEC-подпись зон в zonefile.
+//! - `transfer` — AXFR/IXFR-out из zonefile, TSIG/ACL, IXFR-история и NOTIFY.
+//! - [`server`] — запуск и остановка DNS/API.
 //! - [`stats`] — атомарные счётчики без блокировок на горячем пути.
 //!
 //! # Пример
@@ -31,7 +33,7 @@
 //! use pulsed::server::Server;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = Config::load("examples/zones.json")?;
+//! let config = Config::load("examples/pulsed.json")?;
 //! let mut server = Server::start(&config)?;
 //! println!("udp={:?} tcp={:?}", server.udp_addr(), server.tcp_addr());
 //! server.shutdown()?;
@@ -52,19 +54,16 @@ mod dns;
 mod dnssec;
 mod logging;
 mod master;
-mod names;
-mod persist;
-mod rdata;
 mod secondary;
 mod store;
 mod tcp;
 mod transfer;
 mod udp;
+mod zonefile;
 
 pub mod config;
 pub mod server;
 pub mod stats;
-pub mod zone;
 
 use std::process::ExitCode;
 

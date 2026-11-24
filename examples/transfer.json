@@ -2,30 +2,6 @@
   "listen_udp": "127.0.0.1:5353",
   "listen_tcp": "127.0.0.1:5353",
   "workers": 2,
-  "zones": [
-    {
-      "origin": "example.com.",
-      "records": [
-        {
-          "name": "@",
-          "type": "SOA",
-          "ttl": 3600,
-          "rdata": {
-            "mname": "ns1.example.com.",
-            "rname": "hostmaster.example.com.",
-            "serial": 2026112401,
-            "refresh": 7200,
-            "retry": 900,
-            "expire": 1209600,
-            "minimum": 300
-          }
-        },
-        { "name": "@", "type": "NS", "rdata": "ns1.example.com." },
-        { "name": "ns1", "type": "A", "ttl": 3600, "rdata": "192.0.2.53" },
-        { "name": "www", "type": "A", "ttl": 300, "rdata": "192.0.2.20" }
-      ]
-    }
-  ],
   "tsig_keys": [
     {
       "name": "xfr-key.example.com.",
@@ -36,8 +12,13 @@
   "transfer": {
     "enabled": true,
     "require_tsig": true,
-    "allow_from": ["127.0.0.1", "::1"],
-    "allow_zones": ["example.com."],
+    "allow_from": [
+      "127.0.0.1",
+      "::1"
+    ],
+    "allow_zones": [
+      "example.com."
+    ],
     "history_deltas": 32,
     "message_bytes": 16384,
     "max_records": 1000000,
@@ -46,10 +27,15 @@
     "timeout_ms": 30000,
     "tsig_every": 1,
     "allow_axfr_fallback": true,
-    "notify": ["127.0.0.1:5354"],
+    "notify": [
+      "127.0.0.1:5354"
+    ],
     "notify_tsig_key": "xfr-key.example.com.",
     "notify_retries": 3,
     "notify_timeout_ms": 2000,
     "notify_queue": 1024
-  }
+  },
+  "zonefile": "./transfer.pulse",
+  "durability": "flush",
+  "map_size": 268435456
 }

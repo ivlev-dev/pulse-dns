@@ -2,8 +2,8 @@
 //!
 //! Конфигурация намеренно плоская: адреса транспортов, число UDP worker'ов,
 //! уровень логирования, параметры TCP, persistence (`zonefile`/`durability`/
-//! `map_size`) и список зон. Все записи зоны описаны в [`ZoneConfig`];
-//! RDATA разбирается по типу в [`crate::zone`].
+//! `map_size`), DNSSEC, secondary и transfer. Зоны в JSON больше не
+//! принимаются: единственный источник истины — `pulse-zonefile` (`--data`).
 //!
 //! # Пример
 //!
@@ -13,7 +13,7 @@
 //! let config = Config::from_json_str(r#"{
 //!   "listen_udp": "127.0.0.1:0",
 //!   "listen_tcp": "127.0.0.1:0",
-//!   "zones": []
+//!   "zonefile": "zones.pulse"
 //! }"#).unwrap();
 //! assert!(config.listen_udp.is_some());
 //! ```
@@ -383,16 +383,6 @@ const fn default_true() -> bool {
     true
 }
 
-/// Master-файл зоны (RFC 1035) в конфигурации.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ZoneFileConfig {
-    /// Origin зоны; он же передаётся в `pulse_master::parse_zone`.
-    pub origin: String,
-    /// Путь к master-файлу. Относительные пути считаются от текущего каталога.
-    pub path: PathBuf,
-}
-
 /// Роль DNSSEC-ключа в конфигурации.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -451,31 +441,6 @@ pub struct DnssecZoneConfig {
     pub inception_skew: Option<u32>,
 }
 
-/// Зона в конфигурации.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ZoneConfig {
-    /// Origin зоны (абсолютное или относительное имя).
-    pub origin: String,
-    /// Класс; в v1 поддерживается только `IN`.
-    #[serde(default = "default_class")]
-    pub class: String,
-    /// TTL по умолчанию для записей без явного `ttl`.
-    #[serde(default = "default_ttl")]
-    pub default_ttl: u32,
-    /// Записи зоны.
-    #[serde(default)]
-    pub records: Vec<RecordConfig>,
-}
-
-fn default_class() -> String {
-    "IN".to_owned()
-}
-
-const fn default_ttl() -> u32 {
-    3600
-}
-
 /// Полная конфигурация процесса.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -496,10 +461,12 @@ pub struct Config {
     pub durability: Durability,
     /// Размер map zonefile в байтах.
     pub map_size: u64,
-    /// Обслуживаемые зоны в JSON-форме.
-    pub zones: Vec<ZoneConfig>,
-    /// Дополнительные зоны из master-файлов (RFC 1035).
-    pub zones_files: Vec<ZoneFileConfig>,
+    /// Устаревшее поле миграции: JSON-зоны больше не принимаются.
+    #[serde(default)]
+    pub zones: Option<serde_json::Value>,
+    /// Устаревшее поле миграции: master-файлы в конфигурации не принимаются.
+    #[serde(default)]
+    pub zones_files: Option<serde_json::Value>,
     /// DNSSEC-подпись зон при загрузке (origin → ключи/политика).
     #[serde(default)]
     pub dnssec: BTreeMap<String, DnssecZoneConfig>,
@@ -525,8 +492,8 @@ impl Default for Config {
             zonefile: None,
             durability: Durability::Flush,
             map_size: DEFAULT_MAP_SIZE,
-            zones: Vec::new(),
-            zones_files: Vec::new(),
+            zones: None,
+            zones_files: None,
             dnssec: BTreeMap::new(),
             secondary_zones: Vec::new(),
             tsig_keys: Vec::new(),
@@ -565,8 +532,8 @@ impl Config {
 
     /// Проверяет локальные ограничения конфигурации.
     ///
-    /// Инварианты зон (SOA/NS в apex, CNAME-эксклюзивность) проверяются при
-    /// загрузке зон в [`crate::zone`].
+    /// Конфигурация больше не содержит зон: JSON-поля `zones`/`zones_files`
+    /// отвергаются с инструкцией миграции на `pulsed import --data`.
     ///
     /// # Errors
     ///
@@ -604,6 +571,11 @@ impl Config {
         {
             return Err(ConfigError::Invalid(
                 "zonefile path must not be empty".to_owned(),
+            ));
+        }
+        if self.zonefile.is_none() && !self.secondary_zones.is_empty() {
+            return Err(ConfigError::Invalid(
+                "secondary_zones require a zonefile; pass --data <file>".to_owned(),
             ));
         }
         if self.map_size == 0 {
@@ -664,22 +636,16 @@ impl Config {
                 )));
             }
         }
-        let mut origins = std::collections::HashSet::new();
-        for zone in &self.zones {
-            let name = Name::parse(zone.origin.trim()).map_err(|error| {
-                ConfigError::Invalid(format!("zones: invalid origin {:?}: {error}", zone.origin))
-            })?;
-            origins.insert(name);
+        if self.zones.is_some() || self.zones_files.is_some() {
+            return Err(ConfigError::Invalid(
+                "JSON zones are no longer supported: the configuration keys `zones` and \
+                 `zones_files` have been removed. Put all zones into the binary zonefile \
+                 (`pulsed import --data <file> --origin <origin> <zone-file>` for master \
+                 files) and point the server at it with `--data <file>`."
+                    .to_owned(),
+            ));
         }
-        for file in &self.zones_files {
-            let name = Name::parse(file.origin.trim()).map_err(|error| {
-                ConfigError::Invalid(format!(
-                    "zones_files: invalid origin {:?}: {error}",
-                    file.origin
-                ))
-            })?;
-            origins.insert(name);
-        }
+        let origins: std::collections::HashSet<Name> = std::collections::HashSet::new();
         let mut secondary_origins = std::collections::HashSet::new();
         for zone in &self.secondary_zones {
             let name = Name::parse(zone.origin.trim()).map_err(|error| {
@@ -888,21 +854,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_zone_files() {
-        let config = Config::from_json_str(
-            r#"{
-                "listen_udp": null,
-                "listen_tcp": null,
-                "zones_files": [{"origin": "example.com.", "path": "examples/example.com.zone"}]
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(config.zones_files.len(), 1);
-        assert_eq!(config.zones_files[0].origin, "example.com.");
-        assert_eq!(
-            config.zones_files[0].path,
-            PathBuf::from("examples/example.com.zone")
-        );
+    fn json_zones_are_rejected_with_migration_hint() {
+        for text in [
+            r#"{"listen_udp": "127.0.0.1:0", "listen_tcp": null, "zones": []}"#,
+            r#"{"listen_udp": "127.0.0.1:0", "listen_tcp": null, "zones_files": []}"#,
+        ] {
+            let config = Config::from_json_str(text).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("JSON zones are no longer supported"),
+                "{error}"
+            );
+            assert!(error.contains("pulsed import"), "{error}");
+            assert!(error.contains("--data"), "{error}");
+        }
     }
 
     #[test]

@@ -27,7 +27,7 @@
   RAII-снапшотами, recovery (durable_watermark, torn-мета, sticky sync_mode),
   B+tree (RLE-ключи, канонический компаратор, split, ENT), overflow-цепочки,
   кеш валидированных страниц, zone index, writer/commit, `compact_zone`,
-  `sync`, fsck; используется `pulsed` как write-through хранилище.
+  `sync`, fsck; единственный источник истины зон для `pulsed` (DNS читает mmap).
 - `pulse-runtime` — io_uring UDP (ring-per-core, multishot recv + provided
   buffers, IP_PKTINFO, NODROP-проверка, backpressure, graceful shutdown,
   изоляция паник) + epoll-фолбэк.
@@ -38,10 +38,11 @@
   CRUD/PATCH, settings, bearer-auth + scopes + per-zone allowlist (404 вне
   allowlist), ETag/If-Match, RFC 9457 problem+json, Idempotency-Key,
   пагинация, лимиты тела/rate limit.
-- `pulsed` — бинарник: UDP+TCP, JSON-конфиг зон и master-файлы RFC 1035
-  (`--zone`/`zones_files`, `pulse-master`), единый store с REST, write-through
-  persistence в `pulse-zonefile` (`--data`, durability, single-writer),
-  graceful shutdown, Dockerfile.
+- `pulsed` — бинарник: UDP+TCP, зоны только в `pulse-zonefile` (`--data`),
+  DNS-ответы из mmap без полной in-memory копии, импорт master-файлов RFC 1035
+  (`pulsed import`, `pulse-master`, опционально `--sign`), REST коммитит в тот
+  же файл (durability, single-writer), DNSSEC-подпись в zonefile, graceful
+  shutdown, Dockerfile.
 - `pulsed` replication: AXFR/IXFR-out по TCP (TSIG/ACL, лимиты, SOA first/last),
   ограниченная in-memory IXFR-история, NOTIFY-out с фоновой очередью,
   NOTIFY-in, secondary-зоны (bootstrap AXFR, периодический SOA-refresh,
@@ -57,11 +58,14 @@
 ## Проверено руками
 
 - Реальные UDP/TCP ответы: A, AAAA, MX, NXDOMAIN+SOA, CNAME-цепочка.
-- Загрузка зоны из RFC 1035 master-файла (`--zone`/`zones_files`), UDP A и
-  NXDOMAIN, затем REST-правка и новый ответ без рестарта.
-- Persistence: bootstrap из пустого/отсутствующего файла, REST A/TTL/DELETE,
-  reopen без потери данных, удаление зоны, `Busy` второго writer'а,
-  отказ на усечённом файле.
+- Импорт RFC 1035 master-файла (`pulsed import --data ... --origin ...`), UDP
+  A/AAAA/wildcard/delegation/NXDOMAIN из mmap, рестарт без импорта, затем
+  REST-правка и новый ответ без рестарта.
+- Persistence: import в пустой/отсутствующий файл, REST A/TTL/DELETE, reopen без
+  потери данных, удаление зоны, `Busy` второго writer'а, отказ на усечённом
+  файле, AXFR после импорта и после REST-правки.
+- DNSSEC: подпись в zonefile при старте и `/sign`, DO=1 отдаёт RRSIG из mmap,
+  проверка `pulse-dnssec`; secondary AXFR-in → ответы из mmap → рестарт.
 - REST-сценарий: PUT зоны → SOA/NS/A → UDP отвечает → PATCH → ответ меняется →
   DELETE → NODATA/REFUSED.
 - Резолвер (`pulseresolved`): реальный прогон бинарника против mock upstream —
@@ -81,9 +85,9 @@
 **P0 (корректность/долговечность):**
 - Commit/allocator/GC и параллельная запись по зонам в коде не реализованы
   (только дизайн: ADR 0005/0006, spec parallel-writes-v2).
-- `pulsed` использует `pulse-zonefile` как write-through хранилище только при
-  `--data`; без него зоны остаются in-memory. Нет journal/outbox и
-  параллельной записи; снапшот при мутации пересобирается полностью.
+- Без `--data` сервер поднимается без зон (REFUSED). Нет journal/outbox и
+  параллельной записи; при мутации пересобирается только список зон и
+  пин снапшота, данные не материализуются.
 
 **P1 (безопасность/транспорт/протокол):**
 - DNSSEC-крипто (подпись/валидация) и привязка RRSIG; DNSCrypt.
@@ -111,7 +115,10 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 ```bash
 export PULSED_API_TOKEN="$(openssl rand -hex 32)"
-cargo run -p pulsed -- --config examples/zones.json \
+cargo run -p pulsed -- import --data /tmp/pulse-dns.zonefile \
+  --origin example.com. examples/example.com.zone
+cargo run -p pulsed -- --config examples/pulsed.json \
+  --data /tmp/pulse-dns.zonefile \
   --listen-udp 127.0.0.1:5353 --listen-tcp 127.0.0.1:5353 \
   --api-listen 127.0.0.1:8080 --api-scope example.com.
 dig @127.0.0.1 -p 5353 example.com. A +norecurse
@@ -120,7 +127,6 @@ dig @127.0.0.1 -p 5353 example.com. A +norecurse
 ## Риски и известные дефекты
 
 - RRset lookup ~2–4.9 µs при 1M против цели 500 нс.
-- Зоны в памяти: нет персистентности, потеря при рестарте.
 - API доступен только на loopback, TLS отсутствует.
 - Storage — single-writer: commit/allocator не реализованы, параллельная
   запись по зонам не в коде.

@@ -30,6 +30,7 @@ pulse-transfer = { path = "../pulse-transfer" }
 pulse-zonefile = { path = "../pulse-zonefile" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 signal-hook = "0.3"
 thiserror = "2"
 

@@ -1,5 +1,7 @@
 //! Интеграционные тесты транспортов на реальных сокетах.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
@@ -10,15 +12,10 @@ use pulse_dns::{
 use pulsed::config::Config;
 use pulsed::server::Server;
 
-const EXAMPLE_CONFIG: &str = include_str!("../../../examples/zones.json");
-
-fn test_config() -> Config {
-    let mut config = Config::from_json_str(EXAMPLE_CONFIG).expect("example config must parse");
-    config.listen_udp = Some("127.0.0.1:0".parse().expect("udp addr"));
-    config.listen_tcp = Some("127.0.0.1:0".parse().expect("tcp addr"));
-    config.workers = 2;
-    config.tcp.idle_timeout_ms = 2000;
-    config
+fn test_config() -> (common::TempZone, Config) {
+    let zone = common::TempZone::with_import("transport", "example.com.", &common::example_zone());
+    let config = common::base_config(zone.path());
+    (zone, config)
 }
 
 fn name(text: &str) -> Name {
@@ -74,7 +71,8 @@ fn read_frame(stream: &mut TcpStream) -> Message {
 
 #[test]
 fn udp_serves_a_and_nxdomain() {
-    let mut server = Server::start(&test_config()).expect("start server");
+    let (_zone, config) = test_config();
+    let mut server = Server::start(&config).expect("start server");
     assert!(server.udp_addr().is_some());
 
     let response = udp_exchange(&server, &query("www.example.com.", Rtype::A));
@@ -114,7 +112,8 @@ fn udp_serves_a_and_nxdomain() {
 
 #[test]
 fn udp_edns_is_echoed_and_badvers_is_reported() {
-    let mut server = Server::start(&test_config()).expect("start server");
+    let (_zone, config) = test_config();
+    let mut server = Server::start(&config).expect("start server");
 
     let mut message = query("www.example.com.", Rtype::A);
     message.set_edns(Some(Edns::new(1232)));
@@ -133,7 +132,8 @@ fn udp_edns_is_echoed_and_badvers_is_reported() {
 
 #[test]
 fn udp_malformed_query_gets_formerr_and_short_packet_is_dropped() {
-    let mut server = Server::start(&test_config()).expect("start server");
+    let (_zone, config) = test_config();
+    let mut server = Server::start(&config).expect("start server");
     let address = server.udp_addr().expect("udp enabled");
     let socket = UdpSocket::bind("127.0.0.1:0").expect("client socket");
     socket
@@ -166,7 +166,8 @@ fn udp_malformed_query_gets_formerr_and_short_packet_is_dropped() {
 
 #[test]
 fn tcp_handles_length_prefixed_stream_and_multiple_messages() {
-    let mut server = Server::start(&test_config()).expect("start server");
+    let (_zone, config) = test_config();
+    let mut server = Server::start(&config).expect("start server");
     let address = server.tcp_addr().expect("tcp enabled");
     let mut stream = TcpStream::connect(address).expect("connect");
     stream
@@ -207,7 +208,8 @@ fn tcp_handles_length_prefixed_stream_and_multiple_messages() {
 
 #[test]
 fn shutdown_releases_listeners() {
-    let mut server = Server::start(&test_config()).expect("start server");
+    let (_zone, config) = test_config();
+    let mut server = Server::start(&config).expect("start server");
     let udp = server.udp_addr().expect("udp enabled");
     let tcp = server.tcp_addr().expect("tcp enabled");
     let stats = server.stats();

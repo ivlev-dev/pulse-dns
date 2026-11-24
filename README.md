@@ -4,8 +4,9 @@
 
 Модульный высокопроизводительный DNS-сервер на Rust. Linux-first, edition 2024
 (stable). Текущее состояние — **authoritative MVP + кеширующий резолвер**:
-авторитетный сервер (`pulsed`) с UDP/TCP, REST API и опциональной write-through
-persistence в `pulse-zonefile`, а также резолвер (`pulseresolved`) с
+авторитетный сервер (`pulsed`) с UDP/TCP, REST API и `pulse-zonefile` как
+единственным источником истины зон (DNS читает mmap, REST коммитит в файл), а
+также резолвер (`pulseresolved`) с
 forward/iterative-резолюцией, кешем, blocklist, overrides и DNSSEC-валидацией.
 Это не полный продукт из ТЗ (нет DoT/DoH/DoQ, RRL и т.д.).
 
@@ -30,12 +31,13 @@ forward/iterative-резолюцией, кешем, blocklist, overrides и DNSS
   CRUD/PATCH, settings, bearer-auth + scopes + per-zone allowlist (404 вне
   allowlist), ETag/If-Match, RFC 9457 problem+json, Idempotency-Key,
   пагинация, лимиты тела/rate limit.
-- Бинарник `pulsed`: UDP+TCP, JSON-конфиг зон и RFC 1035 master-файлы
-  (`.zone`, `$ORIGIN`/`$TTL`/`$INCLUDE`), единый store с REST (правки через
-  API сразу видны в DNS), write-through persistence в `pulse-zonefile`
-  (`--data`, `sync`/`flush`/`memory`, один writer), graceful shutdown,
-  AXFR/IXFR-out по TCP с TSIG/ACL, IXFR-история, NOTIFY-out/in и secondary-зоны
-  (AXFR/IXFR-in, bootstrap, SOA-refresh, expire → SERVFAIL), Dockerfile.
+- Бинарник `pulsed`: UDP+TCP, зоны только в `pulse-zonefile` (`--data`; DNS
+  отвечает из mmap, без полной in-memory копии), импорт RFC 1035 master-файлов
+  командой `pulsed import` (`.zone`, `$ORIGIN`/`$TTL`/`$INCLUDE`), REST,
+  коммитящий правки в тот же файл (`sync`/`flush`/`memory`, один writer),
+  graceful shutdown, AXFR/IXFR-out по TCP с TSIG/ACL, IXFR-история,
+  NOTIFY-out/in и secondary-зоны (AXFR/IXFR-in, bootstrap, SOA-refresh,
+  expire → SERVFAIL), DNSSEC-подпись в zonefile, Dockerfile.
 - Бинарник `pulseresolved`: forward/iterative-резолюция через `pulse-resolver`,
   UDP на `pulse-runtime` (N worker) и TCP с length-prefix, EDNS/TC, REFUSED
   для AXFR/IXFR, кеш, blocklist + overrides, DNSSEC-валидация (AD/SERVFAIL),
@@ -44,8 +46,7 @@ forward/iterative-резолюцией, кешем, blocklist, overrides и DNSS
 
 **Не реализовано (см. `STATUS.md`):** commit/allocator/GC и параллельная запись
 по зонам в коде (только дизайн, ADR 0005/0006, spec parallel-writes-v2);
-journal/outbox и параллельная запись в zonefile; зоны в памяти пересобираются
-полностью при мутации; DNSCrypt; DoT/DoH/DoQ; 0x20 echo; TLS
+journal/outbox и параллельная запись в zonefile; DNSCrypt; DoT/DoH/DoQ; 0x20 echo; TLS
 для API и метрик (только loopback); fuzz/Miri/loom в CI; полноценный RRL; REST —
 MVP-подмножество спецификации. У резолвера нет RRL, DoT/DoH-апстримов и
 RFC 5011 (trust anchors статические).
@@ -75,13 +76,19 @@ RFC 5011 (trust anchors статические).
 cargo build --release
 ```
 
-Запуск `pulsed` с примером зон:
+Импорт зоны и запуск `pulsed`:
 
 ```bash
+cargo run -p pulsed -- import \
+  --data /tmp/pulse-dns.zonefile \
+  --origin example.com. \
+  examples/example.com.zone
+
 export PULSED_API_TOKEN="$(openssl rand -hex 32)"
 
 cargo run -p pulsed -- \
-  --config examples/zones.json \
+  --config examples/pulsed.json \
+  --data /tmp/pulse-dns.zonefile \
   --listen-udp 127.0.0.1:5353 \
   --listen-tcp 127.0.0.1:5353 \
   --api-listen 127.0.0.1:8080 \
@@ -113,22 +120,22 @@ CLI: `--config`, `--listen-udp`, `--listen-tcp`, `--metrics-listen`,
 `--forward` (repeatable), `--workers`, `--log-level`, `--blocklist`
 (repeatable), `--no-dnssec`.
 
-Зона из RFC 1035 master-файла:
+Зоны в `pulse-zonefile`:
 
 ```bash
-cargo run -p pulsed -- --config examples/master-files.json
-# или: --config examples/empty.json --zone example.com.=examples/example.com.zone
-```
+# импорт (повторный --replace; опционально --sign с --dnssec-key)
+cargo run -p pulsed -- import \
+  --data /tmp/pulse-dns.zonefile \
+  --origin example.com. \
+  examples/example.com.zone
 
-Persistence в `pulse-zonefile`:
-
-```bash
-cargo run -p pulsed -- --config examples/master-files.json \
+cargo run -p pulsed -- --config examples/pulsed.json \
   --data /tmp/pulse-dns.zonefile --durability flush --map-size 268435456
 ```
 
-Первый запуск импортирует JSON/master-зоны и создаёт файл; последующие
-запуски читают зоны из файла, а REST-мутации коммитятся write-through.
+JSON-поля `zones`/`zones_files` больше не принимаются: конфигурация завершится
+с инструкцией миграции. Все зоны живут в `--data`; REST-правки коммитятся в
+тот же файл и сразу видны DNS.
 
 Подробности — в `examples/README.md`.
 

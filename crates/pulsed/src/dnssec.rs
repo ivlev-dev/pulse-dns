@@ -34,11 +34,6 @@ impl DnssecSigners {
     pub(crate) fn origins(&self) -> impl Iterator<Item = &Name> {
         self.zones.keys()
     }
-
-    /// Число настроенных зон.
-    pub(crate) fn len(&self) -> usize {
-        self.zones.len()
-    }
 }
 
 /// Текущее время UNIX в секундах (насыщается на `u32`).
