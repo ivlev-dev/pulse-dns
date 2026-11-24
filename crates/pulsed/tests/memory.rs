@@ -2,27 +2,35 @@
 //!
 //! Полный тест на 100k `RRset` помечен `#[ignore]`, потому что импорт большого
 //! master-файла в debug-сборке занимает минуты. Обычный прогон проверяет тот
-//! же инвариант на 2k `RRset`: рост `RSS` ограничен, а `zonefile_lookups` растёт.
+//! же инвариант на 2k `RRset`: анонимная память процесса растёт ограниченно,
+//! а `zonefile_lookups` увеличивается после ответа из mmap.
 
 mod common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pulse_dns::{DecodeLimits, EncodeOptions, Message, Name, Question, Rclass, Rtype};
 use pulsed::server::{ApiOptions, Server};
 
 const TOKEN: &str = "pd_live_memory_0123456789abcdef";
+const LOOKUP_DEADLINE: Duration = Duration::from_secs(5);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-fn rss_bytes() -> u64 {
-    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    let pages: u64 = statm
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    pages.saturating_mul(4096)
+/// Память процесса из `/proc/self/status`: `(VmRSS, RssAnon, RssFile)`.
+fn rss() -> (u64, u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.trim().strip_suffix("kB"))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            .saturating_mul(1024)
+    };
+    (field("VmRSS:"), field("RssAnon:"), field("RssFile:"))
 }
 
 fn master_zone(records: u32) -> String {
@@ -39,45 +47,91 @@ fn master_zone(records: u32) -> String {
     text
 }
 
+#[allow(unused_assignments)]
 fn query(server: &Server, qname: &str) -> Message {
     let socket = UdpSocket::bind("127.0.0.1:0").expect("client");
     socket
-        .set_read_timeout(Some(Duration::from_secs(3)))
+        .set_read_timeout(Some(Duration::from_millis(100)))
         .expect("timeout");
+    let address = server.udp_addr().expect("udp");
     let bytes = Message::query(
         1,
         Question::new(Name::parse(qname).expect("qname"), Rtype::A, Rclass::IN),
     )
     .encode(&EncodeOptions::compressed())
     .expect("encode");
-    socket
-        .send_to(&bytes, server.udp_addr().expect("udp"))
-        .expect("send");
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut buffer = [0_u8; 4096];
-    let (length, _) = socket.recv_from(&mut buffer).expect("recv");
-    Message::decode(&buffer[..length], &DecodeLimits::default()).expect("decode")
+    let mut last_error = None;
+    loop {
+        if let Err(error) = socket.send_to(&bytes, address) {
+            panic!("cannot send UDP query for {qname}: {error}");
+        }
+        match socket.recv_from(&mut buffer) {
+            Ok((length, _)) => {
+                return Message::decode(&buffer[..length], &DecodeLimits::default())
+                    .expect("decode");
+            }
+            Err(error) => last_error = Some(error),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no UDP response for {qname} within 15s (last error: {:?},              server stats: {:?}, udp stats: {:?})",
+            last_error,
+            server.stats(),
+            server.udp_stats()
+        );
+    }
 }
 
-fn metrics(api: SocketAddr) -> String {
-    let mut stream = TcpStream::connect(api).expect("connect api");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("timeout");
+fn metrics(api: SocketAddr) -> Option<String> {
+    let mut stream = TcpStream::connect(api).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     let request = format!(
         "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
          Authorization: Bearer {TOKEN}\r\n\r\n"
     );
-    stream.write_all(request.as_bytes()).expect("write");
+    stream.write_all(request.as_bytes()).ok()?;
     let mut response = String::new();
-    stream.read_to_string(&mut response).expect("read");
-    response
+    stream.read_to_string(&mut response).ok()?;
+    Some(response)
 }
 
-fn run(records: u32, max_rss_growth: u64, label: &str) {
+fn lookups(body: &str) -> Option<u64> {
+    body.lines()
+        .find_map(|line| line.strip_prefix("zonefile_lookups "))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// Читает `/metrics` до появления `zonefile_lookups > 0`.
+///
+/// Ответ на UDP уже получен, но HTTP-счётчик читается отдельным соединением;
+/// повтор убирает зависимость от планировщика и коротких сетевых задержек.
+fn wait_for_lookups(api: SocketAddr) -> (u64, String) {
+    let deadline = Instant::now() + LOOKUP_DEADLINE;
+    let mut last_body = String::new();
+    loop {
+        if let Some(body) = metrics(api) {
+            if let Some(value) = lookups(&body)
+                && value > 0
+            {
+                return (value, body);
+            }
+            last_body = body;
+        }
+        if Instant::now() >= deadline {
+            return (0, last_body);
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn run(records: u32, max_anon_growth: u64, label: &str) {
     let (_dir, path) = common::write_text(label, "memory.zone", &master_zone(records));
     let zone = common::TempZone::with_import(label, "memory.test.", &path);
     let config = common::base_config(zone.path());
-    let before = rss_bytes();
+
+    let (_, anon_before, _) = rss();
     let mut server = Server::start_with_api(
         &config,
         Some(ApiOptions {
@@ -87,24 +141,38 @@ fn run(records: u32, max_rss_growth: u64, label: &str) {
         }),
     )
     .expect("start");
-    let response = query(&server, &format!("host{}.memory.test.", records / 2));
-    assert_eq!(
-        response.rcode(),
-        pulse_dns::Rcode::NOERROR,
-        "lookup in mmap must answer"
-    );
     let api = server.api_addr().expect("api");
-    let body = metrics(api);
-    assert!(body.contains("zonefile_lookups "), "{body}");
+
+    // Прогрев: несколько точечных ответов из разных частей дерева, затем
+    // короткая пауза, чтобы фоновые потоки и аллокатор стабилизировались.
+    for host in [0, records / 4, records / 2, records - 1] {
+        let response = query(&server, &format!("host{host}.memory.test."));
+        assert_eq!(
+            response.rcode(),
+            pulse_dns::Rcode::NOERROR,
+            "{label}: lookup in mmap must answer for host{host}"
+        );
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    let (lookup_count, body) = wait_for_lookups(api);
     assert!(
-        !body.contains("zonefile_lookups 0\n"),
-        "answer path must use zonefile lookups: {body}"
+        lookup_count > 0,
+        "{label}: answer path must use zonefile lookups: {body}"
     );
-    let after = rss_bytes();
-    let growth = after.saturating_sub(before);
+    assert!(body.contains("zonefile_snapshot_pins "), "{body}");
+
+    // Сравниваем только анонимную память: file-backed страницы mmap/page cache
+    // не должны выдаваться за материализацию зоны.
+    let (_, anon_after, _) = rss();
+    let growth = anon_after.saturating_sub(anon_before);
     assert!(
-        growth < max_rss_growth,
-        "{label}: RSS grew by {growth} bytes, expected < {max_rss_growth}"
+        growth < max_anon_growth,
+        "{label}: anonymous RSS grew by {growth} bytes, expected < {max_anon_growth} \
+         (VmRSS={} RssAnon={} RssFile={})",
+        rss().0,
+        anon_after,
+        rss().2
     );
     server.shutdown().expect("shutdown");
 }
@@ -117,5 +185,5 @@ fn answer_path_does_not_materialize_zone() {
 #[test]
 #[ignore = "100k RRset import is slow in debug builds; run with --ignored --nocapture"]
 fn answer_path_does_not_materialize_100k_rrsets() {
-    run(100_000, 256 * 1024 * 1024, "rss-100k");
+    run(100_000, 128 * 1024 * 1024, "rss-100k");
 }
