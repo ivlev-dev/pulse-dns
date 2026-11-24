@@ -8,3 +8,5 @@ fuzz/corpus
 /data
 *.mmap
 *.zonefile.bin
+fuzz/artifacts/
+fuzz/coverage/

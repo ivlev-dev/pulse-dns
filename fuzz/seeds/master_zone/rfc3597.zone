@@ -1,0 +1,4 @@
+$ORIGIN example.com.
+@ IN SOA ns1 hostmaster 1 3600 600 604800 300
+@ IN NS ns1
+@ IN TYPE65280 \# 8 0102030405060708

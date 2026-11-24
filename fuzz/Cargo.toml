@@ -1,0 +1,69 @@
+[package]
+name = "pulse-dns-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.99"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pulse-dns = { path = "../crates/pulse-dns" }
+pulse-dnscrypt = { path = "../crates/pulse-dnscrypt" }
+pulse-master = { path = "../crates/pulse-master" }
+pulse-transfer = { path = "../crates/pulse-transfer" }
+pulse-zonefile = { path = "../crates/pulse-zonefile" }
+tempfile = "3"
+
+[[bin]]
+name = "dns_wire"
+path = "fuzz_targets/dns_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "master_zone"
+path = "fuzz_targets/master_zone.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zonefile_v2_open"
+path = "fuzz_targets/zonefile_v2_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transfer_tsig"
+path = "fuzz_targets/transfer_tsig.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dnscrypt_packet"
+path = "fuzz_targets/dnscrypt_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gen_seeds"
+path = "src/bin/gen_seeds.rs"
+test = false
+doc = false
+bench = false
+
+# Отдельный workspace: fuzz-крейт требует nightly + sanitizer-флаги и не
+# должен попадать в обычный `cargo test --workspace`.
+[workspace]
+members = ["."]
+resolver = "3"
+
+[profile.release]
+debug = 1

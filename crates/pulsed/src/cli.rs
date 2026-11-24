@@ -522,10 +522,12 @@ fn fsck_zonefile(matches: &ArgMatches) -> ExitCode {
             graph.leaked_pages as f64 / graph.durable_pages as f64
         }
     };
+    // Утечки — не структурная ошибка (крах/батч аллокатора), но печатаются.
+    let clean = lite.ok && graph.ok;
     println!(
         "fsck {}: ok={} fatal={:?} durable_pages={} reachable={} chain={} buckets={} free={} leaked={} ratio={:.4} damaged={:?}",
         data.display(),
-        lite.ok && graph.ok,
+        clean,
         graph.fatal.or(lite.fatal),
         graph.durable_pages,
         graph.reachable_pages,
@@ -548,7 +550,7 @@ fn fsck_zonefile(matches: &ArgMatches) -> ExitCode {
     for issue in lite.issues.iter().chain(graph.issues.iter()) {
         println!("  issue: {issue}");
     }
-    if lite.ok && graph.ok {
+    if clean {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)

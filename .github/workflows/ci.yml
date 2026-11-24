@@ -24,7 +24,7 @@ jobs:
       - name: Docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
       - name: Build
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --all-features
 
   test-release:
     runs-on: ubuntu-latest
@@ -33,7 +33,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Tests (release)
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --all-features
 
   deny:
     runs-on: ubuntu-latest
@@ -43,3 +43,57 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # Необязательный job: Miri медленный, а часть тестов (`pulse-dnssec`/aws-lc-rs)
+  # использует нативный крипто-код, который Miri не исполняет. Чистые
+  # Rust-крейты проверяются отдельно; падение job'а не блокирует merge.
+  miri:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Miri setup
+        run: cargo +nightly miri setup
+      - name: Miri (pulse-dns, pulse-master)
+        run: cargo +nightly miri test -p pulse-dns -p pulse-master
+
+  # Fuzz-smoke только на push в main, чтобы не тормозить PR.
+  fuzz-smoke:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+      - name: Fuzz smoke (30-60 s per target)
+        run: |
+          set -euo pipefail
+          for target in dns_wire master_zone zonefile_v2_open transfer_tsig dnscrypt_packet; do
+            mkdir -p "fuzz/corpus/$target"
+            cp -n "fuzz/seeds/$target/"* "fuzz/corpus/$target/" 2>/dev/null || true
+            cargo +nightly fuzz run "$target" "fuzz/corpus/$target" -- \
+              -max_total_time=45 -rss_limit_mb=2048 -print_final_stats=1
+          done
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            fuzz/artifacts/**
+            fuzz/corpus/**
+          if-no-files-found: ignore
+          retention-days: 14
