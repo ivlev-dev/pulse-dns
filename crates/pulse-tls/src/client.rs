@@ -552,21 +552,43 @@ impl DohClient {
     /// [`Error::NoAddresses`] если хост не разрешился.
     pub fn with_tls(url: &str, tls: ClientTlsConfig) -> Result<Self, Error> {
         let parsed = parse_doh_url(url)?;
-        let mut addresses = resolve(&parsed.host, parsed.port)?;
+        let addresses = resolve(&parsed.host, parsed.port)?;
+        Self::from_parsed(parsed, tls, addresses)
+    }
+
+    /// Создаёт клиент из URL и явно заданных адресов.
+    ///
+    /// Не выполняет DNS-резолюцию: адреса должны быть получены вызывающим.
+    /// Полезно для тестов, нестандартного резолвера и upstream, доступных
+    /// только по известному IP.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidUrl`] при некорректной схеме/хосте,
+    /// [`Error::NoAddresses`] если список адресов пуст.
+    pub fn with_addresses(
+        url: &str,
+        tls: ClientTlsConfig,
+        addresses: Vec<SocketAddr>,
+    ) -> Result<Self, Error> {
+        let parsed = parse_doh_url(url)?;
+        if addresses.is_empty() {
+            return Err(Error::NoAddresses(parsed.host));
+        }
+        Self::from_parsed(parsed, tls, addresses)
+    }
+
+    fn from_parsed(
+        parsed: DohUrl,
+        tls: ClientTlsConfig,
+        mut addresses: Vec<SocketAddr>,
+    ) -> Result<Self, Error> {
         addresses.dedup();
-        let display_host = if parsed.host.contains(':') {
-            format!("[{}]", parsed.host)
-        } else {
-            parsed.host.clone()
-        };
-        let host_header = if parsed.port == DEFAULT_HTTPS_PORT {
-            display_host
-        } else {
-            format!("{display_host}:{}", parsed.port)
-        };
+        let server_name = parse_server_name(&parsed.server_name)?;
+        let host_header = build_host_header(&parsed.host, parsed.port);
         Ok(Self {
             addresses,
-            server_name: parse_server_name(&parsed.server_name)?,
+            server_name,
             host_header,
             path: parsed.path,
             tls,
@@ -871,6 +893,19 @@ struct DohUrl {
     path: String,
 }
 
+fn build_host_header(host: &str, port: u16) -> String {
+    let display_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    if port == DEFAULT_HTTPS_PORT {
+        display_host
+    } else {
+        format!("{display_host}:{port}")
+    }
+}
+
 fn parse_doh_url(url: &str) -> Result<DohUrl, Error> {
     let (scheme, rest) = url
         .split_once("://")
@@ -1020,13 +1055,31 @@ mod tests {
 
     #[test]
     fn doh_host_header_has_a_single_port() {
+        // Чистая функция: ни сокетов, ни DNS-резолюции.
+        assert_eq!(build_host_header("127.0.0.1", 8443), "127.0.0.1:8443");
+        assert_eq!(build_host_header("127.0.0.1", 443), "127.0.0.1");
+        assert_eq!(build_host_header("::1", 8443), "[::1]:8443");
+        assert_eq!(build_host_header("::1", 443), "[::1]");
+        assert_eq!(build_host_header("dns.example", 8443), "dns.example:8443");
+        assert_eq!(build_host_header("dns.example", 443), "dns.example");
+
+        // Явно заданные адреса: `with_addresses` не резолвит `dns.example`.
         let tls = ClientTlsConfig::for_doh().expect("tls");
-        let client =
-            DohClient::with_tls("https://127.0.0.1:8443/dns-query", tls).expect("doh client");
-        assert_eq!(client.host_header, "127.0.0.1:8443");
+        let client = DohClient::with_addresses(
+            "https://dns.example:8443/dns-query",
+            tls,
+            vec!["127.0.0.1:443".parse().expect("addr")],
+        )
+        .expect("doh client without resolver");
+        assert_eq!(client.host_header, "dns.example:8443");
 
         let tls = ClientTlsConfig::for_doh().expect("tls");
-        let client = DohClient::with_tls("https://127.0.0.1/dns-query", tls).expect("doh client");
+        let client = DohClient::with_addresses(
+            "https://127.0.0.1/dns-query",
+            tls,
+            vec!["127.0.0.1:443".parse().expect("addr")],
+        )
+        .expect("doh client without resolver");
         assert_eq!(client.host_header, "127.0.0.1");
     }
 
