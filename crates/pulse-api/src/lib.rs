@@ -1,9 +1,10 @@
 //! Control-plane REST API (`v1` subset) для `pulse-dns`.
 //!
 //! Крейт реализует синхронный HTTP-сервер управления зонами: health/readiness,
-//! список и CRUD зон, RRset (upsert/patch/delete), настройки зоны, ETag /
-//! `If-Match`, идемпотентность, bearer-аутентификацию со scope-проверками,
-//! ошибки RFC 9457 (`application/problem+json`) и метрики Prometheus.
+//! список и CRUD зон, RRset (upsert/patch/delete), настройки зоны, публичные
+//! DNSSEC-ключи/DS и переподпись зоны, ETag / `If-Match`, идемпотентность,
+//! bearer-аутентификацию со scope-проверками, ошибки RFC 9457
+//! (`application/problem+json`) и метрики Prometheus.
 //!
 //! # Состав
 //!

@@ -10,7 +10,7 @@ use pulse_dns::Name;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::config::{Config, LogLevel, Overrides, ZoneFileConfig};
+use crate::config::{Config, DnssecKeyRole, Durability, LogLevel, Overrides, ZoneFileConfig};
 use crate::logging;
 use crate::server::{ApiOptions, Server, ServerError};
 
@@ -27,6 +27,9 @@ pub(crate) fn run() -> ExitCode {
         listen_tcp: matches.get_one::<SocketAddr>("listen-tcp").copied(),
         workers: matches.get_one::<usize>("workers").copied(),
         log_level: matches.get_one::<LogLevel>("log-level").copied(),
+        zonefile: matches.get_one::<PathBuf>("data").cloned(),
+        durability: matches.get_one::<Durability>("durability").copied(),
+        map_size: matches.get_one::<u64>("map-size").copied(),
     };
 
     let mut config = match Config::load(&config_path) {
@@ -39,6 +42,17 @@ pub(crate) fn run() -> ExitCode {
     config.apply_overrides(&overrides);
     match zone_files(&matches) {
         Ok(files) => config.zones_files.extend(files),
+        Err(error) => {
+            logging::error("config", &error);
+            return ExitCode::from(2);
+        }
+    }
+    match dnssec_keys(&matches) {
+        Ok(keys) => {
+            for (origin, role, path) in keys {
+                config.add_dnssec_key(&origin, role, path);
+            }
+        }
         Err(error) => {
             logging::error("config", &error);
             return ExitCode::from(2);
@@ -186,6 +200,45 @@ fn zone_files(matches: &ArgMatches) -> Result<Vec<ZoneFileConfig>, String> {
     Ok(files)
 }
 
+fn dnssec_keys(
+    matches: &ArgMatches,
+) -> Result<Vec<(String, Option<DnssecKeyRole>, PathBuf)>, String> {
+    let mut keys = Vec::new();
+    let Some(values) = matches.get_many::<String>("dnssec-key") else {
+        return Ok(keys);
+    };
+    for value in values {
+        let (origin, rest) = value
+            .split_once('=')
+            .ok_or_else(|| format!("--dnssec-key expects <zone>=<key-path>, got {value:?}"))?;
+        let origin = origin.trim();
+        let rest = rest.trim();
+        if origin.is_empty() || rest.is_empty() {
+            return Err(format!(
+                "--dnssec-key expects <zone>=<key-path>, got {value:?}"
+            ));
+        }
+        let name = Name::parse(origin)
+            .map_err(|error| format!("invalid --dnssec-key origin {origin:?}: {error}"))?;
+        if name == Name::root() || name.labels().any(|label| label == b"*") {
+            return Err(format!(
+                "--dnssec-key origin {origin:?} must be a non-root name without wildcards"
+            ));
+        }
+        let (role, path) = match rest.split_once(':') {
+            Some((role, path)) if DnssecKeyRole::parse(role).is_some() => {
+                (DnssecKeyRole::parse(role), path.trim())
+            }
+            _ => (None, rest),
+        };
+        if path.is_empty() {
+            return Err(format!("--dnssec-key path is empty in {value:?}"));
+        }
+        keys.push((name.to_string(), role, PathBuf::from(path)));
+    }
+    Ok(keys)
+}
+
 fn api_options(matches: &ArgMatches) -> Result<Option<ApiOptions>, String> {
     let listen = matches.get_one::<SocketAddr>("api-listen").copied();
     let token = matches
@@ -226,7 +279,10 @@ fn api_options(matches: &ArgMatches) -> Result<Option<ApiOptions>, String> {
 
 fn server_exit_code(error: &ServerError) -> ExitCode {
     match error {
-        ServerError::Config(_) | ServerError::Zone(_) | ServerError::Store(_) => ExitCode::from(2),
+        ServerError::Config(_)
+        | ServerError::Zone(_)
+        | ServerError::Store(_)
+        | ServerError::Dnssec(_) => ExitCode::from(2),
         ServerError::Api(error) => match error {
             ApiServerError::Config(_) => ExitCode::from(2),
             _ => ExitCode::from(1),
@@ -278,11 +334,39 @@ fn command() -> Command {
                 .help("Override log level: error, warn, info, debug or trace"),
         )
         .arg(
+            Arg::new("data")
+                .long("data")
+                .value_name("PATH")
+                .value_parser(value_parser!(PathBuf))
+                .help("Enable pulse-zonefile persistence at PATH"),
+        )
+        .arg(
+            Arg::new("durability")
+                .long("durability")
+                .value_name("MODE")
+                .value_parser(value_parser!(Durability))
+                .help("Zonefile durability: sync, flush (default) or memory"),
+        )
+        .arg(
+            Arg::new("map-size")
+                .long("map-size")
+                .value_name("BYTES")
+                .value_parser(value_parser!(u64))
+                .help("Zonefile map size in bytes (default 4 GiB, sparse)"),
+        )
+        .arg(
             Arg::new("zone")
                 .long("zone")
                 .value_name("ORIGIN=PATH")
                 .action(ArgAction::Append)
                 .help("Add a zone from an RFC 1035 master file; repeatable"),
+        )
+        .arg(
+            Arg::new("dnssec-key")
+                .long("dnssec-key")
+                .value_name("ZONE=PATH")
+                .action(ArgAction::Append)
+                .help("Sign a zone with a BIND/PKCS#8 private key; repeatable, optional role: ZONE=[ksk|zsk|csk:]PATH"),
         )
         .arg(
             Arg::new("api-listen")
@@ -304,4 +388,40 @@ fn command() -> Command {
                 .action(ArgAction::Append)
                 .help("Per-zone API allowlist (exact origin or *.suffix.); repeatable"),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn matches(args: &[&str]) -> ArgMatches {
+        command()
+            .try_get_matches_from(std::iter::once("pulsed").chain(args.iter().copied()))
+            .expect("arguments parse")
+    }
+
+    #[test]
+    fn dnssec_key_parses_plain_and_role_forms() {
+        let arguments = matches(&[
+            "--dnssec-key",
+            "example.com.=keys/Kexample.com.+015+12345.private",
+            "--dnssec-key",
+            "example.com.=ksk:keys/ksk.private",
+            "--dnssec-key",
+            "example.com.=zsk:keys/zsk.private",
+        ]);
+        let keys = dnssec_keys(&arguments).expect("keys parse");
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0].0, "example.com.");
+        assert_eq!(keys[0].1, None);
+        assert_eq!(keys[1].1, Some(DnssecKeyRole::Ksk));
+        assert_eq!(keys[2].1, Some(DnssecKeyRole::Zsk));
+    }
+
+    #[test]
+    fn dnssec_key_rejects_bad_input() {
+        assert!(dnssec_keys(&matches(&["--dnssec-key", "example.com."])).is_err());
+        assert!(dnssec_keys(&matches(&["--dnssec-key", ".=keys/key.private"])).is_err());
+        assert!(dnssec_keys(&matches(&["--dnssec-key", "bad..name=keys/key.private"])).is_err());
+    }
 }

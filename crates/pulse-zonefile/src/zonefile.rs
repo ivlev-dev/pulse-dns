@@ -619,6 +619,28 @@ impl ZoneFile {
         self.find_zone(origin)
     }
 
+    /// Per-zone metadata block живой зоны.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённый каталог или страница настроек.
+    pub fn zone_meta(&self, apex: &NameRle) -> Result<Option<ZoneMetaBlock>, ZoneFileError> {
+        let Some(entry) = self.catalog_entry_at(&self.meta, apex)? else {
+            return Ok(None);
+        };
+        if !entry.is_live() || entry.meta_root == 0 {
+            return Ok(None);
+        }
+        let page = self.read_page(entry.meta_root)?;
+        ZoneMetaBlock::decode(
+            page,
+            entry.meta_root,
+            self.meta.txnid,
+            self.superblock.page_size,
+        )
+        .map(Some)
+    }
+
     /// Итератор всех элементов живой зоны: `T_NODE` (apex/ENT), `RRset`,
     /// включая `RRSIG`-подтипы, в каноническом порядке.
     ///
@@ -901,6 +923,21 @@ impl ZoneWriter<'_> {
     /// `AlreadyExists` — живая зона уже есть; `IdSpaceExhausted`;
     /// `InvariantViolation` — зарезервированные флаги; `Corrupt`/`Io`.
     pub fn create_zone(&mut self, apex: &NameRle, flags: u16) -> Result<ZoneEntry, ZoneFileError> {
+        self.create_zone_with_meta(apex, flags, &ZoneMetaBlock::default())
+    }
+
+    /// Создаёт зону с явным per-zone metadata-блоком.
+    ///
+    /// # Errors
+    ///
+    /// См. [`ZoneWriter::create_zone`] плюс `Corrupt`/`InvariantViolation` при
+    /// некорректных значениях metadata-блока.
+    pub fn create_zone_with_meta(
+        &mut self,
+        apex: &NameRle,
+        flags: u16,
+        meta: &ZoneMetaBlock,
+    ) -> Result<ZoneEntry, ZoneFileError> {
         if flags
             & !(crate::zone_meta::ZONE_FLAG_SECONDARY
                 | crate::zone_meta::ZONE_FLAG_FORWARD
@@ -929,10 +966,8 @@ impl ZoneWriter<'_> {
         }
         self.next_zone_seq = seq.saturating_add(1);
         let meta_page = self.pages_mut()?.alloc_page()?;
-        let block = ZoneMetaBlock {
-            txn,
-            ..ZoneMetaBlock::default()
-        };
+        let mut block = *meta;
+        block.txn = txn;
         let image = block.encode(meta_page, self.file.superblock.page_size, txn)?;
         self.pages_mut()?.write_page(meta_page, &image)?;
         let mut entry = ZoneEntry::new(seq, meta_page, apex.len(), txn, now_ns());
@@ -940,6 +975,104 @@ impl ZoneWriter<'_> {
         self.store_entry(apex, entry)?;
         self.zone_count = self.zone_count.saturating_add(1);
         Ok(entry)
+    }
+
+    /// Обновляет per-zone metadata-блок (TTL/denial/SOA timers).
+    ///
+    /// Старая страница освобождается через freelist (безопасно для читателей).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt`/`MapFull`/`Io`; `ReadOnly`, если зоны нет или она tombstone.
+    pub fn update_zone_meta(
+        &mut self,
+        apex: &NameRle,
+        meta: &ZoneMetaBlock,
+    ) -> Result<bool, ZoneFileError> {
+        let Some(mut entry) = self.load_entry(apex)? else {
+            return Ok(false);
+        };
+        if !entry.is_live() {
+            return Ok(false);
+        }
+        let txn = self.txn()?;
+        let new_page = self.pages_mut()?.alloc_page()?;
+        let mut block = *meta;
+        block.txn = txn;
+        let image = block.encode(new_page, self.file.superblock.page_size, txn)?;
+        self.pages_mut()?.write_page(new_page, &image)?;
+        if entry.meta_root != 0 {
+            self.pages_mut()?.free_page(entry.meta_root)?;
+        }
+        entry.meta_root = new_page;
+        entry.last_commit_txn = txn;
+        entry.last_change_unix_ns = now_ns();
+        self.store_entry(apex, entry)?;
+        Ok(true)
+    }
+
+    /// Меняет флаги типа зоны (primary/secondary/forward).
+    ///
+    /// # Errors
+    ///
+    /// `InvariantViolation` для зарезервированных флагов; `Corrupt`/`Io`.
+    pub fn set_zone_flags(&mut self, apex: &NameRle, flags: u16) -> Result<bool, ZoneFileError> {
+        if flags
+            & !(crate::zone_meta::ZONE_FLAG_SECONDARY
+                | crate::zone_meta::ZONE_FLAG_FORWARD
+                | crate::zone_meta::ZONE_FLAG_DYNAMIC
+                | crate::zone_meta::ZONE_FLAG_FROZEN)
+            != 0
+        {
+            return Err(ZoneFileError::InvariantViolation(InvariantId::KeyOrder));
+        }
+        let Some(mut entry) = self.load_entry(apex)? else {
+            return Ok(false);
+        };
+        if !entry.is_live() {
+            return Ok(false);
+        }
+        if entry.flags == flags {
+            return Ok(false);
+        }
+        entry.flags = flags;
+        entry.last_commit_txn = self.txn()?;
+        entry.last_change_unix_ns = now_ns();
+        self.store_entry(apex, entry)?;
+        Ok(true)
+    }
+
+    /// Явно сохраняет существующее пустое имя (`T_NODE` + ENT).
+    ///
+    /// Нужно для write-through: удаление последнего `RRset` в API оставляет имя
+    /// существующим (`NODATA`), тогда как `delete_rrset` сам по себе удалил бы
+    /// листовой `T_NODE`.
+    ///
+    /// # Errors
+    ///
+    /// `NameOutsideZone`, `Corrupt`/`Io`.
+    pub fn ensure_empty_node(
+        &mut self,
+        apex: &NameRle,
+        name: &NameRle,
+    ) -> Result<bool, ZoneFileError> {
+        let Some(mut entry) = self.load_entry(apex)? else {
+            return Ok(false);
+        };
+        if !entry.is_live() {
+            return Ok(false);
+        }
+        let txn = self.txn()?;
+        let mut tree = ZoneTree::new(*apex, entry.tree_root, entry.tree_level)?;
+        let changed = tree.ensure_empty_node(self.pages_mut()?, txn, name)?;
+        if changed {
+            entry.tree_root = tree.root();
+            entry.tree_level = tree.level();
+            entry.last_commit_txn = txn;
+            entry.last_change_unix_ns = now_ns();
+            self.store_entry(apex, entry)?;
+        }
+        Ok(changed)
     }
 
     /// Upsert `RRset`'а (`§13.3`).
@@ -1586,6 +1719,63 @@ fn crash_now() {
 mod tests {
     use super::*;
     use crate::CreateConfig;
+
+    #[test]
+    fn zone_meta_empty_node_and_flags_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zones.zonefile");
+        let mut zonefile = ZoneFile::create(
+            &path,
+            CreateConfig {
+                map_size: 64 * 1024 * 1024,
+                ..CreateConfig::default()
+            },
+        )
+        .unwrap();
+        let apex = NameRle::from_ascii("example.com").unwrap();
+        let empty = NameRle::from_ascii("empty.example.com").unwrap();
+        let meta = ZoneMetaBlock {
+            default_ttl: 600,
+            denial: 1,
+            ..ZoneMetaBlock::default()
+        };
+        let mut writer = zonefile.write().unwrap();
+        writer.create_zone_with_meta(&apex, 0, &meta).unwrap();
+        writer.ensure_empty_node(&apex, &empty).unwrap();
+        writer.commit(SyncMode::Sync).unwrap();
+        let stored = zonefile.zone_meta(&apex).unwrap().unwrap();
+        assert_eq!(stored.default_ttl, 600);
+        assert_eq!(stored.denial, 1);
+
+        let items: Vec<ZoneItem> = zonefile
+            .zone_items(&apex)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(items.iter().any(|item| {
+            item.name == empty && matches!(item.value, ZoneItemValue::Node { .. })
+        }));
+
+        let mut writer = zonefile.write().unwrap();
+        writer
+            .set_zone_flags(&apex, crate::zone_meta::ZONE_FLAG_SECONDARY)
+            .unwrap();
+        writer
+            .update_zone_meta(
+                &apex,
+                &ZoneMetaBlock {
+                    default_ttl: 900,
+                    ..meta
+                },
+            )
+            .unwrap();
+        writer.commit(SyncMode::Sync).unwrap();
+        assert_eq!(
+            zonefile.zone_entry(&apex).unwrap().unwrap().flags,
+            crate::zone_meta::ZONE_FLAG_SECONDARY
+        );
+        assert_eq!(zonefile.zone_meta(&apex).unwrap().unwrap().default_ttl, 900);
+    }
 
     #[test]
     fn snapshot_keeps_txn_and_releases_on_last_drop() {

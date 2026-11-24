@@ -13,6 +13,8 @@ use pulse_server::StatsSnapshot as QueryStatsSnapshot;
 use thiserror::Error;
 
 use crate::config::{Config, ConfigError};
+use crate::dnssec::{self, DnssecError};
+use crate::persist::{self, ZonePersistence};
 use crate::stats::{Stats, StatsSnapshot};
 use crate::store::{self, SharedZoneAdmin};
 use crate::tcp::TcpService;
@@ -65,9 +67,13 @@ impl Server {
 
     /// Запускает DNS-сервер и, если задан `api`, встроенный REST API.
     ///
-    /// JSON-зоны загружаются в [`InMemoryZoneAdmin`] — он является источником
-    /// истины для DNS и для API. API и DNS используют один store, поэтому
-    /// успешная мутация сразу подменяет снапшот `QueryEngine`.
+    /// JSON/master-зоны загружаются в [`InMemoryZoneAdmin`] — он является
+    /// источником истины для DNS и для API. API и DNS используют один store,
+    /// поэтому успешная мутация сразу подменяет снапшот `QueryEngine`.
+    ///
+    /// Если задан `config.zonefile`, при первом запуске store импортируется и
+    /// коммитится в `pulse-zonefile`, при последующих — загружается из файла
+    /// (конфигурационные зоны игнорируются). Мутации пишутся write-through.
     ///
     /// # Errors
     ///
@@ -78,10 +84,54 @@ impl Server {
     pub fn start_with_api(config: &Config, api: Option<ApiOptions>) -> Result<Self, ServerError> {
         config.validate()?;
         let store = Arc::new(InMemoryZoneAdmin::new());
-        store::load_config(&store, config).map_err(ServerError::Store)?;
-        let admin = Arc::new(SharedZoneAdmin::new(store).map_err(|error| {
-            ServerError::Store(format!("cannot build initial DNS snapshot: {error}"))
-        })?);
+        let dnssec = dnssec::load(config).map_err(ServerError::Dnssec)?;
+        let persistence = if let Some(path) = &config.zonefile {
+            let (mut persistence, zones, fresh) = ZonePersistence::open_or_create(
+                path,
+                config.map_size,
+                config.durability.sync_mode(),
+            )
+            .map_err(|error| ServerError::Store(error.to_string()))?;
+            if fresh {
+                let prepared = store::load_config(&store, config, &dnssec).and_then(|()| {
+                    persistence
+                        .bootstrap(&store.snapshot())
+                        .map_err(|error| error.to_string())
+                });
+                if let Err(error) = prepared {
+                    // Не оставляем валидный пустой файл после неудачного
+                    // bootstrap: следующий запуск должен снова пройти
+                    // fail-fast по конфигурации.
+                    drop(persistence);
+                    let _ = std::fs::remove_file(path);
+                    return Err(ServerError::Store(error));
+                }
+                crate::logging::info(
+                    "persistence",
+                    &format!(
+                        "bootstrapped zone file {} from JSON/master sources",
+                        path.display()
+                    ),
+                );
+            } else {
+                let count = zones.len();
+                persist::load_into_store(&store, zones).map_err(ServerError::Store)?;
+                crate::logging::info(
+                    "persistence",
+                    &format!(
+                        "loaded {count} zone(s) from {}; JSON/master zones are ignored",
+                        path.display()
+                    ),
+                );
+            }
+            Some(persistence)
+        } else {
+            store::load_config(&store, config, &dnssec).map_err(ServerError::Store)?;
+            None
+        };
+        let admin = Arc::new(SharedZoneAdmin::new(store, dnssec, persistence).map_err(
+            |error| ServerError::Store(format!("cannot build initial DNS snapshot: {error}")),
+        )?);
         let stats = Arc::new(Stats::new());
 
         let tcp = match config.listen_tcp {
@@ -206,6 +256,11 @@ impl Server {
         {
             first_error.get_or_insert(ServerError::Udp(error));
         }
+        if let Err(error) = self.admin.sync_persistence() {
+            first_error.get_or_insert(ServerError::Store(format!(
+                "cannot sync persistent zone file: {error}"
+            )));
+        }
         first_error.map_or(Ok(()), Err)
     }
 }
@@ -228,6 +283,9 @@ pub enum ServerError {
     /// Ошибка загрузки зон в store или построения DNS-снапшота.
     #[error("zone store error: {0}")]
     Store(String),
+    /// Ошибка загрузки DNSSEC-ключей.
+    #[error(transparent)]
+    Dnssec(#[from] DnssecError),
     /// Не удалось запустить TCP-транспорт.
     #[error("cannot start TCP listener {addr}: {source}")]
     TcpStart {

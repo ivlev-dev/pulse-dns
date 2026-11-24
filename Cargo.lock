@@ -686,7 +686,9 @@ dependencies = [
 name = "pulse-api"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "pulse-dns",
+ "pulse-dnssec",
  "serde",
  "serde_json",
  "sha2",
@@ -745,7 +747,21 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "pulse-dns",
+ "pulse-dnssec",
  "thiserror",
+]
+
+[[package]]
+name = "pulse-transfer"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "hex",
+ "proptest",
+ "pulse-dns",
+ "subtle",
+ "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -771,12 +787,15 @@ dependencies = [
  "hex",
  "pulse-api",
  "pulse-dns",
+ "pulse-dnssec",
  "pulse-master",
  "pulse-runtime",
  "pulse-server",
+ "pulse-zonefile",
  "serde",
  "serde_json",
  "signal-hook",
+ "tempfile",
  "thiserror",
 ]
 

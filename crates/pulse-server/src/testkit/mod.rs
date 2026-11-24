@@ -5,6 +5,7 @@
 //! набора наследуется от [`Rrset`] (каноническая форма), поэтому ответы
 //! детерминированы.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype};
@@ -69,6 +70,8 @@ pub struct InMemoryZone {
     cuts: HashSet<Name>,
     soa: Option<Rrset>,
     ns: Option<Rrset>,
+    /// NSEC-наборы, отсортированные по каноническому порядку владельцев.
+    nsec: Vec<(Name, Rrset)>,
 }
 
 impl InMemoryZone {
@@ -87,6 +90,7 @@ impl InMemoryZone {
             cuts: HashSet::new(),
             soa: None,
             ns: None,
+            nsec: Vec::new(),
         }
     }
 
@@ -158,9 +162,22 @@ impl InMemoryZone {
                 _ => {}
             }
         }
+        let is_nsec = rrset.rr_type() == Rtype::NSEC;
+        let nsec_entry = is_nsec.then(|| (rrset.owner().clone(), rrset.clone()));
         self.rrsets
             .insert((rrset.owner().clone(), rrset.rr_type()), rrset);
+        if let Some((owner, nsec)) = nsec_entry {
+            self.insert_nsec(owner, nsec);
+        }
         Ok(())
+    }
+
+    fn insert_nsec(&mut self, owner: Name, rrset: Rrset) {
+        self.nsec.retain(|(existing, _)| existing != &owner);
+        let position = self
+            .nsec
+            .partition_point(|(existing, _)| existing.cmp_canonical(&owner) == Ordering::Less);
+        self.nsec.insert(position, (owner, rrset));
     }
 
     fn register_node(&mut self, owner: &Name) {
@@ -302,6 +319,50 @@ impl ZoneView for InMemoryZone {
 
     fn node_exists(&self, name: &Name) -> bool {
         self.nodes.contains(name)
+    }
+
+    fn nsec_at(&self, name: &Name) -> Option<Rrset> {
+        self.rrsets.get(&(name.clone(), Rtype::NSEC)).cloned()
+    }
+
+    fn nsec_cover(&self, name: &Name) -> Option<Rrset> {
+        if self.nsec.is_empty() {
+            return None;
+        }
+        let position = self
+            .nsec
+            .partition_point(|(owner, _)| owner.cmp_canonical(name) == Ordering::Less);
+        let candidate = if position == 0 {
+            self.nsec.last()
+        } else {
+            self.nsec.get(position - 1)
+        }?;
+        let (owner, rrset) = candidate;
+        if owner == name {
+            return None;
+        }
+        let next = rrset.rdatas().iter().find_map(|rdata| match rdata {
+            Rdata::Nsec(nsec) => Some(nsec.next_domain()),
+            _ => None,
+        })?;
+        nsec_covers(owner, next, name).then(|| rrset.clone())
+    }
+}
+
+/// RFC 4034 §4.1.2: покрывает ли интервал `(owner, next)` имя `name`.
+fn nsec_covers(owner: &Name, next: &Name, name: &Name) -> bool {
+    if name == owner {
+        return false;
+    }
+    match owner.cmp_canonical(next) {
+        Ordering::Less => {
+            owner.cmp_canonical(name) == Ordering::Less
+                && name.cmp_canonical(next) == Ordering::Less
+        }
+        Ordering::Greater | Ordering::Equal => {
+            owner.cmp_canonical(name) == Ordering::Less
+                || name.cmp_canonical(next) == Ordering::Less
+        }
     }
 }
 

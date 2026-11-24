@@ -197,6 +197,13 @@ impl Problem {
                 instance,
                 request_id,
             ),
+            AdminError::Storage(detail) => Self::new(
+                500,
+                "storage-error",
+                format!("Persistent storage failed: {detail}"),
+                instance,
+                request_id,
+            ),
         }
     }
 }
@@ -225,6 +232,7 @@ pub(crate) fn title_for(code: &str) -> &'static str {
         "unsupported-media-type" => "Unsupported media type",
         "rate-limited" => "Rate limited",
         "internal-error" => "Internal error",
+        "storage-error" => "Persistent storage error",
         "unavailable" => "Unavailable",
         "idempotency-key-reuse" => "Idempotency key reuse",
         "idempotency-in-progress" => "Idempotency request in progress",

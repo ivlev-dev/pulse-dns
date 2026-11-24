@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use pulse_dns::{Name, Rdata, Rtype, Ttl};
+use pulse_dnssec::{DIGEST_SHA256, DNSKEY_FLAG_SEP, DsPolicy, ds_from_dnskey, key_tag};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -14,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::auth::{Authenticator, Principal};
 use crate::codec::{hex_lower, parse_rtype};
 use crate::config::ApiConfig;
-use crate::error::FieldIssue;
+use crate::error::{AdminError, FieldIssue, NotFound};
 use crate::etag::{header_matches, normalize_tag};
 use crate::http::{HttpRequest, HttpResponse, Method};
 use crate::idempotency::{Begin, IdempotencyStore};
@@ -376,6 +378,8 @@ impl Api {
                 Method::Patch => self.patch_settings(request, origin, request_id, instance),
                 _ => Err(internal(instance, request_id)),
             },
+            Route::ZoneKeys(origin) => self.get_zone_keys(origin, request_id, instance),
+            Route::ZoneSign(origin) => self.sign_zone(origin, request_id, instance),
             Route::RrsetList(origin) => self.list_rrsets(request, origin, request_id, instance),
             Route::Rrset {
                 origin,
@@ -397,6 +401,95 @@ impl Api {
                 _ => Err(internal(instance, request_id)),
             },
         }
+    }
+
+    fn get_zone_keys(
+        &self,
+        origin: &Name,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        self.store
+            .get_zone(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let rrset = match self.store.get_rrset(origin, origin, Rtype::DNSKEY) {
+            Ok(rrset) => rrset,
+            Err(AdminError::NotFound(NotFound::Rrset)) => {
+                return Err(Problem::new(
+                    404,
+                    "dnssec_not_configured",
+                    "Zone has no DNSSEC keys.",
+                    instance,
+                    request_id,
+                ));
+            }
+            Err(error) => return Err(Problem::from_admin(error, instance, request_id)),
+        };
+        let dnskeys: Vec<pulse_dns::DnskeyData> = rrset
+            .rdata
+            .iter()
+            .filter_map(|rdata| match rdata {
+                Rdata::Dnskey(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        if dnskeys.is_empty() {
+            return Err(Problem::new(
+                404,
+                "dnssec_not_configured",
+                "Zone has no DNSSEC keys.",
+                instance,
+                request_id,
+            ));
+        }
+        let has_sep = dnskeys.iter().any(|key| key.flags() & DNSKEY_FLAG_SEP != 0);
+        let mut keys = Vec::with_capacity(dnskeys.len());
+        let mut ds = Vec::new();
+        for key in &dnskeys {
+            keys.push(json!({
+                "flags": key.flags(),
+                "protocol": key.protocol(),
+                "algorithm": key.algorithm(),
+                "key_tag": key_tag(key),
+                "role": if key.flags() & DNSKEY_FLAG_SEP != 0 { "ksk" } else { "zsk" },
+                "public_key": base64::engine::general_purpose::STANDARD.encode(key.public_key()),
+            }));
+            let is_ds_candidate = !has_sep || key.flags() & DNSKEY_FLAG_SEP != 0;
+            if is_ds_candidate {
+                let record = ds_from_dnskey(origin, key, DIGEST_SHA256, DsPolicy::strict())
+                    .map_err(|_| internal(instance, request_id))?;
+                ds.push(json!({
+                    "key_tag": record.key_tag(),
+                    "algorithm": record.algorithm(),
+                    "digest_type": record.digest_type(),
+                    "digest": hex_lower(record.digest()),
+                }));
+            }
+        }
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "zone": origin.to_string(),
+                "denial": "nsec",
+                "keys": keys,
+                "ds": ds,
+            }),
+        ))
+    }
+
+    fn sign_zone(
+        &self,
+        origin: &Name,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let zone = self
+            .store
+            .sign_zone(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let mut response = HttpResponse::json(200, zone_json(&zone));
+        response.set_header("ETag", zone.etag);
+        Ok(response)
     }
 
     fn list_zones(
@@ -1241,6 +1334,8 @@ enum Route {
     Zones,
     Zone(Name),
     ZoneSettings(Name),
+    ZoneKeys(Name),
+    ZoneSign(Name),
     RrsetList(Name),
     Rrset {
         origin: Name,
@@ -1259,6 +1354,8 @@ impl Route {
             Self::Zones => "/api/v1/zones",
             Self::Zone(_) => "/api/v1/zones/{origin}",
             Self::ZoneSettings(_) => "/api/v1/zones/{origin}/settings",
+            Self::ZoneKeys(_) => "/api/v1/zones/{origin}/keys",
+            Self::ZoneSign(_) => "/api/v1/zones/{origin}/sign",
             Self::RrsetList(_) => "/api/v1/zones/{origin}/rrsets",
             Self::Rrset { .. } => "/api/v1/zones/{origin}/records/{name}/{type}",
         }
@@ -1266,9 +1363,11 @@ impl Route {
 
     fn origin(&self) -> Option<&Name> {
         match self {
-            Self::Zone(origin) | Self::ZoneSettings(origin) | Self::RrsetList(origin) => {
-                Some(origin)
-            }
+            Self::Zone(origin)
+            | Self::ZoneSettings(origin)
+            | Self::ZoneKeys(origin)
+            | Self::ZoneSign(origin)
+            | Self::RrsetList(origin) => Some(origin),
             Self::Rrset { origin, .. } => Some(origin),
             _ => None,
         }
@@ -1279,6 +1378,8 @@ impl Route {
             Self::Health | Self::Ready | Self::Metrics | Self::OpenApi | Self::Zones => &["GET"],
             Self::Zone(_) => &["GET", "PUT", "DELETE"],
             Self::ZoneSettings(_) => &["GET", "PATCH"],
+            Self::ZoneKeys(_) => &["GET"],
+            Self::ZoneSign(_) => &["POST"],
             Self::Rrset { .. } => &["GET", "PUT", "PATCH", "DELETE"],
             Self::RrsetList(_) => &["GET"],
         }
@@ -1286,9 +1387,11 @@ impl Route {
 
     fn target(&self) -> String {
         match self {
-            Self::Zone(origin) | Self::ZoneSettings(origin) | Self::RrsetList(origin) => {
-                origin.to_string()
-            }
+            Self::Zone(origin)
+            | Self::ZoneSettings(origin)
+            | Self::ZoneKeys(origin)
+            | Self::ZoneSign(origin)
+            | Self::RrsetList(origin) => origin.to_string(),
             Self::Rrset { origin, .. } => origin.to_string(),
             _ => "-".to_owned(),
         }
@@ -1299,6 +1402,7 @@ impl Route {
             (Self::Zone(_), Method::Put) => "zone.put",
             (Self::Zone(_), Method::Delete) => "zone.delete",
             (Self::ZoneSettings(_), Method::Patch) => "zone.settings.patch",
+            (Self::ZoneSign(_), Method::Post) => "zone.sign",
             (Self::Rrset { .. }, Method::Put) => "rrset.put",
             (Self::Rrset { .. }, Method::Patch) => "rrset.patch",
             (Self::Rrset { .. }, Method::Delete) => "rrset.delete",
@@ -1329,6 +1433,16 @@ fn parse_route(request: &HttpRequest, instance: &str, request_id: &str) -> Resul
             Ok(Route::ZoneSettings(parse_name(
                 origin, instance, request_id,
             )?))
+        }
+        [api, version, zones, origin, collection]
+            if api == "api" && version == "v1" && zones == "zones" && collection == "keys" =>
+        {
+            Ok(Route::ZoneKeys(parse_origin(origin, instance, request_id)?))
+        }
+        [api, version, zones, origin, collection]
+            if api == "api" && version == "v1" && zones == "zones" && collection == "sign" =>
+        {
+            Ok(Route::ZoneSign(parse_origin(origin, instance, request_id)?))
         }
         [api, version, zones, origin, collection]
             if api == "api" && version == "v1" && zones == "zones" && collection == "rrsets" =>
@@ -1388,11 +1502,12 @@ fn required_scope(route: &Route, method: &Method) -> Option<&'static str> {
         (Route::OpenApi, _) => None,
         (Route::Zones, _)
         | (Route::Zone(_), Method::Get)
-        | (Route::ZoneSettings(_), Method::Get) => Some("zones:read"),
+        | (Route::ZoneSettings(_), Method::Get)
+        | (Route::ZoneKeys(_), _) => Some("zones:read"),
         (Route::Zone(_), Method::Delete) => Some("zones:delete"),
-        (Route::Zone(_), Method::Put) | (Route::ZoneSettings(_), Method::Patch) => {
-            Some("zones:write")
-        }
+        (Route::Zone(_), Method::Put)
+        | (Route::ZoneSettings(_), Method::Patch)
+        | (Route::ZoneSign(_), _) => Some("zones:write"),
         (Route::RrsetList(_), _) | (Route::Rrset { .. }, Method::Get) => Some("zones:read"),
         (Route::Rrset { .. }, _) => Some("zones:write"),
         _ => None,
@@ -1420,6 +1535,16 @@ fn route_label(path: &str) -> &'static str {
             if api == "api" && version == "v1" && zones == "zones" && settings == "settings" =>
         {
             "/api/v1/zones/{origin}/settings"
+        }
+        [api, version, zones, _, collection]
+            if api == "api" && version == "v1" && zones == "zones" && collection == "keys" =>
+        {
+            "/api/v1/zones/{origin}/keys"
+        }
+        [api, version, zones, _, collection]
+            if api == "api" && version == "v1" && zones == "zones" && collection == "sign" =>
+        {
+            "/api/v1/zones/{origin}/sign"
         }
         [api, version, zones, _, collection]
             if api == "api" && version == "v1" && zones == "zones" && collection == "rrsets" =>

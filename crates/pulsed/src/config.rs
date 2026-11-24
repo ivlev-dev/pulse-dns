@@ -1,8 +1,9 @@
 //! JSON-конфигурация сервера и CLI-overrides.
 //!
 //! Конфигурация намеренно плоская: адреса транспортов, число UDP worker'ов,
-//! уровень логирования, параметры TCP и список зон. Все записи зоны описаны
-//! в [`ZoneConfig`]; RDATA разбирается по типу в [`crate::zone`].
+//! уровень логирования, параметры TCP, persistence (`zonefile`/`durability`/
+//! `map_size`) и список зон. Все записи зоны описаны в [`ZoneConfig`];
+//! RDATA разбирается по типу в [`crate::zone`].
 //!
 //! # Пример
 //!
@@ -17,13 +18,19 @@
 //! assert!(config.listen_udp.is_some());
 //! ```
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use pulse_zonefile::SyncMode;
 use serde::Deserialize;
 use thiserror::Error;
+
+/// Размер map по умолчанию: 4 GiB (sparse-файл; страницы занимаются по мере
+/// записи).
+pub const DEFAULT_MAP_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Уровень логирования.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -66,6 +73,56 @@ impl FromStr for LogLevel {
             "trace" => Ok(Self::Trace),
             other => Err(format!(
                 "unknown log level {other:?}; expected error, warn, info, debug or trace"
+            )),
+        }
+    }
+}
+
+/// Режим durability записи в zonefile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    /// Данные и meta синхронизируются.
+    Sync,
+    /// Данные синхронизируются, meta — нет (по умолчанию).
+    #[default]
+    Flush,
+    /// Без fsync (экспериментальный режим).
+    Memory,
+}
+
+impl Durability {
+    /// Режим `pulse-zonefile`.
+    #[must_use]
+    pub const fn sync_mode(self) -> SyncMode {
+        match self {
+            Self::Sync => SyncMode::Sync,
+            Self::Flush => SyncMode::MetaNoSync,
+            Self::Memory => SyncMode::NoSync,
+        }
+    }
+}
+
+impl fmt::Display for Durability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Sync => "sync",
+            Self::Flush => "flush",
+            Self::Memory => "memory",
+        })
+    }
+}
+
+impl FromStr for Durability {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "sync" => Ok(Self::Sync),
+            "flush" => Ok(Self::Flush),
+            "memory" => Ok(Self::Memory),
+            other => Err(format!(
+                "unknown durability {other:?}; expected sync, flush or memory"
             )),
         }
     }
@@ -124,6 +181,64 @@ pub struct ZoneFileConfig {
     pub path: PathBuf,
 }
 
+/// Роль DNSSEC-ключа в конфигурации.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnssecKeyRole {
+    /// Key Signing Key (подписывает DNSKEY).
+    Ksk,
+    /// Zone Signing Key (подписывает данные).
+    Zsk,
+    /// Combined Signing Key (подписывает всё).
+    Csk,
+}
+
+impl DnssecKeyRole {
+    /// Разбирает имя роли без учёта регистра.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ksk" => Some(Self::Ksk),
+            "zsk" => Some(Self::Zsk),
+            "csk" => Some(Self::Csk),
+            _ => None,
+        }
+    }
+}
+
+/// Ключ подписи зоны.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnssecKeyConfig {
+    /// Роль ключа. При отсутствии выводится из sibling `.key` (SEP-бит) или
+    /// считается CSK для одиночного ключа.
+    #[serde(default)]
+    pub role: Option<DnssecKeyRole>,
+    /// Путь к BIND `.private` (или парному `.key`), либо PKCS#8 PEM/DER.
+    pub path: PathBuf,
+    /// Алгоритм для PKCS#8 (обязателен, если роль/файл не задают его).
+    #[serde(default)]
+    pub algorithm: Option<u8>,
+    /// Явные DNSKEY flags (переопределяют роль).
+    #[serde(default)]
+    pub flags: Option<u16>,
+}
+
+/// DNSSEC-настройки зоны.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnssecZoneConfig {
+    /// Ключи подписи (непустой набор).
+    #[serde(default)]
+    pub keys: Vec<DnssecKeyConfig>,
+    /// Срок действия подписи в днях (по умолчанию 30).
+    #[serde(default)]
+    pub validity_days: Option<u32>,
+    /// Запас на расхождение часов в секундах (по умолчанию 300).
+    #[serde(default)]
+    pub inception_skew: Option<u32>,
+}
+
 /// Зона в конфигурации.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,10 +278,19 @@ pub struct Config {
     pub log_level: LogLevel,
     /// Параметры TCP.
     pub tcp: TcpConfig,
+    /// Файл persistence `pulse-zonefile`; `null`/отсутствие — без persistence.
+    pub zonefile: Option<PathBuf>,
+    /// Режим durability коммитов.
+    pub durability: Durability,
+    /// Размер map zonefile в байтах.
+    pub map_size: u64,
     /// Обслуживаемые зоны в JSON-форме.
     pub zones: Vec<ZoneConfig>,
     /// Дополнительные зоны из master-файлов (RFC 1035).
     pub zones_files: Vec<ZoneFileConfig>,
+    /// DNSSEC-подпись зон при загрузке (origin → ключи/политика).
+    #[serde(default)]
+    pub dnssec: BTreeMap<String, DnssecZoneConfig>,
 }
 
 impl Default for Config {
@@ -177,8 +301,12 @@ impl Default for Config {
             workers: 0,
             log_level: LogLevel::Info,
             tcp: TcpConfig::default(),
+            zonefile: None,
+            durability: Durability::Flush,
+            map_size: DEFAULT_MAP_SIZE,
             zones: Vec::new(),
             zones_files: Vec::new(),
+            dnssec: BTreeMap::new(),
         }
     }
 }
@@ -244,7 +372,35 @@ impl Config {
                 self.tcp.idle_timeout_ms
             )));
         }
+        if self
+            .zonefile
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "zonefile path must not be empty".to_owned(),
+            ));
+        }
+        if self.map_size == 0 {
+            return Err(ConfigError::Invalid(
+                "map_size must be greater than zero".to_owned(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Добавляет ключ подписи зоны (CLI `--dnssec-key`).
+    ///
+    /// Повторные ключи для той же зоны дополняют набор; порядок ключей
+    /// сохраняется.
+    pub fn add_dnssec_key(&mut self, origin: &str, role: Option<DnssecKeyRole>, path: PathBuf) {
+        let entry = self.dnssec.entry(origin.to_owned()).or_default();
+        entry.keys.push(DnssecKeyConfig {
+            role,
+            path,
+            algorithm: None,
+            flags: None,
+        });
     }
 
     /// Применяет CLI-overrides поверх файла.
@@ -261,11 +417,20 @@ impl Config {
         if let Some(level) = overrides.log_level {
             self.log_level = level;
         }
+        if let Some(path) = &overrides.zonefile {
+            self.zonefile = Some(path.clone());
+        }
+        if let Some(durability) = overrides.durability {
+            self.durability = durability;
+        }
+        if let Some(map_size) = overrides.map_size {
+            self.map_size = map_size;
+        }
     }
 }
 
 /// Значения, переопределяющие конфигурационный файл из CLI.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Overrides {
     /// Новый адрес UDP.
     pub listen_udp: Option<SocketAddr>,
@@ -275,6 +440,12 @@ pub struct Overrides {
     pub workers: Option<usize>,
     /// Новый уровень логирования.
     pub log_level: Option<LogLevel>,
+    /// Путь к файлу persistence.
+    pub zonefile: Option<PathBuf>,
+    /// Режим durability.
+    pub durability: Option<Durability>,
+    /// Размер map zonefile.
+    pub map_size: Option<u64>,
 }
 
 /// Ошибка чтения/разбора конфигурации.
@@ -344,6 +515,9 @@ mod tests {
             listen_tcp: None,
             workers: Some(3),
             log_level: Some(LogLevel::Debug),
+            zonefile: None,
+            durability: Some(Durability::Sync),
+            map_size: Some(64 * 1024 * 1024),
         });
         assert_eq!(config.listen_udp, Some(addr));
         assert_eq!(config.workers, 3);

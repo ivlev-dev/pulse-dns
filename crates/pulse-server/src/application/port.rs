@@ -45,10 +45,43 @@ pub trait ZoneView: Send + Sync {
 
     /// Все `RRSIG`-наборы имени, покрывающие `covered` (`type covered`).
     ///
-    /// В v1 движок подписи к ответу не прикладывает, но порт обязан отдавать
-    /// их для следующего этапа (`domain-model.md` §4.5). Пустой результат —
-    /// подписей нет.
+    /// Движок прикладывает их к ответу при `DO = 1`. Пустой результат —
+    /// подписей нет (неподписанная зона или отсутствующий RRset).
     fn lookup_all_rrsig(&self, name: &Name, covered: Rtype) -> Vec<Rrset>;
+
+    /// Подписана ли зона: есть apex `DNSKEY` и его `RRSIG`.
+    ///
+    /// Реализация по умолчанию проверяет это через [`ZoneView::lookup`] и
+    /// [`ZoneView::lookup_all_rrsig`], поэтому адаптерам достаточно хранить
+    /// DNSSEC-записи как обычные RRset. Неподписанная зона не получает
+    /// `RRSIG`/NSEC-доказательств в ответах.
+    fn signed(&self) -> bool {
+        matches!(
+            self.lookup(self.origin(), Rtype::DNSKEY),
+            LookupOutcome::Answer(_)
+        ) && !self
+            .lookup_all_rrsig(self.origin(), Rtype::DNSKEY)
+            .is_empty()
+    }
+
+    /// `NSEC`-набор, владелец которого совпадает с `name`.
+    ///
+    /// Нужен для NODATA-доказательства (RFC 4035 §5.4). `None` — зона не
+    /// публикует NSEC или имя не является владельцем NSEC.
+    fn nsec_at(&self, name: &Name) -> Option<Rrset> {
+        let _ = name;
+        None
+    }
+
+    /// `NSEC`-набор, интервал которого покрывает `name` в каноническом
+    /// порядке (RFC 4034 §4.1.2).
+    ///
+    /// Нужен для NXDOMAIN (покрытие QNAME и wildcard) и positive wildcard
+    /// proof. `None` — покрывающей записи нет.
+    fn nsec_cover(&self, name: &Name) -> Option<Rrset> {
+        let _ = name;
+        None
+    }
 
     /// Является ли имя точкой делегирования (`NS` без `SOA`, не apex).
     fn is_delegation(&self, name: &Name) -> bool;

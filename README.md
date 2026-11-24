@@ -2,8 +2,9 @@
 
 Модульный высокопроизводительный DNS-сервер на Rust. Linux-first, edition 2024
 (stable). Текущее состояние — **authoritative MVP**: рабочий авторитетный сервер
-(`pulsed`) с UDP/TCP и REST API поверх in-memory хранилища. Это не полный
-продукт из ТЗ (нет рекурсии, DNSSEC-крипто, AXFR/IXFR, DoT/DoH/DoQ и т.д.).
+(`pulsed`) с UDP/TCP, REST API и опциональной write-through persistence в
+`pulse-zonefile`; serving-путь остаётся in-memory. Это не полный продукт из ТЗ
+(нет рекурсии, DNSSEC-крипто, AXFR/IXFR, DoT/DoH/DoQ и т.д.).
 
 ## Возможности
 
@@ -28,12 +29,14 @@
   пагинация, лимиты тела/rate limit.
 - Бинарник `pulsed`: UDP+TCP, JSON-конфиг зон и RFC 1035 master-файлы
   (`.zone`, `$ORIGIN`/`$TTL`/`$INCLUDE`), единый store с REST (правки через
-  API сразу видны в DNS), graceful shutdown, Dockerfile.
+  API сразу видны в DNS), write-through persistence в `pulse-zonefile`
+  (`--data`, `sync`/`flush`/`memory`, один writer), graceful shutdown,
+  Dockerfile.
 
 **Не реализовано (см. `STATUS.md`):** commit/allocator/GC и параллельная запись
 по зонам в коде (только дизайн, ADR 0005/0006, spec parallel-writes-v2);
-персистентность (`pulsed` не использует `pulse-zonefile`, зоны in-memory из
-JSON/master/REST); DNSSEC-крипто (подпись/валидация) и привязка RRSIG; DNSCrypt;
+journal/outbox и параллельная запись в zonefile; зоны в памяти пересобираются
+полностью при мутации; DNSSEC-крипто (подпись/валидация) и привязка RRSIG; DNSCrypt;
 рекурсивный резолвер; AXFR/IXFR/NOTIFY/secondary; DoT/DoH/DoQ; 0x20 echo; TLS
 для API (только loopback); fuzz/Miri/loom в CI; полноценный RRL; REST —
 MVP-подмножество спецификации.
@@ -44,7 +47,7 @@ MVP-подмножество спецификации.
 |---|---|
 | `pulse-dns` | Wire-формат DNS и RR-типы |
 | `pulse-master` | RFC 1035 master-файлы: парсер, валидация, экспорт |
-| `pulse-zonefile` | Бинарный mmap-формат зон (reader реализован; writer/commit — в дизайне) |
+| `pulse-zonefile` | Бинарный mmap-формат зон: reader, writer/commit, fsck, compact |
 | `pulse-runtime` | io_uring UDP-рантайм + epoll-фолбэк |
 | `pulse-server` | Авторитетный движок запросов |
 | `pulse-api` | REST API управления зонами |
@@ -88,7 +91,17 @@ cargo run -p pulsed -- --config examples/master-files.json
 # или: --config examples/empty.json --zone example.com.=examples/example.com.zone
 ```
 
-Подробности и `zones_files` — в `examples/README.md`.
+Persistence в `pulse-zonefile`:
+
+```bash
+cargo run -p pulsed -- --config examples/master-files.json \
+  --data /tmp/pulse-dns.zonefile --durability flush --map-size 268435456
+```
+
+Первый запуск импортирует JSON/master-зоны и создаёт файл; последующие
+запуски читают зоны из файла, а REST-мутации коммитятся write-through.
+
+Подробности — в `examples/README.md`.
 
 Запуск с REST: API включается флагом `--api-listen` (токен обязателен,
 предпочтительно через `PULSED_API_TOKEN`; без TLS только loopback). Примеры

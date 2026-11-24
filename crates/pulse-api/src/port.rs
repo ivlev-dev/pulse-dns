@@ -455,4 +455,14 @@ pub trait ZoneAdmin: Send + Sync + 'static {
         patch: &ZoneSettingsPatch,
         preconditions: &Preconditions,
     ) -> Result<ZoneSettingsView, AdminError>;
+
+    /// Переподписывает зону текущими DNSSEC-ключами.
+    ///
+    /// Реализация `pulsed` заменяет `DNSKEY`/`NSEC`/`RRSIG` и возвращает
+    /// обновлённое представление зоны. In-memory store без ключей возвращает
+    /// [`AdminError::Internal`].
+    fn sign_zone(&self, origin: &Name) -> Result<ZoneView, AdminError> {
+        let _ = origin;
+        Err(AdminError::Internal)
+    }
 }

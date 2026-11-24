@@ -52,6 +52,40 @@ cargo run -p pulsed -- --config examples/empty.json \
 каталога процесса. Ошибки парсера печатаются как `path:line:column: причина`,
 процесс завершается с кодом `2`.
 
+## Persistence (`pulse-zonefile`)
+
+Включение файла зон:
+
+```bash
+cargo run -p pulsed -- \
+  --config examples/persistent.json
+# или CLI:
+cargo run -p pulsed -- \
+  --config examples/master-files.json \
+  --data /tmp/pulse-dns.zonefile \
+  --durability flush \
+  --map-size 268435456
+```
+
+Первый запуск при отсутствии (или пустом) файле импортирует JSON/master-зоны
+и делает `commit`. Последующие запуски читают зоны из файла; JSON/master
+источники **игнорируются** — файл является источником истины. Чтобы
+переимпортировать конфиг, удалите файл зон. Относительные пути (`zonefile`,
+`zones_files`, `--data`) считаются от текущего каталога процесса.
+
+Каждый успешный REST PUT/PATCH/DELETE пишется в `pulse-zonefile` и
+коммитится до обновления DNS-снапшота. При shutdown выполняется `sync()`.
+`durability`: `sync` (данные + meta), `flush` (по умолчанию: данные
+синхронизируются, meta — нет), `memory` (без fsync). После первого `sync`
+формат липко переходит в `sync`-режим для следующих коммитов.
+
+Ограничения: один writer на файл (`LOCK_EX`; второй процесс получает `busy`),
+write-through без journal/outbox, при мутации пересобирается полный
+in-memory снапшот всех зон (не только изменённой), `map_size` — размер
+sparse-файла и задаётся при создании (по умолчанию 4 GiB). При ошибке
+`MapFull`/повреждении/несовместимой версии API возвращает `500 storage-error`,
+а запуск завершается fail-closed.
+
 ## Пример: создать зону и получить A по DNS
 
 ```bash
@@ -146,3 +180,61 @@ apex и несколько SOA отклоняются с `422`/`invariant violat
 Зоны из `--config` при старте обязаны иметь apex SOA/NS (fail-fast, как и
 раньше); незавершённые зоны создаются через API. Serial внутри RDATA SOA
 задаётся явно пользователем; метаданные зоны ведут отдельный serial коммитов.
+
+## DNSSEC (authoritative, NSEC)
+
+`pulsed` подписывает зону при загрузке, если для её origin заданы ключи. Ключи
+читаются из BIND-пары `K*.key`/`K*.private` (роль можно вывести из SEP-бита
+`.key`) или из PKCS#8 PEM/DER. Приватный файл обязан иметь режим `0600`
+(каталог `0700`); более широкие права — ошибка запуска. Приватные ключи не
+логируются и не отдаются через API.
+
+JSON-конфигурация:
+
+```json
+{
+  "zones_files": [{"origin": "example.com.", "path": "examples/example.com.zone"}],
+  "dnssec": {
+    "example.com.": {
+      "keys": [
+        {"role": "ksk", "path": "keys/Kexample.com.+015+12345.private"},
+        {"role": "zsk", "path": "keys/Kexample.com.+015+54321.private"}
+      ],
+      "validity_days": 30,
+      "inception_skew": 300
+    }
+  }
+}
+```
+
+CLI (повторяемый; роль опциональна):
+
+```bash
+cargo run -p pulsed -- --config examples/empty.json \
+  --zone example.com.=examples/example.com.zone \
+  --dnssec-key example.com.=ksk:keys/ksk.private \
+  --dnssec-key example.com.=zsk:keys/zsk.private
+```
+
+Проверка (DO=1 — RRSIG/NSEC; DO=0 — без подписей):
+
+```bash
+dig @127.0.0.1 -p 5353 www.example.com. A +dnssec +norecurse
+dig @127.0.0.1 -p 5353 nope.example.com. A +dnssec +norecurse   # NXDOMAIN + NSEC
+dig @127.0.0.1 -p 5353 www.example.com. AAAA +dnssec +norecurse # NODATA + NSEC
+```
+
+Публичные ключи и DS (приватные не отдаются):
+
+```bash
+curl -sS -H "Authorization: Bearer $PULSED_API_TOKEN" \
+  "$API/api/v1/zones/example.com./keys"
+
+# Переподписать после ручных изменений зоны (NSEC/RRSIG пересобираются):
+curl -sS -X POST -H "Authorization: Bearer $PULSED_API_TOKEN" \
+  "$API/api/v1/zones/example.com./sign"
+```
+
+Ограничения v1: только NSEC (NSEC3-подпись не генерируется); `NS` в точке
+делегирования и glue ниже cut не подписываются; после изменения зоны через
+REST вызовите `POST /sign`, иначе подписи/NSEC-цепочка устареют.

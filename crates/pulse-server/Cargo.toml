@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 pulse-dns = { path = "../pulse-dns" }
+pulse-dnssec = { path = "../pulse-dnssec" }
 thiserror = "2"
 
 [dev-dependencies]

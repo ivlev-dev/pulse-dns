@@ -23,10 +23,11 @@
 
 - `pulse-dns` — wire-формат DNS, RR-типы, сжатие имён, EDNS0, RFC 3597,
   канонизация RFC 4034, лимиты, 0 `unsafe`.
-- `pulse-zonefile` — reader-сторона: pager, superblock/meta A/B, CRC32C,
-  reader table с RAII-снапшотами, recovery (durable_watermark, torn-мета,
-  sticky sync_mode), B+tree (RLE-ключи, канонический компаратор, split, ENT),
-  overflow-цепочки, кеш валидированных страниц, zone index.
+- `pulse-zonefile` — pager, superblock/meta A/B, CRC32C, reader table с
+  RAII-снапшотами, recovery (durable_watermark, torn-мета, sticky sync_mode),
+  B+tree (RLE-ключи, канонический компаратор, split, ENT), overflow-цепочки,
+  кеш валидированных страниц, zone index, writer/commit, `compact_zone`,
+  `sync`, fsck; используется `pulsed` как write-through хранилище.
 - `pulse-runtime` — io_uring UDP (ring-per-core, multishot recv + provided
   buffers, IP_PKTINFO, NODROP-проверка, backpressure, graceful shutdown,
   изоляция паник) + epoll-фолбэк.
@@ -38,14 +39,18 @@
   allowlist), ETag/If-Match, RFC 9457 problem+json, Idempotency-Key,
   пагинация, лимиты тела/rate limit.
 - `pulsed` — бинарник: UDP+TCP, JSON-конфиг зон и master-файлы RFC 1035
-  (`--zone`/`zones_files`, `pulse-master`), единый store с REST, graceful
-  shutdown, Dockerfile.
+  (`--zone`/`zones_files`, `pulse-master`), единый store с REST, write-through
+  persistence в `pulse-zonefile` (`--data`, durability, single-writer),
+  graceful shutdown, Dockerfile.
 
 ## Проверено руками
 
 - Реальные UDP/TCP ответы: A, AAAA, MX, NXDOMAIN+SOA, CNAME-цепочка.
 - Загрузка зоны из RFC 1035 master-файла (`--zone`/`zones_files`), UDP A и
   NXDOMAIN, затем REST-правка и новый ответ без рестарта.
+- Persistence: bootstrap из пустого/отсутствующего файла, REST A/TTL/DELETE,
+  reopen без потери данных, удаление зоны, `Busy` второго writer'а,
+  отказ на усечённом файле.
 - REST-сценарий: PUT зоны → SOA/NS/A → UDP отвечает → PATCH → ответ меняется →
   DELETE → NODATA/REFUSED.
 - Производительность (loopback, хост нагружен, числа консервативные):
@@ -58,8 +63,9 @@
 **P0 (корректность/долговечность):**
 - Commit/allocator/GC и параллельная запись по зонам в коде не реализованы
   (только дизайн: ADR 0005/0006, spec parallel-writes-v2).
-- `pulsed` не использует `pulse-zonefile`: зоны in-memory из JSON/master/REST,
-  нет персистентности (рестарт теряет изменения через API).
+- `pulsed` использует `pulse-zonefile` как write-through хранилище только при
+  `--data`; без него зоны остаются in-memory. Нет journal/outbox и
+  параллельной записи; снапшот при мутации пересобирается полностью.
 
 **P1 (безопасность/транспорт/протокол):**
 - DNSSEC-крипто (подпись/валидация) и привязка RRSIG; DNSCrypt.

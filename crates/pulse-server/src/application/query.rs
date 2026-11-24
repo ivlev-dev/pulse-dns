@@ -256,13 +256,14 @@ impl QueryEngine {
             .flags()
             .with_aa(resolution.aa)
             .with_ra(false)
+            .with_ad(false)
             .with_tc(false);
         message.set_flags(flags);
         if let Some(edns) = request.edns() {
             message.set_edns(Some(response_edns(edns)));
         }
         message.set_rcode(status_rcode(resolution.status));
-        Self::append_answer(&mut message, zone, &resolution)?;
+        Self::append_answer(&mut message, zone, &resolution, do_bit)?;
 
         match transport {
             Transport::Udp => {
@@ -311,6 +312,9 @@ impl QueryEngine {
             if matches!(referral.status, Status::NoData | Status::NxDomain) {
                 append_negative_soa(zone, &mut referral)?;
             }
+            if do_bit && zone.signed() {
+                append_denial_proofs(zone, qname, &mut referral);
+            }
             return Ok(referral);
         }
         let mut resolution = Resolution::empty();
@@ -318,6 +322,9 @@ impl QueryEngine {
         self.resolve_name(zone, qname, qtype, 0, &mut visited, &mut resolution)?;
         if matches!(resolution.status, Status::NoData | Status::NxDomain) {
             append_negative_soa(zone, &mut resolution)?;
+        }
+        if do_bit && zone.signed() {
+            append_denial_proofs(zone, qname, &mut resolution);
         }
         Ok(resolution)
     }
@@ -431,13 +438,20 @@ impl QueryEngine {
             resolution.aa = true;
             return Ok(());
         };
+        resolution.wildcard = Some(wildcard.clone());
         match zone.lookup(&wildcard, qtype) {
             LookupOutcome::Answer(rrset) => {
+                resolution
+                    .signature_sources
+                    .insert((qname.clone(), rrset.rr_type()), wildcard.clone());
                 resolution.answers.push(reowner(&rrset, qname)?);
                 resolution.status = Status::Answer;
                 resolution.aa = true;
             }
             LookupOutcome::Cname(rrset, target) => {
+                resolution
+                    .signature_sources
+                    .insert((qname.clone(), rrset.rr_type()), wildcard.clone());
                 resolution.answers.push(reowner(&rrset, qname)?);
                 resolution.status = Status::Answer;
                 resolution.aa = true;
@@ -536,16 +550,36 @@ impl QueryEngine {
         message: &mut Message,
         zone: &dyn ZoneView,
         resolution: &Resolution,
+        do_bit: bool,
     ) -> Result<(), QueryError> {
+        let signed = do_bit && zone.signed();
+        let mut signatures: HashSet<(Name, Rdata)> = HashSet::new();
+
         for rrset in &resolution.answers {
-            for record in rrset_records(rrset)? {
-                message.add_answer(record);
-            }
+            let source = resolution
+                .signature_sources
+                .get(&(rrset.owner().clone(), rrset.rr_type()))
+                .unwrap_or(rrset.owner());
+            append_rrset(
+                message,
+                zone,
+                rrset,
+                Section::Answer,
+                signed,
+                Some(source),
+                &mut signatures,
+            )?;
         }
         for rrset in &resolution.authority {
-            for record in rrset_records(rrset)? {
-                message.add_authority(record);
-            }
+            append_rrset(
+                message,
+                zone,
+                rrset,
+                Section::Authority,
+                signed,
+                None,
+                &mut signatures,
+            )?;
         }
 
         let mut seen: HashSet<(Name, Rtype)> = resolution
@@ -594,9 +628,15 @@ impl QueryEngine {
                 if !seen.insert(key) {
                     continue;
                 }
-                for record in rrset_records(&glue)? {
-                    message.add_additional(record);
-                }
+                append_rrset(
+                    message,
+                    zone,
+                    &glue,
+                    Section::Additional,
+                    signed,
+                    None,
+                    &mut signatures,
+                )?;
             }
         }
         Ok(())
@@ -637,6 +677,151 @@ impl QueryEngine {
     }
 }
 
+/// Секция DNS-сообщения, в которую добавляется RRset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Answer,
+    Authority,
+    Additional,
+}
+
+impl Section {
+    fn add(self, message: &mut Message, record: Record) {
+        match self {
+            Self::Answer => message.add_answer(record),
+            Self::Authority => message.add_authority(record),
+            Self::Additional => message.add_additional(record),
+        }
+    }
+}
+
+/// Добавляет RRset и (при `DO = 1`) его `RRSIG`.
+///
+/// `signature_owner` задаёт имя, под которым подписи хранятся в зоне; для
+/// wildcard-развёрнутого ответа это `*.closest-encloser`, а записи
+/// переименовываются в QNAME (RFC 4035 §5.3.2).
+fn append_rrset(
+    message: &mut Message,
+    zone: &dyn ZoneView,
+    rrset: &Rrset,
+    section: Section,
+    signed: bool,
+    signature_owner: Option<&Name>,
+    signatures: &mut HashSet<(Name, Rdata)>,
+) -> Result<(), QueryError> {
+    for record in rrset_records(rrset)? {
+        section.add(message, record);
+    }
+    if !signed || rrset.rr_type() == Rtype::RRSIG {
+        return Ok(());
+    }
+    let source = signature_owner.unwrap_or_else(|| rrset.owner());
+    for signatures_rrset in zone.lookup_all_rrsig(source, rrset.rr_type()) {
+        let signatures_rrset = if source == rrset.owner() {
+            signatures_rrset
+        } else {
+            reowner(&signatures_rrset, rrset.owner())?
+        };
+        for record in rrset_records(&signatures_rrset)? {
+            let key = (record.owner().clone(), record.rdata().clone());
+            if signatures.insert(key) {
+                section.add(message, record);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Добавляет NSEC-доказательство к негативному или wildcard-ответу.
+fn append_denial_proofs(zone: &dyn ZoneView, qname: &Name, resolution: &mut Resolution) {
+    let mut proofs: Vec<Rrset> = Vec::new();
+    match resolution.status {
+        Status::NxDomain => {
+            if let Some(cover) = zone.nsec_cover(qname) {
+                push_proof(&mut proofs, cover);
+            }
+            let closest = closest_encloser(zone, qname);
+            if let Some(wildcard) = wildcard_name(&closest) {
+                if let Some(exact) = zone.nsec_at(&wildcard) {
+                    push_proof(&mut proofs, exact);
+                } else if let Some(cover) = zone.nsec_cover(&wildcard) {
+                    push_proof(&mut proofs, cover);
+                }
+            }
+        }
+        Status::NoData => {
+            if let Some(wildcard) = &resolution.wildcard {
+                if let Some(exact) = zone.nsec_at(wildcard) {
+                    push_proof(&mut proofs, exact);
+                }
+                if let Some(cover) = zone.nsec_cover(qname) {
+                    push_proof(&mut proofs, cover);
+                }
+            } else if let Some(exact) = zone.nsec_at(qname) {
+                push_proof(&mut proofs, exact);
+            }
+        }
+        Status::Answer => {
+            if let Some(wildcard) = &resolution.wildcard
+                && let Some(closest) = wildcard.parent()
+                && let Some(next) = next_closer_name(qname, &closest)
+                && let Some(cover) = zone.nsec_cover(&next)
+            {
+                push_proof(&mut proofs, cover);
+            }
+        }
+        Status::Referral | Status::YxDomain => {}
+    }
+    resolution.authority.append(&mut proofs);
+}
+
+fn push_proof(proofs: &mut Vec<Rrset>, rrset: Rrset) {
+    if proofs
+        .iter()
+        .any(|existing| existing.owner() == rrset.owner() && existing.rr_type() == rrset.rr_type())
+    {
+        return;
+    }
+    proofs.push(rrset);
+}
+
+/// Самый длинный существующий предок QNAME (включая apex).
+fn closest_encloser(zone: &dyn ZoneView, qname: &Name) -> Name {
+    let mut current = qname.parent();
+    while let Some(name) = current {
+        if zone.node_exists(&name) {
+            return name;
+        }
+        if name == *zone.origin() {
+            return name;
+        }
+        current = name.parent();
+    }
+    zone.origin().clone()
+}
+
+fn wildcard_name(parent: &Name) -> Option<Name> {
+    let mut wire = Vec::with_capacity(parent.wire_len().saturating_add(2));
+    wire.push(1);
+    wire.push(b'*');
+    wire.extend_from_slice(parent.as_wire());
+    Name::from_wire(&wire).ok()
+}
+
+fn next_closer_name(qname: &Name, closest_encloser: &Name) -> Option<Name> {
+    if !qname.is_subdomain_of(closest_encloser) || qname == closest_encloser {
+        return None;
+    }
+    let mut current = qname.clone();
+    while let Some(parent) = current.parent() {
+        if parent == *closest_encloser {
+            return Some(current);
+        }
+        current = parent;
+    }
+    None
+}
+
 /// Итог разбора внутри зоны.
 #[derive(Debug)]
 struct Resolution {
@@ -644,6 +829,11 @@ struct Resolution {
     aa: bool,
     answers: Vec<Rrset>,
     authority: Vec<Rrset>,
+    /// Wildcard-владелец, через который получен ответ/NODATA (для denial proof).
+    wildcard: Option<Name>,
+    /// Для ответа, развёрнутого из wildcard: подписи хранятся под wildcard
+    /// владельцем, а отдаются под QNAME. Ключ — `(owner, type)` ответа.
+    signature_sources: HashMap<(Name, Rtype), Name>,
 }
 
 impl Resolution {
@@ -653,6 +843,8 @@ impl Resolution {
             aa: true,
             answers: Vec::new(),
             authority: Vec::new(),
+            wildcard: None,
+            signature_sources: HashMap::new(),
         }
     }
 
@@ -662,6 +854,8 @@ impl Resolution {
             aa: true,
             answers: vec![rrset],
             authority: Vec::new(),
+            wildcard: None,
+            signature_sources: HashMap::new(),
         }
     }
 
@@ -671,6 +865,8 @@ impl Resolution {
             aa: true,
             answers: Vec::new(),
             authority: Vec::new(),
+            wildcard: None,
+            signature_sources: HashMap::new(),
         }
     }
 
@@ -680,6 +876,8 @@ impl Resolution {
             aa: false,
             answers: Vec::new(),
             authority: vec![ns],
+            wildcard: None,
+            signature_sources: HashMap::new(),
         }
     }
 }
@@ -736,8 +934,15 @@ fn referral_for(
     match zone.lookup(&cut, Rtype::NS) {
         LookupOutcome::Delegation { ns, ds } => {
             let mut resolution = Resolution::referral(ns);
-            if do_bit && let Some(ds) = ds {
-                resolution.authority.push(ds);
+            if do_bit {
+                if let Some(ds) = ds {
+                    resolution.authority.push(ds);
+                } else if zone.signed()
+                    && let Some(nsec) = zone.nsec_at(&cut)
+                {
+                    // Insecure delegation: NSEC at the cut proves DS absence.
+                    resolution.authority.push(nsec);
+                }
             }
             Ok(Some(resolution))
         }

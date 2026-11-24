@@ -10,11 +10,16 @@
 //! перестраивает снапшот `QueryEngine`, поэтому изменения видны сразу, а
 //! DNS-запрос не удерживает блокировки store.
 //!
+//! При заданном `zonefile`/`--data` успешные мутации дополнительно
+//! коммитятся в `pulse-zonefile` (write-through), а shutdown выполняет
+//! `sync()`. Без файла сервер работает только с in-memory store.
+//!
 //! # Состав
 //!
 //! - [`config`] — JSON-конфигурация, master-файлы и CLI-overrides.
 //! - [`zone`] — загрузка JSON-зон и валидация инвариантов; master-файлы
 //!   разбирает `pulse-master` и импортирует тот же store.
+//! - `dnssec` — загрузка ключей и DNSSEC-подпись зон при старте.
 //! - [`server`] — запуск и остановка DNS/API, общий zone store.
 //! - [`stats`] — атомарные счётчики без блокировок на горячем пути.
 //!
@@ -43,9 +48,11 @@
 
 mod cli;
 mod dns;
+mod dnssec;
 mod logging;
 mod master;
 mod names;
+mod persist;
 mod rdata;
 mod store;
 mod tcp;

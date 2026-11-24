@@ -115,6 +115,9 @@ pub enum AdminError {
     /// Внутренняя ошибка адаптера.
     #[error("internal store error")]
     Internal,
+    /// Ошибка persistent-хранилища (write-through commit).
+    #[error("persistent storage error: {0}")]
+    Storage(String),
 }
 
 impl AdminError {

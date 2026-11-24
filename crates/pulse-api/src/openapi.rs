@@ -122,6 +122,29 @@ pub(crate) fn document() -> Value {
                     }
                 }
             },
+            "/api/v1/zones/{origin}/keys": {
+                "parameters": [{ "$ref": "#/components/parameters/Origin" }],
+                "get": {
+                    "summary": "Read public DNSSEC keys and DS records",
+                    "description": "Private key material is never exposed.",
+                    "responses": {
+                        "200": { "description": "DNSKEY and DS records" },
+                        "404": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
+            "/api/v1/zones/{origin}/sign": {
+                "parameters": [{ "$ref": "#/components/parameters/Origin" }],
+                "post": {
+                    "summary": "Re-sign a zone with the configured DNSSEC keys",
+                    "responses": {
+                        "200": { "description": "Zone re-signed" },
+                        "404": { "$ref": "#/components/responses/Problem" },
+                        "409": { "$ref": "#/components/responses/Problem" },
+                        "422": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
             "/api/v1/zones/{origin}/records/{name}/{type}": {
                 "parameters": [
                     { "$ref": "#/components/parameters/Origin" },

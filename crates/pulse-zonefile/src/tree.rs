@@ -2139,6 +2139,40 @@ impl ZoneTree {
         Ok(())
     }
 
+    /// Гарантирует существование `T_NODE` для имени, включая листовой empty node.
+    ///
+    /// Обычная ENT-материализация помечает `EMPTY_NON_TERMINAL` только при
+    /// наличии потомков; для persistence нужно сохранить и листовой пустой узел
+    /// после удаления последнего `RRset`.
+    ///
+    /// # Errors
+    ///
+    /// `NameOutsideZone`, `Corrupt`/`Io`.
+    pub fn ensure_empty_node<P: PageIo + ?Sized>(
+        &mut self,
+        io: &mut P,
+        txn: u64,
+        name: &NameRle,
+    ) -> Result<bool, ZoneFileError> {
+        let _ = self.ancestor_chain(name)?;
+        self.materialize(io, txn, name)?;
+        let mut flags = if name == &self.apex {
+            RR_FLAG_APEX
+        } else {
+            RR_FLAG_EMPTY_NON_TERMINAL
+        };
+        if self.has_children(io, txn, name)? {
+            flags |= RR_FLAG_CHILDREN_MAY_EXIST;
+        }
+        if self.node_flags(io, txn, name)? == Some(flags) {
+            return Ok(false);
+        }
+        let key = Key::new(name, T_NODE, 0, 0)?;
+        self.tree
+            .insert_or_replace(io, txn, &LeafItem::new(key, ItemValue::node(flags)))?;
+        Ok(true)
+    }
+
     /// Upsert `RRset`'а с COW и материализацией `T_NODE`/ENT (§13.3).
     ///
     /// Повторный upsert идентичного набора не пишет страницы:

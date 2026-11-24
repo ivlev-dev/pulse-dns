@@ -12,6 +12,7 @@
 //!   [`domain::ZoneState`].
 //! - [`application`] — порт [`application::ZoneView`], движок
 //!   [`application::QueryEngine`] и счётчики [`application::QueryStats`].
+//! - [`dnssec`] — подпись зоны (DNSKEY/NSEC/RRSIG) и NSEC-цепочка.
 //! - `testkit` — in-memory зона (feature `testkit`, включена по умолчанию).
 //!
 //! # Политики
@@ -32,11 +33,12 @@
 //!   канонизирует имя в нижний регистр, поэтому в ответе вопрос уходит в
 //!   каноническом виде. Это документированный gap (SEC-DNS-011) до появления
 //!   транспорта, который сохраняет сырые байты запроса.
-//! - **RRSIG** — порт отдаёт подписи ([`application::ZoneView::lookup_all_rrsig`]),
-//!   но прикладывание к ответу пока не выполняется (следующий этап, §4.5
-//!   `domain-model.md`); `DO`-бит при этом эхо-ится без изменений.
-//!   NSEC/NSEC3-доказательства несуществования для негативных ответов также
-//!   не формируются — это часть того же следующего этапа.
+//! - **RRSIG** — при `DO = 1` подписи прикладываются к answer/authority/
+//!   additional через [`application::ZoneView::lookup_all_rrsig`], включая
+//!   негативные ответы; при `DO = 0` подписи не отдаются. `AD` на
+//!   authoritative-сервере всегда `0`. Для подписанных зон негативные ответы
+//!   дополняются NSEC + RRSIG (NXDOMAIN — покрытие QNAME и wildcard, NODATA —
+//!   NSEC самого имени); NSEC3-подпись пока не генерируется.
 //! - **CNAME → делегирование** — если цель `CNAME`/`DNAME` находится ниже
 //!   zone cut, цепочка останавливается на уже собранном ответе: клиент или
 //!   резолвер получит referral отдельным запросом.
@@ -101,6 +103,7 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod application;
+pub mod dnssec;
 pub mod domain;
 #[cfg(feature = "testkit")]
 pub mod testkit;
