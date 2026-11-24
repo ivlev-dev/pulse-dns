@@ -254,6 +254,12 @@ fn handle_connection(
                 stats.response();
                 continue;
             }
+            Some(crate::transfer::NotifyAction::Accepted { zone, response, .. }) => {
+                write_frame(&mut stream, &response)?;
+                stats.response();
+                admin.wake_secondary(&zone, std::time::Instant::now());
+                continue;
+            }
             Some(crate::transfer::NotifyAction::Ignore) => return Ok(()),
             None => {}
         }

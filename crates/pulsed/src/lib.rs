@@ -55,6 +55,7 @@ mod master;
 mod names;
 mod persist;
 mod rdata;
+mod secondary;
 mod store;
 mod tcp;
 mod transfer;

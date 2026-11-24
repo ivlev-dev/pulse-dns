@@ -233,6 +233,10 @@ impl QueryEngine {
             self.stats.record_refused();
             return Ok(Self::error_response(request, Rcode::REFUSED));
         };
+        if zone.state() == ZoneState::Expired {
+            self.stats.record_servfail();
+            return Ok(Self::error_response(request, Rcode::SERVFAIL));
+        }
         if zone.state() != ZoneState::Serving {
             self.stats.record_refused();
             return Ok(Self::error_response(request, Rcode::REFUSED));

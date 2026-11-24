@@ -326,10 +326,91 @@ impl InMemoryZoneAdmin {
         Ok(data.view())
     }
 
+    /// Заменяет RRset вторичной зоны данными, полученными трансфером.
+    ///
+    /// В отличие от [`InMemoryZoneAdmin::replace_zone_rrsets`], операция
+    /// разрешена для `ZoneKind::Secondary`: данные secondary управляются
+    /// только AXFR/IXFR, а не HTTP API.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::NotFound`], если зоны нет, [`AdminError::Conflict`] для
+    /// не-secondary зоны, [`AdminError::InvariantViolation`] при нарушении
+    /// инвариантов набора.
+    pub fn replace_secondary_zone_rrsets(
+        &self,
+        origin: &Name,
+        rrsets: Vec<Rrset>,
+    ) -> Result<ZoneView, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let mut data = lock_zone(&zone);
+        if data.kind != ZoneKind::Secondary {
+            return Err(AdminError::Conflict(crate::error::Conflict::ZoneReadOnly));
+        }
+        let now = std::time::SystemTime::now();
+        let (records, nodes, serial) = build_zone_records(origin, rrsets, now)?;
+        data.rrsets = records;
+        data.nodes = nodes;
+        data.serial = serial;
+        data.version = data.version.saturating_add(1);
+        data.txn = self.next_txn();
+        data.updated_at = now;
+        Ok(data.view())
+    }
+
+    /// Инкрементирует apex `SOA` serial первичной зоны.
+    ///
+    /// Нужен `pulsed`, чтобы изменение данных primary через REST/RRset API
+    /// автоматически давало новый serial для IXFR/NOTIFY. Для secondary и
+    /// зон без apex `SOA` возвращает `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::Internal`] при нарушении инвариантов RRset.
+    pub fn bump_soa_serial(&self, origin: &Name) -> Result<Option<Serial>, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let mut data = lock_zone(&zone);
+        if !data.kind.is_writable() {
+            return Ok(None);
+        }
+        let key = Self::rrset_key(origin, Rtype::SOA);
+        let Some(record) = data.rrsets.get(&key) else {
+            return Ok(None);
+        };
+        let Some(Rdata::Soa(soa)) = record.rrset.rdatas().first() else {
+            return Ok(None);
+        };
+        let serial = soa.serial.succ();
+        let mut next_soa = soa.clone();
+        next_soa.serial = serial;
+        let rrset = Rrset::new(
+            origin.clone(),
+            Rtype::SOA,
+            Rclass::IN,
+            record.rrset.ttl(),
+            [Rdata::Soa(next_soa)],
+        )
+        .map_err(map_rrset_error)?;
+        let etag = rrset_etag(&rrset);
+        let now = std::time::SystemTime::now();
+        data.rrsets.insert(
+            key,
+            RrsetRecord {
+                rrset,
+                etag,
+                updated_at: now,
+            },
+        );
+        data.serial = serial;
+        data.version = data.version.saturating_add(1);
+        data.txn = self.next_txn();
+        data.updated_at = now;
+        Ok(Some(serial))
+    }
+
     fn next_txn(&self) -> u64 {
         self.next_txn.fetch_add(1, Ordering::SeqCst)
     }
-
     fn zone_key(origin: &Name) -> String {
         origin.to_string()
     }
@@ -364,7 +445,7 @@ impl InMemoryZoneAdmin {
         preconditions: &Preconditions,
     ) -> Result<ZoneView, AdminError> {
         check_existing(preconditions, &zone.etag(), zone.version)?;
-        if !meta.kind.is_writable() && !zone.rrsets.is_empty() {
+        if meta.kind != zone.kind && !zone.rrsets.is_empty() {
             return Err(AdminError::invariant(
                 "/kind",
                 "zone-not-empty",

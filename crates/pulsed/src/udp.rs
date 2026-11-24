@@ -38,6 +38,16 @@ impl UdpService {
                     stats.response();
                     return Reply::Send(response.len());
                 }
+                Some(crate::transfer::NotifyAction::Accepted { zone, response, .. }) => {
+                    if response.len() > out.len() {
+                        stats.drop_response();
+                        return Reply::Drop;
+                    }
+                    out[..response.len()].copy_from_slice(&response);
+                    stats.response();
+                    admin.wake_secondary(&zone, std::time::Instant::now());
+                    return Reply::Send(response.len());
+                }
                 None => {}
             }
             let engine = admin.engine();

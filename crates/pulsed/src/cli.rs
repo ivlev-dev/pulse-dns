@@ -332,7 +332,8 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
         ServerError::TcpStart { .. }
         | ServerError::Tcp(_)
         | ServerError::Udp(_)
-        | ServerError::Notify(_) => ExitCode::from(1),
+        | ServerError::Notify(_)
+        | ServerError::Secondary(_) => ExitCode::from(1),
     }
 }
 

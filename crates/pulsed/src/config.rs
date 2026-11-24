@@ -260,6 +260,7 @@ impl TransferSettings {
     /// # Errors
     ///
     /// [`ConfigError::Invalid`] при выходе параметров за допустимые пределы.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !(1..=10_000).contains(&self.history_deltas) {
             return Err(ConfigError::Invalid(format!(
@@ -348,6 +349,38 @@ pub struct RecordConfig {
     pub ttl: Option<u32>,
     /// RDATA в JSON-форме, зависящей от типа.
     pub rdata: serde_json::Value,
+}
+
+/// Вторичная зона: источник данных — AXFR/IXFR с master.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecondaryZoneConfig {
+    /// Origin зоны.
+    pub origin: String,
+    /// Master-адреса (TCP для AXFR/IXFR, UDP/TCP для SOA-запроса).
+    pub masters: Vec<SocketAddr>,
+    /// TSIG-ключ из `tsig_keys`; `null` — без TSIG.
+    #[serde(default)]
+    pub tsig_key: Option<String>,
+    /// Переопределение `refresh` из SOA (секунды).
+    #[serde(default)]
+    pub refresh: Option<u32>,
+    /// Переопределение `retry` из SOA (секунды).
+    #[serde(default)]
+    pub retry: Option<u32>,
+    /// Переопределение `expire` из SOA (секунды).
+    #[serde(default)]
+    pub expire: Option<u32>,
+    /// IP-ACL для входящих NOTIFY этой зоны; пусто — общий `transfer.allow_from`.
+    #[serde(default)]
+    pub allow_notify_from: Vec<IpAddr>,
+    /// Загружать зону через AXFR при старте, если её нет в store/zonefile.
+    #[serde(default = "default_true")]
+    pub bootstrap: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// Master-файл зоны (RFC 1035) в конфигурации.
@@ -470,6 +503,9 @@ pub struct Config {
     /// DNSSEC-подпись зон при загрузке (origin → ключи/политика).
     #[serde(default)]
     pub dnssec: BTreeMap<String, DnssecZoneConfig>,
+    /// Вторичные зоны (AXFR/IXFR-in).
+    #[serde(default)]
+    pub secondary_zones: Vec<SecondaryZoneConfig>,
     /// TSIG-ключи для transfer и NOTIFY.
     #[serde(default)]
     pub tsig_keys: Vec<TsigKeyConfig>,
@@ -492,6 +528,7 @@ impl Default for Config {
             zones: Vec::new(),
             zones_files: Vec::new(),
             dnssec: BTreeMap::new(),
+            secondary_zones: Vec::new(),
             tsig_keys: Vec::new(),
             transfer: TransferSettings::default(),
         }
@@ -535,6 +572,7 @@ impl Config {
     ///
     /// [`ConfigError::Invalid`], если не задан ни один транспорт, число
     /// worker'ов выходит за разумные пределы или параметры TCP некорректны.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.listen_udp.is_none() && self.listen_tcp.is_none() {
             return Err(ConfigError::Invalid(
@@ -624,6 +662,73 @@ impl Config {
                 return Err(ConfigError::Invalid(format!(
                     "transfer.notify_tsig_key: key {name} is not declared in tsig_keys"
                 )));
+            }
+        }
+        let mut origins = std::collections::HashSet::new();
+        for zone in &self.zones {
+            let name = Name::parse(zone.origin.trim()).map_err(|error| {
+                ConfigError::Invalid(format!("zones: invalid origin {:?}: {error}", zone.origin))
+            })?;
+            origins.insert(name);
+        }
+        for file in &self.zones_files {
+            let name = Name::parse(file.origin.trim()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "zones_files: invalid origin {:?}: {error}",
+                    file.origin
+                ))
+            })?;
+            origins.insert(name);
+        }
+        let mut secondary_origins = std::collections::HashSet::new();
+        for zone in &self.secondary_zones {
+            let name = Name::parse(zone.origin.trim()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "secondary_zones: invalid origin {:?}: {error}",
+                    zone.origin
+                ))
+            })?;
+            if name == Name::root() || name.labels().any(|label| label == b"*") {
+                return Err(ConfigError::Invalid(format!(
+                    "secondary_zones: origin {name} must be a non-root name without wildcards"
+                )));
+            }
+            if !secondary_origins.insert(name.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "secondary_zones: duplicate origin {name}"
+                )));
+            }
+            if origins.contains(&name) {
+                return Err(ConfigError::Invalid(format!(
+                    "secondary_zones: origin {name} is also configured as primary"
+                )));
+            }
+            if zone.masters.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "secondary_zones: zone {name} has no masters"
+                )));
+            }
+            for timer in [zone.refresh, zone.retry, zone.expire]
+                .into_iter()
+                .flatten()
+            {
+                if timer == 0 {
+                    return Err(ConfigError::Invalid(format!(
+                        "secondary_zones: zone {name} has a zero timer"
+                    )));
+                }
+            }
+            if let Some(key) = &zone.tsig_key {
+                let key = Name::parse(key.trim()).map_err(|error| {
+                    ConfigError::Invalid(format!(
+                        "secondary_zones: zone {name} has invalid tsig_key: {error}"
+                    ))
+                })?;
+                if !key_names.contains(&key) {
+                    return Err(ConfigError::Invalid(format!(
+                        "secondary_zones: zone {name} tsig_key {key} is not declared in tsig_keys"
+                    )));
+                }
             }
         }
         Ok(())

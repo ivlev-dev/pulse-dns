@@ -15,6 +15,7 @@ use thiserror::Error;
 use crate::config::{Config, ConfigError};
 use crate::dnssec::{self, DnssecError};
 use crate::persist::{self, ZonePersistence};
+use crate::secondary::SecondaryScheduler;
 use crate::stats::{Stats, StatsSnapshot};
 use crate::store::{self, SharedZoneAdmin};
 use crate::tcp::TcpService;
@@ -54,6 +55,7 @@ pub struct Server {
     udp: Option<UdpService>,
     tcp: Option<TcpService>,
     api: Option<RunningServer>,
+    secondary: Option<SecondaryScheduler>,
 }
 
 impl Server {
@@ -145,6 +147,14 @@ impl Server {
                 ServerError::Store(format!("cannot build initial DNS snapshot: {error}"))
             })?,
         );
+        let secondary = if admin.has_secondary_zones() {
+            Some(
+                SecondaryScheduler::start(Arc::downgrade(&admin))
+                    .map_err(ServerError::Secondary)?,
+            )
+        } else {
+            None
+        };
         let stats = Arc::new(Stats::new());
 
         let tcp = match config.listen_tcp {
@@ -194,6 +204,7 @@ impl Server {
             udp,
             tcp,
             api,
+            secondary,
         })
     }
 
@@ -251,6 +262,12 @@ impl Server {
         self.admin.pending_updates()
     }
 
+    /// Последняя ошибка secondary-зоны (для диагностики и тестов).
+    #[must_use]
+    pub fn secondary_last_error(&self, origin: &pulse_dns::Name) -> Option<String> {
+        self.admin.secondary_last_error(origin)
+    }
+
     /// Останавливает API, транспорты и дожидается завершения потоков.
     ///
     /// API останавливается первым, чтобы во время shutdown не появлялись новые
@@ -263,6 +280,9 @@ impl Server {
     pub fn shutdown(&mut self) -> Result<(), ServerError> {
         if let Some(api) = self.api.take() {
             api.shutdown();
+        }
+        if let Some(secondary) = self.secondary.take() {
+            secondary.shutdown();
         }
         let mut first_error = None;
         if let Some(mut tcp) = self.tcp.take()
@@ -323,6 +343,9 @@ pub enum ServerError {
     /// Не удалось запустить фоновый NOTIFY-воркер.
     #[error("cannot start NOTIFY worker: {0}")]
     Notify(#[source] io::Error),
+    /// Не удалось запустить фоновый secondary-планировщик.
+    #[error("cannot start secondary scheduler: {0}")]
+    Secondary(#[source] io::Error),
     /// Ошибка встроенного API.
     #[error(transparent)]
     Api(#[from] ApiServerError),

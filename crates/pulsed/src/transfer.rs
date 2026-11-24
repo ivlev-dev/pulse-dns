@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -27,8 +27,7 @@ use pulse_dns::{DecodeLimits, EncodeOptions, Message, Name, Opcode, Rcode, Recor
 use pulse_transfer::{
     AxfrServer, IxfrServer, NotifyIgnoreReason, NotifyOutcome, NotifyPolicy, NotifyRequest,
     NotifyServer, TransferConfig, TransferError, TransferLimits, TsigError, TsigErrorCode, TsigKey,
-    TsigReplayCache, ZoneDelta, ZoneHistory, ZoneSnapshot, build_tsig_error_response, parse_tsig,
-    write_message,
+    ZoneDelta, ZoneHistory, ZoneSnapshot, build_tsig_error_response, parse_tsig, write_message,
 };
 use thiserror::Error;
 
@@ -76,12 +75,20 @@ pub(crate) enum NotifyAction {
     Ignore,
     /// Отправить готовый wire-ответ.
     Reply(Vec<u8>),
+    /// NOTIFY принят: отправить ответ и разбудить secondary-обновление.
+    Accepted {
+        /// Зона из NOTIFY.
+        zone: Name,
+        /// Готовый wire-ответ.
+        response: Vec<u8>,
+    },
 }
 
 /// Одна зона в transfer-состоянии.
 struct ZoneTransfer {
     snapshot: Arc<ZoneSnapshot>,
     history: Arc<ZoneHistory>,
+    notify: bool,
 }
 
 /// Состояние AXFR/IXFR-out, TSIG-replay и NOTIFY.
@@ -91,8 +98,10 @@ pub(crate) struct TransferState {
     keys: HashMap<Name, Arc<TsigKey>>,
     allow_from: HashSet<IpAddr>,
     allow_zones: HashSet<Name>,
+    notify_sources: HashMap<Name, Vec<IpAddr>>,
+    notify_zones: HashSet<Name>,
     zones: RwLock<HashMap<Name, Arc<ZoneTransfer>>>,
-    replay: Mutex<TsigReplayCache>,
+    replay: Mutex<ReplayCache>,
     pending: Mutex<HashMap<Name, Option<Serial>>>,
     notify: Option<Arc<NotifyDispatcher>>,
 }
@@ -105,6 +114,7 @@ impl TransferState {
     pub(crate) fn from_config(
         settings: &TransferSettings,
         keys: &[TsigKeyConfig],
+        secondary: &[crate::config::SecondaryZoneConfig],
         snapshot: &StoreSnapshot,
         notify: Option<Arc<NotifyDispatcher>>,
     ) -> Result<Self, TransferSetupError> {
@@ -123,6 +133,21 @@ impl TransferState {
             })
             .collect::<Result<HashSet<_>, _>>()?;
 
+        let mut notify_sources = HashMap::with_capacity(secondary.len());
+        let mut notify_zones = HashSet::with_capacity(secondary.len());
+        for zone in secondary {
+            let origin = Name::parse(zone.origin.trim()).map_err(|error| {
+                TransferSetupError::Config(format!(
+                    "secondary_zones: invalid origin {:?}: {error}",
+                    zone.origin
+                ))
+            })?;
+            if !zone.allow_notify_from.is_empty() {
+                notify_sources.insert(origin.clone(), zone.allow_notify_from.clone());
+            }
+            notify_zones.insert(origin);
+        }
+
         let mut zones = HashMap::with_capacity(snapshot.zones.len());
         for zone in &snapshot.zones {
             if let Some(built) = build_zone(zone) {
@@ -131,6 +156,7 @@ impl TransferState {
                     Arc::new(ZoneTransfer {
                         snapshot: Arc::new(built),
                         history: Arc::new(ZoneHistory::new()),
+                        notify: zone.kind == ZoneKind::Primary,
                     }),
                 );
             }
@@ -141,8 +167,10 @@ impl TransferState {
             keys: key_map,
             allow_from,
             allow_zones,
+            notify_sources,
+            notify_zones,
             zones: RwLock::new(zones),
-            replay: Mutex::new(TsigReplayCache::new(16_384)),
+            replay: Mutex::new(ReplayCache::new(16_384)),
             pending: Mutex::new(HashMap::new()),
             notify,
         })
@@ -150,10 +178,13 @@ impl TransferState {
 
     /// Перестраивает transfer-снапшоты после мутации store и ставит NOTIFY.
     pub(crate) fn refresh(&self, snapshot: &StoreSnapshot) {
-        let built: Vec<(Name, ZoneSnapshot)> = snapshot
+        let built: Vec<(Name, bool, ZoneSnapshot)> = snapshot
             .zones
             .iter()
-            .filter_map(|zone| build_zone(zone).map(|built| (zone.origin.clone(), built)))
+            .filter_map(|zone| {
+                build_zone(zone)
+                    .map(|built| (zone.origin.clone(), zone.kind == ZoneKind::Primary, built))
+            })
             .collect();
         let max_deltas = self.settings.history_deltas;
         let mut next: HashMap<Name, Arc<ZoneTransfer>> = HashMap::with_capacity(built.len());
@@ -162,7 +193,7 @@ impl TransferState {
 
         {
             let zones = self.zones.read().unwrap_or_else(PoisonError::into_inner);
-            for (origin, snapshot) in built {
+            for (origin, notify, snapshot) in built {
                 current.insert(origin.clone());
                 let previous = zones.get(&origin);
                 let (history, changed) = match previous {
@@ -174,7 +205,7 @@ impl TransferState {
                     ),
                     None => (ZoneHistory::new(), true),
                 };
-                if changed {
+                if notify && changed {
                     notifications.push(NotifyJob {
                         id: next_notify_id(),
                         zone: origin.clone(),
@@ -186,11 +217,12 @@ impl TransferState {
                     Arc::new(ZoneTransfer {
                         snapshot: Arc::new(snapshot),
                         history: Arc::new(history),
+                        notify,
                     }),
                 );
             }
-            for origin in zones.keys() {
-                if !current.contains(origin) {
+            for (origin, previous) in zones.iter() {
+                if !current.contains(origin) && previous.notify {
                     notifications.push(NotifyJob {
                         id: next_notify_id(),
                         zone: origin.clone(),
@@ -222,6 +254,16 @@ impl TransferState {
             .keys()
             .cloned()
             .collect()
+    }
+
+    /// TSIG-ключ по имени (для secondary AXFR/IXFR-in).
+    pub(crate) fn key(&self, name: &Name) -> Option<Arc<TsigKey>> {
+        self.keys.get(name).cloned()
+    }
+
+    /// Лимиты transfer-операций.
+    pub(crate) fn limits(&self) -> TransferLimits {
+        self.config.limits
     }
 
     /// Обслуживает AXFR/IXFR, если запрос адресован трансферу.
@@ -356,10 +398,12 @@ impl TransferState {
                 }
                 {
                     let mut replay = self.replay.lock().unwrap_or_else(PoisonError::into_inner);
-                    if let Err(error) =
-                        replay.check_and_record(key.name(), envelope.record().time_signed())
+                    if !replay.check_and_record(key.name(), envelope.record().mac(), Instant::now())
                     {
-                        logging::warn("transfer_tsig", &format!("TSIG replay: {error}"));
+                        logging::warn(
+                            "transfer_tsig",
+                            &format!("TSIG replay for key {}", key.name()),
+                        );
                         send_tsig_error(
                             stream,
                             request,
@@ -368,7 +412,11 @@ impl TransferState {
                             now,
                             TsigErrorCode::BADTIME,
                         )?;
-                        return Err(TransferError::Tsig(error));
+                        return Err(TransferError::Tsig(TsigError::Replay {
+                            key: key.name().to_string(),
+                            time: envelope.record().time_signed(),
+                            previous: envelope.record().time_signed(),
+                        }));
                     }
                 }
                 Ok(Some(key))
@@ -432,14 +480,24 @@ impl TransferState {
             }
         };
 
-        let zones: Vec<Name> = self
+        let notify_zone = NotifyRequest::decode(raw)
+            .ok()
+            .map(|(request, _)| request.zone().clone());
+        let allowed_sources = notify_zone
+            .as_ref()
+            .and_then(|zone| self.notify_sources.get(zone).cloned())
+            .unwrap_or_else(|| self.settings.allow_from.clone());
+        let mut zones: Vec<Name> = self
             .zones
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .keys()
             .cloned()
             .collect();
-        let policy = NotifyPolicy::new(self.settings.allow_from.clone(), zones);
+        zones.extend(self.notify_zones.iter().cloned());
+        zones.sort_by(Name::cmp_canonical);
+        zones.dedup();
+        let policy = NotifyPolicy::new(allowed_sources, zones);
         let server =
             NotifyServer::with_shared_key(policy, key).require_tsig(self.settings.require_tsig);
         match server.handle(raw, source, now) {
@@ -453,7 +511,7 @@ impl TransferState {
                     "notify_in",
                     &format!("NOTIFY from {source} accepted for {zone} (serial {serial:?})"),
                 );
-                Some(NotifyAction::Reply(response))
+                Some(NotifyAction::Accepted { zone, response })
             }
             Ok(NotifyOutcome::Refused { response }) => {
                 logging::warn("notify_in", &format!("NOTIFY from {source} refused"));
@@ -558,8 +616,8 @@ fn build_keys(keys: &[TsigKeyConfig]) -> Result<HashMap<Name, Arc<TsigKey>>, Tra
     Ok(map)
 }
 
-fn build_zone(zone: &pulse_api::ZoneSnapshot) -> Option<ZoneSnapshot> {
-    if zone.kind != ZoneKind::Primary {
+pub(crate) fn build_zone(zone: &pulse_api::ZoneSnapshot) -> Option<ZoneSnapshot> {
+    if !matches!(zone.kind, ZoneKind::Primary | ZoneKind::Secondary) {
         return None;
     }
     let mut records = Vec::new();
@@ -717,6 +775,38 @@ impl<S: Write> Write for Rewound<'_, S> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.output.flush()
+    }
+}
+
+struct ReplayCache {
+    seen: HashMap<(Name, Vec<u8>), Instant>,
+    max_entries: usize,
+}
+
+impl ReplayCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            seen: HashMap::new(),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    fn check_and_record(&mut self, key: &Name, mac: &[u8], now: Instant) -> bool {
+        let key = (key.clone(), mac.to_vec());
+        if self.seen.contains_key(&key) {
+            return false;
+        }
+        if self.seen.len() >= self.max_entries
+            && let Some(oldest) = self
+                .seen
+                .iter()
+                .min_by_key(|(_, timestamp)| **timestamp)
+                .map(|(key, _)| key.clone())
+        {
+            self.seen.remove(&oldest);
+        }
+        self.seen.insert(key, now);
+        true
     }
 }
 
