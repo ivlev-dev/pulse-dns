@@ -95,4 +95,6 @@ pub use recovery::is_reclaimable;
 pub use superblock::{CreateConfig, SectionDescriptor, Superblock, SyncMode};
 pub use tree::{BTree, PageIo, RrsetData, UpsertOutcome, ZoneTree};
 pub use zone_meta::{ZoneEntry, ZoneMetaBlock, ZoneState};
-pub use zonefile::{CommitOutcome, FsckReport, RrsetView, ZoneFile, ZoneWriter};
+pub use zonefile::{
+    CommitOutcome, FsckReport, RrsetView, ZoneFile, ZoneItem, ZoneItemValue, ZoneItems, ZoneWriter,
+};

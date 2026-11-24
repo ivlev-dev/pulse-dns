@@ -35,6 +35,7 @@ fn shuffled(n: u32) -> Vec<u32> {
 }
 
 #[test]
+#[ignore = "10k insert/delete property test (~4-5 min in debug); run with --ignored"]
 #[allow(clippy::too_many_lines)]
 fn insert_and_delete_10k_with_reopen() {
     const TOTAL: u32 = 10_000;

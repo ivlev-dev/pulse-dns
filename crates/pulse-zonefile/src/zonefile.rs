@@ -22,14 +22,16 @@ use crate::key::{Key, NameRle, T_ZONE_ENTRY, ZoneEntryKey};
 use crate::lock::WriterLock;
 use crate::map::FileMap;
 use crate::meta::Meta;
-use crate::node::{DecodedBranch, DecodedLeaf, DecodedValue, ItemValue, LeafItem, ValueKind};
+use crate::node::{
+    DecodedBranch, DecodedLeaf, DecodedValue, ItemValue, LeafItem, LeafValue, ValueKind,
+};
 use crate::overflow::{self, OverflowRrset};
 use crate::page::PageHeader;
 use crate::pager::{self, LockMode, OpenConfig};
 use crate::readers::{ActiveTxn, Reader, ReaderTable, Snapshot};
 use crate::store::TxnPages;
 use crate::superblock::{CreateConfig, Superblock, SyncMode};
-use crate::tree::{BTree, PageIo, RrsetData, UpsertOutcome, ZoneTree};
+use crate::tree::{BTree, Cursor, PageIo, RrsetData, UpsertOutcome, ZoneTree};
 use crate::wire;
 use crate::zone_index::{ZoneIndex, ZoneLocation};
 use crate::zone_meta::{ZoneEntry, ZoneMetaBlock, ZoneState};
@@ -62,6 +64,124 @@ pub struct CommitOutcome {
     pub bucket_pages: u32,
     /// Режим durability коммита.
     pub sync_mode: SyncMode,
+}
+
+/// Значение элемента зоны при обходе ([`ZoneFile::zone_items`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZoneItemValue {
+    /// `T_NODE`-маркер имени (включая apex и ENT).
+    Node {
+        /// Флаги `T_NODE` (`RR_FLAG_*`).
+        flags: u16,
+    },
+    /// `RRset` с TTL, флагами и RDATA.
+    Rrset(RrsetView),
+}
+
+/// Один элемент дерева зоны в каноническом порядке.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZoneItem {
+    /// Имя-владелец.
+    pub name: NameRle,
+    /// Тип записи (`T_NODE` = 0).
+    pub rr_type: u16,
+    /// Класс (`0` для `T_NODE`).
+    pub class: u16,
+    /// Подтип (`RRSIG` covered type).
+    pub subtype: u16,
+    /// Значение.
+    pub value: ZoneItemValue,
+}
+
+/// Итератор элементов зоны, включая apex, ENT и `T_NODE`.
+///
+/// Элементы выдаются в каноническом порядке ключей; каждый `next()` может
+/// вернуть `Corrupt`, если встретилась повреждённая страница.
+pub struct ZoneItems<'a> {
+    zonefile: &'a ZoneFile,
+    cursor: Cursor<'a, ZoneFile>,
+    txnid: u64,
+    finished: bool,
+}
+
+impl Iterator for ZoneItems<'_> {
+    type Item = Result<ZoneItem, ZoneFileError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let key = match self.cursor.key() {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                self.finished = true;
+                return None;
+            }
+            Err(error) => {
+                self.finished = true;
+                return Some(Err(error));
+            }
+        };
+        let name = match key.owner() {
+            Ok(name) => name,
+            Err(error) => {
+                self.finished = true;
+                return Some(Err(error));
+            }
+        };
+        let value = match self.cursor.value() {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                self.finished = true;
+                return None;
+            }
+            Err(error) => {
+                self.finished = true;
+                return Some(Err(error));
+            }
+        };
+        let item = match value {
+            DecodedValue::ZoneEntry(_) => Err(ZoneFileError::corrupt(
+                CorruptKind::BadZoneMeta,
+                None,
+                CorruptDetail::ZoneMetaField,
+            )),
+            DecodedValue::Rrset { value, payload } => {
+                if value.kind == ValueKind::Node {
+                    Ok(ZoneItem {
+                        name,
+                        rr_type: key.rr_type(),
+                        class: key.class(),
+                        subtype: key.subtype(),
+                        value: ZoneItemValue::Node { flags: value.flags },
+                    })
+                } else {
+                    match self
+                        .zonefile
+                        .rrset_view_from_value(self.txnid, value, payload)
+                    {
+                        Ok(view) => Ok(ZoneItem {
+                            name,
+                            rr_type: key.rr_type(),
+                            class: key.class(),
+                            subtype: key.subtype(),
+                            value: ZoneItemValue::Rrset(view),
+                        }),
+                        Err(error) => Err(error),
+                    }
+                }
+            }
+        };
+        match self.cursor.advance() {
+            Ok(true) => {}
+            Ok(false) => self.finished = true,
+            Err(error) => {
+                self.finished = true;
+                return Some(Err(error));
+            }
+        }
+        Some(item)
+    }
 }
 
 /// Отчёт `fsck`.
@@ -488,6 +608,87 @@ impl ZoneFile {
         Ok(out)
     }
 
+    /// Живая зона по точному origin (apex).
+    ///
+    /// В отличие от [`ZoneFile::zone_entry`], tombstone не возвращается.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённый каталог.
+    pub fn zone_by_origin(&self, origin: &NameRle) -> Result<Option<ZoneEntry>, ZoneFileError> {
+        self.find_zone(origin)
+    }
+
+    /// Итератор всех элементов живой зоны: `T_NODE` (apex/ENT), `RRset`,
+    /// включая `RRSIG`-подтипы, в каноническом порядке.
+    ///
+    /// Пустая зона или tombstone дают пустой итератор.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённый каталог/дерево; `Corrupt(Bounds)` —
+    /// несогласованные `tree_root`/`tree_level`.
+    pub fn zone_items<'a>(&'a self, apex: &NameRle) -> Result<ZoneItems<'a>, ZoneFileError> {
+        let txnid = self.meta.txnid;
+        let Some(entry) = self.catalog_entry_at(&self.meta, apex)? else {
+            return Ok(self.empty_zone_items());
+        };
+        if !entry.is_live() || entry.tree_root == 0 {
+            return Ok(self.empty_zone_items());
+        }
+        let tree = ZoneTree::new(*apex, entry.tree_root, entry.tree_level)?;
+        let mut cursor = tree.btree().cursor(self, txnid);
+        let started = cursor.seek_first()?;
+        Ok(ZoneItems {
+            zonefile: self,
+            cursor,
+            txnid,
+            finished: !started,
+        })
+    }
+
+    fn empty_zone_items(&self) -> ZoneItems<'_> {
+        let cursor = BTree::empty().cursor(self, self.meta.txnid);
+        ZoneItems {
+            zonefile: self,
+            cursor,
+            txnid: self.meta.txnid,
+            finished: true,
+        }
+    }
+
+    fn rrset_view_from_value(
+        &self,
+        txnid: u64,
+        value: LeafValue,
+        payload: &[u8],
+    ) -> Result<RrsetView, ZoneFileError> {
+        let rdata = if value.kind == ValueKind::Overflow {
+            let chain =
+                OverflowRrset::decode(self, txnid, value.val_u32, value.rdlen, value.rr_count)?;
+            let mut rdata = Vec::with_capacity(usize::from(value.rr_count));
+            for index in 0..value.rr_count {
+                let Some(rr) = chain.rr(index)? else {
+                    break;
+                };
+                let mut buf = vec![0_u8; rr.len()];
+                let written = rr.copy_into(&mut buf).map_err(|_| {
+                    ZoneFileError::corrupt(CorruptKind::BadRdata, None, CorruptDetail::RdataSum)
+                })?;
+                buf.truncate(written);
+                rdata.push(buf);
+            }
+            rdata
+        } else {
+            split_inline_payload(payload, value.rr_count)?
+        };
+        Ok(RrsetView {
+            ttl: value.ttl,
+            flags: value.flags,
+            rdata,
+        })
+    }
+
     /// Точный поиск `RRset` в текущей meta.
     ///
     /// # Errors
@@ -532,35 +733,9 @@ impl ZoneFile {
         let DecodedValue::Rrset { value, payload } = stored.value else {
             return Ok(None);
         };
-        let rdata = if value.kind == ValueKind::Overflow {
-            let chain = OverflowRrset::decode(
-                self,
-                meta.txnid,
-                value.val_u32,
-                value.rdlen,
-                value.rr_count,
-            )?;
-            let mut rdata = Vec::with_capacity(usize::from(value.rr_count));
-            for index in 0..value.rr_count {
-                let Some(rr) = chain.rr(index)? else {
-                    break;
-                };
-                let mut buf = vec![0_u8; rr.len()];
-                let written = rr.copy_into(&mut buf).map_err(|_| {
-                    ZoneFileError::corrupt(CorruptKind::BadRdata, None, CorruptDetail::RdataSum)
-                })?;
-                buf.truncate(written);
-                rdata.push(buf);
-            }
-            rdata
-        } else {
-            split_inline_payload(payload, value.rr_count)?
-        };
-        Ok(Some(RrsetView {
-            ttl: value.ttl,
-            flags: value.flags,
-            rdata,
-        }))
+        Ok(Some(
+            self.rrset_view_from_value(meta.txnid, value, payload)?,
+        ))
     }
 
     /// Явный `fdatasync` + чекпойнт meta (`sync()`, §13.6).
