@@ -55,8 +55,10 @@
 //! - `ANY` и трансферы получают `NOTIMP` (антиамплификация).
 //! - DNSSEC без RRSIG считается insecure (см. модуль `dnssec`).
 //! - Приватные адреса в ответах не фильтруются (SEC-RES-010, вне v1).
-//! - Один keep-alive-соединение на DoT/DoH-upstream (запросы к нему
-//!   сериализуются; при обрыве — одно переподключение).
+//! - DoT/DoH-upstream держат пул keep-alive-соединений (`ResolverConfig::pool`,
+//!   по умолчанию 4): последовательные запросы переиспользуют соединение,
+//!   параллельные занимают до `size` слотов, при обрыве — переподключение с
+//!   cooldown/backoff. DoH по-прежнему только HTTP/1.1.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -102,9 +104,9 @@ pub use cache::{Cache, CacheSnapshot};
 pub use config::{
     BlockResponse, BlocklistConfig, CacheConfig, DnssecConfig, ForwardConfig, HttpsUpstream,
     IterativeConfig, Mode, Override, ResolverConfig, TimeoutConfig, TlsUpstream, TrustAnchorConfig,
-    UpstreamConfig,
+    UpstreamConfig, UpstreamPoolConfig,
 };
 pub use error::ResolverError;
 pub use overrides::{OverrideOutcome, Overrides};
-pub use resolver::{CancellationToken, ResolveContext, Resolver, StatsSnapshot};
+pub use resolver::{CancellationToken, ResolveContext, Resolver, StatsSnapshot, UpstreamStatus};
 pub use upstream::UpstreamStats;

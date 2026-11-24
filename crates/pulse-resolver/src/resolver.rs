@@ -14,10 +14,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use pulse_dns::{DecodeLimits, Edns, Message, Name, Question, Rclass, Rcode, Record, Rtype, Ttl};
 use pulse_tls::client::{DohClient, DotClient};
+use pulse_tls::{PoolConfig, PoolStats};
 
 use crate::blocklist::{Blocklist, BlocklistStats};
 use crate::cache::{Cache, CacheSnapshot};
-use crate::config::{BlockResponse, Mode, ResolverConfig, UpstreamConfig};
+use crate::config::{BlockResponse, Mode, ResolverConfig, TrustAnchorConfig, UpstreamConfig};
 use crate::dnssec::{self, Security};
 use crate::error::ResolverError;
 use crate::forward;
@@ -123,22 +124,23 @@ pub(crate) struct Forwarder {
 }
 
 impl Forwarder {
-    fn new(config: UpstreamConfig) -> Result<Self, ResolverError> {
+    fn new(config: UpstreamConfig, pool: PoolConfig) -> Result<Self, ResolverError> {
         let transport = match &config {
             UpstreamConfig::Udp(address) => ForwardTransport::Udp(*address),
             UpstreamConfig::Tcp(address) => ForwardTransport::Tcp(*address),
             UpstreamConfig::Tls(upstream) => {
-                let client = DotClient::new(
+                let client = DotClient::with_pool(
                     &upstream.host,
                     Some(upstream.port),
                     &upstream.server_name,
                     upstream.ca.as_deref(),
+                    pool,
                 )
                 .map_err(transport_config_error)?;
                 ForwardTransport::Dot(client)
             }
             UpstreamConfig::Https(upstream) => {
-                let client = DohClient::new(&upstream.url, upstream.ca.as_deref())
+                let client = DohClient::with_pool(&upstream.url, upstream.ca.as_deref(), pool)
                     .map_err(transport_config_error)?;
                 ForwardTransport::Doh(client)
             }
@@ -153,6 +155,23 @@ impl Forwarder {
 
     fn healthy(&self, now_ms: u64) -> bool {
         self.cooldown_until_ms.load(Ordering::Relaxed) <= now_ms
+    }
+
+    fn pool_stats(&self, stats: &mut PoolStats) {
+        let source = match &self.transport {
+            ForwardTransport::Dot(client) => client.pool_stats(),
+            ForwardTransport::Doh(client) => client.pool_stats(),
+            ForwardTransport::Udp(_) | ForwardTransport::Tcp(_) => return,
+        };
+        stats.acquires = stats.acquires.saturating_add(source.acquires);
+        stats.reuses = stats.reuses.saturating_add(source.reuses);
+        stats.opens = stats.opens.saturating_add(source.opens);
+        stats.waits = stats.waits.saturating_add(source.waits);
+        stats.discards = stats.discards.saturating_add(source.discards);
+        stats.connect_failures = stats
+            .connect_failures
+            .saturating_add(source.connect_failures);
+        stats.cooldowns = stats.cooldowns.saturating_add(source.cooldowns);
     }
 }
 
@@ -194,10 +213,28 @@ pub struct StatsSnapshot {
     pub upstream: UpstreamStats,
 }
 
+/// Состояние одного forward-upstream для control-plane API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamStatus {
+    /// Тип: `udp`, `tcp`, `tls` или `https`.
+    pub kind: &'static str,
+    /// Адрес/URL без параметров сертификата.
+    pub address: String,
+    /// Не находится ли upstream в cooldown.
+    pub healthy: bool,
+    /// Подряд накопленных ошибок.
+    pub failures: u32,
+    /// Остаток cooldown, миллисекунды (`0` — активен).
+    pub cooldown_ms: u64,
+    /// Счётчики пула keep-alive (нули для UDP/TCP).
+    pub pool: PoolStats,
+}
+
 pub(crate) struct Inner {
     pub(crate) config: ResolverConfig,
     pub(crate) cache: Cache,
     pub(crate) blocklist: RwLock<Arc<Blocklist>>,
+    pub(crate) static_anchors: RwLock<Arc<Vec<TrustAnchorConfig>>>,
     pub(crate) overrides: Overrides,
     pub(crate) forwarders: Vec<Forwarder>,
     pub(crate) round_robin: AtomicUsize,
@@ -243,11 +280,16 @@ impl Resolver {
             Blocklist::load_paths(&blocklist_paths, &config.blocklist.allowlist)?
         };
         let overrides = Overrides::build(&config.overrides)?;
+        let pool = PoolConfig {
+            size: config.pool.size,
+            reconnect_backoff: config.pool.reconnect_backoff,
+            max_reconnect_backoff: config.pool.max_reconnect_backoff,
+        };
         let forwarders = match &config.mode {
             Mode::Forward(forward) => forward
                 .effective_upstreams()
                 .into_iter()
-                .map(Forwarder::new)
+                .map(|upstream| Forwarder::new(upstream, pool))
                 .collect::<Result<Vec<_>, _>>()?,
             Mode::Iterative(_) => Vec::new(),
         };
@@ -268,12 +310,14 @@ impl Resolver {
         }));
         let upstream_counters = upstream.counters();
         let cache = Cache::new(config.cache);
+        let static_anchors = Arc::new(config.dnssec.anchors.clone());
 
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 cache,
                 blocklist: RwLock::new(Arc::new(blocklist)),
+                static_anchors: RwLock::new(static_anchors),
                 overrides,
                 forwarders,
                 round_robin: AtomicUsize::new(0),
@@ -326,6 +370,12 @@ impl Resolver {
     /// Снимок статистики.
     #[must_use]
     pub fn stats(&self) -> StatsSnapshot {
+        let mut upstream = self.inner.upstream_counters.snapshot();
+        let mut pool = PoolStats::default();
+        for forwarder in &self.inner.forwarders {
+            forwarder.pool_stats(&mut pool);
+        }
+        upstream.pool = pool;
         StatsSnapshot {
             queries: self.inner.counters.queries.load(Ordering::Relaxed),
             servfail: self.inner.counters.servfail.load(Ordering::Relaxed),
@@ -335,7 +385,7 @@ impl Resolver {
             dnssec_insecure: self.inner.counters.dnssec_insecure.load(Ordering::Relaxed),
             dnssec_bogus: self.inner.counters.dnssec_bogus.load(Ordering::Relaxed),
             cache: self.inner.cache.snapshot(),
-            upstream: self.inner.upstream_counters.snapshot(),
+            upstream,
         }
     }
 
@@ -392,6 +442,60 @@ impl Resolver {
             |_| Arc::new(Blocklist::default()),
             |guard| Arc::clone(&guard),
         )
+    }
+
+    /// Состояние forward-upstream'ов (пусто в итеративном режиме).
+    #[must_use]
+    pub fn upstream_status(&self) -> Vec<UpstreamStatus> {
+        let now = now_millis();
+        self.inner
+            .forwarders
+            .iter()
+            .map(|forwarder| {
+                let mut pool = PoolStats::default();
+                forwarder.pool_stats(&mut pool);
+                let cooldown_until = forwarder.cooldown_until_ms.load(Ordering::Relaxed);
+                UpstreamStatus {
+                    kind: forwarder.config.kind(),
+                    address: upstream_address(&forwarder.config),
+                    healthy: forwarder.healthy(now),
+                    failures: forwarder.failures.load(Ordering::Relaxed),
+                    cooldown_ms: cooldown_until.saturating_sub(now),
+                    pool,
+                }
+            })
+            .collect()
+    }
+
+    /// Статические trust anchors, действующие сейчас.
+    #[must_use]
+    pub fn static_trust_anchors(&self) -> Arc<Vec<TrustAnchorConfig>> {
+        self.inner
+            .static_anchors
+            .read()
+            .map_or_else(|_| Arc::new(Vec::new()), |guard| Arc::clone(&guard))
+    }
+
+    /// Атомарно заменяет статические trust anchors.
+    ///
+    /// Возвращает число установленных anchors. Уже выполняющиеся резолюции
+    /// дочитывают прежний снимок.
+    pub fn replace_trust_anchors(&self, anchors: Vec<TrustAnchorConfig>) -> usize {
+        let count = anchors.len();
+        if let Ok(mut guard) = self.inner.static_anchors.write() {
+            *guard = Arc::new(anchors);
+        }
+        count
+    }
+
+    /// RFC 5011-провайдер anchors, если он настроен.
+    #[must_use]
+    pub fn trust_anchor_provider(&self) -> Option<Arc<dyn pulse_dnssec::TrustAnchorProvider>> {
+        self.inner
+            .config
+            .trust_anchor_provider
+            .as_ref()
+            .map(Arc::clone)
     }
 
     fn effective_context(&self, context: &ResolveContext) -> ResolveContext {
@@ -1060,6 +1164,14 @@ fn random_id() -> u16 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     u16::try_from(nanos & u128::from(u16::MAX)).unwrap_or(1)
+}
+
+fn upstream_address(upstream: &UpstreamConfig) -> String {
+    match upstream {
+        UpstreamConfig::Udp(address) | UpstreamConfig::Tcp(address) => address.to_string(),
+        UpstreamConfig::Tls(upstream) => upstream.authority(),
+        UpstreamConfig::Https(upstream) => upstream.url.clone(),
+    }
 }
 
 pub(crate) fn now_millis() -> u64 {

@@ -69,6 +69,8 @@ pub struct UpstreamStats {
     pub zero_x_fallbacks: u64,
     /// Переключения на следующий upstream после ошибки.
     pub failovers: u64,
+    /// Счётчики пула DoT/DoH-соединений.
+    pub pool: pulse_tls::PoolStats,
 }
 
 impl UpstreamCounters {
@@ -83,6 +85,7 @@ impl UpstreamCounters {
             mismatches: self.mismatches.load(Ordering::Relaxed),
             zero_x_fallbacks: self.zero_x_fallbacks.load(Ordering::Relaxed),
             failovers: self.failovers.load(Ordering::Relaxed),
+            pool: pulse_tls::PoolStats::default(),
         }
     }
 }

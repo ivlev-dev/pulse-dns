@@ -193,6 +193,44 @@ impl Cache {
         }
     }
 
+    /// Удаляет записи по имени и/или типу.
+    ///
+    /// `None` означает «любое значение». Возвращает число удалённых записей.
+    /// Удаление идёт по шардам под короткой write-блокировкой, поэтому
+    /// параллельные чтения горячего пути не теряют уже полученные ответы.
+    pub fn purge_matching(&self, name: Option<&Name>, rr_type: Option<Rtype>) -> usize {
+        if name.is_none() && rr_type.is_none() {
+            let mut removed = 0_usize;
+            for shard in &self.shards {
+                let Ok(mut guard) = shard.write() else {
+                    continue;
+                };
+                removed = removed.saturating_add(guard.map.len());
+                guard.map.clear();
+                guard.bytes = 0;
+            }
+            return removed;
+        }
+        let mut removed = 0_usize;
+        for shard in &self.shards {
+            let Ok(mut guard) = shard.write() else {
+                continue;
+            };
+            let before = guard.map.len();
+            guard.map.retain(|key, _| {
+                let name_matches = name.is_none_or(|name| &key.name == name);
+                let type_matches = rr_type.is_none_or(|rr_type| key.rr_type == rr_type);
+                !(name_matches && type_matches)
+            });
+            let after = guard.map.len();
+            removed = removed.saturating_add(before.saturating_sub(after));
+            if after != before {
+                guard.bytes = guard.map.values().map(|entry| entry.size).sum();
+            }
+        }
+        removed
+    }
+
     /// Текущее число записей.
     #[must_use]
     pub fn len(&self) -> usize {

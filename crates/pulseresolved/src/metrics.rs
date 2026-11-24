@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use pulse_resolver::Resolver;
 
+use crate::rrl::{ResponseClass, Rrl};
 use crate::stats::Stats;
 
 const MAX_HTTP_CONNECTIONS: usize = 32;
@@ -21,17 +22,40 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 
 /// Источник текста метрик.
+#[derive(Clone)]
 pub(crate) struct MetricsSource {
     resolver: Resolver,
     stats: Arc<Stats>,
+    rrl: Option<Arc<Rrl>>,
+    secure: SecureMetrics,
     started: Instant,
 }
 
+/// Общие счётчики TLS/QUIC-серверов (по одному `pulse_tls::Stats` на транспорт).
+#[derive(Clone, Default)]
+pub(crate) struct SecureMetrics {
+    /// DoT.
+    pub dot: Option<Arc<pulse_tls::Stats>>,
+    /// DoH/1.1.
+    pub doh: Option<Arc<pulse_tls::Stats>>,
+    /// DoH/2.
+    pub doh2: Option<Arc<pulse_tls::Stats>>,
+    /// DoQ.
+    pub doq: Option<Arc<pulse_tls::Stats>>,
+}
+
 impl MetricsSource {
-    pub(crate) fn new(resolver: Resolver, stats: Arc<Stats>) -> Self {
+    pub(crate) fn new(
+        resolver: Resolver,
+        stats: Arc<Stats>,
+        rrl: Option<Arc<Rrl>>,
+        secure: SecureMetrics,
+    ) -> Self {
         Self {
             resolver,
             stats,
+            rrl,
+            secure,
             started: Instant::now(),
         }
     }
@@ -65,6 +89,19 @@ impl MetricsSource {
             "pulseresolved_queries_total{{transport=\"tcp\"}} {}",
             stats.tcp_queries
         );
+        for (transport, value) in [
+            ("dot", stats.dot_queries),
+            ("doh", stats.doh_queries),
+            ("doh_http2", stats.doh_http2_queries),
+            ("doq", stats.doq_queries),
+            ("dnscrypt_udp", stats.dnscrypt_udp_queries),
+            ("dnscrypt_tcp", stats.dnscrypt_tcp_queries),
+        ] {
+            let _ = writeln!(
+                out,
+                "pulseresolved_queries_total{{transport=\"{transport}\"}} {value}"
+            );
+        }
         out.push_str("# HELP pulseresolved_responses_total DNS responses by transport.\n");
         out.push_str("# TYPE pulseresolved_responses_total counter\n");
         let _ = writeln!(
@@ -76,6 +113,63 @@ impl MetricsSource {
             out,
             "pulseresolved_responses_total{{transport=\"tcp\"}} {}",
             stats.tcp_responses
+        );
+        for (transport, value) in [
+            ("dot", stats.dot_responses),
+            ("doh", stats.doh_responses),
+            ("doh_http2", stats.doh_http2_responses),
+            ("doq", stats.doq_responses),
+            ("dnscrypt_udp", stats.dnscrypt_udp_responses),
+            ("dnscrypt_tcp", stats.dnscrypt_tcp_responses),
+        ] {
+            let _ = writeln!(
+                out,
+                "pulseresolved_responses_total{{transport=\"{transport}\"}} {value}"
+            );
+        }
+        out.push_str(
+            "# HELP pulseresolved_dnscrypt_errors_total DNSCrypt errors by transport.\n\
+             # TYPE pulseresolved_dnscrypt_errors_total counter\n",
+        );
+        let _ = writeln!(
+            out,
+            "pulseresolved_dnscrypt_errors_total{{transport=\"udp\"}} {}",
+            stats.dnscrypt_udp_errors
+        );
+        let _ = writeln!(
+            out,
+            "pulseresolved_dnscrypt_errors_total{{transport=\"tcp\"}} {}",
+            stats.dnscrypt_tcp_errors
+        );
+        counter(
+            &mut out,
+            "pulseresolved_dnscrypt_tcp_connections_total",
+            "Accepted DNSCrypt TCP connections.",
+            stats.dnscrypt_tcp_connections,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_dnscrypt_tcp_rejected_total",
+            "DNSCrypt TCP connections rejected by the limit.",
+            stats.dnscrypt_tcp_rejected,
+        );
+        gauge(
+            &mut out,
+            "pulseresolved_dnscrypt_tcp_active_connections",
+            "Active DNSCrypt TCP connections.",
+            stats.dnscrypt_tcp_active,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_tls_reloads_total",
+            "Successful TLS certificate reloads.",
+            stats.tls_reloads,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_tls_reload_failures_total",
+            "Failed TLS certificate reloads.",
+            stats.tls_reload_failures,
         );
         counter(
             &mut out,
@@ -330,7 +424,183 @@ impl MetricsSource {
             "Upstream response mismatches.",
             resolver.upstream.mismatches,
         );
+        counter(
+            &mut out,
+            "pulseresolved_upstream_pool_opens_total",
+            "Upstream DoT/DoH connections opened by the pool.",
+            resolver.upstream.pool.opens,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_upstream_pool_reuses_total",
+            "Upstream DoT/DoH pooled connections reused.",
+            resolver.upstream.pool.reuses,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_upstream_pool_waits_total",
+            "Queries that waited for a free upstream pool slot.",
+            resolver.upstream.pool.waits,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_upstream_pool_discards_total",
+            "Broken upstream pooled connections discarded.",
+            resolver.upstream.pool.discards,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_upstream_pool_connect_failures_total",
+            "Failed upstream pool connection attempts.",
+            resolver.upstream.pool.connect_failures,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_upstream_pool_cooldowns_total",
+            "Queries rejected while the upstream pool was cooling down.",
+            resolver.upstream.pool.cooldowns,
+        );
+
+        if let Some(rrl) = &self.rrl {
+            let snapshot = rrl.snapshot();
+            out.push_str(
+                "# HELP pulseresolved_rrl_limited_total Responses limited by RRL by class.\n",
+            );
+            out.push_str("# TYPE pulseresolved_rrl_limited_total counter\n");
+            let mut slipped = String::new();
+            slipped.push_str(
+                "# HELP pulseresolved_rrl_slipped_total Limited responses sent (slip) by class.\n",
+            );
+            slipped.push_str("# TYPE pulseresolved_rrl_slipped_total counter\n");
+            let mut dropped = String::new();
+            dropped.push_str(
+                "# HELP pulseresolved_rrl_dropped_total Limited responses dropped by class.\n",
+            );
+            dropped.push_str("# TYPE pulseresolved_rrl_dropped_total counter\n");
+            for class in ResponseClass::ALL {
+                let stats = snapshot.class(class);
+                let label = class.as_str();
+                let _ = writeln!(
+                    out,
+                    "pulseresolved_rrl_limited_total{{class=\"{label}\"}} {}",
+                    stats.limited
+                );
+                let _ = writeln!(
+                    slipped,
+                    "pulseresolved_rrl_slipped_total{{class=\"{label}\"}} {}",
+                    stats.slipped
+                );
+                let _ = writeln!(
+                    dropped,
+                    "pulseresolved_rrl_dropped_total{{class=\"{label}\"}} {}",
+                    stats.dropped
+                );
+            }
+            out.push_str(&slipped);
+            out.push_str(&dropped);
+            gauge(
+                &mut out,
+                "pulseresolved_rrl_entries",
+                "Occupied RRL bucket entries.",
+                snapshot.entries as u64,
+            );
+        }
+        self.render_secure(&mut out);
         out
+    }
+
+    /// Метрики TLS/QUIC-серверов из общих счётчиков `pulse-tls`.
+    fn render_secure(&self, out: &mut String) {
+        for (prefix, stats, http) in [
+            ("dot", self.secure.dot.as_deref(), false),
+            ("doh", self.secure.doh.as_deref(), true),
+            ("doh_http2", self.secure.doh2.as_deref(), true),
+            ("doq", self.secure.doq.as_deref(), false),
+        ] {
+            let Some(stats) = stats else {
+                continue;
+            };
+            let snapshot = stats.snapshot();
+            let _ = writeln!(
+                out,
+                "# HELP pulseresolved_{prefix}_connections_total Accepted {prefix} connections.\n\
+                 # TYPE pulseresolved_{prefix}_connections_total counter\n\
+                 pulseresolved_{prefix}_connections_total {}",
+                snapshot.connections
+            );
+            let _ = writeln!(
+                out,
+                "# HELP pulseresolved_{prefix}_rejected_connections_total Rejected {prefix} connections.\n\
+                 # TYPE pulseresolved_{prefix}_rejected_connections_total counter\n\
+                 pulseresolved_{prefix}_rejected_connections_total {}",
+                snapshot.rejected_connections
+            );
+            let _ = writeln!(
+                out,
+                "# HELP pulseresolved_{prefix}_handshakes_total Successful {prefix} TLS handshakes.\n\
+                 # TYPE pulseresolved_{prefix}_handshakes_total counter\n\
+                 pulseresolved_{prefix}_handshakes_total {}",
+                snapshot.handshakes
+            );
+            let _ = writeln!(
+                out,
+                "# HELP pulseresolved_{prefix}_handshake_failures_total Failed {prefix} TLS handshakes.\n\
+                 # TYPE pulseresolved_{prefix}_handshake_failures_total counter\n\
+                 pulseresolved_{prefix}_handshake_failures_total {}",
+                snapshot.handshake_failures
+            );
+            let _ = writeln!(
+                out,
+                "# HELP pulseresolved_{prefix}_errors_total {prefix} protocol and I/O errors.\n\
+                 # TYPE pulseresolved_{prefix}_errors_total counter\n\
+                 pulseresolved_{prefix}_errors_total {}",
+                snapshot.errors
+            );
+            let _ = writeln!(
+                out,
+                "# HELP pulseresolved_{prefix}_timeouts_total {prefix} handshake and idle timeouts.\n\
+                 # TYPE pulseresolved_{prefix}_timeouts_total counter\n\
+                 pulseresolved_{prefix}_timeouts_total {}",
+                snapshot.timeouts
+            );
+            let _ = writeln!(
+                out,
+                "# HELP pulseresolved_{prefix}_bytes_read_total {prefix} application bytes read.\n\
+                 # TYPE pulseresolved_{prefix}_bytes_read_total counter\n\
+                 pulseresolved_{prefix}_bytes_read_total {}",
+                snapshot.bytes_read
+            );
+            let _ = writeln!(
+                out,
+                "# HELP pulseresolved_{prefix}_bytes_written_total {prefix} application bytes written.\n\
+                 # TYPE pulseresolved_{prefix}_bytes_written_total counter\n\
+                 pulseresolved_{prefix}_bytes_written_total {}",
+                snapshot.bytes_written
+            );
+            let _ = writeln!(
+                out,
+                "# HELP pulseresolved_{prefix}_active_connections Active {prefix} connections.\n\
+                 # TYPE pulseresolved_{prefix}_active_connections gauge\n\
+                 pulseresolved_{prefix}_active_connections {}",
+                snapshot.active_connections
+            );
+            if http {
+                let _ = writeln!(
+                    out,
+                    "# HELP pulseresolved_{prefix}_http_requests_total {prefix} HTTP requests.\n\
+                     # TYPE pulseresolved_{prefix}_http_requests_total counter\n\
+                     pulseresolved_{prefix}_http_requests_total {}",
+                    snapshot.http_requests
+                );
+                let _ = writeln!(
+                    out,
+                    "# HELP pulseresolved_{prefix}_http_errors_total {prefix} HTTP 4xx/5xx responses.\n\
+                     # TYPE pulseresolved_{prefix}_http_errors_total counter\n\
+                     pulseresolved_{prefix}_http_errors_total {}",
+                    snapshot.http_errors
+                );
+            }
+        }
     }
 
     pub(crate) const fn healthz() -> &'static str {
@@ -532,7 +802,7 @@ mod tests {
         let stats = Arc::new(Stats::new());
         stats.udp_query();
         stats.reload_ok();
-        let source = MetricsSource::new(resolver, stats);
+        let source = MetricsSource::new(resolver, stats, None, SecureMetrics::default());
         let text = source.render();
         assert!(text.contains("pulseresolved_queries_total{transport=\"udp\"} 1"));
         assert!(text.contains("pulseresolved_resolver_queries_total 0"));
@@ -553,7 +823,7 @@ mod tests {
         ]))
         .unwrap();
         let stats = Arc::new(Stats::new());
-        let source = MetricsSource::new(resolver, stats);
+        let source = MetricsSource::new(resolver, stats, None, SecureMetrics::default());
         let mut service = MetricsService::start("127.0.0.1:0".parse().unwrap(), source).unwrap();
         let addr = service.addr();
         assert!(http_get(addr, "/healthz").contains("200 OK"));

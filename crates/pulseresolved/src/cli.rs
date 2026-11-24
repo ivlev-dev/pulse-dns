@@ -21,8 +21,8 @@ pub(crate) fn run() -> ExitCode {
     let config_path = matches
         .get_one::<PathBuf>("config")
         .cloned()
-        .unwrap_or_else(|| PathBuf::from("examples/resolver.json"));
-    let mut config = match Config::load(&config_path) {
+        .unwrap_or_else(|| PathBuf::from("examples/resolver.toml"));
+    let mut config = match Config::from_path(&config_path) {
         Ok(config) => config,
         Err(error) => {
             logging::error("config", &error.to_string());
@@ -46,11 +46,18 @@ pub(crate) fn run() -> ExitCode {
     logging::info(
         "startup",
         &format!(
-            "pulseresolved {} listening: udp={:?} tcp={:?} metrics={:?} workers={:?} backend={:?}",
+            "pulseresolved {} listening: udp={:?} tcp={:?} dot={:?} doh={:?} doh2={:?} doq={:?} dnscrypt_udp={:?} dnscrypt_tcp={:?} metrics={:?} control={:?} workers={:?} backend={:?}",
             env!("CARGO_PKG_VERSION"),
             server.udp_addr(),
             server.tcp_addr(),
+            server.dot_addr(),
+            server.doh_addr(),
+            server.doh2_addr(),
+            server.doq_addr(),
+            server.dnscrypt_udp_addr(),
+            server.dnscrypt_tcp_addr(),
             server.metrics_addr(),
+            server.control_addr(),
             server.udp_workers(),
             server.udp_backend()
         ),
@@ -70,8 +77,18 @@ pub(crate) fn run() -> ExitCode {
     for signal in signals.forever() {
         match signal {
             SIGHUP => {
-                logging::warn("signal", "received SIGHUP, reloading blocklist");
-                let _ = server.reload_blocklist();
+                logging::warn(
+                    "signal",
+                    "received SIGHUP, reloading blocklist and TLS certificate",
+                );
+                let outcome = server.reload();
+                if let Err(error) = &outcome.blocklist {
+                    logging::error("blocklist", &error.to_string());
+                }
+                match &outcome.tls {
+                    Ok(()) => logging::info("tls", "certificate reloaded"),
+                    Err(message) => logging::error("tls", message),
+                }
             }
             SIGINT | SIGTERM => {
                 logging::warn(
@@ -91,11 +108,23 @@ pub(crate) fn run() -> ExitCode {
     logging::info(
         "stats",
         &format!(
-            "queries(udp={},tcp={}) responses(udp={},tcp={}) decode_errors={} encode_errors={} formerr={} refused={} refused_acl={} rate_limited={} truncated={} dropped={}",
+            "queries(udp={},tcp={},dot={},doh={},doh2={},doq={},dnscrypt_udp={},dnscrypt_tcp={}) responses(udp={},tcp={},dot={},doh={},doh2={},doq={},dnscrypt_udp={},dnscrypt_tcp={}) decode_errors={} encode_errors={} formerr={} refused={} refused_acl={} rate_limited={} truncated={} dropped={}",
             stats.udp_queries,
             stats.tcp_queries,
+            stats.dot_queries,
+            stats.doh_queries,
+            stats.doh_http2_queries,
+            stats.doq_queries,
+            stats.dnscrypt_udp_queries,
+            stats.dnscrypt_tcp_queries,
             stats.udp_responses,
             stats.tcp_responses,
+            stats.dot_responses,
+            stats.doh_responses,
+            stats.doh_http2_responses,
+            stats.doq_responses,
+            stats.dnscrypt_udp_responses,
+            stats.dnscrypt_tcp_responses,
             stats.decode_errors,
             stats.encode_errors,
             stats.formerr,
@@ -153,6 +182,16 @@ fn overrides(matches: &ArgMatches) -> Overrides {
     Overrides {
         listen_udp: matches.get_one::<SocketAddr>("listen-udp").copied(),
         listen_tcp: matches.get_one::<SocketAddr>("listen-tcp").copied(),
+        dot_listen: matches.get_one::<SocketAddr>("dot-listen").copied(),
+        doh_listen: matches.get_one::<SocketAddr>("doh-listen").copied(),
+        doh2_listen: matches.get_one::<SocketAddr>("doh2-listen").copied(),
+        doq_listen: matches.get_one::<SocketAddr>("doq-listen").copied(),
+        dnscrypt_listen: matches.get_one::<SocketAddr>("dnscrypt-listen").copied(),
+        dnscrypt_tcp_listen: matches
+            .get_one::<SocketAddr>("dnscrypt-tcp-listen")
+            .copied(),
+        tls_cert: matches.get_one::<PathBuf>("tls-cert").cloned(),
+        tls_key: matches.get_one::<PathBuf>("tls-key").cloned(),
         metrics_listen: matches.get_one::<SocketAddr>("metrics-listen").copied(),
         workers: matches.get_one::<usize>("workers").copied(),
         forwarders: matches
@@ -167,6 +206,9 @@ fn overrides(matches: &ArgMatches) -> Overrides {
             .get_many::<PathBuf>("blocklist")
             .map(|values| values.cloned().collect())
             .unwrap_or_default(),
+        trust_anchor: matches.get_one::<PathBuf>("trust-anchor").cloned(),
+        trust_anchor_state: matches.get_one::<PathBuf>("trust-anchor-state").cloned(),
+        trust_anchor_hold_down: matches.get_one::<u32>("trust-anchor-hold-down").copied(),
         no_dnssec: matches.get_flag("no-dnssec"),
         log_level: matches.get_one::<LogLevel>("log-level").copied(),
     }
@@ -179,7 +221,11 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
         | ServerError::TcpStart { .. }
         | ServerError::Tcp(_)
         | ServerError::MetricsStart { .. }
-        | ServerError::Reload(_) => ExitCode::from(1),
+        | ServerError::ControlStart { .. }
+        | ServerError::Reload(_)
+        | ServerError::SecureStart { .. }
+        | ServerError::Secure { .. }
+        | ServerError::Dnscrypt(_) => ExitCode::from(1),
     }
 }
 
@@ -201,14 +247,14 @@ fn parse_forwarder(value: &str) -> Result<SocketAddr, String> {
 fn command() -> Command {
     Command::new("pulseresolved")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("Caching DNS resolver: forward/iterative, UDP/TCP, blocklist, overrides")
+        .about("Caching DNS resolver: UDP/TCP/DoT/DoH/DoQ/DNSCrypt, blocklist, overrides")
         .arg(
             Arg::new("config")
                 .long("config")
                 .value_name("PATH")
-                .default_value("examples/resolver.json")
+                .default_value("examples/resolver.toml")
                 .value_parser(value_parser!(PathBuf))
-                .help("Path to the JSON configuration file"),
+                .help("Path to the TOML (or legacy JSON) configuration file"),
         )
         .arg(
             Arg::new("listen-udp")
@@ -223,6 +269,62 @@ fn command() -> Command {
                 .value_name("ADDR")
                 .value_parser(value_parser!(SocketAddr))
                 .help("Override TCP listen address, e.g. 127.0.0.1:5353"),
+        )
+        .arg(
+            Arg::new("dot-listen")
+                .long("dot-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNS over TLS on ADDR, e.g. 0.0.0.0:853"),
+        )
+        .arg(
+            Arg::new("doh-listen")
+                .long("doh-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNS over HTTPS/1.1 on ADDR, e.g. 0.0.0.0:443"),
+        )
+        .arg(
+            Arg::new("doh2-listen")
+                .long("doh2-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNS over HTTPS/2 on ADDR, e.g. 0.0.0.0:8443"),
+        )
+        .arg(
+            Arg::new("doq-listen")
+                .long("doq-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNS over QUIC on ADDR, e.g. 0.0.0.0:8853"),
+        )
+        .arg(
+            Arg::new("dnscrypt-listen")
+                .long("dnscrypt-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNSCrypt v2 over UDP on ADDR"),
+        )
+        .arg(
+            Arg::new("dnscrypt-tcp-listen")
+                .long("dnscrypt-tcp-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNSCrypt v2 over TCP on ADDR"),
+        )
+        .arg(
+            Arg::new("tls-cert")
+                .long("tls-cert")
+                .value_name("PATH")
+                .value_parser(value_parser!(PathBuf))
+                .help("PEM certificate chain for DoT/DoH/DoQ"),
+        )
+        .arg(
+            Arg::new("tls-key")
+                .long("tls-key")
+                .value_name("PATH")
+                .value_parser(value_parser!(PathBuf))
+                .help("PEM private key for DoT/DoH/DoQ (mode 0600)"),
         )
         .arg(
             Arg::new("metrics-listen")
@@ -275,6 +377,27 @@ fn command() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Disable DNSSEC validation"),
         )
+        .arg(
+            Arg::new("trust-anchor")
+                .long("trust-anchor")
+                .value_name("PATH")
+                .value_parser(value_parser!(PathBuf))
+                .help("DS file with explicit trust anchors; enables DNSSEC validation"),
+        )
+        .arg(
+            Arg::new("trust-anchor-state")
+                .long("trust-anchor-state")
+                .value_name("PATH")
+                .value_parser(value_parser!(PathBuf))
+                .help("RFC 5011 state file; enables automatic trust anchor updates"),
+        )
+        .arg(
+            Arg::new("trust-anchor-hold-down")
+                .long("trust-anchor-hold-down")
+                .value_name("SECS")
+                .value_parser(value_parser!(u32))
+                .help("RFC 5011 add/revoke hold-down in seconds (default 30 days)"),
+        )
 }
 
 #[cfg(test)]
@@ -325,7 +448,7 @@ mod tests {
             .try_get_matches_from([
                 "pulseresolved",
                 "--config",
-                "examples/resolver.json",
+                "examples/resolver.toml",
                 "--upstream",
                 "tls://dns.example:853#dns.example",
                 "--upstream",
@@ -337,5 +460,25 @@ mod tests {
         assert_eq!(overrides.upstreams[0].kind(), "tls");
         assert_eq!(overrides.upstreams[1].kind(), "https");
         assert!(parse_upstream("http://dns.example/dns-query").is_err());
+    }
+
+    #[test]
+    fn cli_default_config_is_toml() {
+        let matches = command().try_get_matches_from(["pulseresolved"]).unwrap();
+        assert_eq!(
+            matches.get_one::<PathBuf>("config"),
+            Some(&PathBuf::from("examples/resolver.toml"))
+        );
+    }
+
+    #[test]
+    fn cli_accepts_toml_config_path() {
+        let matches = command()
+            .try_get_matches_from(["pulseresolved", "--config", "/etc/pulse/resolver.toml"])
+            .unwrap();
+        assert_eq!(
+            matches.get_one::<PathBuf>("config"),
+            Some(&PathBuf::from("/etc/pulse/resolver.toml"))
+        );
     }
 }

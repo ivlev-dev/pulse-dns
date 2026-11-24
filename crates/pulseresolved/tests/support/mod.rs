@@ -1,19 +1,28 @@
 //! Mock upstream (UDP) и клиенты для интеграционных тестов.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::doc_markdown)]
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pulse_dns::{
     DecodeLimits, Edns, EncodeOptions, Message, Name, Question, Rclass, Rcode, Rdata, Record,
     Rtype, SoaData, Ttl,
 };
+use pulse_dnscrypt::{
+    Certificate, CertificateParams as DnscryptCertificateParams, DnscryptClient, ProviderKeypair,
+    ResolverKeypair, random_client_magic,
+};
 use pulseresolved::config::{CacheSetting, Config, ModeSetting, TimeoutSetting};
+use rcgen::{CertificateParams, KeyPair};
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 /// UDP mock-upstream с обработчиком запросов.
 pub struct MockUpstream {
@@ -229,6 +238,25 @@ pub fn positive_response(request: &Message, record: Record) -> Message {
     response
 }
 
+/// `NS`-запись.
+pub fn ns(owner: &str, ttl: u32, target: &str) -> Record {
+    Record::new(
+        Name::parse(owner).expect("owner"),
+        Rtype::NS,
+        Rclass::IN,
+        Ttl::new(ttl).expect("ttl"),
+        Rdata::Ns(Name::parse(target).expect("target")),
+    )
+    .expect("NS record")
+}
+
+/// Делегирование: NOERROR без ответов, NS в authority.
+pub fn referral_response(request: &Message) -> Message {
+    let mut response = Message::response(request);
+    response.set_rcode(Rcode::NOERROR);
+    response
+}
+
 /// NXDOMAIN с SOA в authority (RFC 2308 negative caching).
 pub fn nxdomain_response(request: &Message, zone: &str) -> Message {
     let owner = Name::parse(zone).expect("zone");
@@ -252,4 +280,355 @@ pub fn nxdomain_response(request: &Message, zone: &str) -> Message {
     response.set_rcode(Rcode::NXDOMAIN);
     response.add_authority(soa);
     response
+}
+
+/// Self-signed сертификат и файлы на диске (ключ с правами `0600`).
+pub struct TestPki {
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub cert_der: Vec<u8>,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    /// Каталог живёт столько же, сколько `TestPki`.
+    pub dir: tempfile::TempDir,
+}
+
+impl TestPki {
+    /// Генерирует пару для `localhost`/`127.0.0.1` и пишет её в tempdir.
+    pub fn generate() -> Self {
+        let key = KeyPair::generate().expect("key pair");
+        let params = CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+            .expect("certificate params");
+        let certificate = params.self_signed(&key).expect("self-signed");
+        let cert_pem = certificate.pem();
+        let key_pem = key.serialize_pem();
+        let cert_der = certificate.der().to_vec();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert_pem.as_bytes()).expect("write cert");
+        write_secret(&key_path, key_pem.as_bytes());
+        Self {
+            cert_pem,
+            key_pem,
+            cert_der,
+            cert_path,
+            key_path,
+            dir,
+        }
+    }
+}
+
+/// Записывает файл и выставляет права `0600` (Unix).
+pub fn write_secret(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).expect("write secret file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+    }
+}
+
+/// Клиентский rustls-конфиг, доверяющий только `cert_der`.
+pub fn tls_client_config(cert_der: &[u8], alpn: &[u8]) -> ClientConfig {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(cert_der.to_vec()))
+        .expect("add root");
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .expect("protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![alpn.to_vec()];
+    config
+}
+
+/// HTTP-ответ тестового клиента.
+pub struct HttpsResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
+/// Синхронный TLS-клиент для DoT и DoH/1.1 (std + rustls).
+pub struct TestTlsClient {
+    connection: ClientConnection,
+    socket: TcpStream,
+    buffer: Vec<u8>,
+}
+
+impl TestTlsClient {
+    pub fn connect(addr: SocketAddr, cert_der: &[u8], alpn: &[u8]) -> Option<Self> {
+        let config = tls_client_config(cert_der, alpn);
+        let name = ServerName::try_from("localhost").ok()?;
+        let mut connection = ClientConnection::new(Arc::new(config), name).ok()?;
+        let mut socket = TcpStream::connect(addr).ok()?;
+        socket.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .ok()?;
+        socket.set_nodelay(true).ok()?;
+        while connection.is_handshaking() {
+            connection.complete_io(&mut socket).ok()?;
+        }
+        Some(Self {
+            connection,
+            socket,
+            buffer: Vec::new(),
+        })
+    }
+
+    pub fn negotiated_alpn(&self) -> Option<Vec<u8>> {
+        self.connection.alpn_protocol().map(<[u8]>::to_vec)
+    }
+
+    pub fn send(&mut self, data: &[u8]) -> Option<()> {
+        self.connection.writer().write_all(data).ok()?;
+        while self.connection.wants_write() {
+            self.connection.write_tls(&mut self.socket).ok()?;
+        }
+        Some(())
+    }
+
+    fn fill(&mut self) -> Option<()> {
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match self.connection.reader().read(&mut chunk) {
+                Ok(0) => return None,
+                Ok(read) => {
+                    self.buffer.extend_from_slice(chunk.get(..read)?);
+                    return Some(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return None,
+            }
+            let read = self.connection.read_tls(&mut self.socket).ok()?;
+            if read == 0 {
+                return None;
+            }
+            self.connection.process_new_packets().ok()?;
+        }
+    }
+
+    pub fn read_exact(&mut self, length: usize) -> Option<Vec<u8>> {
+        while self.buffer.len() < length {
+            self.fill()?;
+        }
+        let bytes = self.buffer.get(..length)?.to_vec();
+        self.buffer.drain(..length);
+        Some(bytes)
+    }
+
+    /// DoT: length-prefixed DNS-запрос и ответ (RFC 7858).
+    pub fn dot_query(&mut self, message: &[u8]) -> Option<Vec<u8>> {
+        let length = u16::try_from(message.len()).ok()?;
+        self.send(&length.to_be_bytes())?;
+        self.send(message)?;
+        let prefix = self.read_exact(2)?;
+        let length = usize::from(u16::from_be_bytes([prefix[0], prefix[1]]));
+        self.read_exact(length)
+    }
+
+    /// DoH/1.1 POST /dns-query.
+    pub fn https_post(&mut self, path: &str, body: &[u8]) -> Option<HttpsResponse> {
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            body.len()
+        );
+        self.send(head.as_bytes())?;
+        self.send(body)?;
+        self.read_http()
+    }
+
+    /// DoH/1.1 GET с уже закодированным query string.
+    pub fn https_get(&mut self, target: &str) -> Option<HttpsResponse> {
+        let head = format!(
+            "GET {target} HTTP/1.1\r\nHost: localhost\r\nAccept: application/dns-message\r\nConnection: keep-alive\r\n\r\n"
+        );
+        self.send(head.as_bytes())?;
+        self.read_http()
+    }
+
+    fn read_http(&mut self) -> Option<HttpsResponse> {
+        let head_end = loop {
+            if let Some(position) = find_head_end(&self.buffer) {
+                break position;
+            }
+            self.fill()?;
+        };
+        let head = String::from_utf8_lossy(self.buffer.get(..head_end)?).into_owned();
+        self.buffer.drain(..head_end);
+        let mut lines = head.split("\r\n");
+        let status = lines
+            .next()?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u16>()
+            .ok()?;
+        let mut content_type = None;
+        let mut length = 0_usize;
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                let name = name.trim().to_ascii_lowercase();
+                match name.as_str() {
+                    "content-type" => content_type = Some(value.trim().to_owned()),
+                    "content-length" => length = value.trim().parse().ok()?,
+                    _ => {}
+                }
+            }
+        }
+        let body = self.read_exact(length)?;
+        Some(HttpsResponse {
+            status,
+            body,
+            content_type,
+        })
+    }
+}
+
+fn find_head_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+/// Ключи, сертификат и клиент DNSCrypt v2.
+pub struct DnscryptFixture {
+    pub provider: ProviderKeypair,
+    pub resolver: ResolverKeypair,
+    pub certificate: Certificate,
+    pub client: DnscryptClient,
+    pub provider_path: PathBuf,
+    pub resolver_path: PathBuf,
+    pub cert_path: PathBuf,
+}
+
+impl DnscryptFixture {
+    /// Генерирует материал и файлы для конфигурации `pulseresolved`.
+    pub fn generate(dir: &Path) -> Self {
+        let provider = ProviderKeypair::generate().expect("provider key");
+        let resolver = ResolverKeypair::generate().expect("resolver key");
+        let now = unix_now();
+        let params = DnscryptCertificateParams::new(
+            resolver.public_key().to_bytes(),
+            random_client_magic().expect("client magic"),
+            1,
+            u32::try_from(now).expect("now fits u32"),
+            u32::try_from(now + 86_400).expect("validity fits u32"),
+        );
+        let certificate = Certificate::sign(&provider, params).expect("sign certificate");
+        let client = DnscryptClient::new(certificate.clone(), provider.public_key(), now)
+            .expect("dnscrypt client");
+
+        let provider_path = dir.join("dnscrypt-provider.key");
+        let resolver_path = dir.join("dnscrypt-resolver.key");
+        let cert_path = dir.join("dnscrypt-cert.hex");
+        let provider_hex = pulse_dnscrypt::to_hex(&*provider.to_seed());
+        let resolver_hex = pulse_dnscrypt::to_hex(&*resolver.to_secret_bytes());
+        write_secret(&provider_path, provider_hex.as_bytes());
+        write_secret(&resolver_path, resolver_hex.as_bytes());
+        std::fs::write(&cert_path, certificate.to_hex()).expect("write certificate");
+        Self {
+            provider,
+            resolver,
+            certificate,
+            client,
+            provider_path,
+            resolver_path,
+            cert_path,
+        }
+    }
+}
+
+/// UDP-обмен DNSCrypt-пакетами.
+pub fn dnscrypt_udp_query(
+    server: SocketAddr,
+    client: &DnscryptClient,
+    request: &Message,
+    timeout: Duration,
+) -> Option<Message> {
+    let wire = request.encode(&EncodeOptions::default()).ok()?;
+    let pending = client
+        .build_query(&wire, pulse_dnscrypt::Transport::Udp)
+        .ok()?;
+    let socket = UdpSocket::bind("127.0.0.1:0").ok()?;
+    socket.set_read_timeout(Some(timeout)).ok()?;
+    socket.send_to(pending.packet(), server).ok()?;
+    let mut buffer = [0_u8; 8192];
+    let (length, _) = socket.recv_from(&mut buffer).ok()?;
+    let packet = buffer.get(..length)?;
+    let response = client.decrypt_response(&pending, packet).ok()?;
+    Message::decode(&response, &DecodeLimits::default()).ok()
+}
+
+/// TCP-обмен DNSCrypt-кадрами (несколько запросов на соединении).
+pub fn dnscrypt_tcp_query(
+    stream: &mut TcpStream,
+    client: &DnscryptClient,
+    request: &Message,
+    timeout: Duration,
+) -> Option<Message> {
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    let wire = request.encode(&EncodeOptions::default()).ok()?;
+    let pending = client
+        .build_query(&wire, pulse_dnscrypt::Transport::Tcp)
+        .ok()?;
+    stream.write_all(pending.packet()).ok()?;
+    stream.flush().ok()?;
+    let mut prefix = [0_u8; 2];
+    stream.read_exact(&mut prefix).ok()?;
+    let length = usize::from(u16::from_be_bytes(prefix));
+    let mut frame = vec![0_u8; 2 + length];
+    frame[..2].copy_from_slice(&prefix);
+    stream.read_exact(&mut frame[2..]).ok()?;
+    let response = client.decrypt_response(&pending, &frame).ok()?;
+    Message::decode(&response, &DecodeLimits::default()).ok()
+}
+
+/// `A`-ответ с TTL.
+pub fn txt_records(name: &str, count: usize, ttl: u32) -> Vec<Record> {
+    (0..count)
+        .map(|index| {
+            let text = format!("{index:04}-{}", "x".repeat(100));
+            Record::new(
+                Name::parse(name).expect("owner"),
+                Rtype::TXT,
+                Rclass::IN,
+                Ttl::new(ttl).expect("ttl"),
+                Rdata::Txt(pulse_dns::TxtData::new([text.as_bytes().to_vec()]).expect("txt")),
+            )
+            .expect("TXT record")
+        })
+        .collect()
+}
+
+/// `AAAA`-ответ с TTL.
+pub fn aaaa_record(name: &str, address: &str, ttl: u32) -> Record {
+    Record::new(
+        Name::parse(name).expect("owner"),
+        Rtype::AAAA,
+        Rclass::IN,
+        Ttl::new(ttl).expect("ttl"),
+        Rdata::Aaaa(address.parse().expect("ipv6")),
+    )
+    .expect("AAAA record")
+}
+
+/// Форматирует hex в нижнем регистре (для отладочных сообщений тестов).
+pub fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }

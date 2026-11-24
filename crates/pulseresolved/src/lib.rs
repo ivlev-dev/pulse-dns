@@ -2,12 +2,17 @@
 //!
 //! Крейт связывает `pulse-resolver` (резолюция, кеш, blocklist, overrides,
 //! DNSSEC-валидация) с транспортами: UDP через `pulse-runtime` (io_uring,
-//! `SO_REUSEPORT`, N worker-потоков) и TCP на std с length-prefix framing.
+//! `SO_REUSEPORT`, N worker-потоков), TCP на std с length-prefix framing,
+//! DoT/DoH/1.1/DoH/2/DoQ через `pulse-tls` и DNSCrypt v2 (UDP/TCP) через
+//! `pulse-dnscrypt`. Все транспорты используют единый путь
+//! `decode → Resolver::resolve → encode`, общий ACL и per-source rate limit.
 //!
 //! # Состав
 //!
-//! - [`config`] — JSON-конфигурация, CLI-overrides и валидация.
-//! - [`server`] — запуск/остановка UDP, TCP и HTTP-метрик, SIGHUP-reload.
+//! - [`config`] — TOML-конфигурация (JSON — совместимость), CLI-overrides и валидация.
+//! - [`server`] — запуск/остановка всех транспортов, HTTP-метрик и SIGHUP-reload.
+//! - `control` — loopback REST API управления кешем, blocklist, upstreams,
+//!   trust anchors, RRL и безопасным снимком конфигурации.
 //! - [`stats`] — атомарные счётчики транспорта и рендер Prometheus.
 //! - [`error`] — ошибки конфигурации и запуска.
 //!
@@ -18,7 +23,7 @@
 //! use pulseresolved::server::Server;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = Config::load("examples/resolver.json")?;
+//! let config = Config::from_path("examples/resolver.toml")?;
 //! let mut server = Server::start(&config)?;
 //! println!("udp={:?} tcp={:?}", server.udp_addr(), server.tcp_addr());
 //! server.shutdown()?;
@@ -28,12 +33,16 @@
 //!
 //! # Ограничения
 //!
-//! - Нет серверных DoT/DoH/DoQ-транспортов: защищённые транспорты есть
-//!   только на стороне upstream (клиент в `pulse-tls`).
-//! - RRL реализован как per-source token bucket с политикой
-//!   `drop`/`refused`/`truncate`, а не как полный RRL авторитетного сервера.
-//! - DNSSEC-валидация использует статические trust anchors (RFC 5011 нет).
-//! - HTTP-метрики доступны только на loopback-адресе и без TLS.
+//! - RRL ([`rrl`]) работает по классам ответов, источнику и хешу имени,
+//!   применяется только к открытому UDP и не реализует DNS Cookies. На
+//!   DoT/DoH/DoQ/DNSCrypt действует per-source token bucket.
+//! - DNSSEC-валидация использует статические anchors или RFC 5011
+//!   ([`pulse_dnssec::TrustAnchorStore`]): add/revoke hold-down, состояние `0600`.
+//! - HTTP-метрики и control-plane REST API доступны только на loopback-адресе
+//!   и без TLS. Control API требует bearer-токен (`control_token` или
+//!   `PULSERESOLVED_API_TOKEN`), лимит тела — 1 МиБ.
+//! - DoH/3 не поддерживается; DNSCrypt hot-reload сертификата требует
+//!   перезапуска (SIGHUP перечитывает только TLS-пару и blocklist).
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -53,20 +62,24 @@
     clippy::option_if_let_else,
     clippy::manual_let_else,
     clippy::struct_excessive_bools,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
 )]
 
 mod anchors;
 mod cli;
+mod control;
 mod logging;
 mod metrics;
 mod query;
 mod reload;
+mod secure;
 mod tcp;
 mod udp;
 
 pub mod config;
 pub mod error;
+pub mod rrl;
 pub mod server;
 pub mod stats;
 

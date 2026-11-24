@@ -383,6 +383,33 @@ impl Default for ForwardConfig {
     }
 }
 
+/// Параметры пула keep-alive соединений к DoT/DoH upstream.
+///
+/// Пул ленивый: соединение открывается по требованию, поэтому
+/// последовательные запросы переиспользуют одно соединение, а параллельные
+/// занимают до `size` слотов. `size` одновременно является лимитом
+/// одновременных запросов к одному upstream: при занятости всех слотов
+/// запрос ждёт свободный до общего дедлайна резолюции.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamPoolConfig {
+    /// Число keep-alive соединений (1..=64).
+    pub size: usize,
+    /// Начальная задержка переподключения после неудачного connect.
+    pub reconnect_backoff: Duration,
+    /// Максимальная задержка переподключения (экспоненциальный backoff).
+    pub max_reconnect_backoff: Duration,
+}
+
+impl Default for UpstreamPoolConfig {
+    fn default() -> Self {
+        Self {
+            size: 4,
+            reconnect_backoff: Duration::from_millis(100),
+            max_reconnect_backoff: Duration::from_secs(5),
+        }
+    }
+}
+
 /// Таймауты.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeoutConfig {
@@ -636,10 +663,14 @@ pub struct ResolverConfig {
     pub parallel_ns: usize,
     /// Максимальный размер ответа upstream.
     pub max_response_bytes: usize,
+    /// Пул keep-alive соединений DoT/DoH.
+    pub pool: UpstreamPoolConfig,
     /// Кеш.
     pub cache: CacheConfig,
     /// DNSSEC.
     pub dnssec: DnssecConfig,
+    /// RFC 5011 provider: текущие anchors и приём валидированных DNSKEY.
+    pub trust_anchor_provider: Option<std::sync::Arc<dyn pulse_dnssec::TrustAnchorProvider>>,
     /// Blocklist.
     pub blocklist: BlocklistConfig,
     /// Overrides.
@@ -660,8 +691,10 @@ impl Default for ResolverConfig {
             max_queries: 64,
             parallel_ns: 2,
             max_response_bytes: pulse_dns::MAX_UDP_PAYLOAD * 8,
+            pool: UpstreamPoolConfig::default(),
             cache: CacheConfig::default(),
             dnssec: DnssecConfig::default(),
+            trust_anchor_provider: None,
             blocklist: BlocklistConfig::default(),
             overrides: Vec::new(),
         }
@@ -726,6 +759,16 @@ impl ResolverConfig {
         {
             return Err(ResolverError::config("timeouts must be non-zero"));
         }
+        if !(1..=pulse_tls::MAX_POOL_SIZE).contains(&self.pool.size) {
+            return Err(ResolverError::config("pool size must be in 1..=64"));
+        }
+        if self.pool.reconnect_backoff.is_zero()
+            || self.pool.max_reconnect_backoff < self.pool.reconnect_backoff
+        {
+            return Err(ResolverError::config(
+                "pool reconnect backoff must be positive and not exceed the maximum",
+            ));
+        }
         if self.cache.max_entries == 0
             || self.cache.max_bytes == 0
             || !(1..=256).contains(&self.cache.shards)
@@ -789,6 +832,22 @@ mod tests {
         let mut config = ResolverConfig::default();
         config.cache.min_ttl = 100;
         config.cache.max_ttl = 10;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn pool_config_is_validated() {
+        let mut config = ResolverConfig::default();
+        assert_eq!(config.pool.size, 4, "pool size defaults to 4");
+        config.pool.size = 0;
+        assert!(config.validate().is_err());
+        config.pool.size = 65;
+        assert!(config.validate().is_err());
+        config.pool.size = 4;
+        config.pool.reconnect_backoff = std::time::Duration::ZERO;
+        assert!(config.validate().is_err());
+        config.pool.reconnect_backoff = std::time::Duration::from_secs(1);
+        config.pool.max_reconnect_backoff = std::time::Duration::from_millis(100);
         assert!(config.validate().is_err());
     }
 

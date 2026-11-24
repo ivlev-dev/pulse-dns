@@ -346,16 +346,22 @@ impl Validator<'_> {
             DsPolicy::strict(),
         )
         .map_err(|error| bogus(error.to_string()))?;
+        if let Some(provider) = &self.resolver.inner.config.trust_anchor_provider {
+            provider.observe_validated_dnskey(zone, &rrset, self.now);
+        }
         Ok(Some(validated))
     }
 
     fn anchors_for(&self, zone: &Name) -> Option<Vec<DsData>> {
+        if let Some(provider) = &self.resolver.inner.config.trust_anchor_provider {
+            let provided = provider.anchors(zone, self.now);
+            if !provided.is_empty() {
+                return Some(provided);
+            }
+        }
         let configured: Vec<DsData> = self
             .resolver
-            .inner
-            .config
-            .dnssec
-            .anchors
+            .static_trust_anchors()
             .iter()
             .filter(|anchor| &anchor.zone == zone)
             .map(|anchor| anchor.ds.clone())

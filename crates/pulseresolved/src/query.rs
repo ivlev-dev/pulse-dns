@@ -11,6 +11,7 @@ use pulse_resolver::Resolver;
 use pulse_tls::{Acl, RateLimiter};
 
 use crate::config::RateLimitAction;
+use crate::rrl::{Rrl, RrlOutcome};
 use crate::stats::Stats;
 
 /// Транспорт, по которому пришёл запрос.
@@ -18,26 +19,85 @@ use crate::stats::Stats;
 pub(crate) enum Transport {
     Udp,
     Tcp,
+    Dot,
+    Doh,
+    Doh2,
+    Doq,
+    DnscryptUdp,
+    DnscryptTcp,
+}
+
+impl Transport {
+    /// Транспорт из семейства TLS/QUIC (действует `tls_allow_from`).
+    const fn is_tls(self) -> bool {
+        matches!(self, Self::Dot | Self::Doh | Self::Doh2 | Self::Doq)
+    }
+
+    /// Лимит сырого ответа для FORMERR/REFUSED без разобранного запроса.
+    const fn raw_limit(self) -> usize {
+        match self {
+            Self::Udp => MAX_UDP_PAYLOAD,
+            _ => MAX_MESSAGE_LEN,
+        }
+    }
+
+    fn count_query(self, stats: &Stats) {
+        match self {
+            Self::Udp => stats.udp_query(),
+            Self::Tcp => stats.tcp_query(),
+            Self::Dot => stats.dot_query(),
+            Self::Doh => stats.doh_query(),
+            Self::Doh2 => stats.doh_http2_query(),
+            Self::Doq => stats.doq_query(),
+            Self::DnscryptUdp => stats.dnscrypt_udp_query(),
+            Self::DnscryptTcp => stats.dnscrypt_tcp_query(),
+        }
+    }
+
+    fn count_response(self, stats: &Stats) {
+        match self {
+            Self::Udp => stats.udp_response(),
+            Self::Tcp => stats.tcp_response(),
+            Self::Dot => stats.dot_response(),
+            Self::Doh => stats.doh_response(),
+            Self::Doh2 => stats.doh_http2_response(),
+            Self::Doq => stats.doq_response(),
+            Self::DnscryptUdp => stats.dnscrypt_udp_response(),
+            Self::DnscryptTcp => stats.dnscrypt_tcp_response(),
+        }
+    }
 }
 
 /// Политика доступа к сервису: ACL клиентов и per-source rate limit.
 pub(crate) struct AccessPolicy {
     acl: Acl,
+    tls_acl: Option<Acl>,
     limiter: Option<RateLimiter>,
     action: RateLimitAction,
 }
 
 impl AccessPolicy {
-    pub(crate) fn new(acl: Acl, limiter: Option<RateLimiter>, action: RateLimitAction) -> Self {
+    pub(crate) fn new(
+        acl: Acl,
+        tls_acl: Option<Acl>,
+        limiter: Option<RateLimiter>,
+        action: RateLimitAction,
+    ) -> Self {
         Self {
             acl,
+            tls_acl,
             limiter,
             action,
         }
     }
 
-    fn allows(&self, peer: IpAddr) -> bool {
-        self.acl.allows(normalize_ip(peer))
+    fn allows(&self, transport: Transport, peer: IpAddr) -> bool {
+        let peer = normalize_ip(peer);
+        if transport.is_tls() {
+            self.tls_acl.as_ref().unwrap_or(&self.acl).allows(peer)
+        } else {
+            self.acl.allows(peer)
+        }
     }
 
     fn rate_allows(&self, peer: IpAddr) -> bool {
@@ -67,6 +127,7 @@ pub(crate) struct Processor {
     resolver: Resolver,
     stats: Arc<Stats>,
     policy: AccessPolicy,
+    rrl: Option<Arc<Rrl>>,
 }
 
 impl Processor {
@@ -74,13 +135,16 @@ impl Processor {
         resolver: Resolver,
         stats: Arc<Stats>,
         acl: Acl,
+        tls_acl: Option<Acl>,
         limiter: Option<RateLimiter>,
         action: RateLimitAction,
+        rrl: Option<Arc<Rrl>>,
     ) -> Self {
         Self {
             resolver,
             stats,
-            policy: AccessPolicy::new(acl, limiter, action),
+            policy: AccessPolicy::new(acl, tls_acl, limiter, action),
+            rrl,
         }
     }
 
@@ -92,15 +156,9 @@ impl Processor {
         transport: Transport,
         peer: std::net::SocketAddr,
     ) -> Option<Vec<u8>> {
-        match transport {
-            Transport::Udp => self.stats.udp_query(),
-            Transport::Tcp => self.stats.tcp_query(),
-        }
-        let raw_limit = match transport {
-            Transport::Udp => MAX_UDP_PAYLOAD,
-            Transport::Tcp => MAX_MESSAGE_LEN,
-        };
-        if !self.policy.allows(peer.ip()) {
+        transport.count_query(&self.stats);
+        let raw_limit = transport.raw_limit();
+        if !self.policy.allows(transport, peer.ip()) {
             self.stats.refused_acl();
             self.stats.refused();
             return self.raw_error(request, Rcode::REFUSED, raw_limit, transport);
@@ -115,7 +173,7 @@ impl Processor {
         }
         let limit = match transport {
             Transport::Udp => udp_limit(&request),
-            Transport::Tcp => MAX_MESSAGE_LEN,
+            _ => MAX_MESSAGE_LEN,
         };
         if !self.policy.rate_allows(peer.ip()) {
             self.stats.rate_limited();
@@ -153,6 +211,25 @@ impl Processor {
             Rcode::REFUSED => self.stats.refused(),
             _ => {}
         }
+        if transport == Transport::Udp
+            && let Some(rrl) = &self.rrl
+        {
+            match rrl.check(peer.ip(), &response) {
+                RrlOutcome::Allow => {}
+                RrlOutcome::Drop => return None,
+                RrlOutcome::Respond(action) => {
+                    let limited = match action {
+                        RateLimitAction::Drop => return None,
+                        RateLimitAction::Refused => {
+                            self.stats.refused();
+                            error_response(&request, Rcode::REFUSED)
+                        }
+                        RateLimitAction::Truncate => truncated_response(&request),
+                    };
+                    return self.encode_response(&limited, limit, transport);
+                }
+            }
+        }
         self.encode_response(&response, limit, transport)
     }
 
@@ -169,7 +246,7 @@ impl Processor {
         if truncated {
             self.stats.truncated();
         }
-        tracing_response(self.stats.as_ref(), transport);
+        transport.count_response(&self.stats);
         Some(bytes)
     }
 
@@ -201,7 +278,7 @@ impl Processor {
             self.stats.encode_error();
             return None;
         };
-        tracing_response(self.stats.as_ref(), transport);
+        transport.count_response(&self.stats);
         Some(bytes)
     }
 }
@@ -215,13 +292,6 @@ fn truncated_response(request: &Message) -> Message {
         response.set_edns(Some(Edns::new(payload).with_dnssec_ok(edns.dnssec_ok())));
     }
     response
-}
-
-fn tracing_response(stats: &Stats, transport: Transport) {
-    match transport {
-        Transport::Udp => stats.udp_response(),
-        Transport::Tcp => stats.tcp_response(),
-    }
 }
 
 fn udp_limit(request: &Message) -> usize {

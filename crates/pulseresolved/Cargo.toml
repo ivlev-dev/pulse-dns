@@ -19,18 +19,29 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
 pulse-dns = { path = "../pulse-dns" }
+pulse-dnscrypt = { path = "../pulse-dnscrypt" }
+pulse-dnssec = { path = "../pulse-dnssec" }
 pulse-resolver = { path = "../pulse-resolver" }
 pulse-runtime = { path = "../pulse-runtime" }
-pulse-tls = { path = "../pulse-tls" }
+pulse-tls = { path = "../pulse-tls", features = ["http2", "doq"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = "0.3"
+subtle = "2"
 thiserror = "2"
+toml = "0.8"
 
 [dev-dependencies]
-pulse-dnssec = { path = "../pulse-dnssec" }
+base64 = "0.22"
+bytes = "1"
+h2 = "0.4"
+http = "1"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
+rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 
 [lints]
 workspace = true

@@ -9,7 +9,7 @@ use std::time::Duration;
 use pulse_dns::{DecodeLimits, EncodeOptions, Message, Rclass, Rcode, Rdata, Record, Rtype, Ttl};
 use pulse_resolver::{HttpsUpstream, TlsUpstream, UpstreamConfig};
 use pulse_tls::{DohConfig, DohServer, DotConfig, DotServer, TlsConfig};
-use pulseresolved::config::{Config, ModeSetting, UpstreamSetting};
+use pulseresolved::config::{Config, ModeSetting, UpstreamPoolSetting, UpstreamSetting};
 use pulseresolved::server::Server;
 use rcgen::{CertificateParams, KeyPair};
 
@@ -150,5 +150,52 @@ fn wrong_ca_yields_servfail() {
     let server = Server::start(&config).expect("server");
     let response = resolve(&server, "badca.secure.test");
     assert_eq!(response.rcode(), Rcode::SERVFAIL);
+    upstream.shutdown().expect("shutdown");
+}
+
+#[test]
+fn dot_pool_serves_parallel_clients() {
+    let cert = test_cert();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca = ca_file(&dir, &cert);
+    let tls =
+        TlsConfig::for_dot(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes()).expect("dot tls");
+    let config = DotConfig::new("127.0.0.1:0".parse().expect("addr"), tls);
+    let mut upstream = DotServer::bind(config, |query: &[u8], _peer: SocketAddr| {
+        answer_handler(query)
+    })
+    .expect("dot server");
+
+    let mut config = server_config(UpstreamConfig::Tls(TlsUpstream {
+        host: "127.0.0.1".to_owned(),
+        port: upstream.local_addr().port(),
+        server_name: "localhost".to_owned(),
+        ca: Some(ca),
+    }));
+    config.upstream_pool = UpstreamPoolSetting {
+        pool_size: 2,
+        reconnect_backoff_ms: 50,
+        max_reconnect_backoff_ms: 500,
+    };
+    let server = Server::start(&config).expect("server");
+    let address = server.udp_addr().expect("udp");
+
+    let mut threads = Vec::new();
+    for index in 0..16 {
+        threads.push(std::thread::spawn(move || {
+            let query = make_query(&format!("pool-{index}.secure.test"), Rtype::A, None);
+            let response = udp_query(address, &query, TIMEOUT).expect("response");
+            assert_eq!(response.rcode(), Rcode::NOERROR, "pool-{index}");
+            assert_eq!(response.answers().len(), 1, "pool-{index}");
+        }));
+    }
+    for thread in threads {
+        thread.join().expect("thread");
+    }
+
+    let stats = server.resolver_stats().upstream.pool;
+    assert!(stats.opens <= 2, "opens: {}", stats.opens);
+    assert!(stats.reuses > 0, "reuses: {}", stats.reuses);
+    assert!(upstream.stats().connections <= 2);
     upstream.shutdown().expect("shutdown");
 }

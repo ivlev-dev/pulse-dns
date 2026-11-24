@@ -1,29 +1,45 @@
-//! JSON-конфигурация резолвера и CLI-overrides.
+//! TOML-конфигурация резолвера (JSON — обратная совместимость) и CLI-overrides.
 //!
-//! Значения по умолчанию безопасны: резолвер запускается только с явно
-//! заданным транспортом, DNSSEC выключен, blocklist пуст, HTTP-метрики
-//! выключены.
+//! Формат определяется расширением файла: `.toml` (рекомендуемый) или
+//! `.json` (legacy). Значения по умолчанию безопасны: резолвер запускается
+//! только с явно заданным транспортом, DNSSEC выключен, blocklist пуст,
+//! HTTP-метрики выключены.
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pulse_dns::{Name, Rdata, Ttl};
+use pulse_dnssec::{
+    SharedTrustAnchors, TrustAnchor, TrustAnchorPolicy, TrustAnchorProvider, TrustAnchorStore,
+};
 use pulse_resolver::{
     BlockResponse, BlocklistConfig as ResolverBlocklistConfig, CacheConfig, DnssecConfig,
     ForwardConfig, IterativeConfig, Mode, Override, ResolverConfig, TimeoutConfig, UpstreamConfig,
+    UpstreamPoolConfig,
 };
 use pulse_tls::{Acl, RateLimitConfig as TlsRateLimitConfig, RateLimiter};
-use serde::Deserialize;
 use serde::de::{self, Deserializer};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::anchors;
-use crate::error::ConfigError;
+use crate::error::{ConfigError, ParseSource};
+use crate::rrl::{Rrl, RrlConfig, RrlRate};
+
+/// Текущее время UNIX в секундах (насыщается на `u32`).
+fn unix_now() -> u32 {
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    u32::try_from(duration.as_secs()).unwrap_or(u32::MAX)
+}
 
 /// Режим резолюции.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModeSetting {
     /// Пересылка настроенным рекурсивным серверам.
@@ -34,7 +50,7 @@ pub enum ModeSetting {
 }
 
 /// Уровень логирования.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     /// Только ошибки.
@@ -80,7 +96,7 @@ impl FromStr for LogLevel {
 }
 
 /// Политика ответа на заблокированное имя.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BlockResponseSetting {
     /// NXDOMAIN.
@@ -109,6 +125,23 @@ pub enum TrustAnchorSetting {
     Embedded,
     /// Файл DS-записей (`{"path": "..."}`).
     PathFile(PathBuf),
+    /// Файл DS-записей + RFC 5011 состояние обновления
+    /// (`{"path": "...", "state": "..."}`).
+    Managed {
+        /// Начальный файл доверенных DS.
+        path: PathBuf,
+        /// Файл состояния RFC 5011 (атомарная запись `0600`).
+        state: PathBuf,
+        /// Add hold-down в секундах (по умолчанию 30 дней).
+        add_hold_down: u32,
+        /// Revoke hold-down в секундах (по умолчанию 30 дней).
+        revoke_hold_down: u32,
+    },
+}
+
+impl TrustAnchorSetting {
+    /// Значение hold-down по умолчанию (RFC 5011 §2.4.1).
+    pub const DEFAULT_HOLD_DOWN: u32 = 30 * 86_400;
 }
 
 impl<'de> Deserialize<'de> for TrustAnchorSetting {
@@ -127,7 +160,25 @@ impl<'de> Deserialize<'de> for TrustAnchorSetting {
                             "trust_anchor must be \"embedded\" or {\"path\": \"<file>\"}",
                         )
                     })?;
-                Ok(Self::PathFile(PathBuf::from(path)))
+                let Some(state) = map.get("state").and_then(serde_json::Value::as_str) else {
+                    return Ok(Self::PathFile(PathBuf::from(path)));
+                };
+                let number = |key: &str| -> Result<u32, D::Error> {
+                    map.get(key).and_then(serde_json::Value::as_u64).map_or(
+                        Ok(Self::DEFAULT_HOLD_DOWN),
+                        |value| {
+                            u32::try_from(value).map_err(|_| {
+                                de::Error::custom(format!("trust_anchor.{key} does not fit in u32"))
+                            })
+                        },
+                    )
+                };
+                Ok(Self::Managed {
+                    path: PathBuf::from(path),
+                    state: PathBuf::from(state),
+                    add_hold_down: number("add_hold_down")?,
+                    revoke_hold_down: number("revoke_hold_down")?,
+                })
             }
             _ => Err(de::Error::custom(
                 "trust_anchor must be \"embedded\" or {\"path\": \"<file>\"}",
@@ -136,8 +187,137 @@ impl<'de> Deserialize<'de> for TrustAnchorSetting {
     }
 }
 
+impl Serialize for TrustAnchorSetting {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Embedded => serializer.serialize_str("embedded"),
+            Self::PathFile(path) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("path", path)?;
+                map.end()
+            }
+            Self::Managed {
+                path,
+                state,
+                add_hold_down,
+                revoke_hold_down,
+            } => {
+                let mut map = serializer.serialize_map(Some(4))?;
+                map.serialize_entry("path", path)?;
+                map.serialize_entry("state", state)?;
+                map.serialize_entry("add_hold_down", add_hold_down)?;
+                map.serialize_entry("revoke_hold_down", revoke_hold_down)?;
+                map.end()
+            }
+        }
+    }
+}
+
+/// Bearer-токен control-plane API.
+///
+/// Печатается в `Debug` как `<redacted>`, чтобы случайный лог конфигурации не
+/// раскрыл секрет. Значение доступно только через [`ControlToken::expose`].
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct ControlToken(String);
+
+impl ControlToken {
+    /// Создаёт токен.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Возвращает секрет.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Проверяет, что токен пригоден для `Authorization: Bearer`.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.0.is_empty()
+            && self.0.len() <= 4096
+            && self.0.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    }
+}
+
+impl fmt::Debug for ControlToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+/// Таймауты и лимиты control-plane HTTP-сервера.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlSetting {
+    /// Дедлайн чтения запроса, миллисекунды.
+    #[serde(default = "default_control_request_ms")]
+    pub request_timeout_ms: u64,
+    /// Таймаут записи ответа, миллисекунды.
+    #[serde(default = "default_control_write_ms")]
+    pub write_timeout_ms: u64,
+    /// Ожидание завершения соединений при остановке, миллисекунды.
+    #[serde(default = "default_control_shutdown_ms")]
+    pub shutdown_timeout_ms: u64,
+    /// Максимум одновременных соединений.
+    #[serde(default = "default_control_connections")]
+    pub max_connections: usize,
+    /// Скорость токен-бакета на токен, запросов в секунду.
+    #[serde(default = "default_control_qps")]
+    pub rate_limit_qps: f64,
+    /// Burst токен-бакета на токен.
+    #[serde(default = "default_control_burst")]
+    pub rate_limit_burst: u32,
+}
+
+impl Default for ControlSetting {
+    fn default() -> Self {
+        Self {
+            request_timeout_ms: default_control_request_ms(),
+            write_timeout_ms: default_control_write_ms(),
+            shutdown_timeout_ms: default_control_shutdown_ms(),
+            max_connections: default_control_connections(),
+            rate_limit_qps: default_control_qps(),
+            rate_limit_burst: default_control_burst(),
+        }
+    }
+}
+
+impl ControlSetting {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(100..=600_000).contains(&self.request_timeout_ms)
+            || !(100..=600_000).contains(&self.write_timeout_ms)
+            || !(100..=600_000).contains(&self.shutdown_timeout_ms)
+        {
+            return Err(ConfigError::invalid(
+                "control timeouts must be in 100..=600000 ms",
+            ));
+        }
+        if !(1..=1024).contains(&self.max_connections) {
+            return Err(ConfigError::invalid(format!(
+                "control.max_connections must be in 1..=1024, got {}",
+                self.max_connections
+            )));
+        }
+        if !self.rate_limit_qps.is_finite() || self.rate_limit_qps <= 0.0 {
+            return Err(ConfigError::invalid(
+                "control.rate_limit_qps must be finite and positive",
+            ));
+        }
+        if self.rate_limit_burst == 0 {
+            return Err(ConfigError::invalid(
+                "control.rate_limit_burst must be positive",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Параметры blocklist.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlocklistSetting {
     /// Файлы blocklist (домены, hosts-формат, adblock, `@@allow`).
@@ -155,7 +335,7 @@ pub struct BlocklistSetting {
 }
 
 /// Параметры кеша.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheSetting {
     /// Максимум записей.
@@ -200,7 +380,7 @@ impl CacheSetting {
 }
 
 /// Параметры TCP-транспорта.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TcpSetting {
     /// Максимум одновременных соединений.
@@ -228,8 +408,223 @@ impl TcpSetting {
     }
 }
 
+/// Общие лимиты защищённых транспортов (DoT, DoH/1.1, DoH/2, DoQ и DNSCrypt TCP).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecureSetting {
+    /// Максимум одновременных соединений на транспорт.
+    #[serde(default = "default_secure_max_connections")]
+    pub max_connections: usize,
+    /// Максимум одновременных stream'ов (DoH/2 и DoQ).
+    #[serde(default = "default_secure_max_streams")]
+    pub max_streams: u32,
+    /// Таймаут TLS/QUIC-рукопожатия, миллисекунды.
+    #[serde(default = "default_secure_handshake_ms")]
+    pub handshake_timeout_ms: u64,
+    /// Таймаут чтения запроса/записи ответа (DoH/2, DoQ), миллисекунды.
+    #[serde(default = "default_secure_request_ms")]
+    pub request_timeout_ms: u64,
+    /// Idle-таймаут соединения, миллисекунды.
+    #[serde(default = "default_secure_idle_ms")]
+    pub idle_timeout_ms: u64,
+    /// Ожидание соединений при graceful shutdown, миллисекунды.
+    #[serde(default = "default_secure_shutdown_ms")]
+    pub shutdown_timeout_ms: u64,
+    /// Максимальный размер DNS-сообщения/HTTP-тела.
+    #[serde(default = "default_secure_max_message")]
+    pub max_message_size: usize,
+    /// Число worker-потоков tokio для DoH/2 и DoQ.
+    #[serde(default = "default_secure_workers")]
+    pub worker_threads: usize,
+    /// Максимум запросов на одно keep-alive соединение DoT/DoH/1.1.
+    #[serde(default = "default_secure_max_requests")]
+    pub max_requests_per_connection: usize,
+    /// Добавлять `Cache-Control: max-age=<min TTL>` к ответам DoH.
+    #[serde(default = "default_true")]
+    pub cache_control: bool,
+}
+
+impl Default for SecureSetting {
+    fn default() -> Self {
+        Self {
+            max_connections: default_secure_max_connections(),
+            max_streams: default_secure_max_streams(),
+            handshake_timeout_ms: default_secure_handshake_ms(),
+            request_timeout_ms: default_secure_request_ms(),
+            idle_timeout_ms: default_secure_idle_ms(),
+            shutdown_timeout_ms: default_secure_shutdown_ms(),
+            max_message_size: default_secure_max_message(),
+            worker_threads: default_secure_workers(),
+            max_requests_per_connection: default_secure_max_requests(),
+            cache_control: true,
+        }
+    }
+}
+
+impl SecureSetting {
+    /// Таймаут рукопожатия.
+    #[must_use]
+    pub fn handshake_timeout(&self) -> Duration {
+        Duration::from_millis(self.handshake_timeout_ms)
+    }
+
+    /// Таймаут одной операции чтения/записи (DoH/2, DoQ).
+    #[must_use]
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_millis(self.request_timeout_ms)
+    }
+
+    /// Idle-таймаут соединения.
+    #[must_use]
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.idle_timeout_ms)
+    }
+
+    /// Таймаут graceful shutdown.
+    #[must_use]
+    pub fn shutdown_timeout(&self) -> Duration {
+        Duration::from_millis(self.shutdown_timeout_ms)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_connections == 0 || self.max_connections > 65_535 {
+            return Err(ConfigError::invalid(format!(
+                "secure.max_connections must be in 1..=65535, got {}",
+                self.max_connections
+            )));
+        }
+        if self.max_streams == 0 || self.max_streams > 65_535 {
+            return Err(ConfigError::invalid(format!(
+                "secure.max_streams must be in 1..=65535, got {}",
+                self.max_streams
+            )));
+        }
+        if self.max_message_size == 0 || self.max_message_size > usize::from(u16::MAX) {
+            return Err(ConfigError::invalid(format!(
+                "secure.max_message_size must be in 1..=65535, got {}",
+                self.max_message_size
+            )));
+        }
+        if self.worker_threads == 0 || self.worker_threads > 64 {
+            return Err(ConfigError::invalid(format!(
+                "secure.worker_threads must be in 1..=64, got {}",
+                self.worker_threads
+            )));
+        }
+        if self.max_requests_per_connection == 0 {
+            return Err(ConfigError::invalid(
+                "secure.max_requests_per_connection must be positive",
+            ));
+        }
+        if self.handshake_timeout_ms == 0
+            || self.request_timeout_ms == 0
+            || self.idle_timeout_ms == 0
+            || self.shutdown_timeout_ms == 0
+        {
+            return Err(ConfigError::invalid(
+                "secure handshake/request/idle/shutdown timeouts must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Параметры DNSCrypt v2-сервера.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnscryptSetting {
+    /// Минимальная длина дополненного UDP-запроса, кратна 64.
+    #[serde(default = "default_dnscrypt_min_query_len")]
+    pub min_query_len: usize,
+    /// Максимальный размер UDP-пакета DNSCrypt.
+    #[serde(default = "default_dnscrypt_max_udp")]
+    pub max_udp_packet: usize,
+    /// Максимальная полезная нагрузка TCP-кадра.
+    #[serde(default = "default_dnscrypt_max_tcp")]
+    pub max_tcp_packet: usize,
+    /// Время жизни anti-replay записи, секунды.
+    #[serde(default = "default_dnscrypt_replay_ttl")]
+    pub replay_ttl_secs: u64,
+    /// Ёмкость anti-replay кэша.
+    #[serde(default = "default_dnscrypt_replay_capacity")]
+    pub replay_capacity: usize,
+    /// Включить anti-replay защиту от повторов nonce.
+    #[serde(default = "default_true")]
+    pub replay_protection: bool,
+    /// Усекать большие UDP-ответы с TC вместо ошибки.
+    #[serde(default = "default_true")]
+    pub truncate_udp_responses: bool,
+}
+
+impl Default for DnscryptSetting {
+    fn default() -> Self {
+        Self {
+            min_query_len: default_dnscrypt_min_query_len(),
+            max_udp_packet: default_dnscrypt_max_udp(),
+            max_tcp_packet: default_dnscrypt_max_tcp(),
+            replay_ttl_secs: default_dnscrypt_replay_ttl(),
+            replay_capacity: default_dnscrypt_replay_capacity(),
+            replay_protection: true,
+            truncate_udp_responses: true,
+        }
+    }
+}
+
+impl DnscryptSetting {
+    /// Собирает `pulse-dnscrypt` `ServerConfig`.
+    #[must_use]
+    pub fn server_config(&self) -> pulse_dnscrypt::ServerConfig {
+        pulse_dnscrypt::ServerConfig {
+            min_query_len: self.min_query_len,
+            max_udp_packet: self.max_udp_packet,
+            max_tcp_packet: self.max_tcp_packet,
+            replay_ttl_secs: self.replay_ttl_secs,
+            replay_capacity: self.replay_capacity,
+            replay_protection: self.replay_protection,
+            truncate_udp_responses: self.truncate_udp_responses,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.min_query_len == 0
+            || !self
+                .min_query_len
+                .is_multiple_of(pulse_dnscrypt::PAD_BLOCK_LEN)
+            || self.min_query_len > 4096
+        {
+            return Err(ConfigError::invalid(
+                "dnscrypt.min_query_len must be a non-zero multiple of 64 and at most 4096",
+            ));
+        }
+        if self.max_udp_packet < pulse_dnscrypt::MIN_QUERY_PACKET_LEN
+            || self.max_udp_packet > pulse_dnscrypt::MAX_UDP_PACKET
+        {
+            return Err(ConfigError::invalid(format!(
+                "dnscrypt.max_udp_packet must be in {}..={}",
+                pulse_dnscrypt::MIN_QUERY_PACKET_LEN,
+                pulse_dnscrypt::MAX_UDP_PACKET
+            )));
+        }
+        if self.max_tcp_packet < pulse_dnscrypt::MIN_QUERY_PACKET_LEN
+            || self.max_tcp_packet > pulse_dnscrypt::MAX_TCP_PACKET
+        {
+            return Err(ConfigError::invalid(format!(
+                "dnscrypt.max_tcp_packet must be in {}..={}",
+                pulse_dnscrypt::MIN_QUERY_PACKET_LEN,
+                pulse_dnscrypt::MAX_TCP_PACKET
+            )));
+        }
+        if self.replay_protection && (self.replay_ttl_secs == 0 || self.replay_capacity == 0) {
+            return Err(ConfigError::invalid(
+                "dnscrypt replay ttl/capacity must be positive when replay_protection is enabled",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Действие при превышении per-source rate limit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RateLimitAction {
     /// Ответить REFUSED.
@@ -243,7 +638,7 @@ pub enum RateLimitAction {
 }
 
 /// Настройки per-source token bucket (RRL-подобное ограничение).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitSetting {
     /// Включить ограничение.
@@ -302,6 +697,155 @@ impl RateLimitSetting {
     }
 }
 
+/// Лимит одного класса ответов RRL.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RrlRateSetting {
+    /// Средняя скорость пополнения, ответов в секунду.
+    #[serde(default = "default_rrl_qps")]
+    pub qps: f64,
+    /// Максимальный burst (запас токенов).
+    #[serde(default = "default_rrl_burst")]
+    pub burst: u32,
+}
+
+impl Default for RrlRateSetting {
+    fn default() -> Self {
+        Self {
+            qps: default_rrl_qps(),
+            burst: default_rrl_burst(),
+        }
+    }
+}
+
+impl RrlRateSetting {
+    fn to_rate(self) -> RrlRate {
+        RrlRate::new(self.qps, self.burst)
+    }
+}
+
+/// Полный RRL: limits по классам ответов, slip и политика.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RrlSetting {
+    /// Включить RRL (применяется только к UDP-ответам).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// `1/N` ограниченных ответов отправляется (`0` — ни одного).
+    #[serde(default = "default_rrl_slip")]
+    pub slip: u32,
+    /// Максимум записей таблицы бакетов.
+    #[serde(default = "default_rrl_entries")]
+    pub max_entries: usize,
+    /// Действие для отправляемых ограниченных ответов.
+    #[serde(default = "default_rrl_action")]
+    pub action: RateLimitAction,
+    /// Класс NOERROR (положительные и NODATA).
+    #[serde(default = "default_rrl_noerror")]
+    pub noerror: RrlRateSetting,
+    /// Класс NXDOMAIN.
+    #[serde(default = "default_rrl_nxdomain")]
+    pub nxdomain: RrlRateSetting,
+    /// Класс referral (делегирование).
+    #[serde(default = "default_rrl_referral")]
+    pub referral: RrlRateSetting,
+    /// Класс ошибок (SERVFAIL/REFUSED/NOTIMP).
+    #[serde(default = "default_rrl_error")]
+    pub error: RrlRateSetting,
+    /// Агрегированный лимит на источник (все имена и классы).
+    #[serde(default = "default_rrl_source")]
+    pub source: RrlRateSetting,
+}
+
+impl Default for RrlSetting {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            slip: default_rrl_slip(),
+            max_entries: default_rrl_entries(),
+            action: default_rrl_action(),
+            noerror: default_rrl_noerror(),
+            nxdomain: default_rrl_nxdomain(),
+            referral: default_rrl_referral(),
+            error: default_rrl_error(),
+            source: default_rrl_source(),
+        }
+    }
+}
+
+impl RrlSetting {
+    fn validate(&self) -> Result<(), ConfigError> {
+        self.to_config().validate()
+    }
+
+    fn to_config(&self) -> RrlConfig {
+        RrlConfig {
+            slip: self.slip,
+            max_entries: self.max_entries,
+            action: self.action,
+            rates: [
+                self.noerror.to_rate(),
+                self.nxdomain.to_rate(),
+                self.referral.to_rate(),
+                self.error.to_rate(),
+            ],
+            source: self.source.to_rate(),
+        }
+    }
+}
+
+/// Параметры пула keep-alive соединений к DoT/DoH upstream.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamPoolSetting {
+    /// Число соединений на один upstream (оно же лимит in-flight).
+    #[serde(default = "default_pool_size", alias = "size")]
+    pub pool_size: usize,
+    /// Начальная задержка переподключения, миллисекунды.
+    #[serde(default = "default_pool_backoff_ms")]
+    pub reconnect_backoff_ms: u64,
+    /// Максимальная задержка переподключения, миллисекунды.
+    #[serde(default = "default_pool_max_backoff_ms")]
+    pub max_reconnect_backoff_ms: u64,
+}
+
+impl Default for UpstreamPoolSetting {
+    fn default() -> Self {
+        Self {
+            pool_size: default_pool_size(),
+            reconnect_backoff_ms: default_pool_backoff_ms(),
+            max_reconnect_backoff_ms: default_pool_max_backoff_ms(),
+        }
+    }
+}
+
+impl UpstreamPoolSetting {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=pulse_tls::MAX_POOL_SIZE).contains(&self.pool_size) {
+            return Err(ConfigError::invalid(format!(
+                "upstream_pool.pool_size must be in 1..={}",
+                pulse_tls::MAX_POOL_SIZE
+            )));
+        }
+        if self.reconnect_backoff_ms == 0
+            || self.max_reconnect_backoff_ms < self.reconnect_backoff_ms
+        {
+            return Err(ConfigError::invalid(
+                "upstream_pool reconnect backoff must be positive and not exceed the maximum",
+            ));
+        }
+        Ok(())
+    }
+
+    fn to_config(self) -> UpstreamPoolConfig {
+        UpstreamPoolConfig {
+            size: self.pool_size,
+            reconnect_backoff: Duration::from_millis(self.reconnect_backoff_ms),
+            max_reconnect_backoff: Duration::from_millis(self.max_reconnect_backoff_ms),
+        }
+    }
+}
+
 /// Один upstream: строка-URL или объект `{addr, tls, server_name, ca}`.
 #[derive(Debug, Clone)]
 pub struct UpstreamSetting {
@@ -356,8 +900,27 @@ impl<'de> Deserialize<'de> for UpstreamSetting {
     }
 }
 
+impl Serialize for UpstreamSetting {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let ca = match &self.upstream {
+            UpstreamConfig::Udp(_) | UpstreamConfig::Tcp(_) => None,
+            UpstreamConfig::Tls(upstream) => upstream.ca.as_ref(),
+            UpstreamConfig::Https(upstream) => upstream.ca.as_ref(),
+        };
+        match ca {
+            None => serializer.serialize_str(&self.upstream.to_string()),
+            Some(ca) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("url", &self.upstream.to_string())?;
+                map.serialize_entry("ca", ca)?;
+                map.end()
+            }
+        }
+    }
+}
+
 /// Таймауты резолвера.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimeoutSetting {
     /// Таймаут одного upstream-запроса, миллисекунды.
@@ -392,7 +955,7 @@ impl TimeoutSetting {
 }
 
 /// Статическая запись override.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverrideSetting {
     /// Владелец.
@@ -407,7 +970,7 @@ pub struct OverrideSetting {
     #[serde(default)]
     pub aaaa: Vec<Ipv6Addr>,
     /// Цель CNAME.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cname: Option<String>,
 }
 
@@ -436,18 +999,69 @@ impl OverrideSetting {
 }
 
 /// Полная конфигурация процесса.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// UDP-listen.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_udp: Option<SocketAddr>,
     /// TCP-listen.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_tcp: Option<SocketAddr>,
-    /// HTTP-метрики (`GET /metrics`, `GET /healthz`); только loopback.
+    /// DNS over TLS listen (RFC 7858).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dot_listen: Option<SocketAddr>,
+    /// DNS over HTTPS/1.1 listen (RFC 8484).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doh_listen: Option<SocketAddr>,
+    /// DNS over HTTPS/2 listen (RFC 8484 + RFC 9113).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doh2_listen: Option<SocketAddr>,
+    /// DNS over QUIC listen (RFC 9250, UDP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doq_listen: Option<SocketAddr>,
+    /// DNSCrypt v2 UDP listen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnscrypt_listen: Option<SocketAddr>,
+    /// DNSCrypt v2 TCP listen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnscrypt_tcp_listen: Option<SocketAddr>,
+    /// PEM-сертификат (цепочка) для DoT/DoH/DoH2/DoQ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<PathBuf>,
+    /// PEM-закрытый ключ TLS (права 0600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<PathBuf>,
+    /// IP/CIDR клиентов защищённых TLS-транспортов. Пусто — общий `allow_from`.
     #[serde(default)]
+    pub tls_allow_from: Vec<String>,
+    /// Файл provider-ключа DNSCrypt (hex, права 0600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnscrypt_provider_key: Option<PathBuf>,
+    /// Файл resolver-ключа DNSCrypt (hex, права 0600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnscrypt_resolver_key: Option<PathBuf>,
+    /// Подписанный сертификат DNSCrypt (JSON `pulsed dnscrypt-gencert` или hex/base64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnscrypt_cert: Option<PathBuf>,
+    /// Лимиты и таймауты TLS-транспортов.
+    #[serde(default)]
+    pub secure: SecureSetting,
+    /// Параметры DNSCrypt-сервера.
+    #[serde(default)]
+    pub dnscrypt: DnscryptSetting,
+    /// HTTP-метрики (`GET /metrics`, `GET /healthz`); только loopback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_listen: Option<SocketAddr>,
+    /// Control-plane REST API; только loopback. По умолчанию выключен.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_listen: Option<SocketAddr>,
+    /// Bearer-токен control-plane API (env `PULSERESOLVED_API_TOKEN` важнее).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<ControlToken>,
+    /// Таймауты и лимиты control-plane.
+    #[serde(default)]
+    pub control: ControlSetting,
     /// Число UDP worker'ов (`0` — по доступному параллелизму).
     #[serde(default)]
     pub workers: usize,
@@ -464,8 +1078,14 @@ pub struct Config {
     #[serde(default)]
     pub allow_from: Vec<String>,
     /// Per-source rate limit (RRL-подобное ограничение).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitSetting>,
+    /// Response Rate Limiting по классам ответов (только UDP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rrl: Option<RrlSetting>,
+    /// Пул keep-alive соединений к DoT/DoH upstream.
+    #[serde(default)]
+    pub upstream_pool: UpstreamPoolSetting,
     /// Root hints для `mode = "iterative"` (пусто — встроенные IANA).
     #[serde(default)]
     pub root_hints: Vec<SocketAddr>,
@@ -476,7 +1096,7 @@ pub struct Config {
     #[serde(default)]
     pub dnssec_validate: bool,
     /// Trust anchors: встроенные корневые или файл DS-записей.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_anchor: Option<TrustAnchorSetting>,
     /// Blocklist.
     #[serde(default)]
@@ -503,13 +1123,32 @@ impl Default for Config {
         Self {
             listen_udp: None,
             listen_tcp: None,
+            dot_listen: None,
+            doh_listen: None,
+            doh2_listen: None,
+            doq_listen: None,
+            dnscrypt_listen: None,
+            dnscrypt_tcp_listen: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_allow_from: Vec::new(),
+            dnscrypt_provider_key: None,
+            dnscrypt_resolver_key: None,
+            dnscrypt_cert: None,
+            secure: SecureSetting::default(),
+            dnscrypt: DnscryptSetting::default(),
             metrics_listen: None,
+            control_listen: None,
+            control_token: None,
+            control: ControlSetting::default(),
             workers: 0,
             mode: ModeSetting::default(),
             forwarders: Vec::new(),
             upstreams: Vec::new(),
             allow_from: Vec::new(),
             rate_limit: None,
+            rrl: None,
+            upstream_pool: UpstreamPoolSetting::default(),
             root_hints: Vec::new(),
             ns_port: default_ns_port(),
             dnssec_validate: false,
@@ -525,28 +1164,61 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Читает конфигурацию из JSON-файла.
+    /// Читает конфигурацию из файла.
+    ///
+    /// Формат выбирается по расширению: `.toml` (рекомендуемый) или `.json`
+    /// (legacy-совместимость). Расширение сравнивается без учёта регистра.
     ///
     /// # Errors
     ///
     /// [`ConfigError::Read`] при ошибке чтения файла,
-    /// [`ConfigError::Parse`] при некорректном JSON или схеме.
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+    /// [`ConfigError::UnsupportedFormat`] для неизвестного расширения,
+    /// [`ConfigError::Parse`] при некорректном синтаксисе или схеме (в
+    /// сообщении есть путь, строка и колонка).
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_json_str(&text).map_err(|error| match error {
-            ConfigError::Parse { source, .. } => ConfigError::Parse {
-                path: path.to_path_buf(),
-                source,
-            },
-            other => other,
+        let extension = path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_ascii_lowercase);
+        let parsed = match extension.as_deref() {
+            Some("toml") => Self::from_toml_str(&text),
+            Some("json") => Self::from_json_str(&text),
+            _ => {
+                return Err(ConfigError::UnsupportedFormat {
+                    path: path.to_path_buf(),
+                });
+            }
+        };
+        parsed.map_err(|error| error.with_path(path))
+    }
+
+    /// Устаревший псевдоним [`Config::from_path`].
+    ///
+    /// # Errors
+    ///
+    /// См. [`Config::from_path`].
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        Self::from_path(path)
+    }
+
+    /// Разбирает конфигурацию из строки TOML.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Parse`] при некорректном TOML или схеме.
+    pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
+        toml::from_str(text).map_err(|source| ConfigError::Parse {
+            path: PathBuf::from("<inline>"),
+            source: ParseSource::Toml(source),
         })
     }
 
-    /// Разбирает конфигурацию из строки JSON.
+    /// Разбирает конфигурацию из строки JSON (legacy-формат).
     ///
     /// # Errors
     ///
@@ -554,8 +1226,17 @@ impl Config {
     pub fn from_json_str(text: &str) -> Result<Self, ConfigError> {
         serde_json::from_str(text).map_err(|source| ConfigError::Parse {
             path: PathBuf::from("<inline>"),
-            source,
+            source: ParseSource::Json(source),
         })
+    }
+
+    /// Сериализует конфигурацию в TOML (например, для примера или дампа).
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Serialize`], если значение нельзя представить в TOML.
+    pub fn to_toml_string(&self) -> Result<String, ConfigError> {
+        toml::to_string(self).map_err(ConfigError::Serialize)
     }
 
     /// Проверяет локальные ограничения конфигурации.
@@ -565,11 +1246,56 @@ impl Config {
     /// [`ConfigError::Invalid`], если не задан ни один транспорт, параметры
     /// выходят за допустимые пределы или overrides некорректны.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.listen_udp.is_none() && self.listen_tcp.is_none() {
+        if !self.has_any_transport() {
             return Err(ConfigError::invalid(
-                "at least one of listen_udp/listen_tcp must be set",
+                "at least one transport must be configured: listen_udp, listen_tcp, dot_listen, doh_listen, doh2_listen, doq_listen, dnscrypt_listen or dnscrypt_tcp_listen",
             ));
         }
+        if self.has_tls_transport() {
+            if self
+                .tls_cert
+                .as_ref()
+                .is_none_or(|path| path.as_os_str().is_empty())
+            {
+                return Err(ConfigError::invalid(
+                    "tls_cert is required for dot_listen/doh_listen/doh2_listen/doq_listen",
+                ));
+            }
+            if self
+                .tls_key
+                .as_ref()
+                .is_none_or(|path| path.as_os_str().is_empty())
+            {
+                return Err(ConfigError::invalid(
+                    "tls_key is required for dot_listen/doh_listen/doh2_listen/doq_listen",
+                ));
+            }
+        }
+        if self.has_dnscrypt_transport() {
+            for (name, path) in [
+                ("dnscrypt_provider_key", &self.dnscrypt_provider_key),
+                ("dnscrypt_resolver_key", &self.dnscrypt_resolver_key),
+                ("dnscrypt_cert", &self.dnscrypt_cert),
+            ] {
+                if path.as_ref().is_none_or(|path| path.as_os_str().is_empty()) {
+                    return Err(ConfigError::invalid(format!(
+                        "{name} is required for dnscrypt_listen/dnscrypt_tcp_listen"
+                    )));
+                }
+            }
+        }
+        if let Some(path) = &self.tls_key {
+            ensure_private(path, "tls_key")?;
+        }
+        if let Some(path) = &self.dnscrypt_provider_key {
+            ensure_private(path, "dnscrypt_provider_key")?;
+        }
+        if let Some(path) = &self.dnscrypt_resolver_key {
+            ensure_private(path, "dnscrypt_resolver_key")?;
+        }
+        self.build_tls_acl()?;
+        self.secure.validate()?;
+        self.dnscrypt.validate()?;
         if self.workers > 1024 {
             return Err(ConfigError::invalid(format!(
                 "workers must be in 0..=1024, got {}",
@@ -604,6 +1330,24 @@ impl Config {
             return Err(ConfigError::invalid(format!(
                 "metrics_listen must be a loopback address, got {metrics}"
             )));
+        }
+        self.control.validate()?;
+        if let Some(control) = self.control_listen {
+            if !control.ip().is_loopback() {
+                return Err(ConfigError::invalid(format!(
+                    "control_listen must be a loopback address, got {control}"
+                )));
+            }
+            let Some(token) = self.effective_control_token() else {
+                return Err(ConfigError::invalid(
+                    "control_listen requires control_token or PULSERESOLVED_API_TOKEN",
+                ));
+            };
+            if !token.is_valid() {
+                return Err(ConfigError::invalid(
+                    "control token must be 1..=4096 visible ASCII characters without spaces",
+                ));
+            }
         }
         if self.cache.max_entries == 0
             || self.cache.max_bytes == 0
@@ -650,15 +1394,81 @@ impl Config {
         {
             return Err(ConfigError::invalid("blocklist paths must not be empty"));
         }
-        if let Some(TrustAnchorSetting::PathFile(path)) = &self.trust_anchor
-            && path.as_os_str().is_empty()
+        match &self.trust_anchor {
+            Some(TrustAnchorSetting::PathFile(path)) if path.as_os_str().is_empty() => {
+                return Err(ConfigError::invalid("trust_anchor path must not be empty"));
+            }
+            Some(TrustAnchorSetting::Managed { path, state, .. })
+                if path.as_os_str().is_empty() || state.as_os_str().is_empty() =>
+            {
+                return Err(ConfigError::invalid(
+                    "trust_anchor path/state must not be empty",
+                ));
+            }
+            _ => {}
+        }
+        self.upstream_pool.validate()?;
+        if let Some(rrl) = &self.rrl
+            && rrl.enabled
         {
-            return Err(ConfigError::invalid("trust_anchor path must not be empty"));
+            rrl.validate()?;
         }
         for entry in &self.overrides {
             entry.to_override()?;
         }
         Ok(())
+    }
+
+    /// Настроен ли хотя бы один транспорт.
+    #[must_use]
+    pub fn has_any_transport(&self) -> bool {
+        self.has_plain_transport() || self.has_tls_transport() || self.has_dnscrypt_transport()
+    }
+
+    /// Настроен ли незашифрованный UDP/TCP.
+    #[must_use]
+    pub fn has_plain_transport(&self) -> bool {
+        self.listen_udp.is_some() || self.listen_tcp.is_some()
+    }
+
+    /// Настроен ли DoT/DoH/DoH2/DoQ.
+    #[must_use]
+    pub fn has_tls_transport(&self) -> bool {
+        self.dot_listen.is_some()
+            || self.doh_listen.is_some()
+            || self.doh2_listen.is_some()
+            || self.doq_listen.is_some()
+    }
+
+    /// Настроен ли DNSCrypt (UDP или TCP).
+    #[must_use]
+    pub fn has_dnscrypt_transport(&self) -> bool {
+        self.dnscrypt_listen.is_some() || self.dnscrypt_tcp_listen.is_some()
+    }
+
+    /// Строит ACL для TLS-транспортов: `tls_allow_from`, иначе общий `allow_from`.
+    ///
+    /// Возвращает `None`, если отдельного ACL нет и действует общий.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] при некорректном CIDR.
+    pub fn build_tls_acl(&self) -> Result<Option<Acl>, ConfigError> {
+        if self.tls_allow_from.is_empty() {
+            return Ok(None);
+        }
+        Acl::from_cidrs(&self.tls_allow_from)
+            .map(Some)
+            .map_err(|error| ConfigError::invalid(format!("tls_allow_from: {error}")))
+    }
+
+    /// Пара файлов сертификата и ключа для TLS-транспортов.
+    #[must_use]
+    pub fn tls_paths(&self) -> Option<(&Path, &Path)> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(cert), Some(key)) => Some((cert.as_path(), key.as_path())),
+            _ => None,
+        }
     }
 
     /// Строит ACL клиентов. Пустой `allow_from` означает loopback-only.
@@ -693,12 +1503,40 @@ impl Config {
             .map_err(|error| ConfigError::invalid(format!("rate_limit: {error}")))
     }
 
+    /// Строит RRL, если он включён.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] при некорректных параметрах.
+    pub fn build_rrl(&self) -> Result<Option<Arc<Rrl>>, ConfigError> {
+        let Some(setting) = &self.rrl else {
+            return Ok(None);
+        };
+        if !setting.enabled {
+            return Ok(None);
+        }
+        let rrl = Rrl::new(setting.to_config())
+            .map_err(|error| ConfigError::invalid(format!("rrl: {error}")))?;
+        Ok(Some(Arc::new(rrl)))
+    }
+
     /// Действие при превышении rate limit.
     #[must_use]
     pub fn rate_limit_action(&self) -> RateLimitAction {
         self.rate_limit
             .as_ref()
             .map_or(RateLimitAction::Refused, |setting| setting.action)
+    }
+
+    /// Действующий bearer-токен: env `PULSERESOLVED_API_TOKEN`, затем файл.
+    #[must_use]
+    pub fn effective_control_token(&self) -> Option<ControlToken> {
+        if let Ok(value) = std::env::var("PULSERESOLVED_API_TOKEN")
+            && !value.is_empty()
+        {
+            return Some(ControlToken::new(value));
+        }
+        self.control_token.clone()
     }
 
     /// Строит конфигурацию `pulse-resolver` (с чтением trust anchors).
@@ -729,13 +1567,58 @@ impl Config {
                 ns_port: self.ns_port,
             }),
         };
-        let anchors = if self.dnssec_validate {
+        let (anchors, trust_anchor_provider) = if self.dnssec_validate {
             match &self.trust_anchor {
-                None | Some(TrustAnchorSetting::Embedded) => Vec::new(),
-                Some(TrustAnchorSetting::PathFile(path)) => anchors::load(path)?,
+                None | Some(TrustAnchorSetting::Embedded) => (Vec::new(), None),
+                Some(TrustAnchorSetting::PathFile(path)) => (anchors::load(path)?, None),
+                Some(TrustAnchorSetting::Managed {
+                    path,
+                    state,
+                    add_hold_down,
+                    revoke_hold_down,
+                }) => {
+                    let loaded = anchors::load(path)?;
+                    let now = unix_now();
+                    let policy = TrustAnchorPolicy::new(*add_hold_down, *revoke_hold_down);
+                    let mut store =
+                        TrustAnchorStore::open(state.clone(), policy).map_err(|error| {
+                            ConfigError::invalid(format!(
+                                "cannot open trust anchor state {}: {error}",
+                                state.display()
+                            ))
+                        })?;
+                    let mut managed = Vec::new();
+                    let mut static_anchors = Vec::new();
+                    for anchor in loaded {
+                        if anchor.zone == Name::root() {
+                            let value =
+                                TrustAnchor::from_ds(&anchor.ds, None, None).map_err(|error| {
+                                    ConfigError::invalid(format!(
+                                        "invalid root trust anchor: {error}"
+                                    ))
+                                })?;
+                            managed.push(value);
+                        } else {
+                            static_anchors.push(anchor);
+                        }
+                    }
+                    if store.anchors().is_empty() {
+                        store.seed(&managed, now);
+                    }
+                    store.advance(now);
+                    store.persist().map_err(|error| {
+                        ConfigError::invalid(format!(
+                            "cannot persist trust anchor state {}: {error}",
+                            state.display()
+                        ))
+                    })?;
+                    let provider: Arc<dyn TrustAnchorProvider> =
+                        Arc::new(SharedTrustAnchors::new(store));
+                    (static_anchors, Some(provider))
+                }
             }
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let overrides = self
             .overrides
@@ -746,11 +1629,13 @@ impl Config {
             mode,
             timeouts: self.timeouts.to_timeout_config(),
             cache: self.cache.to_cache_config(),
+            pool: self.upstream_pool.to_config(),
             dnssec: DnssecConfig {
                 enabled: self.dnssec_validate,
                 anchors,
                 ..DnssecConfig::default()
             },
+            trust_anchor_provider,
             blocklist: ResolverBlocklistConfig {
                 path: None,
                 paths: self.blocklist.paths.clone(),
@@ -769,6 +1654,30 @@ impl Config {
         }
         if let Some(addr) = overrides.listen_tcp {
             self.listen_tcp = Some(addr);
+        }
+        if let Some(addr) = overrides.dot_listen {
+            self.dot_listen = Some(addr);
+        }
+        if let Some(addr) = overrides.doh_listen {
+            self.doh_listen = Some(addr);
+        }
+        if let Some(addr) = overrides.doh2_listen {
+            self.doh2_listen = Some(addr);
+        }
+        if let Some(addr) = overrides.doq_listen {
+            self.doq_listen = Some(addr);
+        }
+        if let Some(addr) = overrides.dnscrypt_listen {
+            self.dnscrypt_listen = Some(addr);
+        }
+        if let Some(addr) = overrides.dnscrypt_tcp_listen {
+            self.dnscrypt_tcp_listen = Some(addr);
+        }
+        if let Some(path) = &overrides.tls_cert {
+            self.tls_cert = Some(path.clone());
+        }
+        if let Some(path) = &overrides.tls_key {
+            self.tls_key = Some(path.clone());
         }
         if let Some(addr) = overrides.metrics_listen {
             self.metrics_listen = Some(addr);
@@ -795,6 +1704,25 @@ impl Config {
                 .paths
                 .extend(overrides.blocklists.iter().cloned());
         }
+        if let Some(state) = &overrides.trust_anchor_state {
+            let path = overrides
+                .trust_anchor
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("root.ds"));
+            let hold_down = overrides
+                .trust_anchor_hold_down
+                .unwrap_or(TrustAnchorSetting::DEFAULT_HOLD_DOWN);
+            self.trust_anchor = Some(TrustAnchorSetting::Managed {
+                path,
+                state: state.clone(),
+                add_hold_down: hold_down,
+                revoke_hold_down: hold_down,
+            });
+            self.dnssec_validate = true;
+        } else if let Some(path) = &overrides.trust_anchor {
+            self.trust_anchor = Some(TrustAnchorSetting::PathFile(path.clone()));
+            self.dnssec_validate = true;
+        }
         if overrides.no_dnssec {
             self.dnssec_validate = false;
         }
@@ -811,6 +1739,22 @@ pub struct Overrides {
     pub listen_udp: Option<SocketAddr>,
     /// Новый TCP-адрес.
     pub listen_tcp: Option<SocketAddr>,
+    /// Новый DoT-адрес.
+    pub dot_listen: Option<SocketAddr>,
+    /// Новый DoH/1.1-адрес.
+    pub doh_listen: Option<SocketAddr>,
+    /// Новый DoH/2-адрес.
+    pub doh2_listen: Option<SocketAddr>,
+    /// Новый DoQ-адрес.
+    pub doq_listen: Option<SocketAddr>,
+    /// Новый DNSCrypt UDP-адрес.
+    pub dnscrypt_listen: Option<SocketAddr>,
+    /// Новый DNSCrypt TCP-адрес.
+    pub dnscrypt_tcp_listen: Option<SocketAddr>,
+    /// PEM-сертификат для защищённых транспортов.
+    pub tls_cert: Option<PathBuf>,
+    /// PEM-ключ для защищённых транспортов.
+    pub tls_key: Option<PathBuf>,
     /// Новый адрес HTTP-метрик.
     pub metrics_listen: Option<SocketAddr>,
     /// Новое число UDP worker'ов.
@@ -821,6 +1765,12 @@ pub struct Overrides {
     pub upstreams: Vec<UpstreamConfig>,
     /// Дополнительные файлы blocklist.
     pub blocklists: Vec<PathBuf>,
+    /// Файл доверенных DS (включает DNSSEC).
+    pub trust_anchor: Option<PathBuf>,
+    /// Файл состояния RFC 5011 (включает автоматическое обновление).
+    pub trust_anchor_state: Option<PathBuf>,
+    /// Hold-down для RFC 5011 (add и revoke).
+    pub trust_anchor_hold_down: Option<u32>,
     /// Выключить DNSSEC-валидацию.
     pub no_dnssec: bool,
     /// Новый уровень логирования.
@@ -841,6 +1791,155 @@ fn default_rate_burst() -> u32 {
 
 fn default_rate_entries() -> usize {
     10_000
+}
+
+fn default_rrl_qps() -> f64 {
+    20.0
+}
+
+fn default_rrl_burst() -> u32 {
+    100
+}
+
+fn default_rrl_slip() -> u32 {
+    2
+}
+
+fn default_rrl_entries() -> usize {
+    20_000
+}
+
+fn default_rrl_action() -> RateLimitAction {
+    RateLimitAction::Truncate
+}
+
+fn default_rrl_noerror() -> RrlRateSetting {
+    RrlRateSetting {
+        qps: 20.0,
+        burst: 100,
+    }
+}
+
+fn default_rrl_nxdomain() -> RrlRateSetting {
+    RrlRateSetting {
+        qps: 5.0,
+        burst: 20,
+    }
+}
+
+fn default_rrl_referral() -> RrlRateSetting {
+    RrlRateSetting {
+        qps: 10.0,
+        burst: 40,
+    }
+}
+
+fn default_rrl_error() -> RrlRateSetting {
+    RrlRateSetting {
+        qps: 5.0,
+        burst: 20,
+    }
+}
+
+fn default_rrl_source() -> RrlRateSetting {
+    RrlRateSetting {
+        qps: 50.0,
+        burst: 200,
+    }
+}
+
+fn default_pool_size() -> usize {
+    4
+}
+
+fn default_pool_backoff_ms() -> u64 {
+    100
+}
+
+fn default_pool_max_backoff_ms() -> u64 {
+    5_000
+}
+
+fn default_secure_max_connections() -> usize {
+    1_024
+}
+
+fn default_secure_max_streams() -> u32 {
+    100
+}
+
+fn default_secure_handshake_ms() -> u64 {
+    10_000
+}
+
+fn default_secure_request_ms() -> u64 {
+    10_000
+}
+
+fn default_secure_idle_ms() -> u64 {
+    30_000
+}
+
+fn default_secure_shutdown_ms() -> u64 {
+    5_000
+}
+
+fn default_secure_max_message() -> usize {
+    usize::from(u16::MAX)
+}
+
+fn default_secure_workers() -> usize {
+    2
+}
+
+fn default_secure_max_requests() -> usize {
+    100
+}
+
+fn default_dnscrypt_min_query_len() -> usize {
+    pulse_dnscrypt::DEFAULT_MIN_QUERY_LEN
+}
+
+fn default_dnscrypt_max_udp() -> usize {
+    pulse_dnscrypt::MAX_UDP_PACKET
+}
+
+fn default_dnscrypt_max_tcp() -> usize {
+    pulse_dnscrypt::MAX_TCP_PACKET
+}
+
+fn default_dnscrypt_replay_ttl() -> u64 {
+    pulse_dnscrypt::DEFAULT_REPLAY_TTL_SECS
+}
+
+fn default_dnscrypt_replay_capacity() -> usize {
+    pulse_dnscrypt::DEFAULT_REPLAY_CAPACITY
+}
+
+/// Проверяет, что секретный файл недоступен группе и остальным (нет битов
+/// `0o077`). Отсутствующий файл проверяется при запуске сервера, поэтому
+/// примеры конфигурации остаются валидными без реальных ключей.
+fn ensure_private(path: &Path, label: &str) -> Result<(), ConfigError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return Ok(());
+        };
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(ConfigError::invalid(format!(
+                "{label} {} has insecure permissions {mode:03o}; expected 0600 or stricter",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, label);
+    }
+    Ok(())
 }
 
 fn default_ns_port() -> u16 {
@@ -883,6 +1982,30 @@ fn default_tcp_idle_ms() -> u64 {
     5_000
 }
 
+fn default_control_request_ms() -> u64 {
+    5_000
+}
+
+fn default_control_write_ms() -> u64 {
+    5_000
+}
+
+fn default_control_shutdown_ms() -> u64 {
+    5_000
+}
+
+fn default_control_connections() -> usize {
+    32
+}
+
+fn default_control_qps() -> f64 {
+    50.0
+}
+
+fn default_control_burst() -> u32 {
+    100
+}
+
 fn default_override_ttl() -> u32 {
     60
 }
@@ -902,7 +2025,7 @@ mod tests {
     #[test]
     fn example_config_parses_and_validates() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/resolver.json");
-        let config = Config::load(&path).expect("example config");
+        let config = Config::from_path(&path).expect("example config");
         config.validate().expect("example config is valid");
         assert_eq!(config.forwarders.len(), 2);
         assert!(config.dnssec_validate);
@@ -910,10 +2033,268 @@ mod tests {
     }
 
     #[test]
+    fn toml_example_parses_and_validates() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/resolver.toml");
+        let config = Config::from_path(&path).expect("toml example config");
+        config.validate().expect("toml example config is valid");
+        assert_eq!(config.forwarders.len(), 2);
+        assert!(config.dnssec_validate);
+        assert_eq!(config.trust_anchor, Some(TrustAnchorSetting::Embedded));
+        assert_eq!(config.overrides.len(), 3);
+        assert_eq!(config.blocklist.paths.len(), 1);
+        assert_eq!(config.timeouts.total_ms, 6_000);
+    }
+
+    #[test]
+    fn toml_and_json_examples_are_equivalent() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let toml = Config::from_path(root.join("resolver.toml")).expect("toml example");
+        let json = Config::from_path(root.join("resolver.json")).expect("json example");
+        assert_eq!(
+            serde_json::to_value(&toml).expect("serialize toml config"),
+            serde_json::to_value(&json).expect("serialize json config")
+        );
+    }
+
+    #[test]
+    fn toml_round_trip_preserves_config() {
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/resolver.toml"),
+        )
+        .expect("read toml example");
+        let config = Config::from_toml_str(&text).expect("parse toml");
+        let rendered = config.to_toml_string().expect("serialize toml");
+        let reparsed = Config::from_toml_str(&rendered).expect("reparse rendered toml");
+        assert_eq!(
+            serde_json::to_value(&config).expect("serialize original"),
+            serde_json::to_value(&reparsed).expect("serialize reparsed")
+        );
+        assert_eq!(reparsed.overrides.len(), 3);
+        assert_eq!(reparsed.cache.max_bytes, 16_777_216);
+    }
+
+    #[test]
+    fn toml_round_trip_preserves_upstreams_and_rate_limit() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/resolver-secure.json");
+        let config = Config::from_path(&path).expect("secure example");
+        let rendered = config.to_toml_string().expect("serialize toml");
+        let reparsed = Config::from_toml_str(&rendered).expect("reparse rendered toml");
+        assert_eq!(
+            serde_json::to_value(&config).expect("serialize original"),
+            serde_json::to_value(&reparsed).expect("serialize reparsed")
+        );
+        assert_eq!(reparsed.upstreams.len(), 4);
+        assert!(reparsed.rate_limit.is_some());
+        assert_eq!(reparsed.allow_from.len(), 3);
+    }
+
+    #[test]
+    fn toml_supports_all_config_fields() {
+        let text = r#"
+listen_udp = "127.0.0.1:5353"
+listen_tcp = "127.0.0.1:5354"
+metrics_listen = "127.0.0.1:9153"
+workers = 0
+mode = "iterative"
+root_hints = ["198.41.0.4:53"]
+ns_port = 53
+dnssec_validate = true
+trust_anchor = { path = "root.ds" }
+log_level = "debug"
+
+[blocklist]
+paths = ["block.txt"]
+allowlist = ["safe.example"]
+response = "null"
+reload_secs = 60
+
+[[overrides]]
+name = "router.home"
+ttl = 120
+a = ["192.168.1.1"]
+aaaa = ["fd00::1"]
+
+[[overrides]]
+name = "printer.home"
+cname = "router.home."
+
+[rate_limit]
+enabled = true
+qps = 5.5
+burst = 10
+max_entries = 100
+action = "truncate"
+
+[cache]
+max_entries = 100
+max_bytes = 1048576
+min_ttl = 1
+max_ttl = 300
+shards = 4
+
+[tcp]
+max_connections = 10
+idle_timeout_ms = 1000
+
+[timeouts]
+per_query_ms = 500
+tcp_ms = 1000
+total_ms = 2000
+"#;
+        let config = Config::from_toml_str(text).expect("all fields");
+        config.validate().expect("all-fields config is valid");
+        assert_eq!(
+            config.listen_udp,
+            Some("127.0.0.1:5353".parse().expect("addr"))
+        );
+        assert_eq!(
+            config.listen_tcp,
+            Some("127.0.0.1:5354".parse().expect("addr"))
+        );
+        assert_eq!(
+            config.metrics_listen,
+            Some("127.0.0.1:9153".parse().expect("addr"))
+        );
+        assert_eq!(config.mode, ModeSetting::Iterative);
+        assert_eq!(
+            config.root_hints,
+            vec!["198.41.0.4:53".parse::<SocketAddr>().expect("hint")]
+        );
+        assert_eq!(config.ns_port, 53);
+        assert_eq!(
+            config.trust_anchor,
+            Some(TrustAnchorSetting::PathFile(PathBuf::from("root.ds")))
+        );
+        assert_eq!(config.blocklist.response, BlockResponseSetting::Null);
+        assert_eq!(config.blocklist.reload_secs, 60);
+        assert_eq!(config.overrides.len(), 2);
+        assert_eq!(config.overrides[1].cname.as_deref(), Some("router.home."));
+        let rate_limit = config.rate_limit.as_ref().expect("rate limit");
+        assert!((rate_limit.qps - 5.5).abs() < f64::EPSILON);
+        assert_eq!(rate_limit.action, RateLimitAction::Truncate);
+        assert_eq!(config.cache.min_ttl, 1);
+        assert_eq!(config.tcp.idle_timeout_ms, 1000);
+        assert_eq!(config.timeouts.per_query_ms, 500);
+        assert_eq!(config.log_level, LogLevel::Debug);
+
+        let rendered = config.to_toml_string().expect("serialize all fields");
+        let reparsed = Config::from_toml_str(&rendered).expect("reparse all fields");
+        assert_eq!(
+            serde_json::to_value(&config).expect("serialize original"),
+            serde_json::to_value(&reparsed).expect("serialize reparsed")
+        );
+    }
+
+    #[test]
+    fn config_extension_is_case_insensitive() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("Config.TOML");
+        std::fs::write(
+            &path,
+            "listen_udp = \"127.0.0.1:5353\"\nupstreams = [\"1.1.1.1\"]\n",
+        )
+        .expect("write config");
+        let config = Config::from_path(&path).expect("uppercase toml extension");
+        config.validate().expect("valid config");
+    }
+
+    #[test]
+    fn unknown_extension_is_rejected_with_hint() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("resolver.yaml");
+        std::fs::write(&path, "listen_udp: 127.0.0.1:5353\n").expect("write config");
+        let error = Config::from_path(&path).expect_err("yaml must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains(path.to_str().expect("utf8 path")),
+            "{message}"
+        );
+        assert!(message.contains("a .toml file (recommended)"), "{message}");
+        assert!(
+            message.contains("a .json file (legacy compatibility)"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn toml_unknown_field_reports_path_line_and_column() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("bad.toml");
+        std::fs::write(&path, "listen_udp = \"127.0.0.1:5353\"\nwat = 1\n").expect("write config");
+        let error = Config::from_path(&path).expect_err("unknown field must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains(path.to_str().expect("utf8 path")),
+            "{message}"
+        );
+        assert!(message.contains("unknown field `wat`"), "{message}");
+        assert!(message.contains("line 2"), "{message}");
+        assert!(message.contains("column 1"), "{message}");
+    }
+
+    #[test]
+    fn toml_bad_type_reports_position() {
+        let error = Config::from_toml_str("listen_udp = \"127.0.0.1:5353\"\nworkers = \"many\"\n")
+            .expect_err("bad type must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("invalid type"), "{message}");
+        assert!(message.contains("line 2"), "{message}");
+        assert!(message.contains("column"), "{message}");
+    }
+
+    #[test]
+    fn toml_syntax_error_reports_position() {
+        let error = Config::from_toml_str("listen_udp = \"127.0.0.1:5353\n")
+            .expect_err("unterminated string must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("TOML parse error"), "{message}");
+        assert!(message.contains("line 1"), "{message}");
+        assert!(message.contains("column"), "{message}");
+    }
+
+    #[test]
+    fn json_unknown_field_reports_position() {
+        let error = Config::from_json_str("{\"listen_udp\": \"127.0.0.1:5353\", \"wat\": 1}")
+            .expect_err("unknown field must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("unknown field `wat`"), "{message}");
+        assert!(message.contains("line 1"), "{message}");
+        assert!(message.contains("column"), "{message}");
+    }
+
+    #[test]
+    fn cli_overrides_apply_over_toml() {
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/resolver.toml"),
+        )
+        .expect("read toml example");
+        let mut config = Config::from_toml_str(&text).expect("parse toml");
+        config.apply_overrides(&Overrides {
+            listen_udp: Some("127.0.0.2:5300".parse().expect("addr")),
+            workers: Some(4),
+            log_level: Some(LogLevel::Debug),
+            blocklists: vec![PathBuf::from("extra-blocklist.txt")],
+            no_dnssec: true,
+            ..Overrides::default()
+        });
+        assert_eq!(
+            config.listen_udp,
+            Some("127.0.0.2:5300".parse().expect("addr"))
+        );
+        assert_eq!(config.workers, 4);
+        assert_eq!(config.log_level, LogLevel::Debug);
+        assert_eq!(config.mode, ModeSetting::Forward);
+        assert_eq!(config.blocklist.paths.len(), 2);
+        assert!(!config.dnssec_validate);
+        config.validate().expect("overridden config is valid");
+    }
+
+    #[test]
     fn secure_example_config_parses() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/resolver-secure.json");
-        let config = Config::load(&path).expect("secure example");
+        let config = Config::from_path(&path).expect("secure example");
         config.validate().expect("secure example is valid");
         assert_eq!(config.upstreams.len(), 4);
         assert!(config.rate_limit.is_some());
@@ -990,6 +2371,31 @@ mod tests {
     }
 
     #[test]
+    fn control_listen_requires_loopback_and_token() {
+        let mut config = forward_config();
+        config.control_listen = Some("127.0.0.1:9154".parse().unwrap());
+        assert!(config.validate().is_err(), "token is required");
+        config.control_token = Some(ControlToken::new("control-secret"));
+        assert!(config.validate().is_ok());
+
+        config.control_listen = Some("0.0.0.0:9154".parse().unwrap());
+        assert!(config.validate().is_err(), "non-loopback is rejected");
+
+        let mut config = forward_config();
+        config.control_listen = Some("127.0.0.1:9154".parse().unwrap());
+        config.control_token = Some(ControlToken::new("bad token"));
+        assert!(config.validate().is_err(), "spaces are rejected");
+
+        let mut config = forward_config();
+        config.control.rate_limit_burst = 0;
+        assert!(config.validate().is_err());
+        assert_eq!(
+            format!("{:?}", ControlToken::new("control-secret")),
+            "<redacted>"
+        );
+    }
+
+    #[test]
     fn upstreams_parse_strings_and_objects() {
         let text = r#"{
             "listen_udp": "127.0.0.1:0",
@@ -1042,6 +2448,67 @@ mod tests {
         config.rate_limit = Some(RateLimitSetting::default());
         assert!(config.validate().is_ok());
         assert!(config.build_rate_limiter().expect("limiter").is_some());
+    }
+
+    #[test]
+    fn rrl_and_pool_settings_parse_and_validate() {
+        let text = r#"{
+            "listen_udp": "127.0.0.1:0",
+            "forwarders": ["127.0.0.1:53"],
+            "upstream_pool": {
+                "pool_size": 8,
+                "reconnect_backoff_ms": 50,
+                "max_reconnect_backoff_ms": 500
+            },
+            "rrl": {
+                "enabled": true,
+                "slip": 3,
+                "action": "truncate",
+                "nxdomain": { "qps": 2, "burst": 10 }
+            }
+        }"#;
+        let config = Config::from_json_str(text).expect("config");
+        config.validate().expect("valid");
+        assert_eq!(config.upstream_pool.pool_size, 8);
+        let rrl = config.rrl.as_ref().expect("rrl");
+        assert_eq!(rrl.slip, 3);
+        assert_eq!(rrl.nxdomain.qps, 2.0);
+        assert_eq!(rrl.nxdomain.burst, 10);
+        // Незаданные классы берут значения по умолчанию.
+        assert_eq!(rrl.noerror.burst, default_rrl_noerror().burst);
+        assert_eq!(rrl.source.qps, default_rrl_source().qps);
+        let resolver = config.resolver_config().expect("resolver");
+        assert_eq!(resolver.pool.size, 8);
+        assert!(config.build_rrl().expect("rrl").is_some());
+
+        let mut config = Config::from_json_str(text).expect("config");
+        config.upstream_pool.pool_size = 0;
+        assert!(config.validate().is_err());
+        let mut config = Config::from_json_str(text).expect("config");
+        config.upstream_pool.reconnect_backoff_ms = 1_000;
+        config.upstream_pool.max_reconnect_backoff_ms = 10;
+        assert!(config.validate().is_err());
+        let mut config = Config::from_json_str(text).expect("config");
+        if let Some(rrl) = config.rrl.as_mut() {
+            rrl.nxdomain.burst = 0;
+        }
+        assert!(config.validate().is_err());
+        let mut config = Config::from_json_str(text).expect("config");
+        if let Some(rrl) = config.rrl.as_mut() {
+            rrl.slip = 10_000;
+        }
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn disabled_rrl_is_not_built() {
+        let mut config = forward_config();
+        config.rrl = Some(RrlSetting {
+            enabled: false,
+            ..RrlSetting::default()
+        });
+        config.validate().expect("disabled rrl is not validated");
+        assert!(config.build_rrl().expect("build").is_none());
     }
 
     #[test]

@@ -9,6 +9,25 @@ pub struct Stats {
     tcp_queries: AtomicU64,
     udp_responses: AtomicU64,
     tcp_responses: AtomicU64,
+    dot_queries: AtomicU64,
+    dot_responses: AtomicU64,
+    doh_queries: AtomicU64,
+    doh_responses: AtomicU64,
+    doh_http2_queries: AtomicU64,
+    doh_http2_responses: AtomicU64,
+    doq_queries: AtomicU64,
+    doq_responses: AtomicU64,
+    dnscrypt_udp_queries: AtomicU64,
+    dnscrypt_udp_responses: AtomicU64,
+    dnscrypt_udp_errors: AtomicU64,
+    dnscrypt_tcp_queries: AtomicU64,
+    dnscrypt_tcp_responses: AtomicU64,
+    dnscrypt_tcp_errors: AtomicU64,
+    dnscrypt_tcp_active: AtomicU64,
+    dnscrypt_tcp_connections: AtomicU64,
+    dnscrypt_tcp_rejected: AtomicU64,
+    tls_reloads: AtomicU64,
+    tls_reload_failures: AtomicU64,
     decode_errors: AtomicU64,
     encode_errors: AtomicU64,
     formerr: AtomicU64,
@@ -39,6 +58,44 @@ pub struct StatsSnapshot {
     pub udp_responses: u64,
     /// TCP-ответы.
     pub tcp_responses: u64,
+    /// DoT-запросы.
+    pub dot_queries: u64,
+    /// DoT-ответы.
+    pub dot_responses: u64,
+    /// DoH/1.1-запросы.
+    pub doh_queries: u64,
+    /// DoH/1.1-ответы.
+    pub doh_responses: u64,
+    /// DoH/2-запросы.
+    pub doh_http2_queries: u64,
+    /// DoH/2-ответы.
+    pub doh_http2_responses: u64,
+    /// DoQ-запросы.
+    pub doq_queries: u64,
+    /// DoQ-ответы.
+    pub doq_responses: u64,
+    /// DNSCrypt UDP-запросы.
+    pub dnscrypt_udp_queries: u64,
+    /// DNSCrypt UDP-ответы.
+    pub dnscrypt_udp_responses: u64,
+    /// Ошибки разбора/аутентификации DNSCrypt UDP.
+    pub dnscrypt_udp_errors: u64,
+    /// DNSCrypt TCP-запросы.
+    pub dnscrypt_tcp_queries: u64,
+    /// DNSCrypt TCP-ответы.
+    pub dnscrypt_tcp_responses: u64,
+    /// Ошибки DNSCrypt TCP.
+    pub dnscrypt_tcp_errors: u64,
+    /// Активные DNSCrypt TCP-соединения.
+    pub dnscrypt_tcp_active: u64,
+    /// Всего принятых DNSCrypt TCP-соединений.
+    pub dnscrypt_tcp_connections: u64,
+    /// Отклонённые DNSCrypt TCP-соединения (лимит).
+    pub dnscrypt_tcp_rejected: u64,
+    /// Успешные перезагрузки TLS-сертификата.
+    pub tls_reloads: u64,
+    /// Неудачные перезагрузки TLS-сертификата.
+    pub tls_reload_failures: u64,
     /// Ошибки декодирования запроса.
     pub decode_errors: u64,
     /// Ошибки кодирования ответа.
@@ -90,6 +147,25 @@ impl Stats {
             tcp_queries: self.tcp_queries.load(Ordering::Relaxed),
             udp_responses: self.udp_responses.load(Ordering::Relaxed),
             tcp_responses: self.tcp_responses.load(Ordering::Relaxed),
+            dot_queries: self.dot_queries.load(Ordering::Relaxed),
+            dot_responses: self.dot_responses.load(Ordering::Relaxed),
+            doh_queries: self.doh_queries.load(Ordering::Relaxed),
+            doh_responses: self.doh_responses.load(Ordering::Relaxed),
+            doh_http2_queries: self.doh_http2_queries.load(Ordering::Relaxed),
+            doh_http2_responses: self.doh_http2_responses.load(Ordering::Relaxed),
+            doq_queries: self.doq_queries.load(Ordering::Relaxed),
+            doq_responses: self.doq_responses.load(Ordering::Relaxed),
+            dnscrypt_udp_queries: self.dnscrypt_udp_queries.load(Ordering::Relaxed),
+            dnscrypt_udp_responses: self.dnscrypt_udp_responses.load(Ordering::Relaxed),
+            dnscrypt_udp_errors: self.dnscrypt_udp_errors.load(Ordering::Relaxed),
+            dnscrypt_tcp_queries: self.dnscrypt_tcp_queries.load(Ordering::Relaxed),
+            dnscrypt_tcp_responses: self.dnscrypt_tcp_responses.load(Ordering::Relaxed),
+            dnscrypt_tcp_errors: self.dnscrypt_tcp_errors.load(Ordering::Relaxed),
+            dnscrypt_tcp_active: self.dnscrypt_tcp_active.load(Ordering::Relaxed),
+            dnscrypt_tcp_connections: self.dnscrypt_tcp_connections.load(Ordering::Relaxed),
+            dnscrypt_tcp_rejected: self.dnscrypt_tcp_rejected.load(Ordering::Relaxed),
+            tls_reloads: self.tls_reloads.load(Ordering::Relaxed),
+            tls_reload_failures: self.tls_reload_failures.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
             encode_errors: self.encode_errors.load(Ordering::Relaxed),
             formerr: self.formerr.load(Ordering::Relaxed),
@@ -124,6 +200,88 @@ impl Stats {
 
     pub(crate) fn tcp_response(&self) {
         self.tcp_responses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dot_query(&self) {
+        self.dot_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dot_response(&self) {
+        self.dot_responses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn doh_query(&self) {
+        self.doh_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn doh_response(&self) {
+        self.doh_responses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn doh_http2_query(&self) {
+        self.doh_http2_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn doh_http2_response(&self) {
+        self.doh_http2_responses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn doq_query(&self) {
+        self.doq_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn doq_response(&self) {
+        self.doq_responses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_udp_query(&self) {
+        self.dnscrypt_udp_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_udp_response(&self) {
+        self.dnscrypt_udp_responses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_udp_error(&self) {
+        self.dnscrypt_udp_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_query(&self) {
+        self.dnscrypt_tcp_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_response(&self) {
+        self.dnscrypt_tcp_responses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_error(&self) {
+        self.dnscrypt_tcp_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_opened(&self) {
+        self.dnscrypt_tcp_connections
+            .fetch_add(1, Ordering::Relaxed);
+        self.dnscrypt_tcp_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_closed(&self) {
+        self.dnscrypt_tcp_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dnscrypt_tcp_active(&self) -> u64 {
+        self.dnscrypt_tcp_active.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn dnscrypt_tcp_rejected(&self) {
+        self.dnscrypt_tcp_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn tls_reload_ok(&self) {
+        self.tls_reloads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn tls_reload_failed(&self) {
+        self.tls_reload_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn decode_error(&self) {
