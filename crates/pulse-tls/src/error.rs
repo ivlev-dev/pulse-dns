@@ -14,6 +14,9 @@ pub enum Error {
     /// Ошибка rustls (рукопожатие, сертификат, ALPN).
     #[error("TLS error: {0}")]
     Tls(#[from] rustls::Error),
+    /// Ошибка разбора PEM (сертификат или ключ).
+    #[error("PEM error: {0}")]
+    Pem(#[from] rustls_pki_types::pem::Error),
     /// Рукопожатие не уложилось в отведённое время.
     #[error("TLS handshake timed out")]
     HandshakeTimeout,

@@ -20,7 +20,7 @@ confidence-threshold = 0.8
 unused-allowed-license = "warn"
 
 [[licenses.exceptions]]
-allow = ["MPL-2.0"]
+allow = ["MPL-2.0", "CDLA-Permissive-2.0"]
 crate = "webpki-roots"
 
 [bans]

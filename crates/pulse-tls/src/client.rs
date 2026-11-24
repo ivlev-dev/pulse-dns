@@ -37,15 +37,16 @@
 //! ```
 
 use std::fs;
-use std::io::{BufReader, Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use rustls::pki_types::ServerName;
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use rustls_pki_types::pem::PemObject;
 
 use crate::error::Error;
 
@@ -95,8 +96,7 @@ impl ClientTlsConfig {
     /// [`Error::InvalidConfig`] при пустом ALPN или ошибка сборки rustls.
     pub fn with_ca_pem(ca_pem: &[u8], alpn: &[u8]) -> Result<Self, Error> {
         let mut roots = RootCertStore::empty();
-        let mut reader = BufReader::new(Cursor::new(ca_pem));
-        let certificates = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+        let certificates = CertificateDer::pem_slice_iter(ca_pem).collect::<Result<Vec<_>, _>>()?;
         if certificates.is_empty() {
             return Err(Error::NoCertificates);
         }

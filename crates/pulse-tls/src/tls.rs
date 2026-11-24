@@ -7,7 +7,6 @@
 
 use std::fmt;
 use std::fs;
-use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -15,6 +14,7 @@ use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ServerConnection;
+use rustls_pki_types::pem::{Error as PemError, PemObject};
 
 use crate::error::Error;
 
@@ -233,8 +233,7 @@ fn build_server_config(
 }
 
 fn parse_certificates(cert_pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, Error> {
-    let mut reader = BufReader::new(Cursor::new(cert_pem));
-    let certificates = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    let certificates = CertificateDer::pem_slice_iter(cert_pem).collect::<Result<Vec<_>, _>>()?;
     if certificates.is_empty() {
         return Err(Error::NoCertificates);
     }
@@ -242,6 +241,9 @@ fn parse_certificates(cert_pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, E
 }
 
 fn parse_private_key(key_pem: &[u8]) -> Result<PrivateKeyDer<'static>, Error> {
-    let mut reader = BufReader::new(Cursor::new(key_pem));
-    rustls_pemfile::private_key(&mut reader)?.ok_or(Error::NoPrivateKey)
+    match PrivateKeyDer::from_pem_slice(key_pem) {
+        Ok(key) => Ok(key),
+        Err(PemError::NoItemsFound) => Err(Error::NoPrivateKey),
+        Err(error) => Err(Error::Pem(error)),
+    }
 }
