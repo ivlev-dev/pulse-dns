@@ -1,0 +1,30 @@
+[package]
+name = "pulse-dnssec"
+description = "DNSSEC signing and validation for pulse-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+aws-lc-rs = "1.19"
+base64 = "0.22"
+pem = "3"
+pulse-dns = { path = "../pulse-dns" }
+thiserror = "2"
+zeroize = { version = "1.9", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+hex = "0.4"
+proptest = "1"
+tempfile = "3"
+
+[[bench]]
+name = "dnssec"
+harness = false
+
+[lints]
+workspace = true
