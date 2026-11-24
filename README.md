@@ -9,8 +9,9 @@
 параллельная запись v2 является основной), а
 также резолвер (`pulseresolved`) с
 forward/iterative-резолюцией, кешем, blocklist, overrides и DNSSEC-валидацией.
-Это не полный продукт из ТЗ (нет DoQ, RRL и т.д.). DoT, DoH (HTTP/1.1) и
-DNSCrypt v2 (авторитетный сервер) реализованы.
+Это не полный продукт из ТЗ (нет DoQ, полного RRL авторитетного сервера и
+т.д.). DoT, DoH (HTTP/1.1) и DNSCrypt v2 (авторитетный сервер) реализованы;
+резолвер умеет ходить в upstream по UDP, TCP, DoT и DoH/1.1.
 
 ## Возможности
 
@@ -41,26 +42,34 @@ DNSCrypt v2 (авторитетный сервер) реализованы.
   (разные зоны коммитятся параллельно; `--commit-mode per-zone|group`,
   `sync`/`flush`/`memory`), graceful shutdown, AXFR/IXFR-out по TCP с TSIG/ACL,
   IXFR-история, NOTIFY-out/in и secondary-зоны (AXFR/IXFR-in, bootstrap,
-  SOA-refresh, expire → SERVFAIL), DNSSEC-подпись в zonefile, Dockerfile.
+  SOA-refresh, expire → SERVFAIL), DNSSEC-подпись в zonefile (NSEC или
+  NSEC3), Dockerfile.
 - Защищённые транспорты `pulsed`: DoT (`dot_listen`, RFC 7858), DoH/1.1
   (`doh_listen`, RFC 8484, ALPN `http/1.1`, только HTTP/1.1) и DNSCrypt v2 по
-  UDP (`dnscrypt_listen`), общий путь `decode → QueryEngine (mmap) → encode`,
-  TLS hot-reload по `SIGHUP`/`tls_reload_secs`, IP/CIDR ACL и лимиты,
+  UDP (`dnscrypt_listen`) и TCP (`dnscrypt_tcp_listen`, 2-байтовый
+  length-prefix, несколько запросов на соединение), общий путь
+  `decode → QueryEngine (mmap) → encode`, TLS hot-reload по
+  `SIGHUP`/`tls_reload_secs`, IP/CIDR ACL и лимиты,
   `pulsed dnscrypt-gencert` (ключи 0600, каталог 0700, TXT-записи), метрики
-  `dot_*`/`doh_*`/`dnscrypt_*` в `/metrics`.
+  `dot_*`/`doh_*`/`dnscrypt_*`/`dnscrypt_tcp_*` в `/metrics`.
 - Бинарник `pulseresolved`: forward/iterative-резолюция через `pulse-resolver`,
   UDP на `pulse-runtime` (N worker) и TCP с length-prefix, EDNS/TC, REFUSED
   для AXFR/IXFR, кеш, blocklist + overrides, DNSSEC-валидация (AD/SERVFAIL),
+  смешанные upstream (UDP/TCP/DoT/DoH) с failover и cooldown, ACL клиентов
+  (`allow_from`, по умолчанию loopback), per-source token bucket
+  (`drop`/`refused`/`truncate`), метрики `refused_acl_total`,
+  `rate_limited_total` и `upstream_queries_total{transport=...}`,
   SIGHUP/периодический reload, `GET /metrics` и `GET /healthz` на loopback,
   graceful shutdown по SIGTERM/SIGINT.
 
 **Не реализовано (см. `STATUS.md`):** межпроцессная параллельная запись
 (N процессов; в v2.0 — один процесс-писатель, `LOCK_EX`); полный `fsck --repair`;
-WAL/journal для write-through; DoQ; DNSCrypt TCP-транспорт (только UDP);
+WAL/journal для write-through; DoQ; NSEC3 Opt-Out и NSEC3 для secondary-зон;
 HTTP/2/3 для DoH (только HTTP/1.1); 0x20 echo; TLS для API и метрик
-(только loopback); fuzz/Miri/loom в CI; полноценный RRL; REST — MVP-подмножество
-спецификации; DNSSEC NSEC3-подпись и автоматическая ротация ключей. У резолвера
-нет RRL, DoT/DoH-апстримов и RFC 5011 (trust anchors статические).
+(только loopback); fuzz/Miri/loom в CI; полноценный RRL авторитетного сервера;
+REST — MVP-подмножество спецификации; автоматическая ротация DNSSEC-ключей.
+У резолвера нет RFC 5011 (trust anchors статические), DoQ и
+HTTP/2/3 для DoH-апстримов; RRL ограничен per-source token bucket.
 
 ## Архитектура
 
@@ -73,7 +82,7 @@ HTTP/2/3 для DoH (только HTTP/1.1); 0x20 echo; TLS для API и мет
 | `pulse-zonefile` | Бинарный mmap-формат зон: reader, writer/commit, fsck, compact |
 | `pulse-runtime` | io_uring UDP-рантайм + epoll-фолбэк |
 | `pulse-server` | Авторитетный движок запросов |
-| `pulse-tls` | DNS over TLS (RFC 7858) и DNS over HTTPS/1.1 (RFC 8484) |
+| `pulse-tls` | DNS over TLS (RFC 7858) и DNS over HTTPS/1.1 (RFC 8484): серверы и клиенты для upstream |
 | `pulse-dnscrypt` | DNSCrypt v2: сертификаты, сервер, клиент |
 | `pulse-api` | REST API управления зонами |
 | `pulse-resolver` | Кеширующий резолвер: forward/iterative, кеш, blocklist, overrides, DNSSEC |
@@ -156,9 +165,25 @@ curl -sS http://127.0.0.1:9153/metrics | head
 # После правки blocklist: kill -HUP <pid> (или blocklist.reload_secs > 0)
 ```
 
+Смешанные upstream, ACL и rate limit (`examples/resolver-secure.json`):
+
+```bash
+cargo run -p pulseresolved -- --config examples/resolver-secure.json
+# или поверх конфига:
+cargo run -p pulseresolved -- --config examples/resolver.json \
+  --upstream tls://dns.google:853#dns.google \
+  --upstream https://cloudflare-dns.com/dns-query
+```
+
+В JSON `upstreams` принимает строки (`udp://`, `tcp://`, `tls://host:853#name`,
+`https://host/dns-query`) и объекты `{ "addr": "...", "tls": true,
+"server_name": "localhost", "ca": "ca.pem" }`. `allow_from` — список IP/CIDR
+(пусто — только loopback); `rate_limit` — `qps`, `burst`, `max_entries` и
+`action` (`refused`, `drop`, `truncate`).
+
 CLI: `--config`, `--listen-udp`, `--listen-tcp`, `--metrics-listen`,
-`--forward` (repeatable), `--workers`, `--log-level`, `--blocklist`
-(repeatable), `--no-dnssec`.
+`--forward` (repeatable), `--upstream` (repeatable, URL/схема), `--workers`,
+`--log-level`, `--blocklist` (repeatable), `--no-dnssec`.
 
 Зоны в `pulse-zonefile` v2:
 
@@ -235,14 +260,16 @@ cargo deny check
 
 - Зоны хранятся в одном бинарном mmap-файле (`--data`); JSON-зон нет. v2:
   параллельная запись по зонам внутри одного процесса; межпроцессная запись
-  (N процессов) не реализована (`LOCK_EX`, один writer на файл); полный
-  `fsck --repair` не завершён; `map_size` задаётся при создании (по умолчанию
+  (N процессов) не реализована (`LOCK_EX`, один writer на файл); offline
+  `pulsed fsck --data <file> [--repair]` проверяет граф/пулы/утечки и
+  изолирует повреждённые зоны; `map_size` задаётся при создании (по умолчанию
   4 GiB); до 4096 зон, страницы 4096 байт.
 - DoT/DoH работают синхронно (поток на соединение), DoH — только HTTP/1.1;
-  DNSCrypt реализован только по UDP (TCP-порт не поднимается, большие ответы
-  усекаются с `TC`); DNSCrypt TXT-запись публикуется вручную.
+  DNSCrypt UDP усекает большие ответы с `TC`, DNSCrypt TCP отдаёт их без
+  усечения; DNSCrypt TXT-запись публикуется вручную.
 - REST — MVP-подмножество спецификации; API доступен только на loopback (без TLS).
-- DNSSEC: NSEC (NSEC3-подпись не реализована), автоматическая ротация ключей нет.
+- DNSSEC: NSEC и NSEC3 (SHA-1, Opt-Out = 0), автоматической ротации ключей нет;
+  NSEC3 для secondary-зон не генерируется.
 - Roadmap: `docs/plan/roadmap.md` (M0–M4 выполнены, M5/M6 частично).
 
 ## Лицензия

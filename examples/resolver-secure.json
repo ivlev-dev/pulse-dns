@@ -1,0 +1,38 @@
+{
+  "listen_udp": "127.0.0.1:5353",
+  "listen_tcp": "127.0.0.1:5353",
+  "metrics_listen": "127.0.0.1:9153",
+  "workers": 2,
+  "mode": "forward",
+  "upstreams": [
+    "udp://1.1.1.1:53",
+    "tcp://9.9.9.9:53",
+    "tls://dns.google:853#dns.google",
+    { "url": "https://cloudflare-dns.com/dns-query" }
+  ],
+  "allow_from": ["127.0.0.0/8", "::1/128", "192.168.0.0/16"],
+  "rate_limit": {
+    "enabled": true,
+    "qps": 20,
+    "burst": 100,
+    "max_entries": 10000,
+    "action": "refused"
+  },
+  "cache": {
+    "max_entries": 32768,
+    "max_bytes": 16777216,
+    "min_ttl": 0,
+    "max_ttl": 86400,
+    "shards": 16
+  },
+  "tcp": {
+    "max_connections": 1024,
+    "idle_timeout_ms": 5000
+  },
+  "timeouts": {
+    "per_query_ms": 2000,
+    "tcp_ms": 3000,
+    "total_ms": 6000
+  },
+  "log_level": "info"
+}

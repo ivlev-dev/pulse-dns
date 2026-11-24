@@ -39,10 +39,13 @@ pub(crate) struct UpstreamResponse {
 pub(crate) struct UpstreamCounters {
     pub(crate) udp_queries: AtomicU64,
     pub(crate) tcp_queries: AtomicU64,
+    pub(crate) tls_queries: AtomicU64,
+    pub(crate) https_queries: AtomicU64,
     pub(crate) retries: AtomicU64,
     pub(crate) timeouts: AtomicU64,
     pub(crate) mismatches: AtomicU64,
     pub(crate) zero_x_fallbacks: AtomicU64,
+    pub(crate) failovers: AtomicU64,
 }
 
 /// Снимок счётчиков транспорта.
@@ -52,6 +55,10 @@ pub struct UpstreamStats {
     pub udp_queries: u64,
     /// TCP-запросы (включая TC-fallback).
     pub tcp_queries: u64,
+    /// DNS-over-TLS-запросы.
+    pub tls_queries: u64,
+    /// DNS-over-HTTPS-запросы.
+    pub https_queries: u64,
     /// Повторы.
     pub retries: u64,
     /// Таймауты.
@@ -60,6 +67,8 @@ pub struct UpstreamStats {
     pub mismatches: u64,
     /// Случаи авто-отключения 0x20.
     pub zero_x_fallbacks: u64,
+    /// Переключения на следующий upstream после ошибки.
+    pub failovers: u64,
 }
 
 impl UpstreamCounters {
@@ -67,12 +76,24 @@ impl UpstreamCounters {
         UpstreamStats {
             udp_queries: self.udp_queries.load(Ordering::Relaxed),
             tcp_queries: self.tcp_queries.load(Ordering::Relaxed),
+            tls_queries: self.tls_queries.load(Ordering::Relaxed),
+            https_queries: self.https_queries.load(Ordering::Relaxed),
             retries: self.retries.load(Ordering::Relaxed),
             timeouts: self.timeouts.load(Ordering::Relaxed),
             mismatches: self.mismatches.load(Ordering::Relaxed),
             zero_x_fallbacks: self.zero_x_fallbacks.load(Ordering::Relaxed),
+            failovers: self.failovers.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Предпочтительный транспорт для UDP/TCP-клиента.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamTransport {
+    /// UDP с автоматическим TCP-fallback при TC.
+    Udp,
+    /// Только TCP (RFC 7766).
+    Tcp,
 }
 
 /// Потокобезопасный upstream-клиент.
@@ -94,6 +115,10 @@ impl UpstreamClient {
         Arc::clone(&self.counters)
     }
 
+    pub(crate) fn options(&self) -> UpstreamOptions {
+        self.options
+    }
+
     pub(crate) fn query(
         &self,
         server: SocketAddr,
@@ -103,8 +128,30 @@ impl UpstreamClient {
         deadline: Instant,
         cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<UpstreamResponse, ResolverError> {
+        self.query_over(
+            server,
+            UpstreamTransport::Udp,
+            question,
+            recursion_desired,
+            dnssec_ok,
+            deadline,
+            cancel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn query_over(
+        &self,
+        server: SocketAddr,
+        transport: UpstreamTransport,
+        question: &Question,
+        recursion_desired: bool,
+        dnssec_ok: bool,
+        deadline: Instant,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> Result<UpstreamResponse, ResolverError> {
         let mut last_error = ResolverError::Timeout;
-        let mut use_0x20 = self.options.use_0x20;
+        let mut use_0x20 = self.options.use_0x20 && transport == UpstreamTransport::Udp;
         let mut attempt = 0_u8;
 
         while attempt <= self.options.retries {
@@ -119,7 +166,7 @@ impl UpstreamClient {
                 self.options.edns_payload,
                 use_0x20,
             )?;
-            match self.exchange(server, &prepared, deadline, cancel) {
+            match self.exchange(server, transport, &prepared, deadline, cancel) {
                 Ok(response) => {
                     return Ok(response);
                 }
@@ -150,18 +197,28 @@ impl UpstreamClient {
     fn exchange(
         &self,
         server: SocketAddr,
+        transport: UpstreamTransport,
         prepared: &PreparedQuery,
         deadline: Instant,
         cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<UpstreamResponse, ResolverError> {
-        self.counters.udp_queries.fetch_add(1, Ordering::Relaxed);
-        let message = self.query_udp(server, prepared, deadline, cancel)?;
-        if message.flags().tc() {
-            self.counters.tcp_queries.fetch_add(1, Ordering::Relaxed);
-            let message = self.query_tcp(server, prepared, deadline, cancel)?;
-            Ok(UpstreamResponse { message })
-        } else {
-            Ok(UpstreamResponse { message })
+        match transport {
+            UpstreamTransport::Udp => {
+                self.counters.udp_queries.fetch_add(1, Ordering::Relaxed);
+                let message = self.query_udp(server, prepared, deadline, cancel)?;
+                if message.flags().tc() {
+                    self.counters.tcp_queries.fetch_add(1, Ordering::Relaxed);
+                    let message = self.query_tcp(server, prepared, deadline, cancel)?;
+                    Ok(UpstreamResponse { message })
+                } else {
+                    Ok(UpstreamResponse { message })
+                }
+            }
+            UpstreamTransport::Tcp => {
+                self.counters.tcp_queries.fetch_add(1, Ordering::Relaxed);
+                let message = self.query_tcp(server, prepared, deadline, cancel)?;
+                Ok(UpstreamResponse { message })
+            }
         }
     }
 
@@ -244,16 +301,16 @@ impl UpstreamClient {
     }
 }
 
-struct PreparedQuery {
-    bytes: Vec<u8>,
+pub(crate) struct PreparedQuery {
+    pub(crate) bytes: Vec<u8>,
     qname_wire: Vec<u8>,
-    id: u16,
-    question: Question,
-    recursion_desired: bool,
-    use_0x20: bool,
+    pub(crate) id: u16,
+    pub(crate) question: Question,
+    pub(crate) recursion_desired: bool,
+    pub(crate) use_0x20: bool,
 }
 
-fn prepare(
+pub(crate) fn prepare(
     question: &Question,
     recursion_desired: bool,
     dnssec_ok: bool,
@@ -280,7 +337,7 @@ fn prepare(
     })
 }
 
-fn verify_response(
+pub(crate) fn verify_response(
     message: &Message,
     bytes: &[u8],
     prepared: &PreparedQuery,

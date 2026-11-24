@@ -1155,6 +1155,8 @@ dependencies = [
  "proptest",
  "pulse-dns",
  "pulse-dnssec",
+ "pulse-tls",
+ "rcgen",
  "tempfile",
  "thiserror",
 ]
@@ -1191,6 +1193,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "thiserror",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1256,6 +1259,8 @@ dependencies = [
  "pulse-dnssec",
  "pulse-resolver",
  "pulse-runtime",
+ "pulse-tls",
+ "rcgen",
  "serde",
  "serde_json",
  "signal-hook",
@@ -1884,6 +1889,15 @@ checksum = "d7d179596ff5ec0f6de4db64d54011bde6289cc49603d3a6e4ce3f329207ab88"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

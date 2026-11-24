@@ -19,27 +19,27 @@
 
 ## Готово
 
-Проверено автоматически: **1083 теста** workspace (`cargo test --workspace
---all-features`), `cargo fmt --check`, `cargo clippy --workspace --all-targets
--D warnings`, rustdoc без warnings.
+Проверено автоматически: `cargo test --workspace --all-features`,
+`cargo fmt --check`, `cargo clippy` для затронутых крейтов, rustdoc без
+warnings.
 
 ### Готово по крейтам (13)
 
 | Крейт | Статус |
 |---|---|
 | `pulse-dns` | wire-формат DNS, RR-типы, сжатие имён, EDNS0, RFC 3597, канонизация RFC 4034, лимиты, 0 `unsafe` |
-| `pulse-dnssec` | sign/validate алгоритмы 8/13/15, RRSIG при DO=1, NSEC (подпись NSEC3 не реализована), DS через API, trust anchors IANA |
+| `pulse-dnssec` | sign/validate алгоритмы 8/13/15, RRSIG при DO=1, NSEC и NSEC3 (SHA-1, salt/iterations, closest encloser, wildcard, Opt-Out), DS через API, trust anchors IANA |
 | `pulse-dnscrypt` | DNSCrypt v2: сертификаты, сервер, клиент |
 | `pulse-master` | парсер/сериализатор RFC 1035 master-файлов |
 | `pulse-transfer` | TSIG, AXFR/IXFR, NOTIFY |
 | `pulse-zonefile` | v2 `ParallelStore`: lock-free аллокатор страниц, ring-головы версий A/B, per-zone пулы/GC, in-process пины читателей, per-zone commit, group commit (2 fsync на группу), PageCache, recovery, `fsck`, `compact_zone`, `sync`; v1 читается для `pulsed convert` |
 | `pulse-runtime` | io_uring UDP (ring-per-core, multishot recv + provided buffers, IP_PKTINFO, NODROP-проверка, backpressure, graceful shutdown, изоляция паник) + epoll-фолбэк |
 | `pulse-server` | авторитетный движок: NXDOMAIN/NODATA/ENT, wildcard/closest encloser, CNAME/DNAME, делегация/glue/DS, EDNS/BADVERS, TC, ANY по RFC 8482, детерминированный additional |
-| `pulse-resolver` | library: forward/iterative, кеш + negative caching, blocklist/allowlist/overrides, DNSSEC AD/BOGUS→SERVFAIL, UDP/TCP |
-| `pulseresolved` | binary резолвер: JSON-конфиг, UDP/TCP, кеш, blocklist, overrides, DNSSEC, SIGHUP, `/metrics`, `/healthz`, graceful shutdown |
-| `pulse-tls` | DoT (RFC 7858) и DoH/1.1 (RFC 8484) на rustls |
+| `pulse-resolver` | library: forward/iterative, кеш + negative caching, blocklist/allowlist/overrides, DNSSEC AD/BOGUS→SERVFAIL, UDP/TCP + upstream DoT/DoH с failover/cooldown/keep-alive |
+| `pulseresolved` | binary резолвер: JSON-конфиг, UDP/TCP, ACL клиентов, per-source rate limit, смешанные upstream (UDP/TCP/DoT/DoH), кеш, blocklist, overrides, DNSSEC, SIGHUP, `/metrics`, `/healthz`, graceful shutdown |
+| `pulse-tls` | DoT (RFC 7858) и DoH/1.1 (RFC 8484) на rustls: серверы и клиенты (webpki-roots/CA, ALPN, keep-alive) |
 | `pulse-api` | REST MVP: health/ready/metrics/OpenAPI, zones CRUD, RRset CRUD/PATCH, settings, bearer-auth + scopes + per-zone allowlist, ETag/If-Match, RFC 9457 problem+json, Idempotency-Key, пагинация, лимиты |
-| `pulsed` | binary: UDP+TCP+DoT+DoH (HTTP/1.1)+DNSCrypt v2 (UDP)+REST, зоны только в `pulse-zonefile` v2 (`--data`), DNS отвечает из mmap, импорт `.zone`, `convert` v1→v2, per-zone/group commit, AXFR/IXFR-out, NOTIFY, secondary-зоны, DNSSEC-подпись, graceful shutdown, Dockerfile |
+| `pulsed` | binary: UDP+TCP+DoT+DoH (HTTP/1.1)+DNSCrypt v2 (UDP/TCP)+REST, зоны только в `pulse-zonefile` v2 (`--data`), DNS отвечает из mmap, импорт `.zone`, `convert` v1→v2, per-zone/group commit, AXFR/IXFR-out, NOTIFY, secondary-зоны, DNSSEC-подпись NSEC/NSEC3, graceful shutdown, Dockerfile |
 
 ## Проверено руками
 
@@ -50,16 +50,18 @@
 - Persistence: import в пустой/отсутствующий файл, REST A/TTL/DELETE, reopen без
   потери данных, удаление зоны, `Busy` второго writer'а, отказ на усечённом
   файле, AXFR после импорта и после REST-правки.
-- DNSSEC: подпись в zonefile при старте и `/sign`, DO=1 отдаёт RRSIG из mmap,
-  проверка `pulse-dnssec`; secondary AXFR-in → ответы из mmap → рестарт.
+- DNSSEC: подпись NSEC и NSEC3 (salt/iterations) в zonefile при старте и
+  `/sign`, DO=1 отдаёт RRSIG/NSEC3 из mmap, негативные доказательства
+  проверены `pulse-dnssec`; secondary AXFR-in → ответы из mmap → рестарт.
 - Защищённые транспорты: реальные клиенты получают A-ответ по DoT, DoH POST/GET
-  и DNSCrypt UDP; все три транспорта работают параллельно на разных портах;
+  и DNSCrypt UDP/TCP; транспорты работают параллельно на разных портах;
   неверный provider-ключ и испорченный сертификат отклоняются; большие ответы
-  DoT/DoH не усекаются, DNSCrypt UDP отдаёт `TC`; TLS hot-reload меняет
-  сертификат для новых соединений; graceful shutdown закрывает порты;
+  DoT/DoH/DNSCrypt TCP не усекаются, DNSCrypt UDP отдаёт `TC`; TLS hot-reload
+  меняет сертификат для новых соединений; graceful shutdown закрывает порты;
+  DNSCrypt TCP держит несколько запросов на соединении и idle timeout;
   `dnscrypt-gencert` создаёт файлы 0600/0700, не печатает секреты и не
   перезаписывает их без `--force`; `/metrics` содержит `dot_*`/`doh_*`/
-  `dnscrypt_*`.
+  `dnscrypt_*`/`dnscrypt_tcp_*`.
 - REST-сценарий: PUT зоны → SOA/NS/A → UDP отвечает → PATCH → ответ меняется →
   DELETE → NODATA/REFUSED.
 - Резолвер (`pulseresolved`): реальный прогон бинарника против mock upstream —
@@ -68,7 +70,9 @@
   TCP-запрос, AXFR → REFUSED, SIGHUP-reload списка, `/metrics` + `/healthz`,
   graceful shutdown по SIGTERM (exit 0). Интеграционные тесты дополнительно
   покрывают DNSSEC AD и BOGUS → SERVFAIL, TC/EDNS, periodic reload и FORMERR
-  на мусор.
+  на мусор, upstream DoT/DoH против self-signed `DotServer`/`DohServer`
+  (включая keep-alive и отказ при неверном CA), failover между upstream,
+  ACL (`refused_acl_total`) и rate limit с изоляцией по source IP.
 - Производительность (loopback, хост нагружен, числа консервативные):
   UDP echo 220 117 qps (4 worker / 4 клиента, окно 16); epoll 230 352 qps;
   окно 1 — 89 036 qps, p50 35 µs, p99 182 µs; zone lookup 156–268 нс;
@@ -89,16 +93,19 @@
 - Межпроцессная параллельная запись (N процессов) не реализована: в v2.0
   один процесс-писатель (`LOCK_EX`), N потоков; межпроцессная запись —
   M3, отдельный ADR (F-5).
-- Полный `fsck --repair` не завершён (recovery базовый есть).
 - Без `--data` сервер поднимается без зон (REFUSED); нет journal/outbox и
   WAL для write-through.
 
 **P1 (безопасность/транспорт/протокол):**
-- DNSSEC: NSEC3-подпись не реализована; автоматическая ротация ключей нет.
-- Резолвер: нет upstream DoT/DoH, ACL клиентов, RRL, RFC 5011 (trust
-  anchors статические).
+- DNSSEC: NSEC3 Opt-Out и NSEC3-подпись secondary-зон не реализованы;
+  автоматической ротации ключей нет.
+- Резолвер: нет RFC 5011 (trust anchors статические), DoQ и HTTP/2/3 для
+  DoH-апстримов; RRL ограничен per-source token bucket (не полный RRL
+  авторитетного сервера).
+- Резолвер: upstream DoT/DoH, ACL клиентов (`allow_from`, loopback по
+  умолчанию) и rate limit (`drop`/`refused`/`truncate`) реализованы и покрыты
+  e2e-тестами с self-signed CA.
 - DoQ не реализован.
-- DNSCrypt TCP-транспорт не реализован (только UDP).
 - DoH HTTP/2/3 не реализован (только HTTP/1.1).
 - TLS для REST API/метрик (только loopback).
 - Полноценный RRL (авторитетный сервер).
@@ -107,15 +114,16 @@
 **P2 (качество/производительность/CI):**
 - REST — MVP-подмножество спецификации.
 - RRset lookup ~2–4.9 µs при 1M против цели 500 нс (не достигнута).
-- Fuzz/Miri/loom в CI отсутствуют.
+- Fuzz-smoke (cargo-fuzz, nightly) и опциональный Miri есть в CI; loom отсутствует.
 - Полный REST-спек (OpenAPI покрывает MVP).
 
 ## Ограничения v2
 
 - До 4096 зон; страницы 4096 байт.
 - Межпроцессная запись (N процессов) — M3/отдельный ADR.
-- Полный `fsck --repair` не завершён.
 - `map_size` задаётся при создании (по умолчанию 4 GiB), sparse-файл.
+- Offline `pulsed fsck --data <file> [--repair]` проверяет граф/пулы/утечки и
+  изолирует повреждённые зоны (`NEEDS_FSCK`) без правки данных.
 
 ## Как проверить за 5 минут
 
@@ -145,7 +153,8 @@ dig @127.0.0.1 -p 5353 example.com. A +norecurse
 - API доступен только на loopback, TLS отсутствует.
 - Storage: параллельная запись по зонам внутри одного процесса (v2); межпроцессная
   запись отсутствует (один writer на файл, `LOCK_EX`).
-- v2: до 4096 зон, страницы 4096; `fsck --repair` не завершён.
+- v2: до 4096 зон, страницы 4096; offline `pulsed fsck [--repair]` есть,
+  file-fatal порча требует ручного разбора (repair её не «чинит»).
 - Числа производительности сняты на loopback при загруженном хосте —
   консервативные оценки, не SLA.
 - io_uring работает на уровне L3 только при поддержке `IORING_FEAT_NODROP`,

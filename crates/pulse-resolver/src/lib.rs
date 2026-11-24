@@ -10,7 +10,10 @@
 //! - **Итеративная резолюция** от встроенных root hints: NS-делегирования,
 //!   bailiwick, glue, CNAME-цепочки (16), глубина 32, бюджет 64 запроса,
 //!   параллельный опрос 1–3 NS, опциональная qname minimization.
-//! - **Forward-режим** с round-robin, health-счётчиками и cooldown.
+//! - **Forward-режим** со смешанными upstream (UDP, TCP, DNS-over-TLS,
+//!   DNS-over-HTTPS/1.1), round-robin, health-счётчиками, cooldown и
+//!   failover по порядку; DoT/DoH проверяют сертификат (webpki-roots или
+//!   явный CA) и держат keep-alive-соединение на upstream.
 //! - **Кеш**: шардированные `RwLock`-шарды, собственная LRU, TTL-декремент,
 //!   negative caching RFC 2308, лимиты записей/памяти, метрики.
 //! - **Blocklist**: домены/hosts/`@@allow`/`*.wildcard`, суффиксное дерево,
@@ -46,10 +49,14 @@
 //!
 //! # Ограничения MVP
 //!
-//! - Нет DoT/DoH/DoQ и io_uring: транспорт блокирующий UDP/TCP.
+//! - Нет DoQ и io_uring: транспорт блокирующий UDP/TCP/DoT/DoH.
+//! - DoH-клиент поддерживает только HTTP/1.1 и `Content-Length`; chunked и
+//!   HTTP/2/3 не реализованы.
 //! - `ANY` и трансферы получают `NOTIMP` (антиамплификация).
 //! - DNSSEC без RRSIG считается insecure (см. модуль `dnssec`).
 //! - Приватные адреса в ответах не фильтруются (SEC-RES-010, вне v1).
+//! - Один keep-alive-соединение на DoT/DoH-upstream (запросы к нему
+//!   сериализуются; при обрыве — одно переподключение).
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -93,8 +100,9 @@ mod upstream;
 pub use blocklist::{Blocklist, BlocklistError, BlocklistStats};
 pub use cache::{Cache, CacheSnapshot};
 pub use config::{
-    BlockResponse, BlocklistConfig, CacheConfig, DnssecConfig, ForwardConfig, IterativeConfig,
-    Mode, Override, ResolverConfig, TimeoutConfig, TrustAnchorConfig,
+    BlockResponse, BlocklistConfig, CacheConfig, DnssecConfig, ForwardConfig, HttpsUpstream,
+    IterativeConfig, Mode, Override, ResolverConfig, TimeoutConfig, TlsUpstream, TrustAnchorConfig,
+    UpstreamConfig,
 };
 pub use error::ResolverError;
 pub use overrides::{OverrideOutcome, Overrides};

@@ -17,6 +17,9 @@ pub enum Error {
     /// Рукопожатие не уложилось в отведённое время.
     #[error("TLS handshake timed out")]
     HandshakeTimeout,
+    /// Операция не уложилась в отведённый дедлайн.
+    #[error("operation timed out")]
+    Timeout,
     /// Клиент не согласовал ALPN.
     #[error("client did not negotiate ALPN")]
     AlpnMissing,
@@ -40,6 +43,21 @@ pub enum Error {
     /// Некорректный CIDR в ACL.
     #[error("invalid CIDR rule: {0}")]
     InvalidCidr(String),
+    /// Некорректный URL upstream-сервера.
+    #[error("invalid upstream URL: {0}")]
+    InvalidUrl(String),
+    /// Имя хоста upstream не разрешилось ни в один адрес.
+    #[error("no addresses found for upstream host {0}")]
+    NoAddresses(String),
+    /// DoH-сервер вернул HTTP-статус, отличный от 200.
+    #[error("DoH server returned HTTP status {status}")]
+    HttpStatus {
+        /// HTTP-статус.
+        status: u16,
+    },
+    /// DoH-сервер вернул не `application/dns-message`.
+    #[error("DoH response has unexpected Content-Type")]
+    HttpContentType,
     /// Обработчик DNS-запроса запаниковал.
     #[error("DNS handler panicked")]
     HandlerPanic,
@@ -77,10 +95,27 @@ impl Error {
     #[must_use]
     pub fn is_timeout(&self) -> bool {
         match self {
-            Self::HandshakeTimeout => true,
+            Self::HandshakeTimeout | Self::Timeout => true,
             Self::Io(error) => matches!(
                 error.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            _ => false,
+        }
+    }
+
+    /// Признак ошибки, после которой имеет смысл переподключиться.
+    #[must_use]
+    pub(crate) fn is_retryable_connection(&self) -> bool {
+        match self {
+            Self::Closed => true,
+            Self::Io(error) => !matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::InvalidInput
+                    | io::ErrorKind::NotFound
+                    | io::ErrorKind::PermissionDenied
             ),
             _ => false,
         }

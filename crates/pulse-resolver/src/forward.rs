@@ -17,21 +17,24 @@ pub(crate) fn resolve(
     if candidates.is_empty() {
         return Err(ResolverError::NoUpstream);
     }
-    let deadline = ctx.deadline();
     let question = Question::new(qname.clone(), qtype, Rclass::IN);
     let mut last_error: Option<ResolverError> = None;
+    let mut position = 0_usize;
 
-    for (index, address) in candidates {
-        match resolver
-            .upstream()
-            .query(address, &question, true, dnssec_ok, deadline, ctx.cancel())
-        {
+    for index in candidates {
+        if position > 0 {
+            resolver.note_failover();
+        }
+        position = position.saturating_add(1);
+        match resolver.query_forwarder(index, &question, dnssec_ok, ctx) {
             Ok(response) => {
                 let rcode = response.message.rcode();
                 if is_retryable_rcode(rcode) {
                     resolver.forwarder_failure(index);
                     last_error = Some(ResolverError::UpstreamRcode {
-                        server: address.to_string(),
+                        server: resolver
+                            .forwarder_config(index)
+                            .map_or_else(|| "upstream".to_owned(), ToString::to_string),
                         rcode,
                     });
                     continue;
@@ -47,13 +50,9 @@ pub(crate) fn resolve(
                 });
             }
             Err(error) => {
-                if matches!(error, ResolverError::Cancelled | ResolverError::Timeout) {
-                    resolver.forwarder_failure(index);
-                    if matches!(error, ResolverError::Cancelled) {
-                        return Err(error);
-                    }
-                } else {
-                    resolver.forwarder_failure(index);
+                resolver.forwarder_failure(index);
+                if matches!(error, ResolverError::Cancelled) {
+                    return Err(error);
                 }
                 last_error = Some(error);
             }

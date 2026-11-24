@@ -15,6 +15,7 @@ pulse-dns = { path = "../pulse-dns" }
 rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 rustls-pemfile = "2.2"
 thiserror = "2"
+webpki-roots = "1"
 
 [dev-dependencies]
 criterion = "0.5"

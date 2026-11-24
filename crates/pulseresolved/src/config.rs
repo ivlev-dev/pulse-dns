@@ -13,8 +13,9 @@ use std::time::Duration;
 use pulse_dns::{Name, Rdata, Ttl};
 use pulse_resolver::{
     BlockResponse, BlocklistConfig as ResolverBlocklistConfig, CacheConfig, DnssecConfig,
-    ForwardConfig, IterativeConfig, Mode, Override, ResolverConfig, TimeoutConfig,
+    ForwardConfig, IterativeConfig, Mode, Override, ResolverConfig, TimeoutConfig, UpstreamConfig,
 };
+use pulse_tls::{Acl, RateLimitConfig as TlsRateLimitConfig, RateLimiter};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 
@@ -227,6 +228,134 @@ impl TcpSetting {
     }
 }
 
+/// Действие при превышении per-source rate limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RateLimitAction {
+    /// Ответить REFUSED.
+    #[default]
+    Refused,
+    /// Молча отбросить запрос (для TCP — закрыть соединение).
+    Drop,
+    /// Ответить пустым усечённым (TC) ответом.
+    #[serde(alias = "tc")]
+    Truncate,
+}
+
+/// Настройки per-source token bucket (RRL-подобное ограничение).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitSetting {
+    /// Включить ограничение.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Средняя скорость пополнения, запросов в секунду.
+    #[serde(default = "default_rate_qps")]
+    pub qps: f64,
+    /// Максимальный burst (запас токенов).
+    #[serde(default = "default_rate_burst")]
+    pub burst: u32,
+    /// Максимум отслеживаемых source IP.
+    #[serde(default = "default_rate_entries")]
+    pub max_entries: usize,
+    /// Действие при превышении.
+    #[serde(default)]
+    pub action: RateLimitAction,
+}
+
+impl Default for RateLimitSetting {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            qps: default_rate_qps(),
+            burst: default_rate_burst(),
+            max_entries: default_rate_entries(),
+            action: RateLimitAction::Refused,
+        }
+    }
+}
+
+impl RateLimitSetting {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.qps.is_finite() || self.qps <= 0.0 {
+            return Err(ConfigError::invalid(
+                "rate_limit.qps must be finite and positive",
+            ));
+        }
+        if self.burst == 0 {
+            return Err(ConfigError::invalid("rate_limit.burst must be positive"));
+        }
+        if self.max_entries == 0 || self.max_entries > 1_000_000 {
+            return Err(ConfigError::invalid(
+                "rate_limit.max_entries must be in 1..=1000000",
+            ));
+        }
+        Ok(())
+    }
+
+    fn to_config(&self) -> TlsRateLimitConfig {
+        TlsRateLimitConfig {
+            burst: self.burst,
+            refill_per_sec: self.qps,
+            max_entries: self.max_entries,
+        }
+    }
+}
+
+/// Один upstream: строка-URL или объект `{addr, tls, server_name, ca}`.
+#[derive(Debug, Clone)]
+pub struct UpstreamSetting {
+    /// Разобранный upstream.
+    pub upstream: UpstreamConfig,
+}
+
+impl<'de> Deserialize<'de> for UpstreamSetting {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(text) => {
+                let upstream = UpstreamConfig::parse(&text).map_err(de::Error::custom)?;
+                Ok(Self { upstream })
+            }
+            serde_json::Value::Object(map) => {
+                let ca = map
+                    .get("ca")
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from);
+                let raw = if let Some(url) = map.get("url").and_then(serde_json::Value::as_str) {
+                    url.to_owned()
+                } else {
+                    let addr = map
+                        .get("addr")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            de::Error::custom("upstream object requires \"url\" or \"addr\" string")
+                        })?;
+                    let tls = map
+                        .get("tls")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let server_name = map.get("server_name").and_then(serde_json::Value::as_str);
+                    if tls && !addr.to_ascii_lowercase().contains("://") {
+                        match server_name {
+                            Some(name) => format!("tls://{addr}#{name}"),
+                            None => format!("tls://{addr}"),
+                        }
+                    } else {
+                        addr.to_owned()
+                    }
+                };
+                let upstream =
+                    UpstreamConfig::parse_with_ca(&raw, ca).map_err(de::Error::custom)?;
+                Ok(Self { upstream })
+            }
+            _ => Err(de::Error::custom(
+                "upstream must be a URL string or an object",
+            )),
+        }
+    }
+}
+
 /// Таймауты резолвера.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -325,9 +454,18 @@ pub struct Config {
     /// Режим резолюции.
     #[serde(default)]
     pub mode: ModeSetting,
-    /// Forwarder-ы для `mode = "forward"`.
+    /// Forwarder-ы для `mode = "forward"` (legacy UDP-список).
     #[serde(default)]
     pub forwarders: Vec<SocketAddr>,
+    /// Смешанные upstream: UDP/TCP/DoT/DoH (URL или объект).
+    #[serde(default)]
+    pub upstreams: Vec<UpstreamSetting>,
+    /// IP/CIDR клиентов, которым разрешены запросы. Пусто — loopback.
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    /// Per-source rate limit (RRL-подобное ограничение).
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitSetting>,
     /// Root hints для `mode = "iterative"` (пусто — встроенные IANA).
     #[serde(default)]
     pub root_hints: Vec<SocketAddr>,
@@ -369,6 +507,9 @@ impl Default for Config {
             workers: 0,
             mode: ModeSetting::default(),
             forwarders: Vec::new(),
+            upstreams: Vec::new(),
+            allow_from: Vec::new(),
+            rate_limit: None,
             root_hints: Vec::new(),
             ns_port: default_ns_port(),
             dnssec_validate: false,
@@ -439,12 +580,23 @@ impl Config {
             return Err(ConfigError::invalid("ns_port must be non-zero"));
         }
         match self.mode {
-            ModeSetting::Forward if self.forwarders.is_empty() => {
+            ModeSetting::Forward if self.forwarders.is_empty() && self.upstreams.is_empty() => {
                 return Err(ConfigError::invalid(
-                    "forward mode requires at least one forwarder",
+                    "forward mode requires at least one forwarder or upstream",
+                ));
+            }
+            ModeSetting::Iterative if !self.upstreams.is_empty() => {
+                return Err(ConfigError::invalid(
+                    "upstreams are only supported in forward mode",
                 ));
             }
             ModeSetting::Forward | ModeSetting::Iterative => {}
+        }
+        self.build_acl()?;
+        if let Some(rate_limit) = &self.rate_limit
+            && rate_limit.enabled
+        {
+            rate_limit.validate()?;
         }
         if let Some(metrics) = self.metrics_listen
             && !metrics.ip().is_loopback()
@@ -509,6 +661,46 @@ impl Config {
         Ok(())
     }
 
+    /// Строит ACL клиентов. Пустой `allow_from` означает loopback-only.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] при некорректном CIDR.
+    pub fn build_acl(&self) -> Result<Acl, ConfigError> {
+        if self.allow_from.is_empty() {
+            return Acl::from_cidrs(["127.0.0.0/8", "::1/128"])
+                .map_err(|error| ConfigError::invalid(format!("allow_from: {error}")));
+        }
+        Acl::from_cidrs(&self.allow_from)
+            .map_err(|error| ConfigError::invalid(format!("allow_from: {error}")))
+    }
+
+    /// Строит rate limiter, если он включён.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] при некорректных параметрах.
+    pub fn build_rate_limiter(&self) -> Result<Option<RateLimiter>, ConfigError> {
+        let Some(rate_limit) = &self.rate_limit else {
+            return Ok(None);
+        };
+        if !rate_limit.enabled {
+            return Ok(None);
+        }
+        rate_limit.validate()?;
+        RateLimiter::new(rate_limit.to_config())
+            .map(Some)
+            .map_err(|error| ConfigError::invalid(format!("rate_limit: {error}")))
+    }
+
+    /// Действие при превышении rate limit.
+    #[must_use]
+    pub fn rate_limit_action(&self) -> RateLimitAction {
+        self.rate_limit
+            .as_ref()
+            .map_or(RateLimitAction::Refused, |setting| setting.action)
+    }
+
     /// Строит конфигурацию `pulse-resolver` (с чтением trust anchors).
     ///
     /// # Errors
@@ -518,7 +710,20 @@ impl Config {
     pub fn resolver_config(&self) -> Result<ResolverConfig, ConfigError> {
         self.validate()?;
         let mode = match self.mode {
-            ModeSetting::Forward => Mode::Forward(ForwardConfig::new(self.forwarders.clone())),
+            ModeSetting::Forward => {
+                let mut upstreams: Vec<UpstreamConfig> = self
+                    .forwarders
+                    .iter()
+                    .copied()
+                    .map(UpstreamConfig::Udp)
+                    .collect();
+                upstreams.extend(
+                    self.upstreams
+                        .iter()
+                        .map(|setting| setting.upstream.clone()),
+                );
+                Mode::Forward(ForwardConfig::with_upstreams(upstreams))
+            }
             ModeSetting::Iterative => Mode::Iterative(IterativeConfig {
                 root_hints: self.root_hints.clone(),
                 ns_port: self.ns_port,
@@ -575,6 +780,16 @@ impl Config {
             self.mode = ModeSetting::Forward;
             self.forwarders.clone_from(&overrides.forwarders);
         }
+        if !overrides.upstreams.is_empty() {
+            self.mode = ModeSetting::Forward;
+            self.upstreams.extend(
+                overrides
+                    .upstreams
+                    .iter()
+                    .cloned()
+                    .map(|upstream| UpstreamSetting { upstream }),
+            );
+        }
         if !overrides.blocklists.is_empty() {
             self.blocklist
                 .paths
@@ -602,12 +817,30 @@ pub struct Overrides {
     pub workers: Option<usize>,
     /// Новые forwarder-ы (включают forward-режим).
     pub forwarders: Vec<SocketAddr>,
+    /// Дополнительные смешанные upstream (включают forward-режим).
+    pub upstreams: Vec<UpstreamConfig>,
     /// Дополнительные файлы blocklist.
     pub blocklists: Vec<PathBuf>,
     /// Выключить DNSSEC-валидацию.
     pub no_dnssec: bool,
     /// Новый уровень логирования.
     pub log_level: Option<LogLevel>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_rate_qps() -> f64 {
+    20.0
+}
+
+fn default_rate_burst() -> u32 {
+    100
+}
+
+fn default_rate_entries() -> usize {
+    10_000
 }
 
 fn default_ns_port() -> u16 {
@@ -677,6 +910,22 @@ mod tests {
     }
 
     #[test]
+    fn secure_example_config_parses() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/resolver-secure.json");
+        let config = Config::load(&path).expect("secure example");
+        config.validate().expect("secure example is valid");
+        assert_eq!(config.upstreams.len(), 4);
+        assert!(config.rate_limit.is_some());
+        assert_eq!(config.allow_from.len(), 3);
+        let resolver = config.resolver_config().expect("resolver config");
+        let Mode::Forward(forward) = resolver.mode else {
+            panic!("forward mode expected");
+        };
+        assert_eq!(forward.effective_upstreams().len(), 4);
+    }
+
+    #[test]
     fn defaults_parse_from_empty_json_and_validate_transport() {
         let config = Config::from_json_str("{}").unwrap();
         assert!(config.validate().is_err());
@@ -738,6 +987,74 @@ mod tests {
         assert!(config.validate().is_err());
         config.metrics_listen = Some("127.0.0.1:9153".parse().unwrap());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn upstreams_parse_strings_and_objects() {
+        let text = r#"{
+            "listen_udp": "127.0.0.1:0",
+            "upstreams": [
+                "1.1.1.1",
+                "tcp://9.9.9.9:53",
+                "tls://dns.example:853#dns.example",
+                {"addr": "127.0.0.1:8853", "tls": true, "server_name": "localhost"},
+                {"url": "https://dns.example/dns-query", "ca": "ca.pem"}
+            ]
+        }"#;
+        let config = Config::from_json_str(text).expect("config");
+        config.validate().expect("valid");
+        assert_eq!(config.upstreams.len(), 5);
+        let resolver = config.resolver_config().expect("resolver");
+        let Mode::Forward(forward) = resolver.mode else {
+            panic!("forward mode expected");
+        };
+        assert_eq!(forward.effective_upstreams().len(), 5);
+        assert_eq!(forward.effective_upstreams()[0].kind(), "udp");
+        assert_eq!(forward.effective_upstreams()[1].kind(), "tcp");
+        assert_eq!(forward.effective_upstreams()[2].kind(), "tls");
+        assert_eq!(forward.effective_upstreams()[3].kind(), "tls");
+        assert_eq!(forward.effective_upstreams()[4].kind(), "https");
+    }
+
+    #[test]
+    fn allow_from_and_rate_limit_are_validated() {
+        let mut config = forward_config();
+        config.allow_from = vec!["192.0.2.0/24".to_owned(), "2001:db8::/32".to_owned()];
+        let acl = config.build_acl().expect("acl");
+        assert!(acl.allows("192.0.2.5".parse().unwrap()));
+        assert!(acl.allows("2001:db8::1".parse().unwrap()));
+        assert!(!acl.allows("198.51.100.1".parse().unwrap()));
+
+        config.allow_from = vec!["not-a-cidr".to_owned()];
+        assert!(config.validate().is_err());
+
+        let mut config = forward_config();
+        config.rate_limit = Some(RateLimitSetting {
+            qps: 0.0,
+            ..RateLimitSetting::default()
+        });
+        assert!(config.validate().is_err());
+        config.rate_limit = Some(RateLimitSetting {
+            burst: 0,
+            ..RateLimitSetting::default()
+        });
+        assert!(config.validate().is_err());
+        config.rate_limit = Some(RateLimitSetting::default());
+        assert!(config.validate().is_ok());
+        assert!(config.build_rate_limiter().expect("limiter").is_some());
+    }
+
+    #[test]
+    fn iterative_mode_rejects_upstreams() {
+        let mut config = Config {
+            mode: ModeSetting::Iterative,
+            ..Config::default()
+        };
+        config.listen_udp = Some("127.0.0.1:0".parse().unwrap());
+        config.upstreams = vec![UpstreamSetting {
+            upstream: UpstreamConfig::parse("1.1.1.1").unwrap(),
+        }];
+        assert!(config.validate().is_err());
     }
 
     #[test]

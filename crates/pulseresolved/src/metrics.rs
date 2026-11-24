@@ -103,6 +103,36 @@ impl MetricsSource {
         );
         counter(
             &mut out,
+            "pulseresolved_refused_acl_total",
+            "REFUSED responses caused by the client ACL.",
+            stats.refused_acl,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_rate_limited_total",
+            "Requests rejected or dropped by the per-source rate limit.",
+            stats.rate_limited,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_rate_limit_dropped_total",
+            "Rate-limited requests dropped without a response.",
+            stats.rate_limit_dropped,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_rate_limit_refused_total",
+            "Rate-limited requests answered with REFUSED.",
+            stats.rate_limit_refused,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_rate_limit_truncated_total",
+            "Rate-limited requests answered with an empty TC response.",
+            stats.rate_limit_truncated,
+        );
+        counter(
+            &mut out,
             "pulseresolved_truncated_total",
             "TC responses.",
             stats.truncated,
@@ -239,6 +269,48 @@ impl MetricsSource {
             "pulseresolved_upstream_tcp_queries_total",
             "Upstream TCP queries.",
             resolver.upstream.tcp_queries,
+        );
+        out.push_str(
+            "# HELP pulseresolved_upstream_queries_total Upstream queries by transport.\n",
+        );
+        out.push_str("# TYPE pulseresolved_upstream_queries_total counter\n");
+        let _ = writeln!(
+            out,
+            "pulseresolved_upstream_queries_total{{transport=\"udp\"}} {}",
+            resolver.upstream.udp_queries
+        );
+        let _ = writeln!(
+            out,
+            "pulseresolved_upstream_queries_total{{transport=\"tcp\"}} {}",
+            resolver.upstream.tcp_queries
+        );
+        let _ = writeln!(
+            out,
+            "pulseresolved_upstream_queries_total{{transport=\"tls\"}} {}",
+            resolver.upstream.tls_queries
+        );
+        let _ = writeln!(
+            out,
+            "pulseresolved_upstream_queries_total{{transport=\"https\"}} {}",
+            resolver.upstream.https_queries
+        );
+        counter(
+            &mut out,
+            "pulseresolved_upstream_tls_queries_total",
+            "Upstream DNS-over-TLS queries.",
+            resolver.upstream.tls_queries,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_upstream_https_queries_total",
+            "Upstream DNS-over-HTTPS queries.",
+            resolver.upstream.https_queries,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_upstream_failovers_total",
+            "Upstream failovers to the next configured server.",
+            resolver.upstream.failovers,
         );
         counter(
             &mut out,
@@ -467,6 +539,10 @@ mod tests {
         assert!(text.contains("pulseresolved_cache_entries 0"));
         assert!(text.contains("# TYPE pulseresolved_queries_total counter"));
         assert!(text.contains("pulseresolved_blocklist_reloads_total 1"));
+        assert!(text.contains("pulseresolved_refused_acl_total"));
+        assert!(text.contains("pulseresolved_rate_limited_total"));
+        assert!(text.contains("pulseresolved_upstream_queries_total{transport=\"tls\"}"));
+        assert!(text.contains("pulseresolved_upstream_failovers_total"));
         assert!(MetricsSource::healthz().starts_with("ok"));
     }
 

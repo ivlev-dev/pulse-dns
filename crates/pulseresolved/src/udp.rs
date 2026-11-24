@@ -27,8 +27,8 @@ impl UdpService {
             .with_workers(workers)
             .with_rx_buffer_size(RX_BUFFER_SIZE)
             .with_tx(512, TX_SLOT_SIZE);
-        let handler = move |request: &[u8], _peer: SocketAddr, _out: &mut [u8]| {
-            Reply::from_owned(processor.handle(request, Transport::Udp))
+        let handler = move |request: &[u8], peer: SocketAddr, _out: &mut [u8]| {
+            Reply::from_owned(processor.handle(request, Transport::Udp, peer))
         };
         let server = UdpServer::bind_with(addr, handler, config)?;
         server.start()?;

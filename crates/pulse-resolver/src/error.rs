@@ -37,6 +37,12 @@ pub enum ResolverError {
     /// Ошибка сокета или файла.
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
+    /// Ошибка защищённого upstream-транспорта (DoT/DoH).
+    #[error("upstream transport error: {reason}")]
+    Transport {
+        /// Причина без секретов.
+        reason: String,
+    },
     /// Не удалось разобрать ответ upstream.
     #[error("malformed upstream response: {0}")]
     Decode(#[from] DecodeError),
@@ -135,6 +141,7 @@ impl ResolverError {
             | Self::Timeout
             | Self::Cancelled
             | Self::Io(_)
+            | Self::Transport { .. }
             | Self::Decode(_)
             | Self::Encode(_)
             | Self::Mismatch { .. }

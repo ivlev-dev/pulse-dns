@@ -4,7 +4,7 @@
 //! root hints, DNSSEC-валидация выключена (passthrough), blocklist пуст,
 //! 0x20 включена для UDP.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -47,11 +47,285 @@ impl Default for IterativeConfig {
     }
 }
 
+/// Upstream DNS-over-TLS.
+///
+/// `host`/`port` разрешаются клиентом при подключении; `server_name` задаёт
+/// SNI и имя для проверки сертификата. `ca` — PEM-файл единственного
+/// доверенного CA (без него используются webpki-roots).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsUpstream {
+    /// Имя хоста или IP-литерал без скобок.
+    pub host: String,
+    /// Порт (по умолчанию 853).
+    pub port: u16,
+    /// Имя для SNI/проверки сертификата.
+    pub server_name: String,
+    /// Опциональный PEM-файл CA.
+    pub ca: Option<PathBuf>,
+}
+
+impl TlsUpstream {
+    /// Создаёт upstream из разрешённого адреса.
+    #[must_use]
+    pub fn new(address: SocketAddr, server_name: impl Into<String>) -> Self {
+        Self {
+            host: address.ip().to_string(),
+            port: address.port(),
+            server_name: server_name.into(),
+            ca: None,
+        }
+    }
+
+    /// `host:port` (IPv6-литерал в скобках).
+    #[must_use]
+    pub fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+impl std::fmt::Display for TlsUpstream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "tls://{}#{}", self.authority(), self.server_name)
+    }
+}
+
+/// Upstream DNS-over-HTTPS (HTTP/1.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpsUpstream {
+    /// Полный URL `https://host[:port]/path`.
+    pub url: String,
+    /// Опциональный PEM-файл CA.
+    pub ca: Option<PathBuf>,
+}
+
+impl std::fmt::Display for HttpsUpstream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.url)
+    }
+}
+
+/// Один upstream смешанного списка.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamConfig {
+    /// Классический UDP с TCP-fallback при TC.
+    Udp(SocketAddr),
+    /// Только TCP (RFC 7766).
+    Tcp(SocketAddr),
+    /// DNS-over-TLS (RFC 7858).
+    Tls(TlsUpstream),
+    /// DNS-over-HTTPS/1.1 (RFC 8484).
+    Https(HttpsUpstream),
+}
+
+impl UpstreamConfig {
+    /// Разбирает URL или адрес: `1.1.1.1`, `tcp://…`, `tls://…#name`,
+    /// `https://…/dns-query`.
+    ///
+    /// # Errors
+    ///
+    /// [`ResolverError::Config`] при некорректной схеме, адресе или имени.
+    pub fn parse(value: &str) -> Result<Self, ResolverError> {
+        Self::parse_with_ca(value, None)
+    }
+
+    /// То же, но с CA-файлом для DoT/DoH.
+    ///
+    /// # Errors
+    ///
+    /// См. [`UpstreamConfig::parse`].
+    pub fn parse_with_ca(value: &str, ca: Option<PathBuf>) -> Result<Self, ResolverError> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(ResolverError::config("upstream must not be empty"));
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("tls://") {
+            return Self::parse_tls(trimmed, ca);
+        }
+        if lower.starts_with("https://") {
+            return Self::parse_https(trimmed, ca);
+        }
+        if lower.starts_with("http://") {
+            return Err(ResolverError::config(
+                "DoH upstream must use https://, http:// is not allowed",
+            ));
+        }
+        if lower.starts_with("tcp://") {
+            let rest = trimmed.get(6..).unwrap_or_default();
+            return Ok(Self::Tcp(parse_socket_addr(rest, 53)?));
+        }
+        if lower.starts_with("udp://") {
+            let rest = trimmed.get(6..).unwrap_or_default();
+            return Ok(Self::Udp(parse_socket_addr(rest, 53)?));
+        }
+        if let Some((scheme, _)) = trimmed.split_once("://") {
+            return Err(ResolverError::config(format!(
+                "unsupported upstream scheme {scheme:?}"
+            )));
+        }
+        Ok(Self::Udp(parse_socket_addr(trimmed, 53)?))
+    }
+
+    fn parse_tls(value: &str, ca: Option<PathBuf>) -> Result<Self, ResolverError> {
+        let rest = value.get("tls://".len()..).unwrap_or_default();
+        let (authority, server_name) = match rest.split_once('#') {
+            Some((authority, name)) => (authority, Some(name)),
+            None => (rest, None),
+        };
+        let (host, port) = split_host_port(authority, 853, "tls")?;
+        if host.is_empty() {
+            return Err(ResolverError::config(format!(
+                "invalid TLS upstream {value:?}"
+            )));
+        }
+        let server_name = server_name
+            .filter(|name| !name.trim().is_empty())
+            .map_or_else(|| host.clone(), |name| name.trim().to_owned());
+        if server_name.contains('/') || server_name.contains(' ') {
+            return Err(ResolverError::config(format!(
+                "invalid TLS server name {server_name:?}"
+            )));
+        }
+        Ok(Self::Tls(TlsUpstream {
+            host,
+            port,
+            server_name,
+            ca,
+        }))
+    }
+
+    fn parse_https(value: &str, ca: Option<PathBuf>) -> Result<Self, ResolverError> {
+        let rest = value.get("https://".len()..).unwrap_or_default();
+        let authority = rest
+            .split_once('/')
+            .map_or(rest, |(authority, _)| authority);
+        let authority = authority.split('#').next().unwrap_or(authority);
+        if authority.is_empty()
+            || authority.contains('\r')
+            || authority.contains('\n')
+            || authority.contains(' ')
+        {
+            return Err(ResolverError::config(format!("invalid DoH URL {value:?}")));
+        }
+        let (host, _port) = split_host_port(authority, 443, "https")?;
+        if host.is_empty() {
+            return Err(ResolverError::config(format!("invalid DoH URL {value:?}")));
+        }
+        Ok(Self::Https(HttpsUpstream {
+            url: value.to_owned(),
+            ca,
+        }))
+    }
+
+    /// Тип upstream для метрик: `udp`, `tcp`, `tls` или `https`.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Udp(_) => "udp",
+            Self::Tcp(_) => "tcp",
+            Self::Tls(_) => "tls",
+            Self::Https(_) => "https",
+        }
+    }
+}
+
+impl std::fmt::Display for UpstreamConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Udp(address) => write!(formatter, "udp://{address}"),
+            Self::Tcp(address) => write!(formatter, "tcp://{address}"),
+            Self::Tls(upstream) => upstream.fmt(formatter),
+            Self::Https(upstream) => upstream.fmt(formatter),
+        }
+    }
+}
+
+fn split_host_port(
+    authority: &str,
+    default_port: u16,
+    scheme: &str,
+) -> Result<(String, u16), ResolverError> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return Err(ResolverError::config(format!(
+            "{scheme} upstream has an empty host"
+        )));
+    }
+    if authority.parse::<std::net::IpAddr>().is_ok() {
+        return Ok((authority.to_owned(), default_port));
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest.split_once(']').ok_or_else(|| {
+            ResolverError::config(format!("{scheme} upstream has an invalid IPv6 host"))
+        })?;
+        let port = match after.strip_prefix(':') {
+            Some(port) if !port.is_empty() => port.parse::<u16>().map_err(|_| {
+                ResolverError::config(format!("{scheme} upstream has an invalid port"))
+            })?,
+            Some(_) => {
+                return Err(ResolverError::config(format!(
+                    "{scheme} upstream has an invalid port"
+                )));
+            }
+            None => default_port,
+        };
+        return Ok((host.to_owned(), port));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|ch| ch.is_ascii_digit()) => Ok((
+            host.to_owned(),
+            port.parse::<u16>().map_err(|_| {
+                ResolverError::config(format!("{scheme} upstream has an invalid port"))
+            })?,
+        )),
+        Some(_) if authority.matches(':').count() == 1 => Err(ResolverError::config(format!(
+            "{scheme} upstream has an invalid port"
+        ))),
+        Some(_) | None => Ok((authority.to_owned(), default_port)),
+    }
+}
+
+fn parse_socket_addr(value: &str, default_port: u16) -> Result<SocketAddr, ResolverError> {
+    let value = value.trim();
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return Ok(address);
+    }
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, default_port));
+    }
+    if let Some((host, port)) = value.rsplit_once(':')
+        && port.chars().all(|ch| ch.is_ascii_digit())
+        && !host.is_empty()
+        && !host.contains(':')
+    {
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| ResolverError::config(format!("invalid upstream port in {value:?}")))?;
+        return resolve_first(host, port);
+    }
+    resolve_first(value, default_port)
+}
+
+fn resolve_first(host: &str, port: u16) -> Result<SocketAddr, ResolverError> {
+    (host, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addresses| addresses.next())
+        .ok_or_else(|| ResolverError::config(format!("cannot resolve upstream host {host:?}")))
+}
+
 /// Параметры forward-режима.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardConfig {
-    /// Адреса forwarder-ов.
+    /// Адреса UDP-forwarder-ов (legacy-поле; используется, если `upstreams`
+    /// пуст).
     pub servers: Vec<SocketAddr>,
+    /// Смешанный список upstream (UDP/TCP/DoT/DoH).
+    pub upstreams: Vec<UpstreamConfig>,
     /// Сколько подряд ошибок переводят forwarder в cooldown.
     pub max_failures: u32,
     /// Длительность cooldown.
@@ -59,13 +333,46 @@ pub struct ForwardConfig {
 }
 
 impl ForwardConfig {
-    /// Создаёт конфигурацию из адресов.
+    /// Создаёт конфигурацию из UDP-адресов.
     #[must_use]
     pub fn new(servers: Vec<SocketAddr>) -> Self {
         Self {
             servers,
+            upstreams: Vec::new(),
             max_failures: 2,
             cooldown: Duration::from_secs(30),
+        }
+    }
+
+    /// Создаёт конфигурацию из смешанного списка upstream.
+    #[must_use]
+    pub fn with_upstreams(upstreams: Vec<UpstreamConfig>) -> Self {
+        let servers = upstreams
+            .iter()
+            .filter_map(|upstream| match upstream {
+                UpstreamConfig::Udp(address) => Some(*address),
+                UpstreamConfig::Tcp(_) | UpstreamConfig::Tls(_) | UpstreamConfig::Https(_) => None,
+            })
+            .collect();
+        Self {
+            servers,
+            upstreams,
+            max_failures: 2,
+            cooldown: Duration::from_secs(30),
+        }
+    }
+
+    /// Итоговый список upstream: явный `upstreams` или legacy `servers`.
+    #[must_use]
+    pub fn effective_upstreams(&self) -> Vec<UpstreamConfig> {
+        if self.upstreams.is_empty() {
+            self.servers
+                .iter()
+                .copied()
+                .map(UpstreamConfig::Udp)
+                .collect()
+        } else {
+            self.upstreams.clone()
         }
     }
 }
@@ -371,6 +678,15 @@ impl ResolverConfig {
         }
     }
 
+    /// Конфигурация forward-режима со смешанными upstream.
+    #[must_use]
+    pub fn forward_upstreams(upstreams: Vec<UpstreamConfig>) -> Self {
+        Self {
+            mode: Mode::Forward(ForwardConfig::with_upstreams(upstreams)),
+            ..Self::default()
+        }
+    }
+
     /// Конфигурация итеративного режима со встроенными root hints.
     #[must_use]
     pub fn iterative() -> Self {
@@ -426,10 +742,10 @@ impl ResolverConfig {
             return Err(ResolverError::config("dnssec limits must be positive"));
         }
         if let Mode::Forward(forward) = &self.mode
-            && forward.servers.is_empty()
+            && forward.effective_upstreams().is_empty()
         {
             return Err(ResolverError::config(
-                "forward mode requires at least one server",
+                "forward mode requires at least one upstream",
             ));
         }
         for entry in &self.overrides {
@@ -474,5 +790,56 @@ mod tests {
         config.cache.min_ttl = 100;
         config.cache.max_ttl = 10;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parses_upstream_urls() {
+        assert_eq!(
+            UpstreamConfig::parse("1.1.1.1").unwrap(),
+            UpstreamConfig::Udp("1.1.1.1:53".parse().unwrap())
+        );
+        assert_eq!(
+            UpstreamConfig::parse("tcp://1.1.1.1:5353").unwrap(),
+            UpstreamConfig::Tcp("1.1.1.1:5353".parse().unwrap())
+        );
+        let tls = UpstreamConfig::parse("tls://dns.example:853#dns.example").unwrap();
+        match &tls {
+            UpstreamConfig::Tls(upstream) => {
+                assert_eq!(upstream.host, "dns.example");
+                assert_eq!(upstream.port, 853);
+                assert_eq!(upstream.server_name, "dns.example");
+            }
+            other => panic!("unexpected upstream: {other:?}"),
+        }
+        assert_eq!(tls.kind(), "tls");
+        assert_eq!(
+            UpstreamConfig::parse("https://dns.example/dns-query")
+                .unwrap()
+                .kind(),
+            "https"
+        );
+        assert!(UpstreamConfig::parse("http://dns.example/dns-query").is_err());
+        assert!(UpstreamConfig::parse("quic://dns.example").is_err());
+        assert!(UpstreamConfig::parse("tls:///foo").is_err());
+    }
+
+    #[test]
+    fn mixed_upstreams_validate() {
+        let upstreams = vec![
+            UpstreamConfig::Udp("127.0.0.1:53".parse().unwrap()),
+            UpstreamConfig::Tls(TlsUpstream {
+                host: "127.0.0.1".to_owned(),
+                port: 853,
+                server_name: "localhost".to_owned(),
+                ca: None,
+            }),
+        ];
+        let config = ResolverConfig::forward_upstreams(upstreams);
+        assert!(config.validate().is_ok());
+        let Mode::Forward(forward) = &config.mode else {
+            return;
+        };
+        assert_eq!(forward.effective_upstreams().len(), 2);
+        assert_eq!(forward.servers.len(), 1);
     }
 }

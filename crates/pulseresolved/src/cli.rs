@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
+use pulse_resolver::UpstreamConfig;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
@@ -90,7 +91,7 @@ pub(crate) fn run() -> ExitCode {
     logging::info(
         "stats",
         &format!(
-            "queries(udp={},tcp={}) responses(udp={},tcp={}) decode_errors={} encode_errors={} formerr={} refused={} truncated={} dropped={}",
+            "queries(udp={},tcp={}) responses(udp={},tcp={}) decode_errors={} encode_errors={} formerr={} refused={} refused_acl={} rate_limited={} truncated={} dropped={}",
             stats.udp_queries,
             stats.tcp_queries,
             stats.udp_responses,
@@ -99,6 +100,8 @@ pub(crate) fn run() -> ExitCode {
             stats.encode_errors,
             stats.formerr,
             stats.refused,
+            stats.refused_acl,
+            stats.rate_limited,
             stats.truncated,
             stats.dropped
         ),
@@ -156,6 +159,10 @@ fn overrides(matches: &ArgMatches) -> Overrides {
             .get_many::<SocketAddr>("forward")
             .map(|values| values.copied().collect())
             .unwrap_or_default(),
+        upstreams: matches
+            .get_many::<UpstreamConfig>("upstream")
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default(),
         blocklists: matches
             .get_many::<PathBuf>("blocklist")
             .map(|values| values.cloned().collect())
@@ -174,6 +181,10 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
         | ServerError::MetricsStart { .. }
         | ServerError::Reload(_) => ExitCode::from(1),
     }
+}
+
+fn parse_upstream(value: &str) -> Result<UpstreamConfig, String> {
+    UpstreamConfig::parse(value).map_err(|error| error.to_string())
 }
 
 fn parse_forwarder(value: &str) -> Result<SocketAddr, String> {
@@ -227,6 +238,14 @@ fn command() -> Command {
                 .action(ArgAction::Append)
                 .value_parser(parse_forwarder)
                 .help("Forwarder address (repeatable); switches to forward mode"),
+        )
+        .arg(
+            Arg::new("upstream")
+                .long("upstream")
+                .value_name("URL")
+                .action(ArgAction::Append)
+                .value_parser(parse_upstream)
+                .help("Upstream URL: udp://addr, tcp://addr, tls://host:853#name or https://host/dns-query (repeatable)"),
         )
         .arg(
             Arg::new("workers")
@@ -298,5 +317,25 @@ mod tests {
         assert_eq!(overrides.blocklists.len(), 2);
         assert!(overrides.no_dnssec);
         assert_eq!(overrides.workers, Some(2));
+    }
+
+    #[test]
+    fn cli_parses_secure_upstreams() {
+        let matches = command()
+            .try_get_matches_from([
+                "pulseresolved",
+                "--config",
+                "examples/resolver.json",
+                "--upstream",
+                "tls://dns.example:853#dns.example",
+                "--upstream",
+                "https://dns.example/dns-query",
+            ])
+            .unwrap();
+        let overrides = overrides(&matches);
+        assert_eq!(overrides.upstreams.len(), 2);
+        assert_eq!(overrides.upstreams[0].kind(), "tls");
+        assert_eq!(overrides.upstreams[1].kind(), "https");
+        assert!(parse_upstream("http://dns.example/dns-query").is_err());
     }
 }

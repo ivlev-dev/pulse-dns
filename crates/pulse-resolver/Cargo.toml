@@ -12,11 +12,13 @@ authors.workspace = true
 getrandom = "0.4"
 pulse-dns = { path = "../pulse-dns" }
 pulse-dnssec = { path = "../pulse-dnssec" }
+pulse-tls = { path = "../pulse-tls" }
 thiserror = "2"
 
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 tempfile = "3"
 
 [[bench]]

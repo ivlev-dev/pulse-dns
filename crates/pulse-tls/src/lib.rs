@@ -15,6 +15,11 @@
 //! обработчик вызывается из потока соединения. `None` закрывает соединение
 //! (DoT) или даёт HTTP 500 (DoH).
 //!
+//! Для upstream-резолвера крейт также предоставляет синхронные клиенты
+//! [`client::DotClient`] и [`client::DohClient`]: проверка сертификата по
+//! webpki-roots или явному CA, ALPN `dot`/`http/1.1`, keep-alive-соединение
+//! с переподключением и раздельные таймауты connect/IO.
+//!
 //! # Ограничения MVP
 //!
 //! - Только HTTP/1.1. HTTP/2 (ALPN `h2`) и HTTP/3 не поддерживаются; preface
@@ -25,6 +30,8 @@
 //!   (`DohConfig::cache_control`) и вычисляется по ответу через `pulse-dns`.
 //! - Hot-reload сертификата применяется к новым соединениям; уже открытые
 //!   TLS-сессии продолжают работать со старой парой.
+//! - Клиент DoH поддерживает только HTTP/1.1 с `Content-Length`; chunked
+//!   transfer-encoding не реализован.
 //!
 //! # Безопасность
 //!
@@ -101,6 +108,7 @@
 )]
 
 pub mod acl;
+pub mod client;
 pub mod doh;
 pub mod dot;
 pub mod error;
@@ -113,6 +121,7 @@ mod server;
 mod transport;
 
 pub use acl::Acl;
+pub use client::{ClientTlsConfig, DohClient, DotClient};
 pub use doh::{DohConfig, DohServer};
 pub use dot::{DnsHandler, DotConfig, DotServer};
 pub use error::Error;

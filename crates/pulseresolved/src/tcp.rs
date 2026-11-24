@@ -126,7 +126,7 @@ fn accept_loop(
 ) {
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _peer)) => {
+            Ok((stream, peer)) => {
                 let active = stats.tcp_active();
                 if active >= u64::try_from(max_connections).unwrap_or(u64::MAX) {
                     stats.tcp_rejected();
@@ -155,7 +155,7 @@ fn accept_loop(
                     .spawn(move || {
                         let _guard = guard;
                         if let Err(error) =
-                            handle_connection(stream, &processor, &shutdown, idle_timeout)
+                            handle_connection(stream, peer, &processor, &shutdown, idle_timeout)
                         {
                             stats.tcp_io_error();
                             logging::debug(
@@ -202,6 +202,7 @@ impl Drop for ConnectionGuard {
 
 fn handle_connection(
     mut stream: TcpStream,
+    peer: SocketAddr,
     processor: &Processor,
     shutdown: &AtomicBool,
     idle_timeout: Duration,
@@ -223,7 +224,7 @@ fn handle_connection(
         if !read_exact_idle(&mut stream, &mut request)? {
             return Ok(());
         }
-        let Some(response) = processor.handle(&request, Transport::Tcp) else {
+        let Some(response) = processor.handle(&request, Transport::Tcp, peer) else {
             return Ok(());
         };
         write_frame(&mut stream, &response)?;

@@ -1,5 +1,6 @@
 //! Обработка одного DNS-запроса: decode → resolve → encode с усечением.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use pulse_dns::{
@@ -7,7 +8,9 @@ use pulse_dns::{
     MAX_MESSAGE_LEN, MAX_UDP_PAYLOAD, Message, Opcode, Rcode, Rtype,
 };
 use pulse_resolver::Resolver;
+use pulse_tls::{Acl, RateLimiter};
 
+use crate::config::RateLimitAction;
 use crate::stats::Stats;
 
 /// Транспорт, по которому пришёл запрос.
@@ -17,31 +20,94 @@ pub(crate) enum Transport {
     Tcp,
 }
 
+/// Политика доступа к сервису: ACL клиентов и per-source rate limit.
+pub(crate) struct AccessPolicy {
+    acl: Acl,
+    limiter: Option<RateLimiter>,
+    action: RateLimitAction,
+}
+
+impl AccessPolicy {
+    pub(crate) fn new(acl: Acl, limiter: Option<RateLimiter>, action: RateLimitAction) -> Self {
+        Self {
+            acl,
+            limiter,
+            action,
+        }
+    }
+
+    fn allows(&self, peer: IpAddr) -> bool {
+        self.acl.allows(normalize_ip(peer))
+    }
+
+    fn rate_allows(&self, peer: IpAddr) -> bool {
+        match &self.limiter {
+            Some(limiter) => limiter.allow(normalize_ip(peer)),
+            None => true,
+        }
+    }
+
+    const fn action(&self) -> RateLimitAction {
+        self.action
+    }
+}
+
+/// Сводит IPv4-mapped IPv6 (`::ffff:a.b.c.d`) к IPv4 для ACL/RRL.
+fn normalize_ip(peer: IpAddr) -> IpAddr {
+    match peer {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        IpAddr::V4(_) => peer,
+    }
+}
+
 /// Общий обработчик UDP и TCP.
 pub(crate) struct Processor {
     resolver: Resolver,
     stats: Arc<Stats>,
+    policy: AccessPolicy,
 }
 
 impl Processor {
-    pub(crate) fn new(resolver: Resolver, stats: Arc<Stats>) -> Self {
-        Self { resolver, stats }
+    pub(crate) fn new(
+        resolver: Resolver,
+        stats: Arc<Stats>,
+        acl: Acl,
+        limiter: Option<RateLimiter>,
+        action: RateLimitAction,
+    ) -> Self {
+        Self {
+            resolver,
+            stats,
+            policy: AccessPolicy::new(acl, limiter, action),
+        }
     }
 
     /// Обрабатывает пакет и возвращает wire-ответ (или `None`, если отвечать
     /// не нужно/невозможно).
-    pub(crate) fn handle(&self, request: &[u8], transport: Transport) -> Option<Vec<u8>> {
+    pub(crate) fn handle(
+        &self,
+        request: &[u8],
+        transport: Transport,
+        peer: std::net::SocketAddr,
+    ) -> Option<Vec<u8>> {
         match transport {
             Transport::Udp => self.stats.udp_query(),
             Transport::Tcp => self.stats.tcp_query(),
         }
-        let limit = match transport {
+        let raw_limit = match transport {
             Transport::Udp => MAX_UDP_PAYLOAD,
             Transport::Tcp => MAX_MESSAGE_LEN,
         };
+        if !self.policy.allows(peer.ip()) {
+            self.stats.refused_acl();
+            self.stats.refused();
+            return self.raw_error(request, Rcode::REFUSED, raw_limit, transport);
+        }
         let Ok(request) = Message::decode(request, &DecodeLimits::default()) else {
             self.stats.decode_error();
-            return self.formerr(request, limit, transport);
+            return self.raw_error(request, Rcode::FORMERR, raw_limit, transport);
         };
         if request.flags().qr() {
             self.stats.dropped();
@@ -51,6 +117,28 @@ impl Processor {
             Transport::Udp => udp_limit(&request),
             Transport::Tcp => MAX_MESSAGE_LEN,
         };
+        if !self.policy.rate_allows(peer.ip()) {
+            self.stats.rate_limited();
+            return match self.policy.action() {
+                RateLimitAction::Drop => {
+                    self.stats.rate_limit_dropped();
+                    None
+                }
+                RateLimitAction::Refused => {
+                    self.stats.rate_limit_refused();
+                    self.stats.refused();
+                    self.encode_response(
+                        &error_response(&request, Rcode::REFUSED),
+                        limit,
+                        transport,
+                    )
+                }
+                RateLimitAction::Truncate => {
+                    self.stats.rate_limit_truncated();
+                    self.encode_response(&truncated_response(&request), limit, transport)
+                }
+            };
+        }
         let axfr = request
             .questions()
             .iter()
@@ -65,7 +153,16 @@ impl Processor {
             Rcode::REFUSED => self.stats.refused(),
             _ => {}
         }
-        let Ok((bytes, truncated)) = encode_limited(&response, limit) else {
+        self.encode_response(&response, limit, transport)
+    }
+
+    fn encode_response(
+        &self,
+        response: &Message,
+        limit: usize,
+        transport: Transport,
+    ) -> Option<Vec<u8>> {
+        let Ok((bytes, truncated)) = encode_limited(response, limit) else {
             self.stats.encode_error();
             return None;
         };
@@ -76,7 +173,13 @@ impl Processor {
         Some(bytes)
     }
 
-    fn formerr(&self, raw: &[u8], limit: usize, transport: Transport) -> Option<Vec<u8>> {
+    fn raw_error(
+        &self,
+        raw: &[u8],
+        rcode: Rcode,
+        limit: usize,
+        transport: Transport,
+    ) -> Option<Vec<u8>> {
         if raw.len() < 12 {
             self.stats.dropped();
             return None;
@@ -90,8 +193,10 @@ impl Processor {
                 .with_ra(true)
                 .with_opcode(Opcode::from_u8(opcode)),
         );
-        response.set_rcode(Rcode::FORMERR);
-        self.stats.formerr();
+        response.set_rcode(rcode);
+        if rcode == Rcode::FORMERR {
+            self.stats.formerr();
+        }
         let Ok((bytes, _)) = encode_limited(&response, limit) else {
             self.stats.encode_error();
             return None;
@@ -99,6 +204,17 @@ impl Processor {
         tracing_response(self.stats.as_ref(), transport);
         Some(bytes)
     }
+}
+
+/// Пустой ответ с TC: клиент повторит запрос по TCP.
+fn truncated_response(request: &Message) -> Message {
+    let mut response = Message::response(request);
+    response.set_flags(response.flags().with_ra(true).with_tc(true).with_qr(true));
+    if let Some(edns) = request.edns() {
+        let payload = edns.udp_payload_size().clamp(512, EDNS_DEFAULT_PAYLOAD);
+        response.set_edns(Some(Edns::new(payload).with_dnssec_ok(edns.dnssec_ok())));
+    }
+    response
 }
 
 fn tracing_response(stats: &Stats, transport: Transport) {

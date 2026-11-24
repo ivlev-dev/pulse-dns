@@ -180,7 +180,7 @@ apex и несколько SOA отклоняются с `422`/`invariant violat
 незавершённые зоны создаются через API. Serial внутри RDATA SOA задаётся явно
 пользователем; метаданные зоны ведут отдельный serial коммитов.
 
-## DNSSEC (authoritative, NSEC)
+## DNSSEC (authoritative, NSEC/NSEC3)
 
 `pulsed` подписывает зону при загрузке, если для её origin заданы ключи. Ключи
 читаются из BIND-пары `K*.key`/`K*.private` (роль можно вывести из SEP-бита
@@ -211,21 +211,29 @@ cargo run -p pulsed -- import --sign \
         {"role": "zsk", "path": "keys/Kexample.com.+015+54321.private"}
       ],
       "validity_days": 30,
-      "inception_skew": 300
+      "inception_skew": 300,
+      "denial": "nsec3",
+      "nsec3_salt": "aabbccddeeff0011",
+      "nsec3_iterations": 5
     }
   }
 }
 ```
 
-Подписанные DNSKEY/NSEC/RRSIG коммитятся в zonefile, а DO=1 отдаёт их из
-mmap.
+`denial` — `nsec` (по умолчанию) или `nsec3`. Для NSEC3 поддерживаются SHA-1
+(alg 1), соль в hex (`nsec3_salt`; без неё генерируется случайная соль на
+время жизни процесса) и `nsec3_iterations` в диапазоне `0..=100`; Opt-Out
+всегда выключен. Смена соли при перезапуске/переподписи пересобирает
+NSEC3-цепочку. Подписанные DNSKEY/NSEC или NSEC3/NSEC3PARAM/RRSIG коммитятся
+в zonefile, а DO=1 отдаёт их из mmap.
 
 Проверка (DO=1 — RRSIG/NSEC; DO=0 — без подписей):
 
 ```bash
 dig @127.0.0.1 -p 5353 www.example.com. A +dnssec +norecurse
-dig @127.0.0.1 -p 5353 nope.example.com. A +dnssec +norecurse   # NXDOMAIN + NSEC
-dig @127.0.0.1 -p 5353 www.example.com. AAAA +dnssec +norecurse # NODATA + NSEC
+dig @127.0.0.1 -p 5353 nope.example.com. A +dnssec +norecurse   # NXDOMAIN + NSEC/NSEC3
+dig @127.0.0.1 -p 5353 www.example.com. AAAA +dnssec +norecurse # NODATA + NSEC/NSEC3
+dig @127.0.0.1 -p 5353 example.com. NSEC3PARAM +dnssec +norecurse # NSEC3-параметры
 ```
 
 Публичные ключи и DS (приватные не отдаются):
@@ -239,16 +247,16 @@ curl -sS -X POST -H "Authorization: Bearer $PULSED_API_TOKEN" \
   "$API/api/v1/zones/example.com./sign"
 ```
 
-Ограничения v1: только NSEC (NSEC3-подпись не генерируется); `NS` в точке
-делегирования и glue ниже cut не подписываются; после изменения зоны через
-REST вызовите `POST /sign`, иначе подписи/NSEC-цепочка устареют.
+Ограничения v1: NSEC3 Opt-Out и NSEC3 для secondary-зон не поддерживаются;
+`NS` в точке делегирования и glue ниже cut не подписываются; после изменения
+зоны через REST вызовите `POST /sign`, иначе подписи/denial-цепочка устареют.
 
 ## Защищённые транспорты: DoT, DoH/1.1 и DNSCrypt
 
 `pulsed` умеет одновременно обслуживать UDP/TCP, DNS-over-TLS (RFC 7858),
-DNS-over-HTTPS/1.1 (RFC 8484) и DNSCrypt v2 по UDP. Все они используют один и
-тот же путь ответа: `decode → QueryEngine (mmap snapshot) → encode`, поэтому
-данные из `--data` и REST-правки видны сразу на всех транспортах.
+DNS-over-HTTPS/1.1 (RFC 8484) и DNSCrypt v2 по UDP и TCP. Все они используют
+один и тот же путь ответа: `decode → QueryEngine (mmap snapshot) → encode`,
+поэтому данные из `--data` и REST-правки видны сразу на всех транспортах.
 
 Пример конфигурации — `examples/transports.json`:
 
@@ -264,6 +272,7 @@ DNS-over-HTTPS/1.1 (RFC 8484) и DNSCrypt v2 по UDP. Все они испол�
   "tls_reload_secs": 300,
   "tls_allow_from": ["127.0.0.0/8", "::1"],
   "dnscrypt_listen": "127.0.0.1:5443",
+  "dnscrypt_tcp_listen": "127.0.0.1:5444",
   "dnscrypt_provider_key": "/tmp/pulsed-tls/dnscrypt-provider.key",
   "dnscrypt_resolver_key": "/tmp/pulsed-tls/dnscrypt-resolver.key",
   "dnscrypt_cert": "/tmp/pulsed-tls/dnscrypt-cert.json",
@@ -272,9 +281,18 @@ DNS-over-HTTPS/1.1 (RFC 8484) и DNSCrypt v2 по UDP. Все они испол�
 ```
 
 `dot_listen`/`doh_listen` требуют **оба** `tls_cert` и `tls_key`; при
-`dnscrypt_listen` обязательны `dnscrypt_provider_key`, `dnscrypt_resolver_key` и
-`dnscrypt_cert`. Приватные ключи должны иметь режим `0600` (иначе запуск
-завершается ошибкой), секреты не попадают в логи и `/metrics`.
+`dnscrypt_listen`/`dnscrypt_tcp_listen` обязательны `dnscrypt_provider_key`,
+`dnscrypt_resolver_key` и `dnscrypt_cert`. Приватные ключи должны иметь режим
+`0600` (иначе запуск завершается ошибкой), секреты не попадают в логи и
+`/metrics`.
+
+DNSCrypt TCP (`dnscrypt_tcp_listen`) использует 2-байтовый length-prefix,
+поддерживает несколько запросов на одном соединении и отдаёт большие ответы
+без `TC`. Лимиты: `dnscrypt_tcp_max_connections` (по умолчанию 1024),
+`dnscrypt_tcp_idle_timeout_ms` (10000) и `dnscrypt_tcp_max_frame` (65535).
+Метрики: `dnscrypt_tcp_connections_total`, `dnscrypt_tcp_connections_rejected_total`,
+`dnscrypt_tcp_active_connections`, `dnscrypt_tcp_queries_total`,
+`dnscrypt_tcp_responses_total`, `dnscrypt_tcp_errors_total`.
 
 ### TLS-сертификат и hot-reload
 
@@ -424,3 +442,23 @@ kill -HUP "$(pgrep pulseresolved)"       # перечитать blocklist
 "null"` (0.0.0.0/::), `blocklist.reload_secs` для периодического reload,
 `trust_anchor: {"path": "root.ds"}` для собственного DS-файла (по строке
 `owner. [TTL] [IN] DS <tag> <alg> <digest-type> <hex>`).
+
+`examples/resolver-secure.json` — смешанные upstream и политика доступа:
+
+```bash
+cargo run -p pulseresolved -- --config examples/resolver-secure.json
+```
+
+- `upstreams`: URL (`udp://`, `tcp://`, `tls://host:853#servername`,
+  `https://host/dns-query`) или объекты `{ "addr": "...", "tls": true,
+  "server_name": "localhost", "ca": "path/to/ca.pem" }`. Для self-signed
+  upstream укажите `ca`; без `ca` используется webpki-roots.
+- `allow_from`: IP/CIDR клиентов. Пусто — только `127.0.0.0/8` и `::1/128`,
+  остальным REFUSED (`pulseresolved_refused_acl_total`).
+- `rate_limit`: per-source token bucket (`qps`, `burst`, `max_entries`,
+  `action` = `refused` | `drop` | `truncate`).
+- Failover идёт по порядку списка; после `max_failures` ошибок upstream
+  уходит в `cooldown`, затем снова пробуется.
+- Для DoT/DoH клиент держит одно keep-alive-соединение на upstream; при
+  обрыве переподключается. Сертификат проверяется по CN/SAN из
+  `server_name`/URL.

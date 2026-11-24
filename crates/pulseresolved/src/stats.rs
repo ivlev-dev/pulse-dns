@@ -13,6 +13,11 @@ pub struct Stats {
     encode_errors: AtomicU64,
     formerr: AtomicU64,
     refused: AtomicU64,
+    refused_acl: AtomicU64,
+    rate_limited: AtomicU64,
+    rate_limit_dropped: AtomicU64,
+    rate_limit_refused: AtomicU64,
+    rate_limit_truncated: AtomicU64,
     truncated: AtomicU64,
     dropped: AtomicU64,
     tcp_active: AtomicU64,
@@ -42,6 +47,16 @@ pub struct StatsSnapshot {
     pub formerr: u64,
     /// Ответы REFUSED.
     pub refused: u64,
+    /// REFUSED из-за ACL клиентов.
+    pub refused_acl: u64,
+    /// Запросы, отклонённые rate limit.
+    pub rate_limited: u64,
+    /// Rate limit: отброшено без ответа.
+    pub rate_limit_dropped: u64,
+    /// Rate limit: REFUSED.
+    pub rate_limit_refused: u64,
+    /// Rate limit: пустой TC-ответ.
+    pub rate_limit_truncated: u64,
     /// Усечённые (TC) ответы.
     pub truncated: u64,
     /// Отброшенные запросы (QR=1, мусор без заголовка).
@@ -79,6 +94,11 @@ impl Stats {
             encode_errors: self.encode_errors.load(Ordering::Relaxed),
             formerr: self.formerr.load(Ordering::Relaxed),
             refused: self.refused.load(Ordering::Relaxed),
+            refused_acl: self.refused_acl.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            rate_limit_dropped: self.rate_limit_dropped.load(Ordering::Relaxed),
+            rate_limit_refused: self.rate_limit_refused.load(Ordering::Relaxed),
+            rate_limit_truncated: self.rate_limit_truncated.load(Ordering::Relaxed),
             truncated: self.truncated.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             tcp_active: self.tcp_active.load(Ordering::Relaxed),
@@ -120,6 +140,26 @@ impl Stats {
 
     pub(crate) fn refused(&self) {
         self.refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn refused_acl(&self) {
+        self.refused_acl.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rate_limited(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rate_limit_dropped(&self) {
+        self.rate_limit_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rate_limit_refused(&self) {
+        self.rate_limit_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rate_limit_truncated(&self) {
+        self.rate_limit_truncated.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn truncated(&self) {

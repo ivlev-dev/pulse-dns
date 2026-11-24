@@ -41,7 +41,16 @@ impl Server {
     pub fn start(config: &Config) -> Result<Self, ServerError> {
         let resolver = Resolver::new(config.resolver_config()?)?;
         let stats = Arc::new(Stats::new());
-        let processor = Arc::new(Processor::new(resolver.clone(), Arc::clone(&stats)));
+        let acl = config.build_acl()?;
+        let limiter = config.build_rate_limiter()?;
+        let action = config.rate_limit_action();
+        let processor = Arc::new(Processor::new(
+            resolver.clone(),
+            Arc::clone(&stats),
+            acl,
+            limiter,
+            action,
+        ));
 
         let metrics = match config.metrics_listen {
             Some(addr) => Some(

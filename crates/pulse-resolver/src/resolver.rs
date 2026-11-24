@@ -12,11 +12,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use pulse_dns::{Edns, Message, Name, Question, Rclass, Rcode, Record, Rtype, Ttl};
+use pulse_dns::{DecodeLimits, Edns, Message, Name, Question, Rclass, Rcode, Record, Rtype, Ttl};
+use pulse_tls::client::{DohClient, DotClient};
 
 use crate::blocklist::{Blocklist, BlocklistStats};
 use crate::cache::{Cache, CacheSnapshot};
-use crate::config::{BlockResponse, Mode, ResolverConfig};
+use crate::config::{BlockResponse, Mode, ResolverConfig, UpstreamConfig};
 use crate::dnssec::{self, Security};
 use crate::error::ResolverError;
 use crate::forward;
@@ -26,7 +27,7 @@ use crate::root_hints;
 use crate::rrutil::{find_soa, group_rrsets, negative_ttl, within_bailiwick};
 use crate::upstream::{
     UpstreamClient, UpstreamCounters, UpstreamOptions, UpstreamResponse, UpstreamStats,
-    is_retryable_rcode,
+    UpstreamTransport, is_retryable_rcode, prepare, verify_response,
 };
 
 /// TTL синтетических ответов blocklist/override.
@@ -106,24 +107,57 @@ impl CancellationToken {
 }
 
 #[derive(Debug)]
+enum ForwardTransport {
+    Udp(SocketAddr),
+    Tcp(SocketAddr),
+    Dot(DotClient),
+    Doh(DohClient),
+}
+
+#[derive(Debug)]
 pub(crate) struct Forwarder {
-    pub(crate) address: SocketAddr,
+    pub(crate) config: UpstreamConfig,
+    transport: ForwardTransport,
     failures: AtomicU32,
     cooldown_until_ms: AtomicU64,
 }
 
 impl Forwarder {
-    fn new(address: SocketAddr) -> Self {
-        Self {
-            address,
+    fn new(config: UpstreamConfig) -> Result<Self, ResolverError> {
+        let transport = match &config {
+            UpstreamConfig::Udp(address) => ForwardTransport::Udp(*address),
+            UpstreamConfig::Tcp(address) => ForwardTransport::Tcp(*address),
+            UpstreamConfig::Tls(upstream) => {
+                let client = DotClient::new(
+                    &upstream.host,
+                    Some(upstream.port),
+                    &upstream.server_name,
+                    upstream.ca.as_deref(),
+                )
+                .map_err(transport_config_error)?;
+                ForwardTransport::Dot(client)
+            }
+            UpstreamConfig::Https(upstream) => {
+                let client = DohClient::new(&upstream.url, upstream.ca.as_deref())
+                    .map_err(transport_config_error)?;
+                ForwardTransport::Doh(client)
+            }
+        };
+        Ok(Self {
+            config,
+            transport,
             failures: AtomicU32::new(0),
             cooldown_until_ms: AtomicU64::new(0),
-        }
+        })
     }
 
     fn healthy(&self, now_ms: u64) -> bool {
         self.cooldown_until_ms.load(Ordering::Relaxed) <= now_ms
     }
+}
+
+fn transport_config_error(error: pulse_tls::Error) -> ResolverError {
+    ResolverError::config(format!("invalid secure upstream: {error}"))
 }
 
 #[derive(Debug, Default)]
@@ -211,10 +245,10 @@ impl Resolver {
         let overrides = Overrides::build(&config.overrides)?;
         let forwarders = match &config.mode {
             Mode::Forward(forward) => forward
-                .servers
-                .iter()
-                .map(|address| Forwarder::new(*address))
-                .collect(),
+                .effective_upstreams()
+                .into_iter()
+                .map(Forwarder::new)
+                .collect::<Result<Vec<_>, _>>()?,
             Mode::Iterative(_) => Vec::new(),
         };
         let root_hints = match &config.mode {
@@ -614,15 +648,11 @@ impl Resolver {
         }
     }
 
-    pub(crate) fn upstream(&self) -> &UpstreamClient {
-        &self.inner.upstream
-    }
-
     pub(crate) fn cache_ref(&self) -> &Cache {
         &self.inner.cache
     }
 
-    pub(crate) fn forwarder_order(&self) -> Vec<(usize, SocketAddr)> {
+    pub(crate) fn forwarder_order(&self) -> Vec<usize> {
         let total = self.inner.forwarders.len();
         if total == 0 {
             return Vec::new();
@@ -637,13 +667,106 @@ impl Resolver {
                 continue;
             };
             if forwarder.healthy(now_ms) {
-                healthy.push((index, forwarder.address));
+                healthy.push(index);
             } else {
-                unhealthy.push((index, forwarder.address));
+                unhealthy.push(index);
             }
         }
         healthy.extend(unhealthy);
         healthy
+    }
+
+    pub(crate) fn forwarder_config(&self, index: usize) -> Option<&UpstreamConfig> {
+        self.inner
+            .forwarders
+            .get(index)
+            .map(|forwarder| &forwarder.config)
+    }
+
+    pub(crate) fn note_failover(&self) {
+        self.inner
+            .upstream_counters
+            .failovers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Один запрос к forwarder-у с учётом его транспорта.
+    pub(crate) fn query_forwarder(
+        &self,
+        index: usize,
+        question: &Question,
+        dnssec_ok: bool,
+        context: &ResolveContext,
+    ) -> Result<UpstreamResponse, ResolverError> {
+        let forwarder = self
+            .inner
+            .forwarders
+            .get(index)
+            .ok_or(ResolverError::NoUpstream)?;
+        check_context(context)?;
+        match &forwarder.transport {
+            ForwardTransport::Udp(address) => self.inner.upstream.query_over(
+                *address,
+                UpstreamTransport::Udp,
+                question,
+                true,
+                dnssec_ok,
+                context.deadline(),
+                context.cancel(),
+            ),
+            ForwardTransport::Tcp(address) => self.inner.upstream.query_over(
+                *address,
+                UpstreamTransport::Tcp,
+                question,
+                true,
+                dnssec_ok,
+                context.deadline(),
+                context.cancel(),
+            ),
+            ForwardTransport::Dot(client) => {
+                self.inner
+                    .upstream_counters
+                    .tls_queries
+                    .fetch_add(1, Ordering::Relaxed);
+                let options = self.inner.upstream.options();
+                let prepared = prepare(question, true, dnssec_ok, options.edns_payload, false)?;
+                let connect_timeout = secure_connect_timeout(self, context);
+                let io_timeout = secure_io_timeout(self, context);
+                let bytes = client
+                    .query(&prepared.bytes, connect_timeout, io_timeout)
+                    .map_err(|error| self.secure_transport_error(error))?;
+                let message = Message::decode(&bytes, &DecodeLimits::default())?;
+                verify_response(&message, &bytes, &prepared)?;
+                Ok(UpstreamResponse { message })
+            }
+            ForwardTransport::Doh(client) => {
+                self.inner
+                    .upstream_counters
+                    .https_queries
+                    .fetch_add(1, Ordering::Relaxed);
+                let options = self.inner.upstream.options();
+                let prepared = prepare(question, true, dnssec_ok, options.edns_payload, false)?;
+                let connect_timeout = secure_connect_timeout(self, context);
+                let io_timeout = secure_io_timeout(self, context);
+                let bytes = client
+                    .query(&prepared.bytes, connect_timeout, io_timeout)
+                    .map_err(|error| self.secure_transport_error(error))?;
+                let message = Message::decode(&bytes, &DecodeLimits::default())?;
+                verify_response(&message, &bytes, &prepared)?;
+                Ok(UpstreamResponse { message })
+            }
+        }
+    }
+
+    fn secure_transport_error(&self, error: pulse_tls::Error) -> ResolverError {
+        let mapped = pulse_transport_error(error);
+        if matches!(mapped, ResolverError::Timeout) {
+            self.inner
+                .upstream_counters
+                .timeouts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        mapped
     }
 
     pub(crate) fn forwarder_failure(&self, index: usize) {
@@ -760,6 +883,30 @@ impl Resolver {
             }
         }
         Err(last_error)
+    }
+}
+
+fn secure_connect_timeout(resolver: &Resolver, context: &ResolveContext) -> std::time::Duration {
+    remaining(context.deadline()).min(resolver.inner.config.timeouts.tcp)
+}
+
+fn secure_io_timeout(resolver: &Resolver, context: &ResolveContext) -> std::time::Duration {
+    remaining(context.deadline()).min(resolver.inner.config.timeouts.per_query)
+}
+
+fn remaining(deadline: Instant) -> std::time::Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+fn pulse_transport_error(error: pulse_tls::Error) -> ResolverError {
+    if error.is_timeout() {
+        return ResolverError::Timeout;
+    }
+    match error {
+        pulse_tls::Error::Io(source) => ResolverError::Io(source),
+        other => ResolverError::Transport {
+            reason: other.to_string(),
+        },
     }
 }
 

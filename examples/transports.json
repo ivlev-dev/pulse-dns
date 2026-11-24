@@ -16,6 +16,7 @@
     "::1"
   ],
   "dnscrypt_listen": "127.0.0.1:5443",
+  "dnscrypt_tcp_listen": "127.0.0.1:5444",
   "dnscrypt_provider_key": "/tmp/pulsed-tls/dnscrypt-provider.key",
   "dnscrypt_resolver_key": "/tmp/pulsed-tls/dnscrypt-resolver.key",
   "dnscrypt_cert": "/tmp/pulsed-tls/dnscrypt-cert.json",

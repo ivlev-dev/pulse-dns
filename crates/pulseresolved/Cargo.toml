@@ -21,6 +21,7 @@ clap = { version = "4", default-features = false, features = ["std", "help", "us
 pulse-dns = { path = "../pulse-dns" }
 pulse-resolver = { path = "../pulse-resolver" }
 pulse-runtime = { path = "../pulse-runtime" }
+pulse-tls = { path = "../pulse-tls" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = "0.3"
@@ -28,6 +29,7 @@ thiserror = "2"
 
 [dev-dependencies]
 pulse-dnssec = { path = "../pulse-dnssec" }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 tempfile = "3"
 
 [lints]
