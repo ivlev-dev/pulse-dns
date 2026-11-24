@@ -15,7 +15,8 @@ use std::cmp::Ordering;
 
 use crate::cache::PageCache;
 use crate::consts::{
-    INLINE_VALUE_MAX, MAX_FILE_PAGES, MAX_RDLENGTH, MAX_RRSET_PAYLOAD, MAX_TREE_DEPTH, MAX_TTL,
+    INLINE_VALUE_MAX, MAX_CUT_SUBTREE_RECORDS, MAX_FILE_PAGES, MAX_RDLENGTH, MAX_RRSET_PAYLOAD,
+    MAX_TREE_DEPTH, MAX_TTL,
 };
 use crate::errors::{CorruptDetail, CorruptKind, InvariantId, ZoneFileError};
 use crate::key::{
@@ -23,10 +24,10 @@ use crate::key::{
     compare_validated, name_cmp,
 };
 use crate::node::{
-    self, BranchItem, DecodedBranch, DecodedLeaf, DecodedValue, EncodeContext, ItemValue, LeafItem,
-    LeafValue, NodeRef, RR_FLAG_APEX, RR_FLAG_CHILDREN_MAY_EXIST, RR_FLAG_CUT_BELOW,
-    RR_FLAG_DELEGATION, RR_FLAG_EMPTY_NON_TERMINAL, RR_FLAG_GLUE, RR_FLAG_NSEC3, RR_FLAG_OCCLUDED,
-    RR_FLAG_RESERVED, RR_FLAG_SECURE_DELEGATION, RR_FLAG_WILDCARD, ValueKind,
+    self, BranchItem, BranchNode, DecodedBranch, DecodedLeaf, DecodedValue, EncodeContext,
+    ItemValue, LeafItem, LeafNode, LeafValue, NodeRef, RR_FLAG_APEX, RR_FLAG_CHILDREN_MAY_EXIST,
+    RR_FLAG_CUT_BELOW, RR_FLAG_DELEGATION, RR_FLAG_EMPTY_NON_TERMINAL, RR_FLAG_GLUE, RR_FLAG_NSEC3,
+    RR_FLAG_OCCLUDED, RR_FLAG_RESERVED, RR_FLAG_SECURE_DELEGATION, RR_FLAG_WILDCARD, ValueKind,
 };
 use crate::overflow::{self, OverflowRrset};
 
@@ -93,6 +94,16 @@ fn invariant(id: InvariantId) -> ZoneFileError {
 
 fn page_size_usize(page_size: u32) -> Result<usize, ZoneFileError> {
     usize::try_from(page_size).map_err(|_| bounds(None, CorruptDetail::OffsetOutOfRange))
+}
+
+pub(crate) fn is_descendant(owner: &NameRle, ancestor: &NameRle) -> bool {
+    let prefix = ancestor.without_terminal();
+    let bytes = owner.as_rle();
+    bytes.len() > prefix.len()
+        && bytes.starts_with(prefix)
+        && bytes
+            .get(prefix.len())
+            .is_some_and(|&label_len| (1..=0x3F).contains(&label_len))
 }
 
 /// In-memory хранилище страниц для тестов и бенчмарков.
@@ -449,6 +460,66 @@ impl BTree {
         })
     }
 
+    /// Удаляет ключ с COW-путём и перебалансировкой (§13.4).
+    ///
+    /// Возвращает старое значение, если ключ существовал. Старые страницы
+    /// пути и overflow-цепочка значения уходят в набор освобождённых
+    /// текущей транзакции; корень схлопывается, пустое дерево даёт `root = 0`.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённая страница; ошибки [`PageIo`].
+    pub fn delete<P: PageIo + ?Sized>(
+        &mut self,
+        io: &mut P,
+        txn: u64,
+        target: &Key,
+    ) -> Result<Option<ItemValue>, ZoneFileError> {
+        if self.root == 0 {
+            return Ok(None);
+        }
+        if self.lookup(io, txn, target)?.is_none() {
+            return Ok(None);
+        }
+        let step = delete_rec(io, None, txn, self.root, self.level - 1, target, 0)?;
+        if step.empty {
+            io.free_page(step.page)?;
+            *self = Self::empty();
+            return Ok(step.old);
+        }
+        self.root = step.page;
+        loop {
+            if self.level <= 1 {
+                break;
+            }
+            let branch = {
+                let decoded =
+                    load_branch(io, None, txn, self.root, self.level - 1, io.page_size())?;
+                decoded.to_branch()?
+            };
+            if branch.items.is_empty() {
+                io.free_page(self.root)?;
+                *self = Self::empty();
+                break;
+            }
+            if branch.items.len() != 1 {
+                break;
+            }
+            let child = branch
+                .items
+                .first()
+                .ok_or_else(|| bounds(Some(self.root), CorruptDetail::ChildRange))?
+                .child;
+            io.free_page(self.root)?;
+            self.root = child;
+            self.level = self
+                .level
+                .checked_sub(1)
+                .ok_or_else(|| bounds(None, CorruptDetail::DepthExceeded))?;
+        }
+        Ok(step.old)
+    }
+
     /// Строит дерево из отсортированных item'ов (bulk load).
     ///
     /// Листья и ветвления пакуются последовательно; каждый узел пишется один
@@ -799,6 +870,7 @@ fn insert_rec<P: PageIo + ?Sized>(
             .ok_or_else(|| invariant(InvariantId::EncodedSize))?;
         if node::leaf_encoded_size_fast(&node.items)? <= page_size {
             let (new_page, _) = write_leaf_page(io, cache, txn, &node.items)?;
+            io.free_page(page_no)?;
             return Ok(Inserted {
                 page: new_page,
                 first_key,
@@ -810,6 +882,7 @@ fn insert_rec<P: PageIo + ?Sized>(
         let (left, right) = split_leaf(&node.items, page_size)?;
         let (left_page, left_first) = write_leaf_page(io, cache, txn, &left)?;
         let (right_page, right_first) = write_leaf_page(io, cache, txn, &right)?;
+        io.free_page(page_no)?;
         return Ok(Inserted {
             page: left_page,
             first_key: left_first,
@@ -853,6 +926,7 @@ fn insert_rec<P: PageIo + ?Sized>(
         .ok_or_else(|| invariant(InvariantId::EncodedSize))?;
     if node::branch_encoded_size_fast(&branch.items)? <= page_size {
         let (new_page, _) = write_branch_page(io, cache, txn, node_level, &branch.items)?;
+        io.free_page(page_no)?;
         return Ok(Inserted {
             page: new_page,
             first_key,
@@ -864,6 +938,7 @@ fn insert_rec<P: PageIo + ?Sized>(
     let (left, right) = split_branch(&branch.items, page_size)?;
     let (left_page, left_first) = write_branch_page(io, cache, txn, node_level, &left)?;
     let (right_page, right_first) = write_branch_page(io, cache, txn, node_level, &right)?;
+    io.free_page(page_no)?;
     Ok(Inserted {
         page: left_page,
         first_key: left_first,
@@ -871,6 +946,438 @@ fn insert_rec<P: PageIo + ?Sized>(
         is_new: child_result.is_new,
         old: child_result.old,
     })
+}
+
+struct DeleteStep {
+    page: u32,
+    first_key: Key,
+    old: Option<ItemValue>,
+    empty: bool,
+    underflow: bool,
+}
+
+#[derive(Debug, Clone)]
+enum NodeData {
+    Leaf(LeafNode),
+    Branch(BranchNode),
+}
+
+fn free_item_overflow<P: PageIo + ?Sized>(
+    io: &mut P,
+    value: &ItemValue,
+) -> Result<(), ZoneFileError> {
+    if let ItemValue::Leaf { value, .. } = value
+        && value.kind == ValueKind::Overflow
+        && value.val_u32 != 0
+    {
+        overflow::free_chain(io, value.val_u32)?;
+    }
+    Ok(())
+}
+
+fn load_node<P: PageIo + ?Sized>(
+    io: &P,
+    cache: Option<&PageCache>,
+    txn: u64,
+    page_no: u32,
+    node_level: u16,
+    page_size: u32,
+) -> Result<NodeData, ZoneFileError> {
+    if node_level == 0 {
+        Ok(NodeData::Leaf(
+            load_leaf(io, cache, txn, page_no, page_size)?.to_leaf()?,
+        ))
+    } else {
+        Ok(NodeData::Branch(
+            load_branch(io, cache, txn, page_no, node_level, page_size)?.to_branch()?,
+        ))
+    }
+}
+
+fn node_first(node: &NodeData) -> Result<Key, ZoneFileError> {
+    match node {
+        NodeData::Leaf(leaf) => leaf
+            .items
+            .first()
+            .map(|item| item.key)
+            .ok_or_else(|| bounds(None, CorruptDetail::ChildRange)),
+        NodeData::Branch(branch) => branch
+            .items
+            .first()
+            .map(|item| item.key)
+            .ok_or_else(|| bounds(None, CorruptDetail::ChildRange)),
+    }
+}
+
+fn node_is_empty(node: &NodeData) -> bool {
+    match node {
+        NodeData::Leaf(leaf) => leaf.items.is_empty(),
+        NodeData::Branch(branch) => branch.items.is_empty(),
+    }
+}
+
+fn node_content(node: &NodeData) -> Result<u32, ZoneFileError> {
+    let size = match node {
+        NodeData::Leaf(leaf) => node::leaf_encoded_size_fast(&leaf.items)?,
+        NodeData::Branch(branch) => node::branch_encoded_size_fast(&branch.items)?,
+    };
+    Ok(size.saturating_sub(u32::try_from(node::NODE_HEADER_BYTES).unwrap_or(0)))
+}
+
+fn append_node(left: &mut NodeData, right: NodeData) {
+    match (left, right) {
+        (NodeData::Leaf(left), NodeData::Leaf(right)) => left.items.extend(right.items),
+        (NodeData::Branch(left), NodeData::Branch(right)) => left.items.extend(right.items),
+        // Смешение типов на одном уровне — повреждение дерева; merge вызывается
+        // только для узлов одного уровня, поэтому ветка недостижима.
+        _ => {}
+    }
+}
+
+fn write_node<P: PageIo + ?Sized>(
+    io: &mut P,
+    cache: Option<&PageCache>,
+    txn: u64,
+    node_level: u16,
+    node: &NodeData,
+) -> Result<u32, ZoneFileError> {
+    match node {
+        NodeData::Leaf(leaf) => Ok(write_leaf_page(io, cache, txn, &leaf.items)?.0),
+        NodeData::Branch(branch) => {
+            Ok(write_branch_page(io, cache, txn, node_level, &branch.items)?.0)
+        }
+    }
+}
+
+fn node_underflow(node: &NodeData, page_size: u32) -> Result<bool, ZoneFileError> {
+    let usable = page_size.saturating_sub(u32::try_from(node::NODE_HEADER_BYTES).unwrap_or(0));
+    if usable == 0 {
+        return Ok(false);
+    }
+    // fill < 25%: content * 4 < usable. checked через u64, чтобы не переполнить.
+    Ok(u64::from(node_content(node)?) * 4 < u64::from(usable))
+}
+
+#[allow(clippy::too_many_lines)]
+fn delete_rec<P: PageIo + ?Sized>(
+    io: &mut P,
+    cache: Option<&PageCache>,
+    txn: u64,
+    page_no: u32,
+    node_level: u16,
+    target: &Key,
+    depth: u16,
+) -> Result<DeleteStep, ZoneFileError> {
+    if depth > MAX_TREE_DEPTH || node_level > MAX_TREE_DEPTH {
+        return Err(invariant(InvariantId::DepthExceeded));
+    }
+    let page_size = io.page_size();
+    if node_level == 0 {
+        let mut node = load_leaf(io, cache, txn, page_no, page_size)?.to_leaf()?;
+        let position = leaf_lower_bound(&node.items, target)?;
+        let equal = position < node.items.len()
+            && compare_validated(
+                &node
+                    .items
+                    .get(position)
+                    .ok_or_else(|| bounds(Some(page_no), CorruptDetail::OffsetOutOfRange))?
+                    .key,
+                target,
+            ) == Ordering::Equal;
+        if !equal {
+            let first_key = node
+                .items
+                .first()
+                .map_or_else(Key::placeholder, |item| item.key);
+            return Ok(DeleteStep {
+                page: page_no,
+                first_key,
+                old: None,
+                empty: node.items.is_empty(),
+                underflow: false,
+            });
+        }
+        let removed = node.items.remove(position);
+        free_item_overflow(io, &removed.value)?;
+        if node.items.is_empty() {
+            return Ok(DeleteStep {
+                page: page_no,
+                first_key: Key::placeholder(),
+                old: Some(removed.value),
+                empty: true,
+                underflow: true,
+            });
+        }
+        let first_key = node
+            .items
+            .first()
+            .map(|item| item.key)
+            .ok_or_else(|| invariant(InvariantId::EncodedSize))?;
+        let underflow = node_underflow(&NodeData::Leaf(node.clone()), page_size)?;
+        let (new_page, _) = write_leaf_page(io, cache, txn, &node.items)?;
+        io.free_page(page_no)?;
+        return Ok(DeleteStep {
+            page: new_page,
+            first_key,
+            old: Some(removed.value),
+            empty: false,
+            underflow,
+        });
+    }
+
+    let mut branch = {
+        let decoded = load_branch(io, cache, txn, page_no, node_level, page_size)?;
+        if decoded.level() != node_level {
+            return Err(bounds(Some(page_no), CorruptDetail::PageType));
+        }
+        decoded.to_branch()?
+    };
+    let position = branch_predecessor(&branch.items, target)?.unwrap_or(0);
+    let child = branch
+        .items
+        .get(position)
+        .ok_or_else(|| bounds(Some(page_no), CorruptDetail::ChildRange))?
+        .child;
+    let mut step = delete_rec(io, cache, txn, child, node_level - 1, target, depth + 1)?;
+    if step.empty {
+        io.free_page(step.page)?;
+        branch.items.remove(position);
+    } else {
+        {
+            let entry = branch
+                .items
+                .get_mut(position)
+                .ok_or_else(|| bounds(Some(page_no), CorruptDetail::ChildRange))?;
+            entry.child = step.page;
+            entry.key = step.first_key;
+        }
+        if step.underflow {
+            rebalance(io, cache, txn, node_level, &mut branch.items, position)?;
+        }
+    }
+    if branch.items.is_empty() {
+        return Ok(DeleteStep {
+            page: page_no,
+            first_key: Key::placeholder(),
+            old: step.old,
+            empty: true,
+            underflow: true,
+        });
+    }
+    let first_key = branch
+        .items
+        .first()
+        .map(|entry| entry.key)
+        .ok_or_else(|| invariant(InvariantId::EncodedSize))?;
+    let underflow = node_underflow(&NodeData::Branch(branch.clone()), page_size)?;
+    let (new_page, _) = write_branch_page(io, cache, txn, node_level, &branch.items)?;
+    io.free_page(page_no)?;
+    step.page = new_page;
+    step.first_key = first_key;
+    step.underflow = underflow;
+    Ok(step)
+}
+
+#[allow(clippy::too_many_lines)]
+fn rebalance<P: PageIo + ?Sized>(
+    io: &mut P,
+    cache: Option<&PageCache>,
+    txn: u64,
+    parent_level: u16,
+    items: &mut Vec<BranchItem>,
+    index: usize,
+) -> Result<(), ZoneFileError> {
+    if items.len() < 2 {
+        return Ok(());
+    }
+    let child_level = parent_level.saturating_sub(1);
+    let page_size = io.page_size();
+    let usable = page_size.saturating_sub(u32::try_from(node::NODE_HEADER_BYTES).unwrap_or(0));
+    let child_page = items
+        .get(index)
+        .ok_or_else(|| bounds(None, CorruptDetail::ChildRange))?
+        .child;
+    let child_node = load_node(io, cache, txn, child_page, child_level, page_size)?;
+    let child_content = node_content(&child_node)?;
+    if node_is_empty(&child_node) && items.len() < 2 {
+        return Ok(());
+    }
+    let right = index + 1 < items.len();
+    let sibling_index = if right { index + 1 } else { index - 1 };
+    let sibling_page = items
+        .get(sibling_index)
+        .ok_or_else(|| bounds(None, CorruptDetail::ChildRange))?
+        .child;
+    let sibling_node = load_node(io, cache, txn, sibling_page, child_level, page_size)?;
+    let sibling_content = node_content(&sibling_node)?;
+    let combined = u64::from(child_content).saturating_add(u64::from(sibling_content));
+
+    // Слияние: суммарное содержимое <= 75% usable.
+    if node_is_empty(&child_node) || combined * 4 <= u64::from(usable) * 3 {
+        let (left_index, right_index) = if right {
+            (index, sibling_index)
+        } else {
+            (sibling_index, index)
+        };
+        let left_node = if right {
+            child_node.clone()
+        } else {
+            sibling_node.clone()
+        };
+        let right_node = if right { sibling_node } else { child_node };
+        let mut merged = left_node;
+        append_node(&mut merged, right_node);
+        let (left_page, right_page) = (
+            items
+                .get(left_index)
+                .ok_or_else(|| bounds(None, CorruptDetail::ChildRange))?
+                .child,
+            items
+                .get(right_index)
+                .ok_or_else(|| bounds(None, CorruptDetail::ChildRange))?
+                .child,
+        );
+        if node_is_empty(&merged) {
+            io.free_page(left_page)?;
+            io.free_page(right_page)?;
+            items.remove(right_index);
+            items.remove(left_index);
+            return Ok(());
+        }
+        let first_key = node_first(&merged)?;
+        let merged_page = write_node(io, cache, txn, child_level, &merged)?;
+        io.free_page(left_page)?;
+        io.free_page(right_page)?;
+        if let Some(entry) = items.get_mut(left_index) {
+            entry.key = first_key;
+            entry.child = merged_page;
+        }
+        items.remove(right_index);
+        return Ok(());
+    }
+
+    // Заимствование: у соседа >= 40% usable. Переносим item'ы, пока это
+    // помогает (не опустошая соседа).
+    let sibling_fraction_ok = u64::from(sibling_content) * 10 >= u64::from(usable) * 4;
+    if !sibling_fraction_ok {
+        return Ok(());
+    }
+    if right {
+        let (new_child, new_right) = match (child_node, sibling_node) {
+            (NodeData::Leaf(mut child), NodeData::Leaf(mut right)) => {
+                if right.items.len() <= 1 {
+                    return Ok(());
+                }
+                let mut moved = false;
+                while node_underflow(&NodeData::Leaf(child.clone()), page_size)?
+                    && right.items.len() > 1
+                {
+                    let Some(item) = right.items.first().cloned() else {
+                        break;
+                    };
+                    right.items.remove(0);
+                    child.items.push(item);
+                    moved = true;
+                }
+                if !moved {
+                    return Ok(());
+                }
+                (NodeData::Leaf(child), NodeData::Leaf(right))
+            }
+            (NodeData::Branch(mut child), NodeData::Branch(mut right)) => {
+                if right.items.len() <= 1 {
+                    return Ok(());
+                }
+                let mut moved = false;
+                while node_underflow(&NodeData::Branch(child.clone()), page_size)?
+                    && right.items.len() > 1
+                {
+                    let Some(item) = right.items.first().cloned() else {
+                        break;
+                    };
+                    right.items.remove(0);
+                    child.items.push(item);
+                    moved = true;
+                }
+                if !moved {
+                    return Ok(());
+                }
+                (NodeData::Branch(child), NodeData::Branch(right))
+            }
+            _ => return Ok(()),
+        };
+        let child_first = node_first(&new_child)?;
+        let right_first = node_first(&new_right)?;
+        let new_child_page = write_node(io, cache, txn, child_level, &new_child)?;
+        let new_right_page = write_node(io, cache, txn, child_level, &new_right)?;
+        io.free_page(child_page)?;
+        io.free_page(sibling_page)?;
+        if let Some(entry) = items.get_mut(index) {
+            entry.key = child_first;
+            entry.child = new_child_page;
+        }
+        if let Some(entry) = items.get_mut(sibling_index) {
+            entry.key = right_first;
+            entry.child = new_right_page;
+        }
+        return Ok(());
+    }
+
+    let (new_left, new_child) = match (sibling_node, child_node) {
+        (NodeData::Leaf(mut left), NodeData::Leaf(mut child)) => {
+            if left.items.len() <= 1 {
+                return Ok(());
+            }
+            let mut moved = false;
+            while node_underflow(&NodeData::Leaf(child.clone()), page_size)? && left.items.len() > 1
+            {
+                let Some(item) = left.items.pop() else {
+                    break;
+                };
+                child.items.insert(0, item);
+                moved = true;
+            }
+            if !moved {
+                return Ok(());
+            }
+            (NodeData::Leaf(left), NodeData::Leaf(child))
+        }
+        (NodeData::Branch(mut left), NodeData::Branch(mut child)) => {
+            if left.items.len() <= 1 {
+                return Ok(());
+            }
+            let mut moved = false;
+            while node_underflow(&NodeData::Branch(child.clone()), page_size)?
+                && left.items.len() > 1
+            {
+                let Some(item) = left.items.pop() else {
+                    break;
+                };
+                child.items.insert(0, item);
+                moved = true;
+            }
+            if !moved {
+                return Ok(());
+            }
+            (NodeData::Branch(left), NodeData::Branch(child))
+        }
+        _ => return Ok(()),
+    };
+    let left_first = node_first(&new_left)?;
+    let child_first = node_first(&new_child)?;
+    let new_left_page = write_node(io, cache, txn, child_level, &new_left)?;
+    let new_child_page = write_node(io, cache, txn, child_level, &new_child)?;
+    io.free_page(sibling_page)?;
+    io.free_page(child_page)?;
+    if let Some(entry) = items.get_mut(sibling_index) {
+        entry.key = left_first;
+        entry.child = new_left_page;
+    }
+    if let Some(entry) = items.get_mut(index) {
+        entry.key = child_first;
+        entry.child = new_child_page;
+    }
+    Ok(())
 }
 
 fn leaf_chunk_size(n_items: usize, item_bytes: usize) -> Result<u32, ZoneFileError> {
@@ -1729,6 +2236,250 @@ impl ZoneTree {
             replaced,
             changed: true,
         })
+    }
+
+    /// Удаляет `RRset` и выполняет `T_NODE`/ENT-каскад (§13.4).
+    ///
+    /// Возвращает `true`, если ключ существовал. Overflow-цепочка значения
+    /// освобождается в текущей транзакции.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево; ошибки [`PageIo`].
+    pub fn delete_rrset<P: PageIo + ?Sized>(
+        &mut self,
+        io: &mut P,
+        txn: u64,
+        name: &NameRle,
+        rr_type: u16,
+        subtype: u16,
+    ) -> Result<bool, ZoneFileError> {
+        if rr_type == T_NODE || rr_type == T_ZONE_ENTRY {
+            return Ok(false);
+        }
+        self.ancestor_chain(name)?;
+        let key = Key::new(name, rr_type, CLASS_IN, subtype)?;
+        if self.tree.delete(io, txn, &key)?.is_none() {
+            return Ok(false);
+        }
+        self.after_delete(io, txn, name)?;
+        Ok(true)
+    }
+
+    /// Удаляет все `RRset` имени (не поддерево) и обновляет `T_NODE`.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево; ошибки [`PageIo`].
+    pub fn delete_name<P: PageIo + ?Sized>(
+        &mut self,
+        io: &mut P,
+        txn: u64,
+        name: &NameRle,
+    ) -> Result<bool, ZoneFileError> {
+        let keys = self.collect_owner_keys(io, txn, name)?;
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        let had_records = keys
+            .iter()
+            .any(|key| key.rr_type() != T_NODE && key.rr_type() != T_ZONE_ENTRY);
+        for key in keys {
+            let _ = self.tree.delete(io, txn, &key)?;
+        }
+        self.after_delete(io, txn, name)?;
+        Ok(had_records)
+    }
+
+    /// Удаляет имя со всем поддеревом (§13.4, каскад cut).
+    ///
+    /// # Errors
+    ///
+    /// `InvariantViolation(CutSubtreeTooLarge)` — поддерево больше
+    /// [`MAX_CUT_SUBTREE_RECORDS`]; `Corrupt` — повреждённое дерево.
+    pub fn delete_subtree<P: PageIo + ?Sized>(
+        &mut self,
+        io: &mut P,
+        txn: u64,
+        name: &NameRle,
+    ) -> Result<bool, ZoneFileError> {
+        let keys = self.collect_subtree_keys(io, txn, name)?;
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        for key in keys {
+            let _ = self.tree.delete(io, txn, &key)?;
+        }
+        self.after_delete(io, txn, name)?;
+        Ok(true)
+    }
+
+    /// Все item'ы дерева (для компакции).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево.
+    pub fn collect_items<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        txn: u64,
+    ) -> Result<Vec<LeafItem>, ZoneFileError> {
+        let mut cursor = self.tree.cursor(io, txn);
+        let mut items = Vec::new();
+        if !cursor.seek_first()? {
+            return Ok(items);
+        }
+        loop {
+            if let Some(item) = cursor.item()? {
+                items.push(item);
+            }
+            if !cursor.advance()? {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    fn collect_owner_keys<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        txn: u64,
+        name: &NameRle,
+    ) -> Result<Vec<Key>, ZoneFileError> {
+        let start = Key::new(name, 0, 0, 0)?;
+        let mut cursor = self.tree.cursor(io, txn);
+        if !cursor.seek(&start)? {
+            return Ok(Vec::new());
+        }
+        let mut keys = Vec::new();
+        while let Some(key) = cursor.key()? {
+            if key.owner_bytes() != name.as_rle() {
+                break;
+            }
+            keys.push(key);
+            if !cursor.advance()? {
+                break;
+            }
+        }
+        Ok(keys)
+    }
+
+    fn collect_subtree_keys<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        txn: u64,
+        name: &NameRle,
+    ) -> Result<Vec<Key>, ZoneFileError> {
+        let start = Key::new(name, 0, 0, 0)?;
+        let mut cursor = self.tree.cursor(io, txn);
+        if !cursor.seek(&start)? {
+            return Ok(Vec::new());
+        }
+        let mut keys = Vec::new();
+        while let Some(key) = cursor.key()? {
+            let owner = key.owner()?;
+            if owner != *name && !is_descendant(&owner, name) {
+                break;
+            }
+            if keys.len() as u64 >= MAX_CUT_SUBTREE_RECORDS {
+                return Err(ZoneFileError::InvariantViolation(
+                    InvariantId::CutSubtreeTooLarge,
+                ));
+            }
+            keys.push(key);
+            if !cursor.advance()? {
+                break;
+            }
+        }
+        Ok(keys)
+    }
+
+    fn owner_has_rrset<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        txn: u64,
+        name: &NameRle,
+    ) -> Result<bool, ZoneFileError> {
+        let start = Key::new(name, 0, 0, 0)?;
+        let mut cursor = self.tree.cursor(io, txn);
+        if !cursor.seek(&start)? {
+            return Ok(false);
+        }
+        while let Some(key) = cursor.key()? {
+            if key.owner_bytes() != name.as_rle() {
+                break;
+            }
+            if key.rr_type() != T_NODE && key.rr_type() != T_ZONE_ENTRY {
+                return Ok(true);
+            }
+            if !cursor.advance()? {
+                break;
+            }
+        }
+        Ok(false)
+    }
+
+    fn after_delete<P: PageIo + ?Sized>(
+        &mut self,
+        io: &mut P,
+        txn: u64,
+        name: &NameRle,
+    ) -> Result<(), ZoneFileError> {
+        if self.owner_has_rrset(io, txn, name)? {
+            // У имени остались RRset'ы: T_NODE не трогаем, флаги уже корректны.
+            return Ok(());
+        }
+        let is_apex = name == &self.apex;
+        let has_children = self.has_children(io, txn, name)?;
+        if is_apex || has_children {
+            let mut flags = 0_u16;
+            if is_apex {
+                flags |= RR_FLAG_APEX;
+            } else {
+                flags |= RR_FLAG_EMPTY_NON_TERMINAL;
+            }
+            if has_children {
+                flags |= RR_FLAG_CHILDREN_MAY_EXIST;
+            }
+            let key = Key::new(name, T_NODE, 0, 0)?;
+            self.tree
+                .insert_or_replace(io, txn, &LeafItem::new(key, ItemValue::node(flags)))?;
+        } else {
+            let key = Key::new(name, T_NODE, 0, 0)?;
+            let _ = self.tree.delete(io, txn, &key)?;
+        }
+
+        let mut current = name.parent();
+        while let Some(parent) = current {
+            let has_children = self.has_children(io, txn, &parent)?;
+            let has_data = self.owner_has_rrset(io, txn, &parent)?;
+            if parent == self.apex {
+                let existing = self.node_flags(io, txn, &parent)?;
+                let flags = self.desired_flags(io, txn, &parent, has_data, existing)?;
+                let key = Key::new(&parent, T_NODE, 0, 0)?;
+                self.tree.insert_or_replace(
+                    io,
+                    txn,
+                    &LeafItem::new(key, ItemValue::node(flags)),
+                )?;
+                break;
+            }
+            if has_data || has_children {
+                let existing = self.node_flags(io, txn, &parent)?;
+                let flags = self.desired_flags(io, txn, &parent, has_data, existing)?;
+                let key = Key::new(&parent, T_NODE, 0, 0)?;
+                self.tree.insert_or_replace(
+                    io,
+                    txn,
+                    &LeafItem::new(key, ItemValue::node(flags)),
+                )?;
+                break;
+            }
+            let key = Key::new(&parent, T_NODE, 0, 0)?;
+            let _ = self.tree.delete(io, txn, &key)?;
+            current = parent.parent();
+        }
+        Ok(())
     }
 
     /// Читает overflow-цепочку значения (если значение overflow).

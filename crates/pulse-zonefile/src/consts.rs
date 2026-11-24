@@ -162,6 +162,8 @@ pub const LOCK_FILE_SUFFIX: &str = ".lock";
 pub const MAX_TTL: u32 = 0x7FFF_FFFF;
 /// Максимальный номер страницы файла.
 pub const MAX_FILE_PAGES: u32 = 0xFFFF_FFFE;
+/// Guard числа зон в файле (спецификация §16).
+pub const MAX_ZONES: u32 = 1_000_000;
 
 /// Максимум сравнений на один lookup.
 pub const MAX_COMPARISONS_PER_LOOKUP: u32 = 128;
