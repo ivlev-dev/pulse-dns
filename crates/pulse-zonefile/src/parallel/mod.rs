@@ -16,8 +16,10 @@
 //! батчинг зон, ровно два `fdatasync` на группу, backpressure и ack после
 //! публикации; `Flush`/`Memory` и липкий `Sync`; tombstone-GC каталога
 //! ([`ParallelZones::gc_catalog`]); sweep утечек ([`ParallelStore::leak_report`],
-//! [`ParallelStore::repair_leaks`], [`fsck_repair`]). Межпроцессная запись —
-//! вне M1. B3: `pulsed` работает поверх v2 (`--data`), а пользовательские
+//! [`ParallelStore::repair_leaks`], [`fsck_repair`]). M3 (ADR 0007):
+//! `multi_process` — общий sidecar-координатор (`coord`), per-zone
+//! `fcntl`-lease, reader table и seqlock публикации. B3: `pulsed` работает
+//! поверх v2 (`--data`), а пользовательские
 //! метаданные зоны (вид, TTL по умолчанию, denial) хранятся в записи каталога
 //! ([`ZoneMetaV2`]); v1-модули остаются для чтения legacy-файлов и
 //! `pulsed convert`.
@@ -49,6 +51,7 @@
 
 pub mod alloc;
 pub mod consts;
+pub mod coord;
 pub mod error;
 pub mod freepool;
 pub mod geometry;

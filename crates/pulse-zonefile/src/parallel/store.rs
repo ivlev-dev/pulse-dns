@@ -12,7 +12,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use rustix::fs::{FileType, Mode, OFlags, fdatasync, fstat, fsync, ftruncate, open as fs_open};
 
@@ -23,9 +23,12 @@ use crate::parallel::alloc::{AllocHandle, AllocTicket, Allocator};
 use crate::parallel::consts::{
     ALLOC_RECORD_SEQ_FIRST, ALLOC_RECORD_SIZE, DEFAULT_MAX_ZONES, DEFAULT_PAGE_COUNT_MAX,
     LAYOUT_HEAD_RECORD_SIZE, LEADER_TERM_M1, MAX_LEAK_RATIO, MAX_ROOT_CHAIN_HOPS,
-    MAX_ROOT_CHAIN_PAGES, PAGE_ALLOC_RECORD_A, PAGE_ALLOC_RECORD_B, PAGE_LAYOUT_HEAD_A,
+    MAX_ROOT_CHAIN_PAGES, NO_VERSION, PAGE_ALLOC_RECORD_A, PAGE_ALLOC_RECORD_B, PAGE_LAYOUT_HEAD_A,
     PAGE_LAYOUT_HEAD_B, PAGE_SIZE_V2, PIN_ATTEMPTS, READER_SLOTS_V2, ROOT_ENTRY_SIZE,
     ROOT_VERSIONS,
+};
+use crate::parallel::coord::{
+    CoordInit, MaintenanceGuard, ProcessIdentity, SharedCoord, self_identity,
 };
 use crate::parallel::error::{FatalKind, ParallelError, V2CorruptKind};
 use crate::parallel::freepool::{BucketImages, FreeChain};
@@ -36,7 +39,8 @@ use crate::parallel::layout::{
 use crate::parallel::pagecache::{DEFAULT_PAGE_CACHE_V2_ENTRIES, PageCacheV2, PageCacheV2Stats};
 use crate::parallel::pins::{EpochGuard, FreezeGuard, GcState, PinGuard, PinTable, Reader};
 use crate::parallel::recovery::{
-    FsckLiteReport, OpenConfigV2, RecoveryReport, merge_fatal, read_at, recover, scan_roots,
+    FsckLiteReport, OpenConfigV2, RecoveryReport, merge_fatal, read_alloc_records, read_at,
+    recover, scan_roots,
 };
 use crate::parallel::ring::Ring;
 use crate::parallel::root::{RootEntry, RootFlags};
@@ -59,6 +63,11 @@ pub struct StoreConfig {
     pub page_cache_entries: usize,
     /// Режим durability; фаза A поддерживает только [`SyncModeV2::Sync`].
     pub sync_mode: SyncModeV2,
+    /// Межпроцессный режим (ADR 0007): общий аллокатор/lease/reader table.
+    ///
+    /// По умолчанию `false` — ровно один процесс (`LOCK_EX`), поведение M1 без
+    /// изменений. `true` создаёт sidecar `.pulsecoord` и `LOCK_SH`.
+    pub multi_process: bool,
 }
 
 impl Default for StoreConfig {
@@ -70,6 +79,7 @@ impl Default for StoreConfig {
             reader_slots: READER_SLOTS_V2,
             page_cache_entries: DEFAULT_PAGE_CACHE_V2_ENTRIES,
             sync_mode: SyncModeV2::Sync,
+            multi_process: false,
         }
     }
 }
@@ -281,6 +291,12 @@ pub struct ParallelStore {
     donation: Mutex<Vec<DonationEntry>>,
     fatal: Mutex<Option<FatalKind>>,
     read_only: bool,
+    /// Общий координатор межпроцессной записи (ADR 0007); `None` — M1.
+    shared: Option<Arc<SharedCoord>>,
+    /// Идентичность процесса для lease/fencing.
+    identity: ProcessIdentity,
+    /// Сериализация фаз коммита внутри процесса (дополняет `fcntl`-лок).
+    commit_gate: Mutex<()>,
     crash_hook: Option<Box<dyn CrashHook>>,
     io_fault_hook: Option<Box<dyn IoFaultHook>>,
     /// Моделируемая задержка `fdatasync` (тесты/бенчи; 0 — выключено).
@@ -295,6 +311,41 @@ struct AllocDurable {
     seq: u64,
     page_limit: u64,
     txn_limit: u64,
+}
+
+/// RAII-окно глобального коммита (in-process mutex + межпроцессный `fcntl`).
+struct CommitWindow<'a> {
+    _gate: Option<MutexGuard<'a, ()>>,
+    _lock: Option<crate::parallel::coord::RangeLock>,
+}
+
+/// RAII-держатель writer-lease зоны.
+///
+/// В single-process режиме — только in-process `MutexGuard` (поведение M1:
+/// второй поток ждёт). В межпроцессном — `try_lock` (`ZoneBusy`) + байтовый
+/// `fcntl`-lock; освобождается в `Drop` или ядром при смерти процесса.
+pub(crate) struct ZoneLease<'a> {
+    _guard: MutexGuard<'a, ()>,
+    shared: Option<Arc<SharedCoord>>,
+    zone: u32,
+    generation: u64,
+}
+
+impl std::fmt::Debug for ZoneLease<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZoneLease")
+            .field("zone", &self.zone)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl Drop for ZoneLease<'_> {
+    fn drop(&mut self) {
+        if let Some(coord) = &self.shared {
+            coord.lease_release(self.zone, self.generation);
+        }
+    }
 }
 
 /// Per-zone состояние рекламации (под шардированным `Mutex`).
@@ -327,6 +378,16 @@ struct ReclaimPrep {
     chain_page: Option<u32>,
     /// Максимальный номер страницы, упомянутой bucket'ами/free-списком.
     max_page: u32,
+    /// Новая append-группа: устанавливается в пул только после фазы 1.
+    append: Option<PreparedAppend>,
+}
+
+/// Append-группа multi-режима: `drop_txn`, освобождённые страницы и страницы
+/// bucket'а (голова — первая).
+struct PreparedAppend {
+    drop_txn: u64,
+    freed: Vec<u32>,
+    page_ids: Vec<u32>,
 }
 
 /// Подготовленный (но ещё не записанный) коммит зоны.
@@ -349,6 +410,10 @@ pub(crate) struct PreparedPublish {
     minimum_limit: u64,
     /// Прежняя ячейка ring (`version % 4`) на момент плана.
     old: Option<RootEntry>,
+    /// Голова зоны на момент плана (`0` — зоны не было).
+    base_version: u64,
+    /// Fencing-поколение lease на момент плана (`0` — single-process).
+    fence: u64,
     /// Оценка байтов коммита для лимитов группы.
     weight: u64,
 }
@@ -423,12 +488,14 @@ impl ParallelStore {
             lock,
             config.page_cache_entries,
             config.sync_mode,
+            config.multi_process,
         );
         match result {
             Ok(store) => Ok(store),
             Err(error) => {
                 let _ = std::fs::remove_file(path);
                 let _ = std::fs::remove_file(&lock_path);
+                let _ = std::fs::remove_file(SharedCoord::path_for(path));
                 Err(error)
             }
         }
@@ -442,6 +509,7 @@ impl ParallelStore {
         lock: WriterLock,
         page_cache_entries: usize,
         sync_mode: SyncModeV2,
+        multi_process: bool,
     ) -> Result<Self, ParallelError> {
         ftruncate(&file, geometry.file_size()).map_err(std::io::Error::from)?;
         let uuid = new_instance_uuid();
@@ -499,7 +567,27 @@ impl ParallelStore {
         let leases = allocate_leases()?;
         let (raw_cache, node_cache) = make_caches(page_cache_entries);
         let dp = u64::from(geometry.page_data_first());
-        let allocator = Allocator::new(dp, 2, geometry.page_count_max())?;
+        let init = CoordInit {
+            durable_pages: dp,
+            durable_txn: 1,
+            next_txn: 2,
+            published: 0,
+            durable_versions: Vec::new(),
+        };
+        let shared = if multi_process {
+            Some(SharedCoord::open(path, geometry, uuid, &init)?)
+        } else {
+            None
+        };
+        let allocator = match &shared {
+            Some(coord) => {
+                Allocator::new_shared(dp, 2, geometry.page_count_max(), Arc::clone(coord))?
+            }
+            None => Allocator::new(dp, 2, geometry.page_count_max())?,
+        };
+        if multi_process {
+            lock.downgrade_to_shared()?;
+        }
         let report = RecoveryReport {
             superblock_source: crate::parallel::error::CopySource::Both,
             torn_superblock: false,
@@ -550,6 +638,9 @@ impl ParallelStore {
             donation: Mutex::new(Vec::new()),
             fatal: Mutex::new(None),
             read_only: false,
+            shared,
+            identity: self_identity(),
+            commit_gate: Mutex::new(()),
             crash_hook: None,
             io_fault_hook: None,
             sync_delay_ns: AtomicU64::new(0),
@@ -565,8 +656,13 @@ impl ParallelStore {
     ///
     /// `Busy` — lock занят; `Corrupt`/`Unsupported`/`Io` — recovery не смог
     /// восстановить доверенную раскладку.
+    #[allow(clippy::too_many_lines)]
     pub fn open(path: &Path, config: OpenConfigV2) -> Result<Self, ParallelError> {
-        let lock = if config.writer_lock && !config.read_only {
+        // В межпроцессном режиме эксклюзивный `flock` не берётся: писатели
+        // держат `LOCK_SH` на sidecar, а per-zone lease — `fcntl`-диапазоны.
+        let lock = if config.multi_process {
+            Some(acquire_shared_lock(path)?)
+        } else if config.writer_lock && !config.read_only {
             Some(acquire_lock(path)?)
         } else {
             None
@@ -615,11 +711,45 @@ impl ParallelStore {
         let gc = GcState::new(geometry.max_zones())?;
         let leases = allocate_leases()?;
         let (raw_cache, node_cache) = make_caches(config.page_cache_entries);
-        let allocator = Allocator::new(
-            recovered.durable_page_limit,
-            recovered.next_txn,
-            geometry.page_count_max(),
-        )?;
+        let durable_version_list = recovered
+            .heads
+            .iter()
+            .enumerate()
+            .filter_map(|(index, head)| {
+                head.as_ref()
+                    .and_then(|entry| u32::try_from(index).ok().map(|zone| (zone, entry.version)))
+            })
+            .collect();
+        let init = CoordInit {
+            durable_pages: recovered.durable_page_limit,
+            durable_txn: recovered.durable_txn_limit,
+            next_txn: recovered.next_txn,
+            published: recovered.report.max_root_version,
+            durable_versions: durable_version_list,
+        };
+        let shared = if config.multi_process {
+            Some(SharedCoord::open(
+                path,
+                geometry,
+                recovered.superblock.instance_uuid,
+                &init,
+            )?)
+        } else {
+            None
+        };
+        let allocator = match &shared {
+            Some(coord) => Allocator::new_shared(
+                recovered.durable_page_limit,
+                recovered.next_txn,
+                geometry.page_count_max(),
+                Arc::clone(coord),
+            )?,
+            None => Allocator::new(
+                recovered.durable_page_limit,
+                recovered.next_txn,
+                geometry.page_count_max(),
+            )?,
+        };
         let published_txn = recovered.report.max_root_version;
         let fatal = recovered.report.fatal;
         let file_mode = recovered.superblock.sync_mode;
@@ -656,6 +786,9 @@ impl ParallelStore {
             donation: Mutex::new(Vec::new()),
             fatal: Mutex::new(fatal),
             read_only: config.read_only,
+            shared,
+            identity: self_identity(),
+            commit_gate: Mutex::new(()),
             crash_hook: None,
             io_fault_hook: None,
             sync_delay_ns: AtomicU64::new(0),
@@ -692,6 +825,82 @@ impl ParallelStore {
         &self.path
     }
 
+    /// Межпроцессный режим включён.
+    #[must_use]
+    pub fn multi_process(&self) -> bool {
+        self.shared.is_some()
+    }
+
+    /// Путь sidecar-координатора (если режим межпроцессный).
+    #[must_use]
+    pub fn coord_path(&self) -> Option<&Path> {
+        self.shared.as_ref().map(|coord| coord.path())
+    }
+
+    /// Владелец lease зоны (диагностика `ZoneBusy`).
+    #[must_use]
+    pub fn zone_lease_owner(&self, zone: u32) -> Option<(u64, u64)> {
+        self.shared
+            .as_ref()
+            .and_then(|coord| coord.lease_owner(zone))
+            .map(|owner| (owner.pid, owner.starttime))
+    }
+
+    /// Захватывает эксклюзивное обслуживание файла (`fsck --repair`).
+    ///
+    /// `None` — режим single-process (других писателей нет по определению) или
+    /// другие процессы живы.
+    pub(crate) fn try_maintenance(&self) -> Option<MaintenanceGuard<'_>> {
+        self.shared.as_ref()?.try_maintenance()
+    }
+
+    fn is_multi(&self) -> bool {
+        self.shared.is_some()
+    }
+
+    /// Читает голову зоны из ring в файле (межпроцессная видимость).
+    fn read_head_disk(&self, zone: u32) -> Result<Option<RootEntry>, ParallelError> {
+        let slot = if zone == 0 {
+            self.geometry.catalog_slot()
+        } else {
+            self.geometry.zone_slot(zone)?
+        };
+        let ring = Ring::new(&self.file, &self.geometry);
+        let view = ring.read_slot_at(slot, zone)?;
+        let mut best: Option<RootEntry> = None;
+        for cell in &view.cells {
+            if let Some(entry) = cell.best
+                && best.is_none_or(|current| entry.version > current.version)
+            {
+                best = Some(entry);
+            }
+        }
+        Ok(best)
+    }
+
+    /// `MP(z)` с учётом чужого процесса.
+    fn effective_mp(&self, zone: u32) -> u64 {
+        let local = self.gc.mp(zone);
+        match &self.shared {
+            Some(coord) => local.min(coord.oldest_pin(zone).unwrap_or(NO_VERSION)),
+            None => local,
+        }
+    }
+
+    /// `RV_z = min(D_z − 1, MP(z), freeze)` (мультипроцессный `MP`).
+    fn reclaim_ceiling(&self, zone: u32) -> u64 {
+        let durable = self.durable_version(zone);
+        if durable == 0 {
+            return 0;
+        }
+        let mut rv = durable.saturating_sub(1).min(self.effective_mp(zone));
+        let freeze = self.gc.freeze_epoch();
+        if freeze != 0 {
+            rv = rv.min(freeze);
+        }
+        rv
+    }
+
     /// Геометрия.
     #[must_use]
     pub const fn geometry(&self) -> Geometry {
@@ -719,19 +928,28 @@ impl ParallelStore {
     /// Durable `page_limit` (`DP`).
     #[must_use]
     pub fn durable_page_limit(&self) -> u64 {
-        self.durable_page_limit.load(Ordering::Acquire)
+        match &self.shared {
+            Some(coord) => coord.durable_pages().load(Ordering::Acquire),
+            None => self.durable_page_limit.load(Ordering::Acquire),
+        }
     }
 
     /// Durable `txn_limit` (`DT`).
     #[must_use]
     pub fn durable_txn_limit(&self) -> u64 {
-        self.durable_txn_limit.load(Ordering::Acquire)
+        match &self.shared {
+            Some(coord) => coord.durable_txn().load(Ordering::Acquire),
+            None => self.durable_txn_limit.load(Ordering::Acquire),
+        }
     }
 
     /// Максимальный опубликованный `txn` (`e0` для пинов).
     #[must_use]
     pub fn published_txn(&self) -> u64 {
-        self.published_txn.load(Ordering::Acquire)
+        match &self.shared {
+            Some(coord) => coord.published().load(Ordering::Acquire),
+            None => self.published_txn.load(Ordering::Acquire),
+        }
     }
 
     /// Аллокатор.
@@ -767,7 +985,10 @@ impl ParallelStore {
     ///
     /// `TooManyReaders` — все слоты заняты.
     pub fn reader(&self) -> Result<Reader<'_>, ParallelError> {
-        Reader::register(&self.pins)
+        match &self.shared {
+            Some(coord) => Reader::register_shared(&self.pins, coord),
+            None => Reader::register(&self.pins),
+        }
     }
 
     /// Текущая причина `write_locked`.
@@ -802,9 +1023,7 @@ impl ParallelStore {
             group_fsyncs: self.stats.group_fsyncs.load(Ordering::Relaxed),
             group_max_members: self.stats.group_max_members.load(Ordering::Relaxed),
             group_aborted: self.stats.group_aborted.load(Ordering::Relaxed),
-            aborted_pages_estimate: self
-                .allocator
-                .leaked_pages(self.durable_page_limit.load(Ordering::Acquire)),
+            aborted_pages_estimate: self.allocator.leaked_pages(self.durable_page_limit()),
         }
     }
 
@@ -827,9 +1046,13 @@ impl ParallelStore {
     /// `D_z` — durable-версия зоны (двигается только `Sync`/`sync()`).
     #[must_use]
     pub fn durable_version(&self, zone: u32) -> u64 {
-        self.durable_versions
-            .get(zone as usize)
-            .map_or(0, |value| value.load(Ordering::Acquire))
+        match &self.shared {
+            Some(coord) => coord.durable_version(zone),
+            None => self
+                .durable_versions
+                .get(zone as usize)
+                .map_or(0, |value| value.load(Ordering::Acquire)),
+        }
     }
 
     /// Включает липкий `Sync` (после durable-группы или `sync()`).
@@ -909,7 +1132,10 @@ impl ParallelStore {
     /// Число активных in-process пинов (диагностика/метрики).
     #[must_use]
     pub fn active_pins(&self) -> usize {
-        self.pins.snapshot_pins().len()
+        match &self.shared {
+            Some(coord) => coord.snapshot_pins().len(),
+            None => self.pins.snapshot_pins().len(),
+        }
     }
 
     /// Число страниц в per-zone пулах (durable + in-memory).
@@ -962,7 +1188,7 @@ impl ParallelStore {
         current_version: u64,
     ) -> Result<Option<u32>, ParallelError> {
         let durable = self.durable_version(zone);
-        let rv = self.gc.reclaim_version(zone, durable);
+        let rv = self.reclaim_ceiling(zone);
         {
             let mut shard = lock_unpoison(self.pool_shard(zone));
             let entry = shard.zones.entry(zone).or_default();
@@ -973,6 +1199,11 @@ impl ParallelStore {
             if let Some(page) = entry.immediate.pop() {
                 self.stats.reclaimed_pages.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(page));
+            }
+            // Межпроцессный режим — bump-only: общий per-zone пул не
+            // кэшируется между процессами (иначе возможна двойная выдача).
+            if self.is_multi() {
+                return Ok(None);
             }
             if let Some(page) = entry.chain.take_eligible(durable, rv, current_version) {
                 entry.dirty = true;
@@ -991,7 +1222,7 @@ impl ParallelStore {
         max_pages: u32,
     ) -> Result<Vec<u32>, ParallelError> {
         let durable = self.durable_version(zone);
-        let rv = self.gc.reclaim_version(zone, durable);
+        let rv = self.reclaim_ceiling(zone);
         let mut pages = Vec::new();
         let mut shard = lock_unpoison(self.pool_shard(zone));
         let entry = shard.zones.entry(zone).or_default();
@@ -1000,10 +1231,13 @@ impl ParallelStore {
             entry.loaded = true;
         }
         while u32::try_from(pages.len()).unwrap_or(u32::MAX) < max_pages {
-            let page = entry
-                .immediate
-                .pop()
-                .or_else(|| entry.chain.take_eligible(durable, rv, current_version));
+            let page = entry.immediate.pop().or_else(|| {
+                if self.is_multi() {
+                    None
+                } else {
+                    entry.chain.take_eligible(durable, rv, current_version)
+                }
+            });
             match page {
                 Some(page) => pages.push(page),
                 None => break,
@@ -1070,15 +1304,19 @@ impl ParallelStore {
     ///
     /// `InvalidArgument` — внутренняя ошибка индекса.
     pub fn gc_pass(&self) -> Result<u32, ParallelError> {
+        if let Some(coord) = &self.shared {
+            let _ = coord.sanitize_dead();
+        }
         let zones = self.gc.dirty_zones();
         for zone in &zones {
-            self.gc.refresh(*zone, &self.pins, &self.zone_guard)?;
+            self.gc
+                .refresh_with(*zone, &self.pins, self.shared.as_deref(), &self.zone_guard)?;
             if !self.read_only
                 && self.fatal().is_none()
                 && *zone != 0
                 && self.geometry.zone_slot(*zone).is_ok()
             {
-                let _lease = lock_unpoison(self.lease(*zone));
+                let _lease = self.lease_guard(*zone)?;
                 self.reclaim_chain_pages(*zone)?;
             }
         }
@@ -1096,13 +1334,24 @@ impl ParallelStore {
         if head.prev_record == 0 {
             return Ok(0);
         }
+        // Межпроцессный режим не переиспользует страницы пула, а chain-страницы
+        // достижимы из durable-головы (их видит `fsck`), поэтому перенос в
+        // bucket не даёт ни рекламации, ни уменьшения утечек.
+        if self.is_multi() {
+            return Ok(0);
+        }
         let guard_ref = self
             .zone_guard
             .get(zone as usize)
             .ok_or(ParallelError::InvalidArgument { field: "zone_seq" })?;
         let floor = {
             let _guard = EpochGuard::enter(guard_ref);
-            self.gc.chain_floor(zone)
+            let freeze = self.gc.freeze_epoch();
+            if freeze == 0 {
+                self.effective_mp(zone)
+            } else {
+                self.effective_mp(zone).min(freeze)
+            }
         };
         let ring = Ring::new(&self.file, &self.geometry);
         let mut page = head.prev_record;
@@ -1180,6 +1429,8 @@ impl ParallelStore {
     /// `ReadOnly` — файл `write_locked`; `Io` — ошибка записи/fsync.
     pub fn sync(&self) -> Result<(u64, u64), ParallelError> {
         self.ensure_writable()?;
+        let _window = self.begin_commit_window()?;
+        self.reload_durable()?;
         // Снимок голов ДО fsync: всё, что записано к этому моменту, попадёт в
         // fdatasync; более новые публикации останутся неdurable (консервативно).
         let mut durable_heads = Vec::new();
@@ -1201,9 +1452,18 @@ impl ParallelStore {
         durable.txn_limit = txn_limit;
         self.durable_page_limit.store(page_limit, Ordering::Release);
         self.durable_txn_limit.store(txn_limit, Ordering::Release);
+        if let Some(coord) = &self.shared {
+            coord
+                .durable_pages()
+                .fetch_max(page_limit, Ordering::Release);
+            coord.durable_txn().fetch_max(txn_limit, Ordering::Release);
+        }
         for (zone, version) in durable_heads {
             if let Some(slot) = self.durable_versions.get(zone as usize) {
                 slot.store(version, Ordering::Release);
+            }
+            if let Some(coord) = &self.shared {
+                coord.set_durable_version(zone, version);
             }
         }
         self.promote_sticky();
@@ -1222,7 +1482,7 @@ impl ParallelStore {
     /// с пином (публикация не выполнена); `MapFull`/`Io`/`InvalidArgument`.
     #[allow(clippy::too_many_lines)]
     pub fn publish_root(&self, entry: RootEntry) -> Result<PublishOutcome, ParallelError> {
-        let _lease = lock_unpoison(self.lease(entry.owner_zone));
+        let _lease = self.lease_guard(entry.owner_zone)?;
         self.publish_root_locked(entry)
     }
 
@@ -1391,7 +1651,7 @@ impl ParallelStore {
         let mut max_allocated = self.allocator.cursor().saturating_sub(1);
         let mut needs_chain = None;
         if let Some(previous) = old {
-            let mp = self.gc.mp(zone);
+            let mp = self.effective_mp(zone);
             if previous.version >= mp {
                 let depth = self.chain_depth(zone)?;
                 if depth >= self.geometry.max_root_chain_pages() {
@@ -1444,11 +1704,11 @@ impl ParallelStore {
             });
         }
         record.page_limit_at_commit = minimum_limit;
-        record
-            .check_fields(self.geometry.page_count_max())
-            .map_err(|_| ParallelError::InvalidArgument {
+        if record.check_fields(self.geometry.page_count_max()).is_err() {
+            return Err(ParallelError::InvalidArgument {
                 field: "root entry",
-            })?;
+            });
+        }
         let weight = weight
             .saturating_add(reclaim.images.iter().fold(0_u64, |acc, (_, image)| {
                 acc.saturating_add(u64::try_from(image.len()).unwrap_or(u64::MAX))
@@ -1462,6 +1722,11 @@ impl ParallelStore {
             reclaim,
             minimum_limit: u64::from(minimum_limit),
             old,
+            base_version: head.map_or(0, |current| current.version),
+            fence: self
+                .shared
+                .as_ref()
+                .map_or(0, |coord| coord.lease_generation(zone)),
             weight,
         })
     }
@@ -1529,10 +1794,20 @@ impl ParallelStore {
         };
         self.stats.group_fsyncs.fetch_add(fsyncs, Ordering::Relaxed);
 
+        let window = match self.begin_commit_window() {
+            Ok(window) => window,
+            Err(error) => {
+                let message = error.to_string();
+                return (0..count)
+                    .map(|_| Err(ParallelError::Io(std::io::Error::other(message.clone()))))
+                    .collect();
+            }
+        };
         let page_limit = match self.phase1(&members, mode) {
             Ok(limit) => limit,
             Err(_error) => {
                 // Исход группы не определён: ни одна голова не публикуется.
+                drop(window);
                 self.mark_fatal(FatalKind::CommitUncertain);
                 return (0..count)
                     .map(|_| {
@@ -1545,6 +1820,7 @@ impl ParallelStore {
         };
         let mut pending: Vec<usize> = (0..count).collect();
         if let Err(error) = self.phase2(&members, mode, &mut results, &mut pending) {
+            drop(window);
             self.mark_fatal(FatalKind::CommitUncertain);
             let reason = if let ParallelError::ReadOnly { reason } = error {
                 reason
@@ -1561,6 +1837,7 @@ impl ParallelStore {
             Ordering::Relaxed,
         );
         self.publish_group(members, mode, page_limit, &pending, &mut results);
+        drop(window);
         results
             .into_iter()
             .map(|slot| {
@@ -1571,10 +1848,29 @@ impl ParallelStore {
             .collect()
     }
 
+    /// Окно глобального коммита: сериализует фазы 1–2 между процессами.
+    ///
+    /// В single-process режиме окно пустое (текущая семантика не меняется).
+    fn begin_commit_window(&self) -> Result<CommitWindow<'_>, ParallelError> {
+        if let Some(coord) = &self.shared {
+            let gate = lock_unpoison(&self.commit_gate);
+            let lock = coord.lock_commit()?;
+            return Ok(CommitWindow {
+                _gate: Some(gate),
+                _lock: Some(lock),
+            });
+        }
+        Ok(CommitWindow {
+            _gate: None,
+            _lock: None,
+        })
+    }
+
     /// Фаза 1: `ALLOC_RECORD` (`Sync`) + chain/bucket-образы всех зон группы,
     /// затем один `fdatasync` (кроме `Memory`).
     fn phase1(&self, members: &[PreparedPublish], mode: SyncModeV2) -> Result<u64, ParallelError> {
-        let mut candidate = self.durable_page_limit.load(Ordering::Acquire);
+        self.reload_durable()?;
+        let mut candidate = self.durable_page_limit();
         for member in members {
             candidate = candidate
                 .max(member.minimum_limit)
@@ -1585,6 +1881,7 @@ impl ParallelStore {
             self.fire(CrashPoint::BeforeAllocRecord);
             self.write_group_metadata(members)?;
             self.fire(CrashPoint::AfterPhase1Writes);
+            self.install_appends(members)?;
             self.fire(CrashPoint::AfterPhase1Fsync);
             return Ok(candidate);
         }
@@ -1617,6 +1914,7 @@ impl ParallelStore {
         self.write_group_metadata(members)?;
         self.fire(CrashPoint::AfterPhase1Writes);
         self.fsync_data()?;
+        self.install_appends(members)?;
         self.fire(CrashPoint::AfterPhase1Fsync);
         if mode == SyncModeV2::Sync {
             durable.seq = seq;
@@ -1624,8 +1922,76 @@ impl ParallelStore {
             durable.txn_limit = txn_limit;
             self.durable_page_limit.store(candidate, Ordering::Release);
             self.durable_txn_limit.store(txn_limit, Ordering::Release);
+            if let Some(coord) = &self.shared {
+                coord
+                    .durable_pages()
+                    .fetch_max(candidate, Ordering::Release);
+                coord.durable_txn().fetch_max(txn_limit, Ordering::Release);
+            }
         }
         Ok(candidate)
+    }
+
+    /// Перечитывает durable-барьер из файла под глобальным commit-lock.
+    ///
+    /// В межпроцессном режиме `ALLOC_RECORD` мог уйти вперёд (другой процесс),
+    /// поэтому локальный кэш `alloc_durable` и атомики поднимаются до
+    /// max-valid значения; `DP`/`DT` монотонны (§3.4).
+    fn reload_durable(&self) -> Result<(), ParallelError> {
+        if self.shared.is_none() {
+            return Ok(());
+        }
+        let (record, _, _) = read_alloc_records(&self.file, self.geometry, &mut None)?;
+        let Some(record) = record else {
+            return Ok(());
+        };
+        let mut durable = lock_unpoison(&self.alloc_durable);
+        durable.seq = durable.seq.max(record.seq);
+        durable.page_limit = durable.page_limit.max(record.page_limit);
+        durable.txn_limit = durable.txn_limit.max(record.txn_limit);
+        self.durable_page_limit
+            .fetch_max(durable.page_limit, Ordering::Release);
+        self.durable_txn_limit
+            .fetch_max(durable.txn_limit, Ordering::Release);
+        if let Some(coord) = &self.shared {
+            coord
+                .durable_pages()
+                .fetch_max(durable.page_limit, Ordering::Release);
+            coord
+                .durable_txn()
+                .fetch_max(durable.txn_limit, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Устанавливает append-группы в in-memory пул после durable-фазы 1.
+    ///
+    /// Только здесь подготовленный план становится частью пула: если запрос
+    /// потерян до фазы 1, пул не содержит «половины» группы, а выделенные
+    /// страницы — обычная утечка `[DP, cursor)`.
+    fn install_appends(&self, members: &[PreparedPublish]) -> Result<(), ParallelError> {
+        for member in members {
+            let Some(append) = &member.reclaim.append else {
+                continue;
+            };
+            let mut shard = lock_unpoison(self.pool_shard(member.zone));
+            let entry = shard.zones.entry(member.zone).or_default();
+            if !entry.loaded {
+                entry.chain = self.load_zone_chain(member.zone)?;
+                entry.loaded = true;
+            }
+            let Some(group_head) = append.page_ids.first().copied() else {
+                continue;
+            };
+            entry.chain.install_group(
+                append.drop_txn,
+                &append.freed,
+                group_head,
+                self.geometry.page_data_first(),
+            )?;
+            entry.dirty = false;
+        }
+        Ok(())
     }
 
     fn write_group_metadata(&self, members: &[PreparedPublish]) -> Result<(), ParallelError> {
@@ -1667,11 +2033,56 @@ impl ParallelStore {
                 return Err(ParallelError::InvalidArgument { field: "zone_seq" });
             };
             let guard = EpochGuard::enter(guard_ref);
+            let shared = self.shared.as_deref();
+            let mut sequenced = false;
+            if let Some(coord) = shared {
+                // Кросс-процессный seqlock: читатель валидирует свой пин
+                // относительно этого окна (ADR 0007 §6).
+                if !coord.zone_write_begin(member.zone) {
+                    drop(guard);
+                    return Err(ParallelError::InvalidArgument { field: "zone_seq" });
+                }
+                sequenced = true;
+                if !coord.lease_owned_by(member.zone, self.identity)
+                    || coord.lease_generation(member.zone) != member.fence
+                {
+                    coord.zone_write_end(member.zone);
+                    drop(guard);
+                    if let Some(slot) = results.get_mut(index) {
+                        *slot = Some(Err(ParallelError::ZoneBusy { zone: member.zone }));
+                    }
+                    continue;
+                }
+                // Пока мы ждали commit-lock, голову могли перевести (другой
+                // процесс успел закоммитить под своим lease до нас). План
+                // устарел — retryable, без записи.
+                let current = self
+                    .read_head_disk(member.zone)
+                    .map(|head| head.map_or(0, |entry| entry.version));
+                match current {
+                    Ok(version) if version == member.base_version => {}
+                    Ok(_) => {
+                        coord.zone_write_end(member.zone);
+                        drop(guard);
+                        if let Some(slot) = results.get_mut(index) {
+                            *slot = Some(Err(ParallelError::ZoneBusy { zone: member.zone }));
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        coord.zone_write_end(member.zone);
+                        drop(guard);
+                        return Err(error);
+                    }
+                }
+            }
+            let mp = self.effective_mp(member.zone);
             if member.chain_write.is_none()
-                && member
-                    .old
-                    .is_some_and(|previous| previous.version >= self.gc.mp(member.zone))
+                && member.old.is_some_and(|previous| previous.version >= mp)
             {
+                if sequenced && let Some(coord) = shared {
+                    coord.zone_write_end(member.zone);
+                }
                 drop(guard);
                 self.stats.reader_contended.fetch_add(1, Ordering::Relaxed);
                 if let Some(slot) = results.get_mut(index) {
@@ -1685,6 +2096,9 @@ impl ParallelStore {
                 member.slot.cell_offset(member.record.version),
                 &member.record,
             ) {
+                if sequenced && let Some(coord) = shared {
+                    coord.zone_write_end(member.zone);
+                }
                 drop(guard);
                 return Err(error);
             }
@@ -1694,6 +2108,9 @@ impl ParallelStore {
                 member.slot.cell_offset(member.record.version),
                 &member.record,
             );
+            if sequenced && let Some(coord) = shared {
+                coord.zone_write_end(member.zone);
+            }
             drop(guard);
             written?;
             self.fire(CrashPoint::AfterRootCopyB);
@@ -1737,6 +2154,16 @@ impl ParallelStore {
                 && let Some(slot) = self.durable_versions.get(member.zone as usize)
             {
                 slot.store(member.record.version, Ordering::Release);
+            }
+            if let Some(coord) = &self.shared {
+                if mode == SyncModeV2::Sync {
+                    // D_z двигается только после durable-фазы 2; другой процесс
+                    // использует его как гейт рекламации.
+                    coord.set_durable_version(member.zone, member.record.version);
+                }
+                coord
+                    .published()
+                    .fetch_max(member.record.version, Ordering::Release);
             }
             published_txn = published_txn.max(member.record.version);
             self.stats.publications.fetch_add(1, Ordering::Relaxed);
@@ -1784,13 +2211,20 @@ impl ParallelStore {
         needs_chain: bool,
         max_allocated: &mut u64,
     ) -> Result<ReclaimPrep, ParallelError> {
+        if self.is_multi() {
+            return self.prepare_reclaim_multi(zone, version, drops, needs_chain, max_allocated);
+        }
         let durable = self.durable_version(zone);
-        let rv = self.gc.reclaim_version(zone, durable);
+        let rv = self.reclaim_ceiling(zone);
         let data_first = self.geometry.page_data_first();
         let mut pool = {
             let mut shard = lock_unpoison(self.pool_shard(zone));
             let entry = shard.zones.entry(zone).or_default();
             if !entry.loaded {
+                // Межпроцессный режим: durable-цепочка могла измениться
+                // (другой процесс коммитил эту зону до захвата lease). Под
+                // lease перечитываем её, иначе `free_head` укажет на старую
+                // цепочку и новые bucket'ы станут недостижимыми.
                 entry.chain = self.load_zone_chain(zone)?;
                 entry.loaded = true;
             }
@@ -1806,6 +2240,7 @@ impl ParallelStore {
                     images: Vec::new(),
                     chain_page: None,
                     max_page: free_head,
+                    append: None,
                 });
             }
             entry.clone()
@@ -1832,6 +2267,7 @@ impl ParallelStore {
                 images: Vec::new(),
                 chain_page,
                 max_page,
+                append: None,
             });
         }
 
@@ -1905,11 +2341,126 @@ impl ParallelStore {
             images,
             chain_page,
             max_page,
+            append: None,
+        })
+    }
+
+    /// Append-only рекламация межпроцессного режима (ADR 0007 §7).
+    ///
+    /// Пул зоны обновляется in-place под шардовым mutex: clone всей цепочки на
+    /// каждый коммит дал бы O(n²). Безопасность: зону пишет только держатель
+    /// lease, а группа `drop_txn = V` попадает в durable bucket в фазе 1 того
+    /// же коммита; при отмене фазы 2 группа остаётся недостижимой из головы
+    /// (утечка), но не портит цепочку.
+    fn prepare_reclaim_multi(
+        &self,
+        zone: u32,
+        version: u64,
+        drops: &[u32],
+        needs_chain: bool,
+        max_allocated: &mut u64,
+    ) -> Result<ReclaimPrep, ParallelError> {
+        let mut shard = lock_unpoison(self.pool_shard(zone));
+        let entry = shard.zones.entry(zone).or_default();
+        if !entry.loaded {
+            entry.chain = self.load_zone_chain(zone)?;
+            entry.loaded = true;
+        }
+        let durable = self.durable_version(zone);
+        let rv = self.reclaim_ceiling(zone);
+        let mut chain_page = None;
+        if needs_chain {
+            chain_page = Some(Self::allocate_from_pool(
+                self,
+                &mut entry.chain,
+                durable,
+                rv,
+                version,
+                max_allocated,
+            )?);
+        }
+        let immediate = std::mem::take(&mut entry.immediate);
+        let rebuild = !drops.is_empty() || !immediate.is_empty() || needs_chain;
+        if !rebuild {
+            return Ok(ReclaimPrep {
+                pool: None,
+                free_head: entry.chain.head(),
+                images: Vec::new(),
+                chain_page,
+                max_page: Self::chain_max_page(&entry.chain),
+                append: None,
+            });
+        }
+        // Retry того же `version` (ReaderContended после фазы 1): bucket уже
+        // durable и уже в голове цепочки. Повторный append удвоил бы группу,
+        // поэтому переиспользуем опубликованную голову без новых образов.
+        if entry
+            .chain
+            .buckets()
+            .iter()
+            .any(|bucket| bucket.drop_txn == version && bucket.page != 0)
+        {
+            return Ok(ReclaimPrep {
+                pool: None,
+                free_head: entry.chain.head(),
+                images: Vec::new(),
+                chain_page,
+                max_page: Self::chain_max_page(&entry.chain),
+                append: None,
+            });
+        }
+        let mut freed: Vec<u32> = Vec::new();
+        let mut seen: HashSet<u32> = HashSet::new();
+        for page in drops.iter().copied().chain(immediate) {
+            if page == 0 || !seen.insert(page) {
+                return Err(ParallelError::Corrupt {
+                    kind: V2CorruptKind::WatermarkRegression,
+                    page: Some(page),
+                });
+            }
+            freed.push(page);
+        }
+        let needed = FreeChain::append_pages_needed(freed.len());
+        let mut page_ids: Vec<u32> = Vec::with_capacity(needed);
+        while page_ids.len() < needed {
+            let ticket = self.allocator.reserve_exact(1)?;
+            *max_allocated = (*max_allocated).max(u64::from(ticket.first_page));
+            if Some(ticket.first_page) == chain_page || page_ids.contains(&ticket.first_page) {
+                return Err(ParallelError::Corrupt {
+                    kind: V2CorruptKind::WatermarkRegression,
+                    page: Some(ticket.first_page),
+                });
+            }
+            page_ids.push(ticket.first_page);
+        }
+        // Пул не меняется до фазы 1: неудачная подготовка/потеря запроса
+        // оставляет только утёкшие страницы, но не «половину» группы.
+        let (free_head, images) = entry.chain.plan_append(zone, version, &freed, &page_ids)?;
+        let mut max_page = Self::chain_max_page(&entry.chain).max(free_head);
+        for page in &page_ids {
+            max_page = max_page.max(*page);
+        }
+        let append = if freed.is_empty() {
+            None
+        } else {
+            Some(PreparedAppend {
+                drop_txn: version,
+                freed,
+                page_ids,
+            })
+        };
+        Ok(ReclaimPrep {
+            pool: None,
+            free_head,
+            images,
+            chain_page,
+            max_page,
+            append,
         })
     }
 
     fn chain_max_page(chain: &FreeChain) -> u32 {
-        let mut max_page = 0_u32;
+        let mut max_page = chain.head();
         for bucket in chain.buckets() {
             max_page = max_page.max(bucket.page);
             for page in &bucket.pages {
@@ -1927,7 +2478,12 @@ impl ParallelStore {
         version: u64,
         max_allocated: &mut u64,
     ) -> Result<u32, ParallelError> {
-        if let Some(page) = chain.take_eligible(durable, rv, version) {
+        // Межпроцессный режим не переиспользует durable-пул: кэш `FreeChain`
+        // локален для процесса, и выдача из чужого bucket'а дала бы двойную
+        // аллокацию. Bump-only сохраняет инвариант «страница выдана один раз».
+        if !self.is_multi()
+            && let Some(page) = chain.take_eligible(durable, rv, version)
+        {
             return Ok(page);
         }
         let ticket = self.allocator.reserve_exact(1)?;
@@ -2024,6 +2580,9 @@ impl ParallelStore {
         reader: &'a Reader<'a>,
         zone: u32,
     ) -> Result<ZoneSnapshot<'a>, ParallelError> {
+        if let Some(coord) = &self.shared {
+            return self.zone_snapshot_shared(reader, zone, coord);
+        }
         let e0 = self.published_txn.load(Ordering::Acquire);
         let mut stuck_odd: Option<(u32, std::time::Instant)> = None;
         for attempt in 0..PIN_ATTEMPTS {
@@ -2087,6 +2646,68 @@ impl ParallelStore {
             }
             drop(pin);
             self.gc.mark_dirty(zone);
+            self.stats.reader_contended.fetch_add(1, Ordering::Relaxed);
+            backoff(attempt);
+        }
+        Err(ParallelError::ReaderContended)
+    }
+
+    /// `zone_snapshot` межпроцессного режима: ring → пин → валидация seqlock.
+    ///
+    /// Протокол (ADR 0007 §6): писатель входит в нечётное окно
+    /// `zone_write_seq` до сканирования пинов и выходит после записи ячейки;
+    /// читатель читает ring, публикует пин `SeqCst`, затем проверяет, что
+    /// `zone_write_seq` не изменился и чётен. Гарантия: либо читатель увидит
+    /// новую версию, либо писатель увидит пин и не перезапишет ячейку.
+    fn zone_snapshot_shared<'a>(
+        &'a self,
+        reader: &'a Reader<'a>,
+        zone: u32,
+        coord: &'a SharedCoord,
+    ) -> Result<ZoneSnapshot<'a>, ParallelError> {
+        if reader.shared_slot().is_none() {
+            return Err(ParallelError::ReaderContended);
+        }
+        for attempt in 0..PIN_ATTEMPTS {
+            let before = coord.zone_write_seq(zone);
+            if before & 1 != 0 {
+                backoff(attempt);
+                continue;
+            }
+            let head = match self.read_head_disk(zone) {
+                Ok(head) => head,
+                Err(ParallelError::Corrupt { kind, .. }) if !kind.is_file_fatal() => {
+                    // Зона-локальная порча: карантин только этой зоны.
+                    self.degrade_zone(zone);
+                    return Err(ParallelError::ZoneDegraded {
+                        zone,
+                        epoch: self.load_guard(zone),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(head) = head else {
+                return Err(ParallelError::NoZoneVersion { zone });
+            };
+            if head.is_tombstone() {
+                return Err(ParallelError::NoZoneVersion { zone });
+            }
+            self.ensure_zone_readable(zone)?;
+            let pin = reader.pin(zone, head.version, 0);
+            fence(Ordering::SeqCst);
+            let after = coord.zone_write_seq(zone);
+            if before == after && after & 1 == 0 {
+                self.gc.note_pin(zone, head.version);
+                self.gc.mark_dirty(zone);
+                return Ok(ZoneSnapshot {
+                    root: head,
+                    pin,
+                    gc: &self.gc,
+                    zone,
+                    _not_send: std::marker::PhantomData,
+                });
+            }
+            drop(pin);
             self.stats.reader_contended.fetch_add(1, Ordering::Relaxed);
             backoff(attempt);
         }
@@ -2318,9 +2939,7 @@ impl ParallelStore {
     }
 
     fn leak_report_from(graph: &crate::parallel::verify::GraphReport, store: &Self) -> LeakReport {
-        let aborted = store
-            .allocator
-            .leaked_pages(store.durable_page_limit.load(Ordering::Acquire));
+        let aborted = store.allocator.leaked_pages(store.durable_page_limit());
         let ratio = if graph.durable_pages == 0 {
             0.0
         } else {
@@ -2356,7 +2975,15 @@ impl ParallelStore {
     /// # Errors
     ///
     /// `Corrupt(PageOverlap)` — пересечение множеств; `ReadOnly`/`Io`/`MapFull`.
+    #[allow(clippy::too_many_lines)]
     pub fn repair_leaks(&self) -> Result<RepairReport, ParallelError> {
+        // В межпроцессном режиме repair — эксклюзивная maintenance-операция:
+        // пока живы другие процессы, страницы/пулы нельзя перераспределять.
+        let _maintenance = match self.try_maintenance() {
+            Some(guard) => Some(guard),
+            None if self.shared.is_some() => return Err(ParallelError::Busy),
+            None => None,
+        };
         let initial = crate::parallel::verify::verify(self)?;
         if let Some(kind) = initial.fatal {
             self.note_fatal(kind);
@@ -2434,6 +3061,7 @@ impl ParallelStore {
 
         // 4. Утечки — bucket-группа каталога (`owner_zone = 0`).
         self.ensure_writable()?;
+        let _catalog_lease = self.lease_guard(0)?;
         let head = self.catalog_head();
         let version = self.allocator.next_txn_exact()?;
         let entry = RootEntry {
@@ -2528,6 +3156,9 @@ impl ParallelStore {
             flags.fetch_or(ZONE_DEGRADED | ZONE_NEEDS_FSCK, Ordering::AcqRel);
         }
         self.published_txn.fetch_max(version, Ordering::Release);
+        if let Some(coord) = &self.shared {
+            coord.published().fetch_max(version, Ordering::Release);
+        }
         self.stats.publications.fetch_add(1, Ordering::Relaxed);
         // Durable `ALLOC_RECORD.txn_limit` должен покрывать новую версию.
         self.sync()?;
@@ -2594,6 +3225,11 @@ impl ParallelStore {
     }
 
     fn head(&self, zone: u32) -> Option<RootEntry> {
+        if self.is_multi() {
+            // Межпроцессный режим не доверяет локальному кэшу: голова могла
+            // быть опубликована другим процессом.
+            return self.read_head_disk(zone).ok().flatten();
+        }
         match self.heads.get(zone as usize) {
             Some(block) => match block.load() {
                 HeadRead::Stable(entry) => Some(entry),
@@ -2620,9 +3256,45 @@ impl ParallelStore {
     /// Берёт writer-lease зоны (или каталога `0`).
     ///
     /// Разные зоны пишутся параллельно; коллизия шардов лишь сериализует
-    /// открытие/коммит. Lease удерживается пока жив `MutexGuard`.
-    pub(crate) fn lease_guard(&self, zone: u32) -> MutexGuard<'_, ()> {
-        lock_unpoison(self.lease(zone))
+    /// открытие/коммит. Lease удерживается пока жив [`ZoneLease`].
+    ///
+    /// # Errors
+    ///
+    /// `ZoneBusy` — в межпроцессном режиме зона уже под lease (другой процесс
+    /// или поток); `Io` — ошибка `fcntl`; `InvalidArgument` — зона вне геометрии.
+    pub(crate) fn lease_guard(&self, zone: u32) -> Result<ZoneLease<'_>, ParallelError> {
+        let mutex = self.lease(zone);
+        if let Some(coord) = &self.shared {
+            let guard = match mutex.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => {
+                    return Err(ParallelError::ZoneBusy { zone });
+                }
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            };
+            let generation = coord.lease_acquire(zone, self.identity)?;
+            // Кэш durable-пула мог устареть, пока зону писал другой процесс.
+            // Под взятым lease перечитываем цепочку один раз (лениво).
+            {
+                let mut shard = lock_unpoison(self.pool_shard(zone));
+                let entry = shard.zones.entry(zone).or_default();
+                entry.chain = FreeChain::empty();
+                entry.loaded = false;
+                entry.dirty = false;
+            }
+            return Ok(ZoneLease {
+                _guard: guard,
+                shared: Some(Arc::clone(coord)),
+                zone,
+                generation,
+            });
+        }
+        Ok(ZoneLease {
+            _guard: lock_unpoison(mutex),
+            shared: None,
+            zone,
+            generation: 0,
+        })
     }
 
     /// Голова зоны без проверки читаемости (включая каталог `0`).
@@ -2710,7 +3382,10 @@ impl ParallelStore {
             txn_limit,
             write_unix_ns: unix_now_ns(),
             leader_term: LEADER_TERM_M1,
-            epoch_hint: self.gc.freeze_epoch(),
+            epoch_hint: self.shared.as_ref().map_or_else(
+                || self.gc.freeze_epoch(),
+                |coord| coord.generation().load(Ordering::Acquire),
+            ),
             writer_pid: u64::from(std::process::id()),
         };
         let record_b = AllocRecord {
@@ -2887,7 +3562,7 @@ impl ZoneSnapshot<'_> {
 
     /// Использован EPOCH-overflow-пин.
     #[must_use]
-    pub const fn is_overflow_pin(&self) -> bool {
+    pub fn is_overflow_pin(&self) -> bool {
         self.pin.is_overflow()
     }
 }
@@ -3072,12 +3747,41 @@ fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+/// Короткое «окно прощения» для `Busy`.
+///
+/// `flock`-лок наследуется через `fork` до `exec` (fd помечен `CLOEXEC`), поэтому
+/// чужой `fork` в момент открытия может на единицы миллисекунд удержать лок.
+/// Реальный писатель держит лок дольше окна, и `Busy` остаётся `Busy`.
+const LOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 fn acquire_lock(path: &Path) -> Result<WriterLock, ParallelError> {
-    match WriterLock::acquire(path) {
-        Ok(Some(lock)) => Ok(lock),
-        Err(crate::ZoneFileError::NotRegularFile) => Err(ParallelError::NotRegularFile),
-        Err(crate::ZoneFileError::Io(error)) => Err(ParallelError::Io(error)),
-        Ok(None) | Err(_) => Err(ParallelError::Busy),
+    acquire_lock_grace(path, false)
+}
+
+fn acquire_shared_lock(path: &Path) -> Result<WriterLock, ParallelError> {
+    acquire_lock_grace(path, true)
+}
+
+fn acquire_lock_grace(path: &Path, shared: bool) -> Result<WriterLock, ParallelError> {
+    let deadline = std::time::Instant::now() + LOCK_GRACE;
+    loop {
+        let attempt = if shared {
+            WriterLock::acquire_shared(path)
+        } else {
+            WriterLock::acquire(path)
+        };
+        match attempt {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(ParallelError::Busy);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(crate::ZoneFileError::NotRegularFile) => return Err(ParallelError::NotRegularFile),
+            Err(crate::ZoneFileError::Io(error)) => return Err(ParallelError::Io(error)),
+            Err(_) => return Err(ParallelError::Busy),
+        }
     }
 }
 
@@ -3164,6 +3868,7 @@ pub fn open_read_only(path: &Path) -> Result<ParallelStore, ParallelError> {
         OpenConfigV2 {
             read_only: true,
             writer_lock: false,
+            multi_process: false,
             page_cache_entries: DEFAULT_PAGE_CACHE_V2_ENTRIES,
         },
     )
@@ -3185,6 +3890,7 @@ pub fn fsck_repair(path: &Path) -> Result<RepairReport, ParallelError> {
         OpenConfigV2 {
             read_only: false,
             writer_lock: true,
+            multi_process: false,
             page_cache_entries: DEFAULT_PAGE_CACHE_V2_ENTRIES,
         },
     )?;

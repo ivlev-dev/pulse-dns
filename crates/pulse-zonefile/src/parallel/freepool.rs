@@ -104,6 +104,12 @@ pub(crate) type BucketImages = Vec<(u32, Vec<u8>)>;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FreeChain {
     buckets: Vec<FreeBucket>,
+    /// Страница-голова on-disk цепочки (`0` — пусто).
+    ///
+    /// Для COW-пересборки (single-process) это страница самой старой группы;
+    /// для append-режима (multi-process) — самой новой. `buckets` всегда
+    /// хранится в порядке `drop_txn` возрастания.
+    head_page: u32,
 }
 
 impl FreeChain {
@@ -122,7 +128,11 @@ impl FreeChain {
     /// Голова цепочки (`0` — пусто).
     #[must_use]
     pub(crate) fn head(&self) -> u32 {
-        self.buckets.first().map_or(0, |bucket| bucket.page)
+        if self.head_page != 0 {
+            self.head_page
+        } else {
+            self.buckets.first().map_or(0, |bucket| bucket.page)
+        }
     }
 
     /// Bucket'ы в порядке цепочки.
@@ -145,7 +155,6 @@ impl FreeChain {
     ) -> Result<Self, ParallelError> {
         let mut buckets = Vec::new();
         let mut page = head.free_head;
-        let mut previous_txn = 0_u64;
         let mut seen_buckets = std::collections::HashSet::new();
         let mut seen_pages = std::collections::HashSet::new();
         let ring = Ring::new(file, geometry);
@@ -160,10 +169,6 @@ impl FreeChain {
             if image.drop_txn > head.version {
                 return Err(corrupt(page, V2CorruptKind::WatermarkRegression));
             }
-            if image.drop_txn < previous_txn {
-                return Err(corrupt(page, V2CorruptKind::WatermarkRegression));
-            }
-            previous_txn = image.drop_txn;
             for freed in &image.pages {
                 if !seen_pages.insert(*freed) {
                     return Err(corrupt(*freed, V2CorruptKind::WatermarkRegression));
@@ -176,20 +181,48 @@ impl FreeChain {
             });
             page = image.next;
         }
+        // Цепочка читается от `free_head`. В single-process режиме группы
+        // идут по возрастанию `drop_txn` (COW-пересборка), в append-режиме
+        // (multi-process) — по убыванию. Оба порядка валидны; смешанный —
+        // порча. В памяти всегда ascending.
+        let mut ascending = true;
+        let mut descending = true;
+        for pair in buckets.windows(2) {
+            let (left, right) = match pair {
+                [left, right] => (left.drop_txn, right.drop_txn),
+                _ => continue,
+            };
+            if left > right {
+                ascending = false;
+            }
+            if left < right {
+                descending = false;
+            }
+        }
+        if !ascending && !descending {
+            return Err(corrupt(head.free_head, V2CorruptKind::WatermarkRegression));
+        }
+        if descending {
+            buckets.reverse();
+        }
         if buckets
             .iter()
             .any(|bucket| seen_pages.contains(&bucket.page))
         {
             return Err(corrupt(head.free_head, V2CorruptKind::WatermarkRegression));
         }
-        Ok(Self { buckets })
+        Ok(Self {
+            buckets,
+            head_page: head.free_head,
+        })
     }
 
     /// Строит in-memory цепочку из уже прочитанных образов (для тестов).
     #[cfg(test)]
     #[must_use]
     pub(crate) fn from_buckets(buckets: Vec<FreeBucket>) -> Self {
-        Self { buckets }
+        let head_page = buckets.first().map_or(0, |bucket| bucket.page);
+        Self { buckets, head_page }
     }
 
     /// Добавляет группу `drop_txn` (сливает с существующей группой).
@@ -271,6 +304,103 @@ impl FreeChain {
             .sum()
     }
 
+    /// Число страниц под одну append-группу `pages` (multi-process).
+    #[must_use]
+    pub(crate) fn append_pages_needed(pages: usize) -> usize {
+        pages.div_ceil(FREE_BUCKET_CAPACITY)
+    }
+
+    /// Планирует append-образы новой группы без изменения цепочки.
+    ///
+    /// On-disk цепочка в multi-режиме идёт по убыванию `drop_txn`: голова —
+    /// новейшая группа, `next` последней страницы новой группы указывает на
+    /// старый head. Установка в память — отдельный шаг
+    /// [`FreeChain::install_group`] (после durable-фазы 1), поэтому неудачная
+    /// подготовка не оставляет «половину» группы в пуле.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — не совпало число страниц.
+    pub(crate) fn plan_append(
+        &self,
+        zone: u32,
+        drop_txn: u64,
+        freed: &[u32],
+        page_ids: &[u32],
+    ) -> Result<(u32, BucketImages), ParallelError> {
+        if freed.is_empty() {
+            return Ok((self.head(), Vec::new()));
+        }
+        let needed = Self::append_pages_needed(freed.len());
+        if page_ids.len() != needed {
+            return Err(corrupt(0, V2CorruptKind::WatermarkRegression));
+        }
+        let mut images = Vec::with_capacity(needed);
+        for (index, chunk) in freed.chunks(FREE_BUCKET_CAPACITY).enumerate() {
+            let Some(page) = page_ids.get(index).copied() else {
+                return Err(corrupt(0, V2CorruptKind::WatermarkRegression));
+            };
+            let next = page_ids
+                .get(index + 1)
+                .copied()
+                .unwrap_or_else(|| self.head());
+            images.push((page, encode_bucket(page, zone, drop_txn, next, chunk)?));
+        }
+        Ok((
+            page_ids.first().copied().unwrap_or_else(|| self.head()),
+            images,
+        ))
+    }
+
+    /// Устанавливает append-группу в память после записи/fsync её образов.
+    ///
+    /// Идемпотентна: повторный вызов с тем же `drop_txn` ничего не делает.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — страница уже присутствует в пуле.
+    pub(crate) fn install_group(
+        &mut self,
+        drop_txn: u64,
+        freed: &[u32],
+        group_head: u32,
+        data_first: u32,
+    ) -> Result<(), ParallelError> {
+        if freed.is_empty() {
+            return Ok(());
+        }
+        if self
+            .buckets
+            .iter()
+            .any(|bucket| bucket.drop_txn == drop_txn && bucket.page != 0)
+        {
+            return Ok(());
+        }
+        if group_head < data_first {
+            return Err(corrupt(group_head, V2CorruptKind::Bounds));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for page in freed {
+            if *page < data_first || !seen.insert(*page) {
+                return Err(corrupt(*page, V2CorruptKind::Bounds));
+            }
+            if self
+                .buckets
+                .iter()
+                .any(|bucket| bucket.pages.contains(page))
+            {
+                return Err(corrupt(*page, V2CorruptKind::WatermarkRegression));
+            }
+        }
+        self.buckets.push(FreeBucket {
+            page: group_head,
+            drop_txn,
+            pages: freed.to_vec(),
+        });
+        self.head_page = group_head;
+        Ok(())
+    }
+
     /// Назначает новые bucket-страницы группам и возвращает образы для записи.
     ///
     /// `pages.len()` обязан совпадать с [`FreeChain::needed_images`].
@@ -319,6 +449,7 @@ impl FreeChain {
             }
         }
         self.buckets = rebuilt;
+        self.head_page = self.buckets.first().map_or(0, |bucket| bucket.page);
         Ok((self.head(), images))
     }
 }

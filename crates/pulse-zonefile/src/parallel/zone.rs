@@ -19,7 +19,6 @@
 //! [`ParallelError::Unsupported`] (B2).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::MutexGuard;
 
 use crate::consts::{MAX_OVERFLOW_PAGES, PAGE_TYPE_OVERFLOW};
 use crate::errors::{CorruptDetail, CorruptKind, ZoneFileError};
@@ -631,7 +630,7 @@ impl<'a> ParallelZones<'a> {
     }
 
     fn write_catalog_edit(&mut self, edit: CatalogEdit<'_>) -> Result<bool, ParallelError> {
-        let _lease = self.store.lease_guard(0);
+        let _lease = self.store.lease_guard(0)?;
         let mut io = WriteIo::new(self.store, 0, self.version);
         io.clear_cache();
         let txn = io.next_txn()?;
@@ -734,7 +733,7 @@ pub struct ParallelZone<'a> {
     zone: u32,
     tree: ZoneTree,
     io: WriteIo<'a>,
-    _lease: MutexGuard<'a, ()>,
+    _lease: crate::parallel::store::ZoneLease<'a>,
     base_version: u64,
     txn: Option<u64>,
     /// Новой/переиспользованной зоне нужен первый durable `RootEntry`.
@@ -796,7 +795,7 @@ impl<'a> ParallelZone<'a> {
         zone: u32,
         cached: bool,
     ) -> Result<Self, ParallelError> {
-        let lease = store.lease_guard(zone);
+        let lease = store.lease_guard(zone)?;
         let head = store
             .head_entry(zone)
             .ok_or(ParallelError::NoZoneVersion { zone })?;
@@ -830,7 +829,7 @@ impl<'a> ParallelZone<'a> {
         zone: u32,
         soa_serial: u32,
     ) -> Result<Self, ParallelError> {
-        let lease = store.lease_guard(zone);
+        let lease = store.lease_guard(zone)?;
         let base_version = match store.head_entry(zone) {
             None => 0,
             Some(head) if head.is_tombstone() => head.version,

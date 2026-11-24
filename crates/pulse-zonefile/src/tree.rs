@@ -488,6 +488,20 @@ impl BTree {
             return Ok(step.old);
         }
         self.root = step.page;
+        if let Some((separator, right)) = step.split {
+            let new_level = self
+                .level
+                .checked_add(1)
+                .filter(|&level| level <= MAX_TREE_DEPTH)
+                .ok_or_else(|| invariant(InvariantId::DepthExceeded))?;
+            let items = [
+                BranchItem::new(step.first_key, self.root),
+                BranchItem::new(separator, right),
+            ];
+            let (root_page, _) = write_branch_page(io, None, txn, new_level - 1, &items)?;
+            self.root = root_page;
+            self.level = new_level;
+        }
         loop {
             if self.level <= 1 {
                 break;
@@ -954,6 +968,11 @@ struct DeleteStep {
     old: Option<ItemValue>,
     empty: bool,
     underflow: bool,
+    /// Новый правый сосед, если узел после удаления перестал помещаться в
+    /// страницу (front-coding зависит от позиций restart'ов, поэтому узел с
+    /// меньшим числом item'ов может кодироваться длиннее). Родитель вставляет
+    /// сепаратор `(Key, u32)` сразу за текущим item'ом.
+    split: Option<(Key, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1016,22 +1035,27 @@ fn node_is_empty(node: &NodeData) -> bool {
     }
 }
 
+fn node_encoded_size(node: &NodeData) -> Result<u32, ZoneFileError> {
+    match node {
+        NodeData::Leaf(leaf) => node::leaf_encoded_size_fast(&leaf.items),
+        NodeData::Branch(branch) => node::branch_encoded_size_fast(&branch.items),
+    }
+}
+
 fn node_content(node: &NodeData) -> Result<u32, ZoneFileError> {
-    let size = match node {
-        NodeData::Leaf(leaf) => node::leaf_encoded_size_fast(&leaf.items)?,
-        NodeData::Branch(branch) => node::branch_encoded_size_fast(&branch.items)?,
-    };
+    let size = node_encoded_size(node)?;
     Ok(size.saturating_sub(u32::try_from(node::NODE_HEADER_BYTES).unwrap_or(0)))
 }
 
-fn append_node(left: &mut NodeData, right: NodeData) {
+fn append_node(left: &mut NodeData, right: NodeData) -> Result<(), ZoneFileError> {
     match (left, right) {
         (NodeData::Leaf(left), NodeData::Leaf(right)) => left.items.extend(right.items),
         (NodeData::Branch(left), NodeData::Branch(right)) => left.items.extend(right.items),
-        // Смешение типов на одном уровне — повреждение дерева; merge вызывается
-        // только для узлов одного уровня, поэтому ветка недостижима.
-        _ => {}
+        // Смешение типов на одном уровне — повреждение дерева: merge вызывается
+        // только для узлов одного уровня, поэтому это защитная проверка.
+        _ => return Err(bounds(None, CorruptDetail::PageType)),
     }
+    Ok(())
 }
 
 fn write_node<P: PageIo + ?Sized>(
@@ -1095,6 +1119,7 @@ fn delete_rec<P: PageIo + ?Sized>(
                 old: None,
                 empty: node.items.is_empty(),
                 underflow: false,
+                split: None,
             });
         }
         let removed = node.items.remove(position);
@@ -1106,6 +1131,7 @@ fn delete_rec<P: PageIo + ?Sized>(
                 old: Some(removed.value),
                 empty: true,
                 underflow: true,
+                split: None,
             });
         }
         let first_key = node
@@ -1113,69 +1139,110 @@ fn delete_rec<P: PageIo + ?Sized>(
             .first()
             .map(|item| item.key)
             .ok_or_else(|| invariant(InvariantId::EncodedSize))?;
-        let underflow = node_underflow(&NodeData::Leaf(node.clone()), page_size)?;
-        let (new_page, _) = write_leaf_page(io, cache, txn, &node.items)?;
+        if node::leaf_encoded_size_fast(&node.items)? <= page_size {
+            let underflow = node_underflow(&NodeData::Leaf(node.clone()), page_size)?;
+            let (new_page, _) = write_leaf_page(io, cache, txn, &node.items)?;
+            io.free_page(page_no)?;
+            return Ok(DeleteStep {
+                page: new_page,
+                first_key,
+                old: Some(removed.value),
+                empty: false,
+                underflow,
+                split: None,
+            });
+        }
+        // Удаление сдвинуло restart-разметку: узел с меньшим числом item'ов
+        // кодируется длиннее и перестал помещаться. Делим его и сообщаем
+        // родителю о новом правом соседе.
+        let (left, right) = split_leaf(&node.items, page_size)?;
+        let (left_page, left_first) = write_leaf_page(io, cache, txn, &left)?;
+        let (right_page, right_first) = write_leaf_page(io, cache, txn, &right)?;
         io.free_page(page_no)?;
-        return Ok(DeleteStep {
-            page: new_page,
-            first_key,
+        Ok(DeleteStep {
+            page: left_page,
+            first_key: left_first,
             old: Some(removed.value),
             empty: false,
-            underflow,
-        });
-    }
-
-    let mut branch = {
-        let decoded = load_branch(io, cache, txn, page_no, node_level, page_size)?;
-        if decoded.level() != node_level {
-            return Err(bounds(Some(page_no), CorruptDetail::PageType));
-        }
-        decoded.to_branch()?
-    };
-    let position = branch_predecessor(&branch.items, target)?.unwrap_or(0);
-    let child = branch
-        .items
-        .get(position)
-        .ok_or_else(|| bounds(Some(page_no), CorruptDetail::ChildRange))?
-        .child;
-    let mut step = delete_rec(io, cache, txn, child, node_level - 1, target, depth + 1)?;
-    if step.empty {
-        io.free_page(step.page)?;
-        branch.items.remove(position);
+            underflow: false,
+            split: Some((right_first, right_page)),
+        })
     } else {
-        {
-            let entry = branch
-                .items
-                .get_mut(position)
-                .ok_or_else(|| bounds(Some(page_no), CorruptDetail::ChildRange))?;
-            entry.child = step.page;
-            entry.key = step.first_key;
+        let mut branch = {
+            let decoded = load_branch(io, cache, txn, page_no, node_level, page_size)?;
+            if decoded.level() != node_level {
+                return Err(bounds(Some(page_no), CorruptDetail::PageType));
+            }
+            decoded.to_branch()?
+        };
+        let position = branch_predecessor(&branch.items, target)?.unwrap_or(0);
+        let child = branch
+            .items
+            .get(position)
+            .ok_or_else(|| bounds(Some(page_no), CorruptDetail::ChildRange))?
+            .child;
+        let mut step = delete_rec(io, cache, txn, child, node_level - 1, target, depth + 1)?;
+        let child_split = step.split.take();
+        if step.empty {
+            io.free_page(step.page)?;
+            branch.items.remove(position);
+        } else {
+            {
+                let entry = branch
+                    .items
+                    .get_mut(position)
+                    .ok_or_else(|| bounds(Some(page_no), CorruptDetail::ChildRange))?;
+                entry.child = step.page;
+                entry.key = step.first_key;
+            }
+            if let Some((separator, right)) = child_split {
+                branch
+                    .items
+                    .insert(position + 1, BranchItem::new(separator, right));
+            } else if step.underflow {
+                rebalance(io, cache, txn, node_level, &mut branch.items, position)?;
+            }
         }
-        if step.underflow {
-            rebalance(io, cache, txn, node_level, &mut branch.items, position)?;
+        if branch.items.is_empty() {
+            return Ok(DeleteStep {
+                page: page_no,
+                first_key: Key::placeholder(),
+                old: step.old,
+                empty: true,
+                underflow: true,
+                split: None,
+            });
         }
+        let first_key = branch
+            .items
+            .first()
+            .map(|entry| entry.key)
+            .ok_or_else(|| invariant(InvariantId::EncodedSize))?;
+        if node::branch_encoded_size_fast(&branch.items)? <= page_size {
+            let underflow = node_underflow(&NodeData::Branch(branch.clone()), page_size)?;
+            let (new_page, _) = write_branch_page(io, cache, txn, node_level, &branch.items)?;
+            io.free_page(page_no)?;
+            step.page = new_page;
+            step.first_key = first_key;
+            // Ветвление выжило: `empty` от удалённого ребёнка не наследуется,
+            // иначе родитель удалил бы всё поддерево.
+            step.empty = false;
+            step.underflow = underflow;
+            step.split = None;
+            return Ok(step);
+        }
+        // Та же restart-разметка, но на уровне ветвления.
+        let (left, right) = split_branch(&branch.items, page_size)?;
+        let (left_page, left_first) = write_branch_page(io, cache, txn, node_level, &left)?;
+        let (right_page, right_first) = write_branch_page(io, cache, txn, node_level, &right)?;
+        io.free_page(page_no)?;
+        step.page = left_page;
+        step.first_key = left_first;
+        step.empty = false;
+        step.underflow = false;
+        step.split = Some((right_first, right_page));
+        Ok(step)
     }
-    if branch.items.is_empty() {
-        return Ok(DeleteStep {
-            page: page_no,
-            first_key: Key::placeholder(),
-            old: step.old,
-            empty: true,
-            underflow: true,
-        });
-    }
-    let first_key = branch
-        .items
-        .first()
-        .map(|entry| entry.key)
-        .ok_or_else(|| invariant(InvariantId::EncodedSize))?;
-    let underflow = node_underflow(&NodeData::Branch(branch.clone()), page_size)?;
-    let (new_page, _) = write_branch_page(io, cache, txn, node_level, &branch.items)?;
-    io.free_page(page_no)?;
-    step.page = new_page;
-    step.first_key = first_key;
-    step.underflow = underflow;
-    Ok(step)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1199,7 +1266,13 @@ fn rebalance<P: PageIo + ?Sized>(
         .child;
     let child_node = load_node(io, cache, txn, child_page, child_level, page_size)?;
     let child_content = node_content(&child_node)?;
-    if node_is_empty(&child_node) && items.len() < 2 {
+    if node_is_empty(&child_node) {
+        if items.len() < 2 {
+            return Ok(());
+        }
+        // Пустой ребёнок: его item и страница удаляются, сосед не переписывается.
+        io.free_page(child_page)?;
+        items.remove(index);
         return Ok(());
     }
     let right = index + 1 < items.len();
@@ -1212,8 +1285,10 @@ fn rebalance<P: PageIo + ?Sized>(
     let sibling_content = node_content(&sibling_node)?;
     let combined = u64::from(child_content).saturating_add(u64::from(sibling_content));
 
-    // Слияние: суммарное содержимое <= 75% usable.
-    if node_is_empty(&child_node) || combined * 4 <= u64::from(usable) * 3 {
+    // Слияние: суммарное содержимое <= 75% usable и результат реально
+    // помещается в страницу. Оценка по `node_content` игнорирует сдвиг
+    // restart-разметки, поэтому размер проверяется повторным планированием.
+    if combined * 4 <= u64::from(usable) * 3 {
         let (left_index, right_index) = if right {
             (index, sibling_index)
         } else {
@@ -1224,9 +1299,13 @@ fn rebalance<P: PageIo + ?Sized>(
         } else {
             sibling_node.clone()
         };
-        let right_node = if right { sibling_node } else { child_node };
+        let right_node = if right {
+            sibling_node.clone()
+        } else {
+            child_node.clone()
+        };
         let mut merged = left_node;
-        append_node(&mut merged, right_node);
+        append_node(&mut merged, right_node)?;
         let (left_page, right_page) = (
             items
                 .get(left_index)
@@ -1244,16 +1323,20 @@ fn rebalance<P: PageIo + ?Sized>(
             items.remove(left_index);
             return Ok(());
         }
-        let first_key = node_first(&merged)?;
-        let merged_page = write_node(io, cache, txn, child_level, &merged)?;
-        io.free_page(left_page)?;
-        io.free_page(right_page)?;
-        if let Some(entry) = items.get_mut(left_index) {
-            entry.key = first_key;
-            entry.child = merged_page;
+        if node_encoded_size(&merged)? <= page_size {
+            let first_key = node_first(&merged)?;
+            let merged_page = write_node(io, cache, txn, child_level, &merged)?;
+            io.free_page(left_page)?;
+            io.free_page(right_page)?;
+            if let Some(entry) = items.get_mut(left_index) {
+                entry.key = first_key;
+                entry.child = merged_page;
+            }
+            items.remove(right_index);
+            return Ok(());
         }
-        items.remove(right_index);
-        return Ok(());
+        // Не помещается: пробуем заимствование ниже, иначе узел остаётся
+        // недозаполненным (это корректное состояние дерева).
     }
 
     // Заимствование: у соседа >= 40% usable. Переносим item'ы, пока это
@@ -1308,6 +1391,10 @@ fn rebalance<P: PageIo + ?Sized>(
         };
         let child_first = node_first(&new_child)?;
         let right_first = node_first(&new_right)?;
+        if node_encoded_size(&new_child)? > page_size || node_encoded_size(&new_right)? > page_size
+        {
+            return Ok(());
+        }
         let new_child_page = write_node(io, cache, txn, child_level, &new_child)?;
         let new_right_page = write_node(io, cache, txn, child_level, &new_right)?;
         io.free_page(child_page)?;
@@ -1365,6 +1452,9 @@ fn rebalance<P: PageIo + ?Sized>(
     };
     let left_first = node_first(&new_left)?;
     let child_first = node_first(&new_child)?;
+    if node_encoded_size(&new_left)? > page_size || node_encoded_size(&new_child)? > page_size {
+        return Ok(());
+    }
     let new_left_page = write_node(io, cache, txn, child_level, &new_left)?;
     let new_child_page = write_node(io, cache, txn, child_level, &new_child)?;
     io.free_page(sibling_page)?;

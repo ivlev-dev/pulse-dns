@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 crc32c = "0.6"
+libc = "0.2"
 memmap2 = "0.9"
 rustix = { version = "1", features = ["fs", "process", "time"] }
 thiserror = "2"
@@ -49,4 +50,8 @@ harness = false
 
 [[bench]]
 name = "v2_group"
+harness = false
+
+[[bench]]
+name = "v2_multiprocess"
 harness = false

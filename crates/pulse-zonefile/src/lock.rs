@@ -16,7 +16,8 @@ use crate::errors::ZoneFileError;
 #[derive(Debug)]
 pub(crate) struct WriterLock {
     // Держит дескриптор открытым: блокировка снимается только при `Drop`.
-    _file: File,
+    #[allow(dead_code)]
+    file: File,
 }
 
 impl WriterLock {
@@ -25,6 +26,44 @@ impl WriterLock {
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(LOCK_FILE_SUFFIX);
         lock_path
+    }
+
+    /// Понижает удерживаемый `LOCK_EX` до `LOCK_SH`.
+    ///
+    /// Нужно `create` в межпроцессном режиме: создание сериализовано
+    /// эксклюзивно, а дальнейшая жизнь файла допускает N `LOCK_SH`.
+    pub(crate) fn downgrade_to_shared(&self) -> Result<(), ZoneFileError> {
+        flock_retry(&self.file, rustix::fs::FlockOperation::LockShared)
+            .map_err(|error| ZoneFileError::Io(std::io::Error::from(error)))
+    }
+
+    /// Пытается взять `LOCK_SH | LOCK_NB` (межпроцессные писатели/читатели).
+    ///
+    /// `Ok(None)` — файл занят эксклюзивным (single-process) writer'ом.
+    pub(crate) fn acquire_shared(path: &Path) -> Result<Option<Self>, ZoneFileError> {
+        let lock_path = Self::path_for(path);
+        let fd = match open(
+            lock_path.as_os_str(),
+            OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(fd) => fd,
+            Err(error) if error == Errno::LOOP || error == Errno::ISDIR => {
+                return Err(ZoneFileError::NotRegularFile);
+            }
+            Err(error) => return Err(ZoneFileError::Io(std::io::Error::from(error))),
+        };
+        let file = File::from(fd);
+        let stat = fstat(&file).map_err(std::io::Error::from)?;
+        if !FileType::from_raw_mode(stat.st_mode).is_file() {
+            return Err(ZoneFileError::NotRegularFile);
+        }
+        fchmod(&file, Mode::RUSR | Mode::WUSR).map_err(std::io::Error::from)?;
+        match flock_retry(&file, rustix::fs::FlockOperation::NonBlockingLockShared) {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(Errno::WOULDBLOCK) => Ok(None),
+            Err(error) => Err(ZoneFileError::Io(std::io::Error::from(error))),
+        }
     }
 
     /// Пытается взять `LOCK_EX | LOCK_NB`.
@@ -57,9 +96,22 @@ impl WriterLock {
         }
         fchmod(&file, Mode::RUSR | Mode::WUSR).map_err(std::io::Error::from)?;
         match flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => Ok(Some(Self { file })),
             Err(Errno::WOULDBLOCK) => Ok(None),
             Err(error) => Err(ZoneFileError::Io(std::io::Error::from(error))),
+        }
+    }
+}
+
+/// `flock` с повтором на `EINTR`.
+///
+/// Под нагрузкой (много дочерних процессов) `SIGCHLD` может прервать
+/// non-blocking `flock`; без повтора это выглядело бы как ложный `Busy`.
+fn flock_retry(file: &File, operation: rustix::fs::FlockOperation) -> Result<(), Errno> {
+    loop {
+        match flock(file, operation) {
+            Err(Errno::INTR) => {}
+            result => return result,
         }
     }
 }

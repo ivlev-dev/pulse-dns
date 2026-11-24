@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 
 use crate::parallel::consts::{NO_VERSION, READER_PINS};
+use crate::parallel::coord::{SharedCoord, self_identity};
 use crate::parallel::error::ParallelError;
 
 /// Смещение `zone_seq` в пине (для golden/тестов).
@@ -304,6 +305,9 @@ struct SlotView {
 /// живого процесса не вытесняется, §6.5).
 pub struct Reader<'a> {
     table: &'a PinTable,
+    /// Межпроцессная reader table (ADR 0007 §5); `None` — single-process.
+    shared: Option<&'a SharedCoord>,
+    shared_slot: Option<usize>,
     index: usize,
     token: u64,
     _not_send: PhantomData<Rc<()>>,
@@ -313,6 +317,7 @@ impl std::fmt::Debug for Reader<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Reader")
             .field("slot", &self.index)
+            .field("shared_slot", &self.shared_slot)
             .field("token", &self.token)
             .finish()
     }
@@ -328,6 +333,39 @@ impl<'a> Reader<'a> {
         let (index, token) = table.register()?;
         Ok(Self {
             table,
+            shared: None,
+            shared_slot: None,
+            index,
+            token,
+            _not_send: PhantomData,
+        })
+    }
+
+    /// Занимает слот в in-process и межпроцессной reader table.
+    ///
+    /// # Errors
+    ///
+    /// `TooManyReaders` — все слоты (локальные или общие) заняты.
+    pub(crate) fn register_shared(
+        table: &'a PinTable,
+        coord: &'a SharedCoord,
+    ) -> Result<Self, ParallelError> {
+        let (index, token) = table.register()?;
+        let identity = self_identity();
+        let shared_slot = coord.reader_register(identity).or_else(|| {
+            // Мёртвые слоты освобождаются лениво: перед отказом чистим и
+            // пробуем ещё раз.
+            let _ = coord.sanitize_dead();
+            coord.reader_register(identity)
+        });
+        let Some(shared_slot) = shared_slot else {
+            table.unregister(index, token);
+            return Err(ParallelError::TooManyReaders);
+        };
+        Ok(Self {
+            table,
+            shared: Some(coord),
+            shared_slot: Some(shared_slot),
             index,
             token,
             _not_send: PhantomData,
@@ -340,17 +378,36 @@ impl<'a> Reader<'a> {
         self.index
     }
 
+    /// Индекс слота в межпроцессной таблице.
+    #[must_use]
+    pub const fn shared_slot(&self) -> Option<usize> {
+        self.shared_slot
+    }
+
     /// Захватывает пин зоны (низкоуровневый API; обычно через `zone_snapshot`).
     ///
     /// Пин заимствует читателя на всё время жизни: слот нельзя освободить,
     /// пока жив хотя бы один `PinGuard`.
     #[must_use]
     pub fn pin(&'a self, zone: u32, version: u64, epoch: u64) -> PinGuard<'a> {
+        if let (Some(coord), Some(slot)) = (self.shared, self.shared_slot) {
+            let pin = coord.reader_pin(slot, zone, version, epoch);
+            return PinGuard {
+                table: self.table,
+                index: self.index,
+                key: PinKey::Zone(READER_PINS),
+                shared: Some(SharedPin { coord, slot, pin }),
+                zone,
+                version,
+                _not_send: PhantomData,
+            };
+        }
         let key = self.table.pin_zone(self.index, zone, version, epoch);
         PinGuard {
             table: self.table,
             index: self.index,
             key,
+            shared: None,
             zone,
             version,
             _not_send: PhantomData,
@@ -360,8 +417,18 @@ impl<'a> Reader<'a> {
 
 impl Drop for Reader<'_> {
     fn drop(&mut self) {
+        if let (Some(coord), Some(slot)) = (self.shared, self.shared_slot) {
+            coord.reader_unregister(slot, self_identity());
+        }
         self.table.unregister(self.index, self.token);
     }
+}
+
+struct SharedPin<'a> {
+    coord: &'a SharedCoord,
+    slot: usize,
+    /// `None` — EPOCH-overflow (удерживается до `Reader::drop`).
+    pin: Option<usize>,
 }
 
 /// RAII-пин: снимается в `Drop` (успех/паника/ранний выход).
@@ -370,9 +437,19 @@ pub struct PinGuard<'a> {
     table: &'a PinTable,
     index: usize,
     key: PinKey,
+    shared: Option<SharedPin<'a>>,
     zone: u32,
     version: u64,
     _not_send: PhantomData<Rc<()>>,
+}
+
+impl std::fmt::Debug for SharedPin<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedPin")
+            .field("slot", &self.slot)
+            .field("pin", &self.pin)
+            .finish()
+    }
 }
 
 impl PinGuard<'_> {
@@ -390,13 +467,22 @@ impl PinGuard<'_> {
 
     /// Переполнение слотов (EPOCH-пин).
     #[must_use]
-    pub const fn is_overflow(&self) -> bool {
-        matches!(self.key, PinKey::Overflow)
+    pub fn is_overflow(&self) -> bool {
+        match &self.shared {
+            Some(shared) => shared.pin.is_none(),
+            None => matches!(self.key, PinKey::Overflow),
+        }
     }
 }
 
 impl Drop for PinGuard<'_> {
     fn drop(&mut self) {
+        if let Some(shared) = &self.shared {
+            if let Some(pin) = shared.pin {
+                shared.coord.reader_unpin(shared.slot, pin);
+            }
+            return;
+        }
         self.table.unpin(self.index, self.key);
     }
 }
@@ -503,6 +589,24 @@ impl GcState {
         pins: &PinTable,
         guards: &[AtomicU32],
     ) -> Result<u64, ParallelError> {
+        self.refresh_with(zone, pins, None, guards)
+    }
+
+    /// Пересчитывает `MP(z)` с учётом межпроцессной reader table.
+    ///
+    /// `MP(z) = min(локальные пины, общие пины, freeze)`. Под guard'ом зоны;
+    /// подъём `MP` — только здесь (§5.4).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` — зона вне диапазона.
+    pub(crate) fn refresh_with(
+        &self,
+        zone: u32,
+        pins: &PinTable,
+        shared: Option<&SharedCoord>,
+        guards: &[AtomicU32],
+    ) -> Result<u64, ParallelError> {
         let guard = guards
             .get(zone as usize)
             .ok_or(ParallelError::InvalidArgument { field: "zone_seq" })?;
@@ -515,7 +619,11 @@ impl GcState {
             .get(zone as usize)
             .ok_or(ParallelError::InvalidArgument { field: "zone_seq" })?;
         let epoch_guard = EpochGuard::enter(guard);
-        let value = pins.oldest_reader(zone).unwrap_or(NO_VERSION);
+        let local = pins.oldest_reader(zone).unwrap_or(NO_VERSION);
+        let foreign = shared
+            .and_then(|coord| coord.oldest_pin(zone))
+            .unwrap_or(NO_VERSION);
+        let value = local.min(foreign);
         slot.store(value, Ordering::Release);
         dirty.store(false, Ordering::Release);
         drop(epoch_guard);

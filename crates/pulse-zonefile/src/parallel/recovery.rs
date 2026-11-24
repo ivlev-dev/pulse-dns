@@ -24,6 +24,9 @@ pub struct OpenConfigV2 {
     pub read_only: bool,
     /// Брать `LOCK_EX` на lock-файл (M1: обязателен для writer'а).
     pub writer_lock: bool,
+    /// Межпроцессный режим (M3, ADR 0007): общий аллокатор, per-zone lease,
+    /// общая reader table и `LOCK_SH` вместо `LOCK_EX`. По умолчанию выключен.
+    pub multi_process: bool,
     /// Ёмкость кеша валидированных страниц (0 — кеш отключён).
     pub page_cache_entries: usize,
 }
@@ -33,6 +36,7 @@ impl Default for OpenConfigV2 {
         Self {
             read_only: false,
             writer_lock: true,
+            multi_process: false,
             page_cache_entries: crate::parallel::pagecache::DEFAULT_PAGE_CACHE_V2_ENTRIES,
         }
     }
@@ -370,7 +374,7 @@ fn read_writer_registry(
     Ok(None)
 }
 
-fn read_alloc_records(
+pub(crate) fn read_alloc_records(
     file: &File,
     geometry: Geometry,
     fatal: &mut Option<FatalKind>,

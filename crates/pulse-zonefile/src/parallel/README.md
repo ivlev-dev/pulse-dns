@@ -272,20 +272,49 @@ ack-лог с `sync_data`, родитель убивает его `SIGKILL` (с�
 group commit там проигрывает на накладных расходах; выигрыш — на устройстве, где
 fsync доминирует (целевой режим спеки §7.4).
 
+## M3: межпроцессная запись (ADR 0007)
+
+M3 реализован отдельным координатором `<file>.pulsecoord` (`MAP_SHARED`):
+общий CAS-курсор/`txn`, per-zone `fcntl`-lease с fencing `(pid, starttime,
+generation)`, общая reader table, per-zone seqlock публикации и глобальный
+commit-lock для `ALLOC_RECORD`/двух `fdatasync`. Формат данных v2.0 не изменён;
+`SEC-ZF-014` (один writable-регион файла данных) сохранён.
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use pulse_zonefile::parallel::{OpenConfigV2, ParallelStore};
+let store = ParallelStore::open(
+    std::path::Path::new("zones.v2"),
+    OpenConfigV2 { multi_process: true, writer_lock: false, ..OpenConfigV2::default() },
+)?;
+let reader = store.reader()?;                 // общий слот reader table
+let _snap = store.zone_snapshot(&reader, 1)?; // seqlock + пин
+# let _ = store;
+# Ok(())
+# }
+```
+
+Тесты: `tests/v2_multiprocess.rs` (4×4 зоны, `ZoneBusy`, читатель в другом
+процессе, `kill -9` писателя/читателя/во время коммита, 10k циклов в 2
+процессах + `fsck`). Bench: `cargo bench -p pulse-zonefile --bench v2_multiprocess`.
+
 ## Остаток до фазы C
 
-1. Межпроцессная запись M3: слоты reader table в файле, writer registry/`LOCK_SH`,
-   выборный лидер, общий `ALLOC_RECORD`-курсор (отдельный ADR, Q7).
-2. `fsck --verify` уровня «полный scrub»: битсет-дизъюнктность на больших файлах,
-   `fsck --at-epoch`, проверка `page.txn ≤ version` по всем достижимым страницам.
-3. Страницы 8192/16384 (геометрия ring = 16 зон зафиксирована для 4096).
-4. Loom-модели, ARM64 CI, `dm-log-writes`-реплей, `perf c2c`, `strace -c`.
-5. Bulk-lane и шардирование координатора для потолка `fdatasync` (R7).
+1. Выборный лидер M3 (`leader_term`, writer registry) и `fsck --verify` уровня
+   «полный scrub»: битсет-дизъюнктность на больших файлах, `fsck --at-epoch`,
+   проверка `page.txn ≤ version` по всем достижимым страницам.
+2. Страницы 8192/16384 (геометрия ring = 16 зон зафиксирована для 4096).
+3. Loom-модели, ARM64 CI, `dm-log-writes`-реплей, `perf c2c`, `strace -c`.
+4. Bulk-lane и шардирование координатора для потолка `fdatasync` (R7).
 
 ## Осознанные ограничения фазы A
 
 - Только `page_size = 4096`; v2-файл с другим размером отвергается.
-- Txn-курсор и пины — в памяти процесса (M1); второй writer → `Busy`.
+- Single-process (по умолчанию): txn-курсор и пины — в памяти процесса; второй
+  writer файла → `Busy`. M3 включается `multi_process: true` (ADR 0007).
+- В multi рекламация durable-пулов — bump-only (PW-L13): drop'ы остаются
+  reachable-free до quiescent-окна; каталог-мутации должен выполнять один
+  процесс (M3-L1).
 - `publish_root` (низкоуровневый API фазы A) всегда выполняет два `fdatasync`;
   группировка — `commit_group`/`GroupCommitter` (B2b).
 - `publish_root` принимает `version` от вызывающего и проверяет монотонность

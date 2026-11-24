@@ -6,11 +6,13 @@
 //! вперёд, `[DP, cursor)` — учтённая утечка.
 
 use std::cell::Cell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::parallel::consts::{
     ALLOC_EXTENT_PAGES, ALLOC_THREAD_CACHE_PAGES, NO_VERSION, TXN_BATCH,
 };
+use crate::parallel::coord::SharedCoord;
 use crate::parallel::error::ParallelError;
 
 /// Выданный диапазон страниц.
@@ -41,6 +43,12 @@ impl AllocTicket {
 pub struct Allocator {
     reserve_cursor: AtomicU64,
     reserve_txn: AtomicU64,
+    /// Общий (межпроцессный) курсор и `txn` в `MAP_SHARED`-стороне.
+    ///
+    /// При наличии `shared` локальные атомики не используются: курсор и `txn`
+    /// живут в sidecar-файле координатора и резервируются CAS между процессами
+    /// (ADR 0007 §4).
+    shared: Option<Arc<SharedCoord>>,
     hard_limit: u64,
     start_page_limit: u64,
     cas_retries: AtomicU64,
@@ -65,6 +73,7 @@ impl Allocator {
         Ok(Self {
             reserve_cursor: AtomicU64::new(dp),
             reserve_txn: AtomicU64::new(next_txn),
+            shared: None,
             hard_limit: u64::from(hard_limit),
             start_page_limit: dp,
             cas_retries: AtomicU64::new(0),
@@ -72,16 +81,89 @@ impl Allocator {
         })
     }
 
+    /// Создаёт аллокатор поверх общего `MAP_SHARED`-курсора.
+    ///
+    /// Значения курсора/`txn` уже установлены [`SharedCoord::open`] (с учётом
+    /// `DP` и живых писателей), поэтому здесь они только читаются.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` — `dp`/`next_txn` вне контракта.
+    pub(crate) fn new_shared(
+        dp: u64,
+        next_txn: u64,
+        hard_limit: u32,
+        shared: Arc<SharedCoord>,
+    ) -> Result<Self, ParallelError> {
+        if dp == 0 || dp > u64::from(hard_limit) {
+            return Err(ParallelError::InvalidArgument {
+                field: "durable_page_limit",
+            });
+        }
+        if next_txn == 0 {
+            return Err(ParallelError::InvalidArgument { field: "next_txn" });
+        }
+        Ok(Self {
+            reserve_cursor: AtomicU64::new(dp),
+            reserve_txn: AtomicU64::new(next_txn),
+            shared: Some(shared),
+            hard_limit: u64::from(hard_limit),
+            start_page_limit: dp,
+            cas_retries: AtomicU64::new(0),
+            txn_cas_retries: AtomicU64::new(0),
+        })
+    }
+
+    fn load_cursor(&self) -> u64 {
+        match &self.shared {
+            Some(coord) => coord.cursor().load(Ordering::Acquire),
+            None => self.reserve_cursor.load(Ordering::Acquire),
+        }
+    }
+
+    fn cas_cursor(&self, current: u64, next: u64) -> bool {
+        match &self.shared {
+            Some(coord) => coord
+                .cursor()
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            None => self
+                .reserve_cursor
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+        }
+    }
+
+    fn load_txn(&self) -> u64 {
+        match &self.shared {
+            Some(coord) => coord.txn().load(Ordering::Acquire),
+            None => self.reserve_txn.load(Ordering::Acquire),
+        }
+    }
+
+    fn cas_txn(&self, current: u64, next: u64) -> bool {
+        match &self.shared {
+            Some(coord) => coord
+                .txn()
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            None => self
+                .reserve_txn
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+        }
+    }
+
     /// Первая невыданная страница.
     #[must_use]
     pub fn cursor(&self) -> u64 {
-        self.reserve_cursor.load(Ordering::Acquire)
+        self.load_cursor()
     }
 
     /// Следующий `txn`, который будет выдан.
     #[must_use]
     pub fn txn_cursor(&self) -> u64 {
-        self.reserve_txn.load(Ordering::Acquire)
+        self.load_txn()
     }
 
     /// Жёсткий лимит страниц.
@@ -128,7 +210,7 @@ impl Allocator {
         }
         let requested = u64::from(pages);
         loop {
-            let current = self.reserve_cursor.load(Ordering::Acquire);
+            let current = self.load_cursor();
             let Some(next) = current.checked_add(requested) else {
                 return Err(ParallelError::MapFull {
                     high_water: current,
@@ -141,17 +223,10 @@ impl Allocator {
                     page_count_max: u32::try_from(self.hard_limit).unwrap_or(u32::MAX),
                 });
             }
-            match self.reserve_cursor.compare_exchange(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return ticket(current, pages),
-                Err(_) => {
-                    self.cas_retries.fetch_add(1, Ordering::Relaxed);
-                }
+            if self.cas_cursor(current, next) {
+                return ticket(current, pages);
             }
+            self.cas_retries.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -192,27 +267,20 @@ impl Allocator {
     /// `InvalidArgument` — `txn` переполнен.
     pub fn next_txn_exact(&self) -> Result<u64, ParallelError> {
         loop {
-            let current = self.reserve_txn.load(Ordering::Acquire);
+            let current = self.load_txn();
             let Some(next) = current.checked_add(1) else {
                 return Err(ParallelError::InvalidArgument { field: "txn" });
             };
-            match self.reserve_txn.compare_exchange(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(current),
-                Err(_) => {
-                    self.txn_cas_retries.fetch_add(1, Ordering::Relaxed);
-                }
+            if self.cas_txn(current, next) {
+                return Ok(current);
             }
+            self.txn_cas_retries.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     fn reserve_batch(&self, minimum: u32) -> Result<(u64, u32), ParallelError> {
         loop {
-            let current = self.reserve_cursor.load(Ordering::Acquire);
+            let current = self.load_cursor();
             let remaining = self.hard_limit.saturating_sub(current);
             let available = u32::try_from(remaining).unwrap_or(u32::MAX);
             let batch = if remaining >= u64::from(ALLOC_THREAD_CACHE_PAGES) {
@@ -241,39 +309,23 @@ impl Allocator {
                     page_count_max: u32::try_from(self.hard_limit).unwrap_or(u32::MAX),
                 });
             }
-            match self.reserve_cursor.compare_exchange(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Ok((current, batch));
-                }
-                Err(_) => {
-                    self.cas_retries.fetch_add(1, Ordering::Relaxed);
-                }
+            if self.cas_cursor(current, next) {
+                return Ok((current, batch));
             }
+            self.cas_retries.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     fn reserve_txn_batch(&self) -> Result<u64, ParallelError> {
         loop {
-            let current = self.reserve_txn.load(Ordering::Acquire);
+            let current = self.load_txn();
             let Some(next) = current.checked_add(TXN_BATCH) else {
                 return Err(ParallelError::InvalidArgument { field: "txn" });
             };
-            match self.reserve_txn.compare_exchange(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(current),
-                Err(_) => {
-                    self.txn_cas_retries.fetch_add(1, Ordering::Relaxed);
-                }
+            if self.cas_txn(current, next) {
+                return Ok(current);
             }
+            self.txn_cas_retries.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
