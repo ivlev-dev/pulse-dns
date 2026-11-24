@@ -26,13 +26,14 @@
   CRUD/PATCH, settings, bearer-auth + scopes + per-zone allowlist (404 вне
   allowlist), ETag/If-Match, RFC 9457 problem+json, Idempotency-Key,
   пагинация, лимиты тела/rate limit.
-- Бинарник `pulsed`: UDP+TCP, JSON-конфиг зон, единый store с REST (правки через
+- Бинарник `pulsed`: UDP+TCP, JSON-конфиг зон и RFC 1035 master-файлы
+  (`.zone`, `$ORIGIN`/`$TTL`/`$INCLUDE`), единый store с REST (правки через
   API сразу видны в DNS), graceful shutdown, Dockerfile.
 
 **Не реализовано (см. `STATUS.md`):** commit/allocator/GC и параллельная запись
 по зонам в коде (только дизайн, ADR 0005/0006, spec parallel-writes-v2);
 персистентность (`pulsed` не использует `pulse-zonefile`, зоны in-memory из
-JSON/REST); DNSSEC-крипто (подпись/валидация) и привязка RRSIG; DNSCrypt;
+JSON/master/REST); DNSSEC-крипто (подпись/валидация) и привязка RRSIG; DNSCrypt;
 рекурсивный резолвер; AXFR/IXFR/NOTIFY/secondary; DoT/DoH/DoQ; 0x20 echo; TLS
 для API (только loopback); fuzz/Miri/loom в CI; полноценный RRL; REST —
 MVP-подмножество спецификации.
@@ -42,6 +43,7 @@ MVP-подмножество спецификации.
 | Крейт | Назначение |
 |---|---|
 | `pulse-dns` | Wire-формат DNS и RR-типы |
+| `pulse-master` | RFC 1035 master-файлы: парсер, валидация, экспорт |
 | `pulse-zonefile` | Бинарный mmap-формат зон (reader реализован; writer/commit — в дизайне) |
 | `pulse-runtime` | io_uring UDP-рантайм + epoll-фолбэк |
 | `pulse-server` | Авторитетный движок запросов |
@@ -79,6 +81,15 @@ dig @127.0.0.1 -p 5353 example.com. A +norecurse
 dig @127.0.0.1 -p 5353 example.com. MX +tcp +norecurse
 ```
 
+Зона из RFC 1035 master-файла:
+
+```bash
+cargo run -p pulsed -- --config examples/master-files.json
+# или: --config examples/empty.json --zone example.com.=examples/example.com.zone
+```
+
+Подробности и `zones_files` — в `examples/README.md`.
+
 Запуск с REST: API включается флагом `--api-listen` (токен обязателен,
 предпочтительно через `PULSED_API_TOKEN`; без TLS только loopback). Примеры
 запросов — в `examples/README.md`. Короткий пример:
@@ -97,8 +108,9 @@ curl -sS -X PUT "$API/api/v1/zones/dynamic.test." \
 cargo test --workspace
 ```
 
-В workspace 544 теста (включая doctests). Также проходят `cargo fmt --check`,
-`cargo clippy --workspace --all-targets -D warnings` и rustdoc без warnings.
+Полный набор workspace-тестов (включая doctests) проходит. Также проходят
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` и
+rustdoc без warnings.
 
 ## Производительность
 

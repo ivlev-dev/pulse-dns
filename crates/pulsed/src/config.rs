@@ -114,6 +114,16 @@ pub struct RecordConfig {
     pub rdata: serde_json::Value,
 }
 
+/// Master-файл зоны (RFC 1035) в конфигурации.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZoneFileConfig {
+    /// Origin зоны; он же передаётся в `pulse_master::parse_zone`.
+    pub origin: String,
+    /// Путь к master-файлу. Относительные пути считаются от текущего каталога.
+    pub path: PathBuf,
+}
+
 /// Зона в конфигурации.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -153,8 +163,10 @@ pub struct Config {
     pub log_level: LogLevel,
     /// Параметры TCP.
     pub tcp: TcpConfig,
-    /// Обслуживаемые зоны.
+    /// Обслуживаемые зоны в JSON-форме.
     pub zones: Vec<ZoneConfig>,
+    /// Дополнительные зоны из master-файлов (RFC 1035).
+    pub zones_files: Vec<ZoneFileConfig>,
 }
 
 impl Default for Config {
@@ -166,6 +178,7 @@ impl Default for Config {
             log_level: LogLevel::Info,
             tcp: TcpConfig::default(),
             zones: Vec::new(),
+            zones_files: Vec::new(),
         }
     }
 }
@@ -341,6 +354,24 @@ mod tests {
     fn rejects_unknown_fields() {
         let error = Config::from_json_str(r#"{"listen_udp": "127.0.0.1:0", "wat": 1}"#);
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn parses_zone_files() {
+        let config = Config::from_json_str(
+            r#"{
+                "listen_udp": null,
+                "listen_tcp": null,
+                "zones_files": [{"origin": "example.com.", "path": "examples/example.com.zone"}]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.zones_files.len(), 1);
+        assert_eq!(config.zones_files[0].origin, "example.com.");
+        assert_eq!(
+            config.zones_files[0].path,
+            PathBuf::from("examples/example.com.zone")
+        );
     }
 
     #[test]

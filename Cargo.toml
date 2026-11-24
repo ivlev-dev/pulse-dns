@@ -1,11 +1,13 @@
 [workspace]
 members = [
     "crates/pulse-dns",
+    "crates/pulse-dnssec",
     "crates/pulse-runtime",
     "crates/pulse-server",
     "crates/pulse-zonefile",
     "crates/pulse-api",
     "crates/pulsed",
+    "crates/pulse-master",
 ]
 resolver = "3"
 

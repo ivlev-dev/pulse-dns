@@ -6,10 +6,11 @@ use std::process::ExitCode;
 
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use pulse_api::server::ApiServerError;
+use pulse_dns::Name;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::config::{Config, LogLevel, Overrides};
+use crate::config::{Config, LogLevel, Overrides, ZoneFileConfig};
 use crate::logging;
 use crate::server::{ApiOptions, Server, ServerError};
 
@@ -36,6 +37,13 @@ pub(crate) fn run() -> ExitCode {
         }
     };
     config.apply_overrides(&overrides);
+    match zone_files(&matches) {
+        Ok(files) => config.zones_files.extend(files),
+        Err(error) => {
+            logging::error("config", &error);
+            return ExitCode::from(2);
+        }
+    }
     logging::init(config.log_level);
     if let Err(error) = config.validate() {
         logging::error("config", &error.to_string());
@@ -149,6 +157,35 @@ pub(crate) fn run() -> ExitCode {
     }
 }
 
+fn zone_files(matches: &ArgMatches) -> Result<Vec<ZoneFileConfig>, String> {
+    let mut files = Vec::new();
+    let Some(values) = matches.get_many::<String>("zone") else {
+        return Ok(files);
+    };
+    for value in values {
+        let (origin, path) = value
+            .split_once('=')
+            .ok_or_else(|| format!("--zone expects <origin>=<path>, got {value:?}"))?;
+        let origin = origin.trim();
+        let path = path.trim();
+        if origin.is_empty() || path.is_empty() {
+            return Err(format!("--zone expects <origin>=<path>, got {value:?}"));
+        }
+        let name = Name::parse(origin)
+            .map_err(|error| format!("invalid --zone origin {origin:?}: {error}"))?;
+        if name == Name::root() || name.labels().any(|label| label == b"*") {
+            return Err(format!(
+                "--zone origin {origin:?} must be a non-root name without wildcards"
+            ));
+        }
+        files.push(ZoneFileConfig {
+            origin: name.to_string(),
+            path: PathBuf::from(path),
+        });
+    }
+    Ok(files)
+}
+
 fn api_options(matches: &ArgMatches) -> Result<Option<ApiOptions>, String> {
     let listen = matches.get_one::<SocketAddr>("api-listen").copied();
     let token = matches
@@ -239,6 +276,13 @@ fn command() -> Command {
                 .value_name("LEVEL")
                 .value_parser(value_parser!(LogLevel))
                 .help("Override log level: error, warn, info, debug or trace"),
+        )
+        .arg(
+            Arg::new("zone")
+                .long("zone")
+                .value_name("ORIGIN=PATH")
+                .action(ArgAction::Append)
+                .help("Add a zone from an RFC 1035 master file; repeatable"),
         )
         .arg(
             Arg::new("api-listen")

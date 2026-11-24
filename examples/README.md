@@ -24,6 +24,34 @@ cargo run -p pulsed -- \
   `*.internal.`. Без флагов токен видит все зоны.
 - Без TLS API разрешён только на loopback-адресе (политика `pulse-api`).
 
+## Зоны из master-файлов (.zone)
+
+Поддерживаются RFC 1035 master-файлы через `pulse-master`: `$ORIGIN`, `$TTL`,
+`$INCLUDE` (внутри каталога файла), относительные имена, `(...)`, комментарии.
+Источники можно смешивать; одинаковый origin в JSON/файлах/`--zone` — ошибка
+запуска. REST API правит тот же store.
+
+Через JSON (`zones_files`):
+
+```bash
+cargo run -p pulsed -- --config examples/master-files.json
+dig @127.0.0.1 -p 5353 www.example.com. A +norecurse
+dig @127.0.0.1 -p 5353 missing.example.com. A +norecurse   # NXDOMAIN
+```
+
+Через CLI (`--zone` повторяемый; `empty.json` — конфиг без зон):
+
+```bash
+cargo run -p pulsed -- --config examples/empty.json \
+  --zone example.com.=examples/example.com.zone
+```
+
+Файл `examples/example.com.zone` содержит SOA/NS/A/AAAA/MX/TXT/CNAME/wildcard.
+`$ORIGIN` внутри файла допускается; owner'ы обязаны оставаться внутри origin
+из ключа `--zone`/`zones_files`. Относительные пути считаются от текущего
+каталога процесса. Ошибки парсера печатаются как `path:line:column: причина`,
+процесс завершается с кодом `2`.
+
 ## Пример: создать зону и получить A по DNS
 
 ```bash

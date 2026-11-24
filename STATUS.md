@@ -17,9 +17,9 @@
 
 ## Готово
 
-Проверено автоматически: 544 теста в workspace (включая doctests) проходят;
-`cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`,
-rustdoc без warnings.
+Проверено автоматически: полный набор workspace-тестов (включая doctests)
+проходит; `cargo fmt --check`, `cargo clippy --workspace --all-targets
+-D warnings`, rustdoc без warnings.
 
 - `pulse-dns` — wire-формат DNS, RR-типы, сжатие имён, EDNS0, RFC 3597,
   канонизация RFC 4034, лимиты, 0 `unsafe`.
@@ -37,12 +37,15 @@ rustdoc без warnings.
   CRUD/PATCH, settings, bearer-auth + scopes + per-zone allowlist (404 вне
   allowlist), ETag/If-Match, RFC 9457 problem+json, Idempotency-Key,
   пагинация, лимиты тела/rate limit.
-- `pulsed` — бинарник: UDP+TCP, JSON-конфиг зон, единый store с REST, graceful
+- `pulsed` — бинарник: UDP+TCP, JSON-конфиг зон и master-файлы RFC 1035
+  (`--zone`/`zones_files`, `pulse-master`), единый store с REST, graceful
   shutdown, Dockerfile.
 
 ## Проверено руками
 
 - Реальные UDP/TCP ответы: A, AAAA, MX, NXDOMAIN+SOA, CNAME-цепочка.
+- Загрузка зоны из RFC 1035 master-файла (`--zone`/`zones_files`), UDP A и
+  NXDOMAIN, затем REST-правка и новый ответ без рестарта.
 - REST-сценарий: PUT зоны → SOA/NS/A → UDP отвечает → PATCH → ответ меняется →
   DELETE → NODATA/REFUSED.
 - Производительность (loopback, хост нагружен, числа консервативные):
@@ -55,8 +58,8 @@ rustdoc без warnings.
 **P0 (корректность/долговечность):**
 - Commit/allocator/GC и параллельная запись по зонам в коде не реализованы
   (только дизайн: ADR 0005/0006, spec parallel-writes-v2).
-- `pulsed` не использует `pulse-zonefile`: зоны in-memory из JSON/REST, нет
-  персистентности (рестарт теряет изменения через API).
+- `pulsed` не использует `pulse-zonefile`: зоны in-memory из JSON/master/REST,
+  нет персистентности (рестарт теряет изменения через API).
 
 **P1 (безопасность/транспорт/протокол):**
 - DNSSEC-крипто (подпись/валидация) и привязка RRSIG; DNSCrypt.

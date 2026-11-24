@@ -78,7 +78,7 @@ impl Server {
     pub fn start_with_api(config: &Config, api: Option<ApiOptions>) -> Result<Self, ServerError> {
         config.validate()?;
         let store = Arc::new(InMemoryZoneAdmin::new());
-        store::load_config(&store, &config.zones).map_err(ServerError::Store)?;
+        store::load_config(&store, config).map_err(ServerError::Store)?;
         let admin = Arc::new(SharedZoneAdmin::new(store).map_err(|error| {
             ServerError::Store(format!("cannot build initial DNS snapshot: {error}"))
         })?);

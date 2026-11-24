@@ -5,6 +5,7 @@
 //! DNS-запрос берёт `Arc` под коротким read-lock и отвечает уже без блокировок
 //! store; таким образом write-lock никогда не удерживается на время запроса.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
@@ -18,9 +19,10 @@ use pulse_server::testkit::InMemoryZone;
 use pulse_server::{QueryEngine, QueryStats, ZoneState};
 use thiserror::Error;
 
-use crate::config::ZoneConfig;
+use crate::config::Config;
 use crate::logging;
-use crate::zone;
+use crate::master;
+use crate::zone::{self, LoadedZone};
 
 /// Ошибка начального построения DNS-снапшота.
 #[derive(Debug, Error)]
@@ -75,14 +77,39 @@ impl SharedZoneAdmin {
     }
 }
 
-/// Загружает зоны из JSON-конфигурации атомарным `import_zone`.
+/// Загружает JSON-зоны и master-файлы в один store.
 ///
-/// Импорт допускает DNSSEC-записи из конфига, которые HTTP RRset API
-/// намеренно не принимает. Ошибки содержат origin; частично загруженный store
-/// при ошибке отбрасывается вызывающим (процесс не стартует).
-pub(crate) fn load_config(store: &InMemoryZoneAdmin, zones: &[ZoneConfig]) -> Result<(), String> {
-    let loaded = zone::load_zones(zones).map_err(|error| error.to_string())?;
-    for zone in loaded {
+/// Конфликт origin между любыми источниками (JSON, `zones_files`, CLI
+/// `--zone`) обнаруживается **до** импорта и завершает запуск. Импорт
+/// допускает DNSSEC-записи из файлов, которые HTTP RRset API намеренно не
+/// принимает.
+pub(crate) fn load_config(store: &InMemoryZoneAdmin, config: &Config) -> Result<(), String> {
+    let mut zones: Vec<(String, LoadedZone)> = Vec::new();
+    let json_zones =
+        zone::load_zones(&config.zones).map_err(|error| format!("JSON zones: {error}"))?;
+    for (index, zone) in json_zones.into_iter().enumerate() {
+        zones.push((format!("config.zones[{index}]"), zone));
+    }
+    for (index, file) in config.zones_files.iter().enumerate() {
+        let loaded = master::load_zone_file(file)
+            .map_err(|error| format!("zones_files[{index}] ({}): {error}", file.path.display()))?;
+        zones.push((
+            format!("zone file {} (zones_files[{index}])", file.path.display()),
+            loaded,
+        ));
+    }
+
+    let mut origins: HashMap<Name, String> = HashMap::with_capacity(zones.len());
+    for (source, zone) in &zones {
+        if let Some(first) = origins.insert(zone.origin.clone(), source.clone()) {
+            return Err(format!(
+                "zone {} is declared more than once: {first} and {source}",
+                zone.origin
+            ));
+        }
+    }
+
+    for (source, zone) in zones {
         let meta = ZoneMetaInput {
             kind: ZoneKind::Primary,
             default_ttl: zone.default_ttl,
@@ -90,7 +117,7 @@ pub(crate) fn load_config(store: &InMemoryZoneAdmin, zones: &[ZoneConfig]) -> Re
         };
         store
             .import_zone(&zone.origin, &meta, zone.rrsets)
-            .map_err(|error| format!("cannot import zone {}: {error}", zone.origin))?;
+            .map_err(|error| format!("{source}: cannot import zone {}: {error}", zone.origin))?;
     }
     Ok(())
 }
