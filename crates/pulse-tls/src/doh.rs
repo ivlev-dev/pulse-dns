@@ -1,27 +1,22 @@
-//! DNS over HTTPS (RFC 8484), только HTTP/1.1 поверх TLS.
+//! DNS over HTTPS/1.1 (RFC 8484) поверх TLS.
 //!
 //! Поддерживаются `GET /dns-query?dns=<base64url>`, `POST /dns-query` с
-//! `Content-Type: application/dns-message` и `GET /healthz`. HTTP/2 не
-//! входит в MVP: ALPN сервера — только `http/1.1`, preface HTTP/2 получает
-//! `505 HTTP Version Not Supported`.
+//! `Content-Type: application/dns-message` и `GET /healthz`. ALPN сервера —
+//! `http/1.1`, preface HTTP/2 получает `505 HTTP Version Not Supported`.
+//! Для HTTP/2 используйте `Doh2Server` (feature `http2`).
 
 use std::net::{Shutdown as SocketShutdown, SocketAddr, TcpListener, TcpStream};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
-
 use crate::acl::Acl;
+use crate::doh_core::DohCore;
 use crate::dot::DnsHandler;
 use crate::error::Error;
-use crate::http::{
-    HttpResponse, Method, ParseError, find_head_end, parse_head, query_param, response_max_age,
-};
-use crate::ratelimit::{RateLimitConfig, RateLimiter};
+use crate::http::{HttpResponse, Method, ParseError, find_head_end, parse_head};
+use crate::ratelimit::RateLimitConfig;
 use crate::server::{ConnectionGuard, ConnectionSet};
 use crate::stats::{Stats, StatsSnapshot};
 use crate::tls::TlsConfig;
@@ -32,8 +27,6 @@ const DEFAULT_MAX_BODY: usize = 65_535;
 const DEFAULT_MAX_HEADER: usize = 16 * 1024;
 const MAX_HEADER_SOFT_LIMIT: usize = 1024 * 1024;
 const DEFAULT_MAX_REQUESTS: usize = 100;
-const DNS_PATH: &str = "/dns-query";
-const HEALTH_PATH: &str = "/healthz";
 
 /// Конфигурация DoH-сервера.
 #[derive(Clone, Debug)]
@@ -113,8 +106,7 @@ impl DohConfig {
 
 struct Shared {
     config: DohConfig,
-    handler: DnsHandler,
-    limiter: Option<RateLimiter>,
+    core: DohCore,
     stats: Arc<Stats>,
     shutdown: Arc<AtomicBool>,
 }
@@ -181,18 +173,20 @@ impl DohServer {
         stats: Arc<Stats>,
     ) -> Result<Self, Error> {
         config.validate()?;
-        let limiter = match config.rate_limit {
-            Some(rate_limit) => Some(RateLimiter::new(rate_limit)?),
-            None => None,
-        };
+        let core = DohCore::new(
+            config.max_body_size,
+            config.cache_control,
+            handler,
+            config.rate_limit,
+            Arc::clone(&stats),
+        )?;
         let listener = TcpListener::bind(config.listen)?;
         let local_addr = listener.local_addr()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let connections = Arc::new(ConnectionSet::new(Arc::clone(&stats)));
         let shared = Arc::new(Shared {
             config: config.clone(),
-            handler,
-            limiter,
+            core,
             stats: Arc::clone(&stats),
             shutdown: Arc::clone(&shutdown),
         });
@@ -365,11 +359,7 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Re
         };
         let keep_alive = head.headers.keep_alive(head.version)
             && requests < shared.config.max_requests_per_connection;
-        if let Some(limiter) = &shared.limiter
-            && !limiter.allow(peer.ip())
-        {
-            shared.stats.rate_limited();
-            shared.stats.http_error();
+        if !shared.core.allow_rate(peer) {
             let response = HttpResponse::error(429, "rate limit exceeded", true);
             send_response(&mut tls, &response, &shared.stats)?;
             break;
@@ -425,7 +415,9 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Re
             }
         };
         shared.stats.read_bytes(body.len());
-        let mut response = route(shared, peer, method, &target, &headers, &body);
+        let mut response = shared
+            .core
+            .route(peer, method, &target, headers.content_type(), &body);
         response.close |= !keep_alive;
         let status = response.status;
         let close = response.close;
@@ -497,93 +489,6 @@ fn read_body(tls: &mut TlsStream, pending: &mut Vec<u8>, length: usize) -> Resul
         body.extend_from_slice(data);
     }
     Ok(body)
-}
-
-fn route(
-    shared: &Shared,
-    peer: SocketAddr,
-    method: Method,
-    target: &str,
-    headers: &crate::http::Headers,
-    body: &[u8],
-) -> HttpResponse {
-    let path = target.split('?').next().unwrap_or(target);
-    if path == HEALTH_PATH {
-        return if method == Method::Get {
-            HttpResponse::text(200, "ok\n", false)
-        } else {
-            let mut response = HttpResponse::method_not_allowed(false);
-            response.allow = Some("GET");
-            response
-        };
-    }
-    if path != DNS_PATH {
-        return HttpResponse::error(404, "not found", false);
-    }
-    match method {
-        Method::Get => {
-            let Some(encoded) = query_param(target, "dns") else {
-                return HttpResponse::error(400, "missing dns query parameter", false);
-            };
-            let Some(query) = decode_dns(&encoded) else {
-                return HttpResponse::error(400, "invalid base64url dns parameter", false);
-            };
-            if query.is_empty() {
-                return HttpResponse::error(400, "empty dns message", false);
-            }
-            if query.len() > shared.config.max_body_size {
-                return HttpResponse::error(413, "dns message too large", false);
-            }
-            invoke(shared, peer, &query)
-        }
-        Method::Post => {
-            if !headers.content_type_is("application/dns-message") {
-                return HttpResponse::error(
-                    415,
-                    "Content-Type must be application/dns-message",
-                    false,
-                );
-            }
-            if body.is_empty() {
-                return HttpResponse::error(400, "empty dns message", false);
-            }
-            if body.len() > shared.config.max_body_size {
-                return HttpResponse::error(413, "dns message too large", false);
-            }
-            invoke(shared, peer, body)
-        }
-        Method::Other => HttpResponse::method_not_allowed(false),
-    }
-}
-
-fn invoke(shared: &Shared, peer: SocketAddr, query: &[u8]) -> HttpResponse {
-    shared.stats.query();
-    let outcome = catch_unwind(AssertUnwindSafe(|| (shared.handler)(query, peer)));
-    let response = match outcome {
-        Ok(Some(response)) => response,
-        Ok(None) | Err(_) => {
-            return HttpResponse::error(500, "DNS handler failed", false);
-        }
-    };
-    if response.is_empty() {
-        return HttpResponse::error(500, "DNS handler returned an empty response", false);
-    }
-    if response.len() > shared.config.max_body_size {
-        return HttpResponse::error(500, "DNS response too large", false);
-    }
-    let cache = if shared.config.cache_control {
-        response_max_age(&response)
-    } else {
-        None
-    };
-    HttpResponse::dns(response, cache, false)
-}
-
-fn decode_dns(encoded: &[u8]) -> Option<Vec<u8>> {
-    URL_SAFE_NO_PAD
-        .decode(encoded)
-        .or_else(|_| URL_SAFE.decode(encoded))
-        .ok()
 }
 
 fn send_response(tls: &mut TlsStream, response: &HttpResponse, stats: &Stats) -> Result<(), Error> {

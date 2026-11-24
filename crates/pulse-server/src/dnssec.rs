@@ -127,12 +127,14 @@ impl KeyRole {
 
 /// Параметры NSEC3-цепочки для подписи.
 ///
-/// Поддерживается только hash algorithm SHA-1 (alg 1) и Opt-Out = 0:
-/// opt-out и подпись secondary-зон в v1 не поддерживаются.
+/// Поддерживается только hash algorithm SHA-1 (alg 1). Opt-Out включается
+/// явно через [`Nsec3Config::with_opt_out`] и требует, чтобы insecure
+/// делегирования (NS без DS) были исключены из цепочки.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nsec3Config {
     salt: Vec<u8>,
     iterations: u16,
+    opt_out: bool,
 }
 
 impl Nsec3Config {
@@ -156,7 +158,18 @@ impl Nsec3Config {
                 max: MAX_NSEC3_ITERATIONS,
             });
         }
-        Ok(Self { salt, iterations })
+        Ok(Self {
+            salt,
+            iterations,
+            opt_out: false,
+        })
+    }
+
+    /// Включает/выключает Opt-Out (RFC 5155 §6).
+    #[must_use]
+    pub const fn with_opt_out(mut self, opt_out: bool) -> Self {
+        self.opt_out = opt_out;
+        self
     }
 
     /// Соль (сырые байты).
@@ -169,6 +182,12 @@ impl Nsec3Config {
     #[must_use]
     pub const fn iterations(&self) -> u16 {
         self.iterations
+    }
+
+    /// Включён ли Opt-Out.
+    #[must_use]
+    pub const fn opt_out(&self) -> bool {
+        self.opt_out
     }
 }
 
@@ -197,7 +216,7 @@ pub enum DenialPolicy {
     /// NSEC-цепочка (RFC 4034).
     #[default]
     Nsec,
-    /// NSEC3-цепочка без Opt-Out (RFC 5155).
+    /// NSEC3-цепочка (RFC 5155; опционально Opt-Out).
     Nsec3(Nsec3Config),
 }
 
@@ -219,6 +238,7 @@ pub struct ZoneSigningKey {
     key: PrivateKey,
     role: KeyRole,
     flags: u16,
+    signs: bool,
 }
 
 impl fmt::Debug for ZoneSigningKey {
@@ -228,6 +248,7 @@ impl fmt::Debug for ZoneSigningKey {
             .field("algorithm", &self.key.algorithm().name())
             .field("role", &self.role.as_str())
             .field("flags", &self.flags)
+            .field("signs", &self.signs)
             .field("material", &"<redacted>")
             .finish_non_exhaustive()
     }
@@ -249,9 +270,29 @@ impl ZoneSigningKey {
     ///
     /// [`ZoneSignerError::Key`], если публичный DNSKEY не строится.
     pub fn with_flags(key: PrivateKey, role: KeyRole, flags: u16) -> Result<Self, ZoneSignerError> {
-        let candidate = Self { key, role, flags };
+        let candidate = Self {
+            key,
+            role,
+            flags,
+            signs: true,
+        };
         candidate.dnskey()?;
         Ok(candidate)
+    }
+
+    /// Помечает ключ как «только публикуемый» (pre-publish/retired).
+    ///
+    /// DNSKEY ключа попадает в apex, но RRSIG им не создаются (RFC 7583).
+    #[must_use]
+    pub const fn publish_only(mut self) -> Self {
+        self.signs = false;
+        self
+    }
+
+    /// Участвует ли ключ в подписи (а не только в публикации DNSKEY).
+    #[must_use]
+    pub const fn signs(&self) -> bool {
+        self.signs
     }
 
     /// Роль ключа.
@@ -338,7 +379,7 @@ impl ZoneSigner {
         let mut dnskey_signers: Vec<usize> = keys
             .iter()
             .enumerate()
-            .filter_map(|(index, key)| key.role().signs_dnskey().then_some(index))
+            .filter_map(|(index, key)| (key.role().signs_dnskey() && key.signs()).then_some(index))
             .collect();
         if dnskey_signers.is_empty() {
             dnskey_signers = (0..keys.len()).collect();
@@ -346,7 +387,7 @@ impl ZoneSigner {
         let mut data_signers: Vec<usize> = keys
             .iter()
             .enumerate()
-            .filter_map(|(index, key)| key.role().signs_data().then_some(index))
+            .filter_map(|(index, key)| (key.role().signs_data() && key.signs()).then_some(index))
             .collect();
         if data_signers.is_empty() {
             data_signers = (0..keys.len()).collect();
@@ -576,9 +617,9 @@ pub fn sign_zone(
 /// Подписывает зону с явной denial-политикой.
 ///
 /// При `DenialPolicy::Nsec3` в apex добавляется `NSEC3PARAM`, а для каждого
-/// авторитетного имени (включая empty non-terminals и точки делегирования)
-/// строится hashed-владелец `<base32hex(SHA-1(name))>.zone`. Opt-Out всегда
-/// выключен, поэтому NSEC3-цепочка покрывает и незащищённые делегирования.
+/// авторитетного имени (включая empty non-terminals и secure-делегирования)
+/// строится hashed-владелец `<base32hex(SHA-1(name))>.zone`. При включённом
+/// Opt-Out insecure-делегирования (NS без DS) из цепочки исключаются.
 ///
 /// # Errors
 ///
@@ -756,7 +797,11 @@ fn build_nsec_chain(
     Ok(())
 }
 
-/// Строит NSEC3-цепочку (SHA-1, Opt-Out = 0) и apex `NSEC3PARAM`.
+/// Строит NSEC3-цепочку (SHA-1) и apex `NSEC3PARAM`.
+///
+/// При `opt_out = true` insecure-делегирования (NS без DS) не получают
+/// NSEC3-запись и остаются вне hash-цепочки; флаг Opt-Out устанавливается
+/// на всех NSEC3 зоны (RFC 5155 §6, §7.1).
 fn build_nsec3_chain(
     origin: &Name,
     data: &mut HashMap<(Name, Rtype), Rrset>,
@@ -765,8 +810,12 @@ fn build_nsec3_chain(
     nsec_ttl: Ttl,
     config: &Nsec3Config,
 ) -> Result<(), SignZoneError> {
+    let insecure = insecure_delegations(origin, data);
     let mut hashes: BTreeMap<Vec<u8>, BTreeSet<Rtype>> = BTreeMap::new();
     for name in nodes {
+        if config.opt_out() && insecure.contains(name) {
+            continue;
+        }
         let hash = nsec3_hash(name, config.salt(), config.iterations());
         let entry = hashes.entry(hash).or_default();
         if let Some(node_types) = types.get(name) {
@@ -793,7 +842,7 @@ fn build_nsec3_chain(
             nsec3_owner_name(origin, hash).map_err(|error| SignZoneError::denial(origin, error))?;
         let nsec3 = Nsec3Data::new(
             Nsec3Config::HASH_SHA1,
-            0,
+            u8::from(config.opt_out()),
             config.iterations(),
             config.salt().to_vec(),
             next_hash.clone(),
@@ -853,6 +902,14 @@ fn collect_cuts(origin: &Name, data: &HashMap<(Name, Rtype), Rrset>) -> HashSet<
     data.keys()
         .filter(|(owner, rr_type)| *rr_type == Rtype::NS && owner != origin)
         .map(|(owner, _)| owner.clone())
+        .collect()
+}
+
+/// Делегирования без DS — кандидаты на Opt-Out.
+fn insecure_delegations(origin: &Name, data: &HashMap<(Name, Rtype), Rrset>) -> HashSet<Name> {
+    collect_cuts(origin, data)
+        .into_iter()
+        .filter(|owner| !data.contains_key(&(owner.clone(), Rtype::DS)))
         .collect()
 }
 
@@ -1135,5 +1192,159 @@ mod tests {
             .sign_zone(&origin, &[], 1_700_000_000)
             .expect_err("SOA is required");
         assert!(matches!(error, SignZoneError::MissingSoa { .. }));
+    }
+
+    fn delegation_zone() -> Vec<Rrset> {
+        let mut records = zone();
+        // secure delegation: NS + DS
+        records.push(rrset(
+            "secure.example.com",
+            Rtype::NS,
+            [Rdata::Ns(name("ns.secure.example.com"))],
+        ));
+        records.push(rrset(
+            "secure.example.com",
+            Rtype::DS,
+            [Rdata::Ds(
+                pulse_dns::DsData::new(12345, 15, 2, vec![0xAB; 32]).expect("ds"),
+            )],
+        ));
+        records.push(rrset(
+            "ns.secure.example.com",
+            Rtype::A,
+            [Rdata::A("192.0.2.5".parse().expect("ip"))],
+        ));
+        // insecure delegation: NS only
+        records.push(rrset(
+            "insecure.example.com",
+            Rtype::NS,
+            [Rdata::Ns(name("ns.insecure.example.com"))],
+        ));
+        records.push(rrset(
+            "ns.insecure.example.com",
+            Rtype::A,
+            [Rdata::A("192.0.2.6".parse().expect("ip"))],
+        ));
+        records
+    }
+
+    fn nsec3_rrsets(signed: &SignedZone, origin: &Name) -> Vec<Rrset> {
+        signed
+            .rrsets
+            .iter()
+            .filter(|rrset| {
+                rrset.rr_type() == Rtype::NSEC3 && rrset.owner().is_subdomain_of(origin)
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn opt_out_omits_insecure_delegation_and_sets_flag() {
+        let origin = name("example.com");
+        let signer = signer();
+        let denial = DenialPolicy::Nsec3(
+            Nsec3Config::new(vec![0xAA, 0xBB], 0)
+                .expect("config")
+                .with_opt_out(true),
+        );
+        let output = signer
+            .sign_zone_with(&origin, &delegation_zone(), 1_700_000_000, &denial)
+            .expect("sign opt-out");
+        let records = nsec3_rrsets(&output, &origin);
+        assert_ne!(records.len(), 0);
+
+        let params = Nsec3Config::new(vec![0xAA, 0xBB], 0).expect("params");
+        let insecure_hash = pulse_dnssec::rdata_util::nsec3_hash(
+            &name("insecure.example.com"),
+            params.salt(),
+            params.iterations(),
+        );
+        let secure_hash = pulse_dnssec::rdata_util::nsec3_hash(
+            &name("secure.example.com"),
+            params.salt(),
+            params.iterations(),
+        );
+        let mut hashes = Vec::new();
+        for rrset in &records {
+            let label = rrset.owner().first_label().expect("label");
+            hashes.push(pulse_dnssec::denial::base32hex::decode(label).expect("base32hash"));
+            let Rdata::Nsec3(data) = rrset.rdatas().first().expect("nsec3") else {
+                panic!("expected NSEC3");
+            };
+            assert_eq!(data.flags() & 1, 1, "Opt-Out flag must be set");
+        }
+        assert!(
+            !hashes.iter().any(|hash| hash == &insecure_hash),
+            "insecure delegation must be omitted from NSEC3 chain"
+        );
+        assert!(
+            hashes.iter().any(|hash| hash == &secure_hash),
+            "secure delegation must stay in NSEC3 chain"
+        );
+
+        // Apex не должен потерять свои типы из-за фильтра insecure-делегирований.
+        let apex_hash = pulse_dnssec::rdata_util::nsec3_hash(&origin, params.salt(), 0);
+        let apex = records
+            .iter()
+            .find(|rrset| {
+                rrset
+                    .owner()
+                    .first_label()
+                    .and_then(|label| pulse_dnssec::denial::base32hex::decode(label).ok())
+                    .is_some_and(|hash| hash == apex_hash)
+            })
+            .expect("apex NSEC3");
+        let Rdata::Nsec3(apex_data) = apex.rdatas().first().expect("apex rdata") else {
+            panic!("expected NSEC3");
+        };
+        assert!(apex_data.type_bitmap().contains(Rtype::SOA));
+        assert!(apex_data.type_bitmap().contains(Rtype::NS));
+        assert!(apex_data.type_bitmap().contains(Rtype::DNSKEY));
+    }
+
+    #[test]
+    fn opt_out_proof_marks_referral_insecure() {
+        use pulse_dnssec::DenialLimits;
+        use pulse_dnssec::denial::nsec3_ds_nodata;
+
+        let origin = name("example.com");
+        let denial = DenialPolicy::Nsec3(
+            Nsec3Config::new(vec![0x01, 0x02], 0)
+                .expect("config")
+                .with_opt_out(true),
+        );
+        let output = signer()
+            .sign_zone_with(&origin, &delegation_zone(), 1_700_000_000, &denial)
+            .expect("sign opt-out");
+
+        let proofs: Vec<pulse_dnssec::Nsec3Proof> = output
+            .rrsets
+            .iter()
+            .filter(|rrset| rrset.rr_type() == Rtype::NSEC3)
+            .filter_map(|rrset| {
+                let record = pulse_dns::Record::new(
+                    rrset.owner().clone(),
+                    Rtype::NSEC3,
+                    Rclass::IN,
+                    rrset.ttl(),
+                    rrset.rdatas().first().cloned().expect("rdata"),
+                )
+                .expect("record");
+                pulse_dnssec::Nsec3Proof::from_record(&record, DenialLimits::new()).ok()
+            })
+            .collect();
+        let outcome = nsec3_ds_nodata(
+            &name("insecure.example.com"),
+            &origin,
+            &proofs,
+            DenialLimits::new(),
+        )
+        .expect("opt-out DS proof");
+        assert!(
+            outcome.opt_out,
+            "insecure delegation must be proven Opt-Out"
+        );
+        assert!(!outcome.is_secure());
     }
 }

@@ -2,7 +2,9 @@
 //! (RFC 8484) для upstream-резолвера.
 //!
 //! Клиенты используют только `rustls` и std-сокеты: без tokio и без `unsafe`.
-//! Каждый клиент держит одно keep-alive-соединение на upstream; при обрыве
+//! Каждый клиент держит пул keep-alive-соединений на upstream
+//! ([`PoolConfig`], по умолчанию 4): последовательные запросы переиспользуют
+//! одно соединение, параллельные занимают до `size` слотов; при обрыве
 //! соединение пересоздаётся (одна повторная попытка), сертификат сервера
 //! проверяется по webpki-roots или по явно заданному CA.
 //!
@@ -40,8 +42,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -49,6 +51,8 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use rustls_pki_types::pem::PemObject;
 
 use crate::error::Error;
+use crate::pool::Pool;
+pub use crate::pool::{PoolConfig, PoolStats};
 
 const DEFAULT_DOT_PORT: u16 = 853;
 const DEFAULT_HTTPS_PORT: u16 = 443;
@@ -290,6 +294,9 @@ impl ClientStream {
     }
 
     fn close(&mut self) {
+        let _ = self
+            .socket
+            .set_write_timeout(Some(Duration::from_millis(100)));
         self.connection.send_close_notify();
         while self.connection.wants_write() {
             match self.connection.write_tls(&mut self.socket) {
@@ -301,12 +308,18 @@ impl ClientStream {
     }
 }
 
-/// DNS-over-TLS клиент с одним keep-alive-соединением.
+impl Drop for ClientStream {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// DNS-over-TLS клиент с пулом keep-alive-соединений.
 pub struct DotClient {
     addresses: Vec<SocketAddr>,
     server_name: ServerName<'static>,
     tls: ClientTlsConfig,
-    connection: Mutex<Option<ClientStream>>,
+    pool: Pool<ClientStream>,
     reconnects: AtomicU64,
 }
 
@@ -314,17 +327,33 @@ impl DotClient {
     /// Создаёт клиент для `host:port` (порт по умолчанию 853).
     ///
     /// `server_name` — имя для SNI и проверки сертификата. Если `ca` задан,
-    /// он используется как единственный корень доверия.
+    /// он используется как единственный корень доверия. Размер пула и
+    /// backoff берутся из [`PoolConfig::default`].
     ///
     /// # Errors
     ///
-    /// [`Error::NoAddresses`] если хост не разрешился, ошибки чтения CA или
-    /// сборки rustls.
+    /// [`Error::NoAddresses`] если хост не разрешился, ошибки чтения CA,
+    /// сборки rustls или параметров пула.
     pub fn new(
         host: &str,
         port: Option<u16>,
         server_name: &str,
         ca: Option<&Path>,
+    ) -> Result<Self, Error> {
+        Self::with_pool(host, port, server_name, ca, PoolConfig::default())
+    }
+
+    /// То же, но с явными параметрами пула.
+    ///
+    /// # Errors
+    ///
+    /// См. [`DotClient::new`] и [`PoolConfig::validate`].
+    pub fn with_pool(
+        host: &str,
+        port: Option<u16>,
+        server_name: &str,
+        ca: Option<&Path>,
+        pool: PoolConfig,
     ) -> Result<Self, Error> {
         let port = port.unwrap_or(DEFAULT_DOT_PORT);
         let mut addresses = resolve(host, port)?;
@@ -337,7 +366,7 @@ impl DotClient {
             addresses,
             server_name: parse_server_name(server_name)?,
             tls,
-            connection: Mutex::new(None),
+            pool: Pool::new(pool)?,
             reconnects: AtomicU64::new(0),
         })
     }
@@ -369,11 +398,26 @@ impl DotClient {
         server_name: &str,
         tls: ClientTlsConfig,
     ) -> Result<Self, Error> {
+        Self::from_addr_with_tls_and_pool(address, server_name, tls, PoolConfig::default())
+    }
+
+    /// Создаёт клиент для адреса с TLS-конфигурацией и параметрами пула.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidUrl`] при некорректном имени сервера,
+    /// [`Error::InvalidConfig`] при некорректном пуле.
+    pub fn from_addr_with_tls_and_pool(
+        address: SocketAddr,
+        server_name: &str,
+        tls: ClientTlsConfig,
+        pool: PoolConfig,
+    ) -> Result<Self, Error> {
         Ok(Self {
             addresses: vec![address],
             server_name: parse_server_name(server_name)?,
             tls,
-            connection: Mutex::new(None),
+            pool: Pool::new(pool)?,
             reconnects: AtomicU64::new(0),
         })
     }
@@ -384,15 +428,23 @@ impl DotClient {
         self.reconnects.load(Ordering::Relaxed)
     }
 
+    /// Снимок счётчиков пула.
+    #[must_use]
+    pub fn pool_stats(&self) -> PoolStats {
+        self.pool.stats()
+    }
+
     /// Отправляет DNS-сообщение и возвращает ответ.
     ///
     /// `connect_timeout` ограничивает установку соединения, `io_timeout` —
-    /// обмен DNS-сообщением. При обрыве соединения выполняется одно
-    /// переподключение.
+    /// обмен DNS-сообщением; оба ограничены общим дедлайном. Если все
+    /// соединения пула заняты, запрос ждёт свободный слот. При обрыве
+    /// соединения выполняется одно переподключение.
     ///
     /// # Errors
     ///
-    /// Ошибки TLS, I/O, таймауты и некорректное length-prefix-сообщение.
+    /// Ошибки TLS, I/O, таймауты, cooldown upstream и некорректное
+    /// length-prefix-сообщение.
     pub fn query(
         &self,
         message: &[u8],
@@ -411,39 +463,23 @@ impl DotClient {
         let overall = Instant::now()
             .checked_add(total)
             .ok_or(Error::InvalidConfig("query timeout is too large"))?;
-        let mut guard = lock_until(&self.connection, overall)?;
         let mut last_error = Error::Timeout;
         for attempt in 0..2 {
-            if guard.is_none() {
+            let mut reservation = self.pool.checkout(overall, |_deadline| {
                 let connect_deadline = deadline_after(connect_timeout, overall)?;
-                match self.connect(connect_deadline) {
-                    Ok(stream) => {
-                        if attempt > 0 {
-                            self.reconnects.fetch_add(1, Ordering::Relaxed);
-                        }
-                        *guard = Some(stream);
-                    }
-                    Err(error) => {
-                        last_error = error;
-                        if attempt > 0 || !last_error.is_retryable_connection() {
-                            return Err(last_error);
-                        }
-                        continue;
-                    }
-                }
-            }
-            let Some(stream) = guard.as_mut() else {
-                continue;
-            };
+                self.connect(connect_deadline)
+            })?;
             let io_deadline = deadline_after(io_timeout, overall)?;
+            let stream = reservation.connection()?;
             match exchange_dot(stream, message, io_deadline) {
                 Ok(response) => return Ok(response),
                 Err(error) => {
-                    *guard = None;
+                    reservation.discard();
                     last_error = error;
                     if attempt > 0 || !last_error.is_retryable_connection() {
                         return Err(last_error);
                     }
+                    self.reconnects.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -475,17 +511,8 @@ impl std::fmt::Debug for DotClient {
             .debug_struct("DotClient")
             .field("addresses", &self.addresses)
             .field("server_name", &self.server_name)
+            .field("pool", &self.pool.config())
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for DotClient {
-    fn drop(&mut self) {
-        if let Ok(guard) = self.connection.get_mut()
-            && let Some(stream) = guard.as_mut()
-        {
-            stream.close();
-        }
     }
 }
 
@@ -515,14 +542,14 @@ struct HttpsConnection {
     pending: Vec<u8>,
 }
 
-/// DNS-over-HTTPS/1.1 клиент с keep-alive соединением.
+/// DNS-over-HTTPS/1.1 клиент с пулом keep-alive-соединений.
 pub struct DohClient {
     addresses: Vec<SocketAddr>,
     server_name: ServerName<'static>,
     host_header: String,
     path: String,
     tls: ClientTlsConfig,
-    connection: Mutex<Option<HttpsConnection>>,
+    pool: Pool<HttpsConnection>,
     reconnects: AtomicU64,
 }
 
@@ -537,11 +564,20 @@ impl DohClient {
     /// [`Error::InvalidUrl`] при некорректной схеме/хосте,
     /// [`Error::NoAddresses`] если хост не разрешился, ошибки CA/rustls.
     pub fn new(url: &str, ca: Option<&Path>) -> Result<Self, Error> {
+        Self::with_pool(url, ca, PoolConfig::default())
+    }
+
+    /// То же, но с явными параметрами пула.
+    ///
+    /// # Errors
+    ///
+    /// См. [`DohClient::new`] и [`PoolConfig::validate`].
+    pub fn with_pool(url: &str, ca: Option<&Path>, pool: PoolConfig) -> Result<Self, Error> {
         let tls = match ca {
             Some(path) => ClientTlsConfig::with_ca_file(path, b"http/1.1")?,
             None => ClientTlsConfig::for_doh()?,
         };
-        Self::with_tls(url, tls)
+        Self::with_tls_and_pool(url, tls, pool)
     }
 
     /// Создаёт клиент из URL с готовой TLS-конфигурацией.
@@ -551,9 +587,24 @@ impl DohClient {
     /// [`Error::InvalidUrl`] при некорректной схеме/хосте,
     /// [`Error::NoAddresses`] если хост не разрешился.
     pub fn with_tls(url: &str, tls: ClientTlsConfig) -> Result<Self, Error> {
+        Self::with_tls_and_pool(url, tls, PoolConfig::default())
+    }
+
+    /// Создаёт клиент из URL с TLS-конфигурацией и параметрами пула.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidUrl`] при некорректной схеме/хосте,
+    /// [`Error::NoAddresses`] если хост не разрешился,
+    /// [`Error::InvalidConfig`] при некорректном пуле.
+    pub fn with_tls_and_pool(
+        url: &str,
+        tls: ClientTlsConfig,
+        pool: PoolConfig,
+    ) -> Result<Self, Error> {
         let parsed = parse_doh_url(url)?;
         let addresses = resolve(&parsed.host, parsed.port)?;
-        Self::from_parsed(parsed, tls, addresses)
+        Self::from_parsed(parsed, tls, addresses, pool)
     }
 
     /// Создаёт клиент из URL и явно заданных адресов.
@@ -571,17 +622,32 @@ impl DohClient {
         tls: ClientTlsConfig,
         addresses: Vec<SocketAddr>,
     ) -> Result<Self, Error> {
+        Self::with_addresses_and_pool(url, tls, addresses, PoolConfig::default())
+    }
+
+    /// То же, но с явными параметрами пула.
+    ///
+    /// # Errors
+    ///
+    /// См. [`DohClient::with_addresses`].
+    pub fn with_addresses_and_pool(
+        url: &str,
+        tls: ClientTlsConfig,
+        addresses: Vec<SocketAddr>,
+        pool: PoolConfig,
+    ) -> Result<Self, Error> {
         let parsed = parse_doh_url(url)?;
         if addresses.is_empty() {
             return Err(Error::NoAddresses(parsed.host));
         }
-        Self::from_parsed(parsed, tls, addresses)
+        Self::from_parsed(parsed, tls, addresses, pool)
     }
 
     fn from_parsed(
         parsed: DohUrl,
         tls: ClientTlsConfig,
         mut addresses: Vec<SocketAddr>,
+        pool: PoolConfig,
     ) -> Result<Self, Error> {
         addresses.dedup();
         let server_name = parse_server_name(&parsed.server_name)?;
@@ -592,7 +658,7 @@ impl DohClient {
             host_header,
             path: parsed.path,
             tls,
-            connection: Mutex::new(None),
+            pool: Pool::new(pool)?,
             reconnects: AtomicU64::new(0),
         })
     }
@@ -601,6 +667,12 @@ impl DohClient {
     #[must_use]
     pub fn reconnects(&self) -> u64 {
         self.reconnects.load(Ordering::Relaxed)
+    }
+
+    /// Снимок счётчиков пула.
+    #[must_use]
+    pub fn pool_stats(&self) -> PoolStats {
+        self.pool.stats()
     }
 
     /// Отправляет DNS-сообщение POST-запросом и возвращает тело ответа.
@@ -629,47 +701,32 @@ impl DohClient {
         let overall = Instant::now()
             .checked_add(total)
             .ok_or(Error::InvalidConfig("query timeout is too large"))?;
-        let mut guard = lock_until(&self.connection, overall)?;
         let mut last_error = Error::Timeout;
         for attempt in 0..2 {
-            if guard.is_none() {
+            let mut reservation = self.pool.checkout(overall, |_deadline| {
                 let connect_deadline = deadline_after(connect_timeout, overall)?;
-                match self.connect(connect_deadline) {
-                    Ok(stream) => {
-                        if attempt > 0 {
-                            self.reconnects.fetch_add(1, Ordering::Relaxed);
-                        }
-                        *guard = Some(HttpsConnection {
-                            stream,
-                            pending: Vec::new(),
-                        });
-                    }
-                    Err(error) => {
-                        last_error = error;
-                        if attempt > 0 || !last_error.is_retryable_connection() {
-                            return Err(last_error);
-                        }
-                        continue;
-                    }
-                }
-            }
-            let Some(connection) = guard.as_mut() else {
-                continue;
-            };
+                let stream = self.connect(connect_deadline)?;
+                Ok(HttpsConnection {
+                    stream,
+                    pending: Vec::new(),
+                })
+            })?;
             let io_deadline = deadline_after(io_timeout, overall)?;
+            let connection = reservation.connection()?;
             match self.exchange(connection, message, io_deadline) {
                 Ok((body, keep_alive)) => {
                     if !keep_alive {
-                        *guard = None;
+                        reservation.discard();
                     }
                     return Ok(body);
                 }
                 Err(error) => {
-                    *guard = None;
+                    reservation.discard();
                     last_error = error;
                     if attempt > 0 || !last_error.is_retryable_connection() {
                         return Err(last_error);
                     }
+                    self.reconnects.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -752,17 +809,8 @@ impl std::fmt::Debug for DohClient {
             .field("addresses", &self.addresses)
             .field("host_header", &self.host_header)
             .field("path", &self.path)
+            .field("pool", &self.pool.config())
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for DohClient {
-    fn drop(&mut self) {
-        if let Ok(guard) = self.connection.get_mut()
-            && let Some(connection) = guard.as_mut()
-        {
-            connection.stream.close();
-        }
     }
 }
 
@@ -1011,23 +1059,6 @@ fn remaining(deadline: Instant) -> Result<Duration, Error> {
         return Err(Error::Timeout);
     }
     Ok(remaining)
-}
-
-fn lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> Result<MutexGuard<'_, T>, Error> {
-    loop {
-        match mutex.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                return Ok(PoisonError::into_inner(poisoned));
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if Instant::now() >= deadline {
-                    return Err(Error::Timeout);
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
 }
 
 #[cfg(test)]

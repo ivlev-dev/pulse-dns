@@ -777,6 +777,13 @@ fn append_nsec3_proofs(zone: &dyn ZoneView, qname: &Name, resolution: &mut Resol
                 push_nsec3_exact(zone, &params, wildcard, &mut proofs);
             } else {
                 push_nsec3_exact(zone, &params, qname, &mut proofs);
+                if proofs.is_empty() {
+                    // Opt-Out: DS-NODATA в insecure-делегировании не имеет
+                    // точного NSEC3; доказываем CE + покрытием имени.
+                    let closest = closest_encloser(zone, qname);
+                    push_nsec3_exact(zone, &params, &closest, &mut proofs);
+                    push_nsec3_cover(zone, &params, qname, &mut proofs);
+                }
             }
         }
         Status::Answer => {
@@ -789,7 +796,21 @@ fn append_nsec3_proofs(zone: &dyn ZoneView, qname: &Name, resolution: &mut Resol
                 }
             }
         }
-        Status::Referral | Status::YxDomain => {}
+        Status::Referral | Status::YxDomain => {
+            if resolution.status == Status::Referral
+                && let Some(cut) = resolution
+                    .authority
+                    .iter()
+                    .find(|rrset| rrset.rr_type() == Rtype::NS)
+                    .map(Rrset::owner)
+            {
+                // Opt-Out: у insecure-делегирования нет точного NSEC3.
+                // Доказываем отсутствие DS closest-encloser + покрытием cut.
+                let closest = closest_encloser(zone, cut);
+                push_nsec3_exact(zone, &params, &closest, &mut proofs);
+                push_nsec3_cover(zone, &params, cut, &mut proofs);
+            }
+        }
     }
     resolution.authority.append(&mut proofs);
 }

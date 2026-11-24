@@ -16,9 +16,10 @@
 //! - **DS**: [`ds_from_dnskey`], [`ds_matches`], цепочка
 //!   [`chain::validate_dnskey_rrset`] / [`chain::validate_rrset_in_chain`].
 //! - **Denial**: NSEC и NSEC3 (SHA-1, salt, лимит итераций, closest
-//!   encloser, wildcard, opt-out).
+//!   encloser, wildcard, Opt-Out).
 //! - **Trust anchors**: встроенные root KSK IANA (20326, 38696), загрузка
-//!   `root-anchors.xml`; RFC 5011 не реализован.
+//!   `root-anchors.xml`; RFC 5011 — [`trust_update::TrustAnchorStore`]
+//!   (add/revoke hold-down, персистентное состояние `0600`).
 //! - **Файлы ключей**: атомарная запись `0600` в каталог `0700`,
 //!   аудит-хук без записи секретов.
 //!
@@ -97,6 +98,7 @@ pub mod rdata_util;
 pub mod secret;
 pub mod sign;
 pub mod trust_anchor;
+pub mod trust_update;
 pub mod verify;
 
 pub use algorithm::{Algorithm, AlgorithmPolicy};
@@ -116,6 +118,10 @@ pub use rdata_util::key_tag;
 pub use secret::SecretRef;
 pub use sign::{SignOptions, sign_rrset};
 pub use trust_anchor::{RFC_5011_SUPPORTED, TrustAnchor, TrustAnchorSet, builtin_root_anchors};
+pub use trust_update::{
+    AnchorStatus, SharedTrustAnchors, TrustAnchorPolicy, TrustAnchorProvider, TrustAnchorSnapshot,
+    TrustAnchorStore, TrustUpdateError, UpdateReport,
+};
 pub use verify::{VerifyOptions, verify_rrset_with_dnskeys, verify_rrsig};
 
 /// Псевдоним RRSIG RDATA в терминах RFC.

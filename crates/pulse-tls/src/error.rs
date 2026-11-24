@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::IpAddr;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -73,6 +74,12 @@ pub enum Error {
     /// Соединение закрыто.
     #[error("connection closed")]
     Closed,
+    /// Upstream в cooldown после неудачных подключений.
+    #[error("upstream is cooling down for {retry_after:?}")]
+    Cooldown {
+        /// Сколько осталось до следующей попытки.
+        retry_after: Duration,
+    },
     /// Клиент превысил rate limit.
     #[error("rate limit exceeded")]
     RateLimited,
@@ -91,6 +98,10 @@ pub enum Error {
     /// Сервис уже остановлен.
     #[error("server is shut down")]
     Shutdown,
+    /// Ошибка QUIC/DoQ.
+    #[cfg(feature = "doq")]
+    #[error("QUIC error: {0}")]
+    Quic(String),
 }
 
 impl Error {

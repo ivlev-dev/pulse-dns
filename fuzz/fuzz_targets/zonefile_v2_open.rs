@@ -27,6 +27,7 @@ fuzz_target!(|data: &[u8]| {
     let config = OpenConfigV2 {
         read_only: true,
         writer_lock: false,
+        multi_process: false,
         page_cache_entries: 0,
     };
     let Ok(store) = ParallelStore::open(file.path(), config) else {

@@ -1,11 +1,9 @@
 //! Trust anchors: встроенный корневой KSK IANA и обновление из файла.
 //!
 //! В поставку включены **актуальные** root KSK: 20326 (KSK-2017) и 38696
-//! (KSK-2024). Обновление — с релизами ПО (ADR-0004 SEC-CR-007).
-//!
-//! RFC 5011 (автоматическое обновление) в v1 **не реализован**: метка
-//! [`RFC_5011_SUPPORTED`] равна `false`; anchors задаются статически или
-//! загружаются из файла IANA `root-anchors.xml`.
+//! (KSK-2024). Статический набор обновляется с релизами ПО
+//! (ADR-0004 SEC-CR-007); автоматическое обновление по RFC 5011 реализовано
+//! в [`crate::trust_update`] (см. [`RFC_5011_SUPPORTED`]).
 
 use std::path::Path;
 use std::str::FromStr;
@@ -15,8 +13,9 @@ use pulse_dns::{DnskeyData, DsData, Name};
 use crate::ds::{DsPolicy, ds_matches};
 use crate::error::TrustAnchorError;
 
-/// RFC 5011 не поддерживается в v1.
-pub const RFC_5011_SUPPORTED: bool = false;
+/// RFC 5011 (trust anchor update) поддерживается через
+/// [`crate::trust_update::TrustAnchorStore`].
+pub const RFC_5011_SUPPORTED: bool = true;
 
 const KSK_20326_DIGEST: [u8; 32] = [
     0xE0, 0x6D, 0x44, 0xB8, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65, 0xD0, 0x84,
@@ -120,6 +119,26 @@ impl TrustAnchor {
         let started = self.valid_from.is_none_or(|from| now >= from);
         let not_finished = self.valid_until.is_none_or(|until| now < until);
         started && not_finished
+    }
+
+    /// Создаёт anchor из DS-записи (например, из файла доверенных DS).
+    ///
+    /// # Errors
+    ///
+    /// [`TrustAnchorError::DigestLength`] при неверной длине digest.
+    pub fn from_ds(
+        ds: &DsData,
+        valid_from: Option<u32>,
+        valid_until: Option<u32>,
+    ) -> Result<Self, TrustAnchorError> {
+        Self::new(
+            ds.key_tag(),
+            ds.algorithm(),
+            ds.digest_type(),
+            ds.digest().to_vec(),
+            valid_from,
+            valid_until,
+        )
     }
 
     /// Преобразует anchor в DS (если digest type поддерживается).

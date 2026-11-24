@@ -113,6 +113,51 @@ impl TlsConfig {
         Self::from_pem(cert_pem, key_pem, &[b"http/1.1"])
     }
 
+    /// Конфигурация для DoH HTTP/2 (ALPN `h2`, RFC 9113/8484).
+    ///
+    /// # Errors
+    ///
+    /// См. [`TlsConfig::from_pem`].
+    pub fn for_doh2(cert_pem: &[u8], key_pem: &[u8]) -> Result<Self, Error> {
+        Self::from_pem(cert_pem, key_pem, &[b"h2"])
+    }
+
+    /// Конфигурация для DNS over QUIC (ALPN `doq`, RFC 9250).
+    ///
+    /// `TlsConfig` хранит rustls-конфигурацию с TLS 1.3; для quinn используйте
+    /// [`TlsConfig::quic_server_config`].
+    ///
+    /// # Errors
+    ///
+    /// См. [`TlsConfig::from_pem`].
+    #[cfg(feature = "doq")]
+    pub fn for_doq(cert_pem: &[u8], key_pem: &[u8]) -> Result<Self, Error> {
+        Self::from_pem(cert_pem, key_pem, &[b"doq"])
+    }
+
+    /// Собирает QUIC-конфигурацию quinn из текущей rustls-пары и ALPN.
+    ///
+    /// 0-RTT не включается: `max_early_data_size` равен нулю. Транспортные
+    /// лимиты QUIC задаются вызывающим через `transport` (idle timeout,
+    /// число двунаправленных потоков, окна).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Quic`], если rustls-конфигурация несовместима с QUIC
+    /// (например, отключён TLS 1.3 или нет TLS 1.3 cipher suite).
+    #[cfg(feature = "doq")]
+    pub fn quic_server_config(
+        &self,
+        transport: Arc<quinn::TransportConfig>,
+    ) -> Result<quinn::ServerConfig, Error> {
+        let rustls = self.server_config();
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls)
+            .map_err(|error| Error::Quic(error.to_string()))?;
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        config.transport_config(transport);
+        Ok(config)
+    }
+
     /// Заменяет сертификат и ключ новыми PEM-байтами.
     ///
     /// Новая конфигурация собирается полностью до подмены: при ошибке

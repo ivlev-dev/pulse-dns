@@ -532,10 +532,15 @@ pub fn nsec3_wildcard_answer(
         current = parent;
     };
     let hash = params.hash(&next_closer);
-    if find_cover(proofs, &hash).is_none() {
+    let Some(covering) = find_cover(proofs, &hash) else {
         return Err(DenialError::NextCloserNotCovered {
             name: next_closer.to_string(),
         });
-    }
-    Ok(DenialResult::new(DenialOutcome::WildcardExpansion, false))
+    };
+    // Opt-Out в покрытии next closer означает, что под ним может быть
+    // insecure-делегирование; ответ нельзя считать полностью secure.
+    Ok(DenialResult::new(
+        DenialOutcome::WildcardExpansion,
+        covering.opt_out(),
+    ))
 }

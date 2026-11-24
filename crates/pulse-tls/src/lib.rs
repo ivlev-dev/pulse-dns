@@ -1,6 +1,20 @@
-//! DNS over TLS (RFC 7858) и DNS over HTTPS (RFC 8484) для `pulse-dns`.
+//! Защищённые DNS-транспорты для `pulse-dns`: DoT (RFC 7858),
+//! DoH/1.1 (RFC 8484), DoH/HTTP/2 (RFC 8484 + RFC 9113) и DoQ (RFC 9250).
 //!
-//! Крейт предоставляет два синхронных сервера (std + rustls, без tokio):
+//! # Серверы
+//!
+//! Все серверы принимают один и тот же обработчик
+//! `Fn(&[u8], SocketAddr) -> Option<Vec<u8>>` (или [`DnsHandler`]) и не
+//! зависят от `pulsed`, `pulse-server` или `pulse-resolver`. Конфигурация,
+//! ACL и rate limit передаются параметрами, поэтому транспорт можно поднять
+//! в любом бинарнике за несколько строк.
+//!
+//! | Транспорт | Тип | Конфиг | Feature |
+//! |---|---|---|---|
+//! | DoT | [`DotServer`] | [`DotConfig`] | — |
+//! | DoH/1.1 | [`DohServer`] | [`DohConfig`] | — |
+//! | DoH/2 | `Doh2Server` | `Doh2Config` | `http2` |
+//! | DoQ | `DoqServer` | `DoqConfig` | `doq` |
 //!
 //! - [`DotServer`] — TLS 1.2/1.3 с ALPN `dot`, length-prefixed DNS
 //!   (2 байта BE), несколько сообщений на соединение, idle timeout,
@@ -9,29 +23,59 @@
 //!   (`application/dns-message`), `GET /dns-query?dns=<base64url>`,
 //!   `GET /healthz`, keep-alive, лимит тела 64 KiB и коды
 //!   `200/400/404/405/413/415/429/500/505`.
+//! - `Doh2Server` — HTTPS/2 с ALPN `h2` на tokio + h2: те же маршруты,
+//!   мультиплексирование stream'ов, лимит одновременных stream'ов,
+//!   лимит тела 64 KiB, GOAWAY при shutdown.
+//! - `DoqServer` — QUIC с ALPN `doq` на quinn: один двунаправленный
+//!   stream на запрос, 2-байтовый length-prefix, лимиты stream'ов/размера/
+//!   времени, idle timeout, 0-RTT выключен.
 //!
-//! Оба сервера принимают обработчик
-//! `Fn(&[u8], SocketAddr) -> Option<Vec<u8>>` и возвращают готовый DNS-ответ;
-//! обработчик вызывается из потока соединения. `None` закрывает соединение
-//! (DoT) или даёт HTTP 500 (DoH).
+//! Синхронные DoT/DoH/1.1 работают на std-потоках без tokio. Асинхронные
+//! DoH/2 и DoQ включаются feature-флагами `http2` и `doq`; каждый сервер
+//! поднимает собственный tokio runtime в фоновом потоке, а наружу отдаёт
+//! синхронный RAII-API (`bind` → `local_addr`/`stats` → `shutdown`).
+//!
+//! # Пример: поднять любой транспорт
+//!
+//! ```no_run
+//! use pulse_tls::{DotConfig, DotServer, TlsConfig};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let cert = std::fs::read("cert.pem")?;
+//! let key = std::fs::read("key.pem")?;
+//! let mut dot = DotServer::bind(
+//!     DotConfig::new("0.0.0.0:853".parse()?, TlsConfig::for_dot(&cert, &key)?),
+//!     |query: &[u8], _peer: std::net::SocketAddr| Some(query.to_vec()),
+//! )?;
+//! dot.shutdown()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! DoH/2 и DoQ поднимаются так же:
+//! `Doh2Server::bind(Doh2Config::new(addr, TlsConfig::for_doh2(&cert, &key)?), handler)`
+//! и `DoqServer::bind(DoqConfig::new(addr, TlsConfig::for_doq(&cert, &key)?), handler)`.
 //!
 //! Для upstream-резолвера крейт также предоставляет синхронные клиенты
 //! [`client::DotClient`] и [`client::DohClient`]: проверка сертификата по
-//! webpki-roots или явному CA, ALPN `dot`/`http/1.1`, keep-alive-соединение
-//! с переподключением и раздельные таймауты connect/IO.
+//! webpki-roots или явному CA, ALPN `dot`/`http/1.1`, пул keep-alive
+//! соединений (по умолчанию 4) с переподключением, cooldown/backoff и
+//! раздельными таймаутами connect/IO.
 //!
-//! # Ограничения MVP
+//! # Ограничения
 //!
-//! - Только HTTP/1.1. HTTP/2 (ALPN `h2`) и HTTP/3 не поддерживаются; preface
-//!   HTTP/2 получает `505`.
-//! - Нет async/tokio: поток на соединение, ограниченный
-//!   `max_connections`.
+//! - DoH/3 не реализован. HTTP/1.1-сервер отвечает `505` на preface HTTP/2;
+//!   для HTTP/2 используйте `Doh2Server`.
+//! - DoT/DoH/1.1 — поток на соединение, ограниченный `max_connections`.
 //! - `Cache-Control: max-age=<min TTL>` включается опционально
-//!   (`DohConfig::cache_control`) и вычисляется по ответу через `pulse-dns`.
+//!   (`DohConfig::cache_control`/`Doh2Config::cache_control`) и вычисляется
+//!   по ответу через `pulse-dns`.
 //! - Hot-reload сертификата применяется к новым соединениям; уже открытые
-//!   TLS-сессии продолжают работать со старой парой.
+//!   сессии продолжают работать со старой парой. DoQ применяет новый
+//!   сертификат к новым QUIC-соединениям через `set_server_config`.
 //! - Клиент DoH поддерживает только HTTP/1.1 с `Content-Length`; chunked
 //!   transfer-encoding не реализован.
+//! - 0-RTT для DoQ не включается.
 //!
 //! # Безопасность
 //!
@@ -116,7 +160,14 @@ pub mod ratelimit;
 pub mod stats;
 pub mod tls;
 
+#[cfg(feature = "http2")]
+pub mod doh2;
+#[cfg(feature = "doq")]
+pub mod doq;
+
+mod doh_core;
 mod http;
+mod pool;
 mod server;
 mod transport;
 
@@ -125,6 +176,12 @@ pub use client::{ClientTlsConfig, DohClient, DotClient};
 pub use doh::{DohConfig, DohServer};
 pub use dot::{DnsHandler, DotConfig, DotServer};
 pub use error::Error;
+pub use pool::{DEFAULT_POOL_SIZE, MAX_POOL_SIZE, PoolConfig, PoolStats};
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use stats::{Stats, StatsSnapshot};
 pub use tls::TlsConfig;
+
+#[cfg(feature = "http2")]
+pub use doh2::{Doh2Config, Doh2Server};
+#[cfg(feature = "doq")]
+pub use doq::{DoqConfig, DoqServer};

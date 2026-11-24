@@ -1,7 +1,7 @@
 //! Разбор HTTP/1.1 и сериализация ответов для DoH (RFC 8484).
 //!
-//! HTTP/2 сознательно не поддерживается: ALPN DoH-сервера — только
-//! `http/1.1`.
+//! HTTP/2 использует общее протокол-независимое ядро `doh_core` и `h2`
+//! (feature `http2`); здесь остаётся только HTTP/1.1-обвязка.
 
 use std::fmt::Write as _;
 
@@ -75,15 +75,13 @@ impl Headers {
         })
     }
 
+    pub(crate) fn content_type(&self) -> Option<&[u8]> {
+        self.first("content-type")
+    }
+
+    #[cfg(test)]
     pub(crate) fn content_type_is(&self, expected: &str) -> bool {
-        self.first("content-type").is_some_and(|value| {
-            std::str::from_utf8(value).is_ok_and(|text| {
-                text.split(';')
-                    .next()
-                    .map(str::trim)
-                    .is_some_and(|media| media.eq_ignore_ascii_case(expected))
-            })
-        })
+        content_type_is(self.content_type(), expected)
     }
 
     pub(crate) fn keep_alive(&self, version: u8) -> bool {
@@ -106,6 +104,18 @@ fn contains_token(value: &[u8], token: &str) -> bool {
     std::str::from_utf8(value).is_ok_and(|text| {
         text.split(',')
             .any(|part| part.trim().eq_ignore_ascii_case(token))
+    })
+}
+
+/// Проверяет media type без параметров (`application/dns-message; charset=…`).
+pub(crate) fn content_type_is(value: Option<&[u8]>, expected: &str) -> bool {
+    value.is_some_and(|value| {
+        std::str::from_utf8(value).is_ok_and(|text| {
+            text.split(';')
+                .next()
+                .map(str::trim)
+                .is_some_and(|media| media.eq_ignore_ascii_case(expected))
+        })
     })
 }
 

@@ -8,6 +8,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# DoH over HTTP/2 (RFC 9113) на tokio + h2 + tokio-rustls.
+http2 = ["dep:bytes", "dep:h2", "dep:http", "dep:tokio", "dep:tokio-rustls"]
+# DNS over QUIC (RFC 9250) на quinn.
+doq = ["dep:quinn", "dep:tokio"]
+
 [dependencies]
 base64 = "0.22"
 httparse = "1.10"
@@ -17,6 +24,13 @@ rustls-pki-types = { version = "1.16", default-features = false, features = ["st
 thiserror = "2"
 webpki-roots = "1"
 
+bytes = { version = "1", optional = true }
+h2 = { version = "0.4", optional = true }
+http = { version = "1", optional = true }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"], optional = true }
+
 [dev-dependencies]
 criterion = "0.5"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
@@ -24,6 +38,23 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc
 [[bench]]
 name = "tls"
 harness = false
+
+[[bench]]
+name = "async_transports"
+harness = false
+required-features = ["http2", "doq"]
+
+[[test]]
+name = "doh_h2"
+required-features = ["http2"]
+
+[[test]]
+name = "doq"
+required-features = ["doq"]
+
+[[test]]
+name = "parallel_features"
+required-features = ["http2", "doq"]
 
 [lints]
 workspace = true
