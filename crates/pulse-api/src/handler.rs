@@ -36,6 +36,7 @@ pub(crate) struct Api {
     store: Arc<dyn ZoneAdmin>,
     auth: Authenticator,
     metrics: Metrics,
+    extra_metrics: Option<crate::server::MetricsProvider>,
     limiter: RateLimiter,
     idempotency: IdempotencyStore,
     max_body_bytes: usize,
@@ -44,11 +45,17 @@ pub(crate) struct Api {
 
 impl Api {
     /// Создаёт обработчик из валидированной конфигурации.
-    pub(crate) fn new(config: &ApiConfig, store: Arc<dyn ZoneAdmin>, auth: Authenticator) -> Self {
+    pub(crate) fn new(
+        config: &ApiConfig,
+        store: Arc<dyn ZoneAdmin>,
+        auth: Authenticator,
+        extra_metrics: Option<crate::server::MetricsProvider>,
+    ) -> Self {
         Self {
             store,
             auth,
             metrics: Metrics::default(),
+            extra_metrics,
             limiter: RateLimiter::new(config.rate_limit_per_sec),
             idempotency: IdempotencyStore::new(config.idempotency_ttl, config.idempotency_capacity),
             max_body_bytes: config.max_body_bytes,
@@ -281,10 +288,14 @@ impl Api {
             }
             "/metrics" => {
                 if request.method == Method::Get {
+                    let mut body = self.metrics.render_with(self.store.zonefile_metrics());
+                    if let Some(extra) = &self.extra_metrics {
+                        body.push_str(&extra());
+                    }
                     Some(HttpResponse::text(
                         200,
                         "text/plain; version=0.0.4; charset=utf-8",
-                        self.metrics.render_with(self.store.zonefile_metrics()),
+                        body,
                     ))
                 } else {
                     Some(method_not_allowed(&["GET"], instance, request_id).into_response())

@@ -8,7 +8,8 @@
 единственным источником истины зон (DNS читает mmap, REST коммитит в файл), а
 также резолвер (`pulseresolved`) с
 forward/iterative-резолюцией, кешем, blocklist, overrides и DNSSEC-валидацией.
-Это не полный продукт из ТЗ (нет DoT/DoH/DoQ, RRL и т.д.).
+Это не полный продукт из ТЗ (нет DoQ, RRL и т.д.). DoT, DoH (HTTP/1.1) и
+DNSCrypt v2 (авторитетный сервер) реализованы.
 
 ## Возможности
 
@@ -38,6 +39,12 @@ forward/iterative-резолюцией, кешем, blocklist, overrides и DNSS
   graceful shutdown, AXFR/IXFR-out по TCP с TSIG/ACL, IXFR-история,
   NOTIFY-out/in и secondary-зоны (AXFR/IXFR-in, bootstrap, SOA-refresh,
   expire → SERVFAIL), DNSSEC-подпись в zonefile, Dockerfile.
+- Защищённые транспорты `pulsed`: DoT (`dot_listen`, RFC 7858), DoH/1.1
+  (`doh_listen`, RFC 8484, ALPN `http/1.1`, только HTTP/1.1) и DNSCrypt v2 по
+  UDP (`dnscrypt_listen`), общий путь `decode → QueryEngine (mmap) → encode`,
+  TLS hot-reload по `SIGHUP`/`tls_reload_secs`, IP/CIDR ACL и лимиты,
+  `pulsed dnscrypt-gencert` (ключи 0600, каталог 0700, TXT-записи), метрики
+  `dot_*`/`doh_*`/`dnscrypt_*` в `/metrics`.
 - Бинарник `pulseresolved`: forward/iterative-резолюция через `pulse-resolver`,
   UDP на `pulse-runtime` (N worker) и TCP с length-prefix, EDNS/TC, REFUSED
   для AXFR/IXFR, кеш, blocklist + overrides, DNSSEC-валидация (AD/SERVFAIL),
@@ -46,7 +53,8 @@ forward/iterative-резолюцией, кешем, blocklist, overrides и DNSS
 
 **Не реализовано (см. `STATUS.md`):** commit/allocator/GC и параллельная запись
 по зонам в коде (только дизайн, ADR 0005/0006, spec parallel-writes-v2);
-journal/outbox и параллельная запись в zonefile; DNSCrypt; DoT/DoH/DoQ; 0x20 echo; TLS
+journal/outbox и параллельная запись в zonefile; DoQ; DNSCrypt TCP-транспорт
+(только UDP); HTTP/2/3 для DoH; 0x20 echo; TLS
 для API и метрик (только loopback); fuzz/Miri/loom в CI; полноценный RRL; REST —
 MVP-подмножество спецификации. У резолвера нет RRL, DoT/DoH-апстримов и
 RFC 5011 (trust anchors статические).
@@ -60,9 +68,11 @@ RFC 5011 (trust anchors статические).
 | `pulse-zonefile` | Бинарный mmap-формат зон: reader, writer/commit, fsck, compact |
 | `pulse-runtime` | io_uring UDP-рантайм + epoll-фолбэк |
 | `pulse-server` | Авторитетный движок запросов |
+| `pulse-tls` | DNS over TLS (RFC 7858) и DNS over HTTPS/1.1 (RFC 8484) |
+| `pulse-dnscrypt` | DNSCrypt v2: сертификаты, сервер, клиент |
 | `pulse-api` | REST API управления зонами |
 | `pulse-resolver` | Кеширующий резолвер: forward/iterative, кеш, blocklist, overrides, DNSSEC |
-| `pulsed` | Бинарник сервера (UDP+TCP+REST) |
+| `pulsed` | Бинарник сервера (UDP+TCP+DoT+DoH+DNSCrypt+REST) |
 | `pulseresolved` | Бинарник резолвера (UDP+TCP+метрики) |
 
 Спецификации и решения: `docs/adr/`, `docs/spec/`, `docs/api/rest-v1.md`,
@@ -100,6 +110,31 @@ cargo run -p pulsed -- \
 ```bash
 dig @127.0.0.1 -p 5353 example.com. A +norecurse
 dig @127.0.0.1 -p 5353 example.com. MX +tcp +norecurse
+```
+
+DoT/DoH/DNSCrypt (самоподписанный сертификат и генерация DNSCrypt-ключей —
+подробнее в `examples/README.md`):
+
+```bash
+mkdir -p /tmp/pulsed-tls && chmod 700 /tmp/pulsed-tls
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout /tmp/pulsed-tls/key.pem -out /tmp/pulsed-tls/cert.pem \
+  -days 365 -nodes -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+chmod 600 /tmp/pulsed-tls/key.pem
+
+cargo run -p pulsed -- dnscrypt-gencert --out /tmp/pulsed-tls \
+  --provider-name 2.dnscrypt-cert.example.com.
+
+cargo run -p pulsed -- --config examples/transports.json \
+  --data /tmp/pulse-dns.zonefile
+
+kdig @127.0.0.1 -p 8853 +tls +tls-ca=/tmp/pulsed-tls/cert.pem \
+  +tls-hostname=localhost www.example.com. A
+kdig @127.0.0.1 -p 8443 +https +tls-ca=/tmp/pulsed-tls/cert.pem \
+  +tls-hostname=localhost www.example.com. A
+# DNSCrypt: клиент pulse-dnscrypt/dnscrypt-proxy, сертификат из
+# /tmp/pulsed-tls/dnscrypt-cert.json, TXT — /tmp/pulsed-tls/dnscrypt-cert.txt
 ```
 
 Запуск резолвера (forward на 1.1.1.1/9.9.9.9, blocklist и overrides из
@@ -185,6 +220,9 @@ cargo deny check
 
 - Зоны хранятся в памяти (нет персистентности); commit/allocator и
   параллельная запись по зонам — только в дизайне.
+- DoT/DoH работают синхронно (поток на соединение), DoH — только HTTP/1.1;
+  DNSCrypt реализован только по UDP (TCP-порт не поднимается, большие ответы
+  усекаются с `TC`); DNSCrypt TXT-запись публикуется вручную.
 - REST — MVP-подмножество спецификации; API доступен только на loopback.
 - Roadmap: `docs/plan/roadmap.md` (M0 выполнено, M1 в работе).
 

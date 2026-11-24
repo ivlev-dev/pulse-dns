@@ -3,23 +3,29 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use pulse_api::server::ApiServerError;
 use pulse_dns::Name;
-use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::config::{Config, DnssecKeyRole, Durability, LogLevel, Overrides};
+use crate::dnscrypt::{GenCertOptions, generate_certificate};
 use crate::logging;
 use crate::server::{ApiOptions, Server, ServerError};
 
-#[allow(clippy::too_many_lines)] // Жизненный цикл процесса линеен и читается сверху вниз.
+#[allow(clippy::too_many_lines)]
+// Жизненный цикл процесса линеен и читается сверху вниз.
+#[allow(clippy::similar_names)] // dot/doh — имена протоколов, не опечатка.
 pub(crate) fn run() -> ExitCode {
     logging::init(LogLevel::Info);
     let matches = command().get_matches();
-    if let Some(("import", matches)) = matches.subcommand() {
-        return import_zone(matches);
+    match matches.subcommand() {
+        Some(("import", matches)) => return import_zone(matches),
+        Some(("dnscrypt-gencert", matches)) => return dnscrypt_gencert(matches),
+        _ => {}
     }
     let config_path = matches
         .get_one::<PathBuf>("config")
@@ -28,6 +34,20 @@ pub(crate) fn run() -> ExitCode {
     let overrides = Overrides {
         listen_udp: matches.get_one::<SocketAddr>("listen-udp").copied(),
         listen_tcp: matches.get_one::<SocketAddr>("listen-tcp").copied(),
+        dot_listen: matches.get_one::<SocketAddr>("dot-listen").copied(),
+        doh_listen: matches.get_one::<SocketAddr>("doh-listen").copied(),
+        tls_cert: matches.get_one::<PathBuf>("tls-cert").cloned(),
+        tls_key: matches.get_one::<PathBuf>("tls-key").cloned(),
+        tls_reload_secs: matches.get_one::<u64>("tls-reload-secs").copied(),
+        tls_allow_from: matches
+            .get_many::<String>("tls-allow-from")
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default(),
+        dnscrypt_listen: matches.get_one::<SocketAddr>("dnscrypt-listen").copied(),
+        dnscrypt_provider_key: matches.get_one::<PathBuf>("dnscrypt-provider-key").cloned(),
+        dnscrypt_resolver_key: matches.get_one::<PathBuf>("dnscrypt-resolver-key").cloned(),
+        dnscrypt_cert: matches.get_one::<PathBuf>("dnscrypt-cert").cloned(),
+        dnscrypt_provider_name: matches.get_one::<String>("dnscrypt-provider-name").cloned(),
         workers: matches.get_one::<usize>("workers").copied(),
         log_level: matches.get_one::<LogLevel>("log-level").copied(),
         zonefile: matches.get_one::<PathBuf>("data").cloned(),
@@ -88,17 +108,50 @@ pub(crate) fn run() -> ExitCode {
     logging::info(
         "startup",
         &format!(
-            "pulsed {} listening: udp={:?} tcp={:?} api={:?} workers={:?} backend={:?}",
+            "pulsed {} listening: udp={:?} tcp={:?} dot={:?} doh={:?} dnscrypt={:?} api={:?} workers={:?} backend={:?}",
             env!("CARGO_PKG_VERSION"),
             server.udp_addr(),
             server.tcp_addr(),
+            server.dot_addr(),
+            server.doh_addr(),
+            server.dnscrypt_addr(),
             server.api_addr(),
             server.udp_workers(),
             server.udp_backend()
         ),
     );
+    if let Some(stats) = server.dot_stats() {
+        logging::info(
+            "dot",
+            &format!(
+                "DoT enabled (ALPN dot, TLS 1.2/1.3): connections={} active={}",
+                stats.connections, stats.active_connections
+            ),
+        );
+    }
+    if let Some(stats) = server.doh_stats() {
+        logging::info(
+            "doh",
+            &format!(
+                "DoH enabled (HTTP/1.1 only, ALPN http/1.1): connections={} active={}",
+                stats.connections, stats.active_connections
+            ),
+        );
+    }
+    if let Some(addr) = server.dnscrypt_addr() {
+        logging::info(
+            "dnscrypt",
+            &format!(
+                "DNSCrypt enabled on {addr} (UDP v2, workers={:?}, provider={:?}, serial={:?}, valid_until={:?})",
+                server.dnscrypt_workers(),
+                server.dnscrypt_provider_name(),
+                server.dnscrypt_serial(),
+                server.dnscrypt_valid_until()
+            ),
+        );
+    }
 
-    let mut signals = match Signals::new([SIGINT, SIGTERM]) {
+    let mut signals = match Signals::new([SIGINT, SIGTERM, SIGHUP]) {
         Ok(signals) => signals,
         Err(error) => {
             logging::error(
@@ -109,15 +162,39 @@ pub(crate) fn run() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match signals.forever().next() {
-        Some(signal) => logging::warn(
-            "signal",
-            &format!("received signal {signal}, starting graceful shutdown"),
-        ),
-        None => logging::warn("signal", "signal iterator ended, shutting down"),
+    let reload_every = config.tls_reload_secs.map(Duration::from_secs);
+    let mut last_reload = Instant::now();
+    loop {
+        let mut terminate = false;
+        for signal in signals.pending() {
+            match signal {
+                SIGHUP => reload_tls(&server, "SIGHUP"),
+                SIGINT | SIGTERM => {
+                    logging::warn(
+                        "signal",
+                        &format!("received signal {signal}, starting graceful shutdown"),
+                    );
+                    terminate = true;
+                }
+                _ => {}
+            }
+        }
+        if terminate {
+            break;
+        }
+        if let Some(period) = reload_every
+            && last_reload.elapsed() >= period
+        {
+            reload_tls(&server, "tls_reload_secs");
+            last_reload = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 
     let udp_stats = server.udp_stats();
+    let dot_snapshot = server.dot_stats();
+    let doh_snapshot = server.doh_stats();
+    let dnscrypt_snapshot = server.dnscrypt_stats();
     let shutdown_result = server.shutdown();
     let stats = server.stats();
     let query_stats = server.query_stats();
@@ -166,6 +243,40 @@ pub(crate) fn run() -> ExitCode {
             ),
         );
     }
+    if let Some(dot) = dot_snapshot {
+        logging::info(
+            "dot_stats",
+            &format!(
+                "connections={} handshakes={} queries={} responses={} errors={}",
+                dot.connections, dot.handshakes, dot.queries, dot.responses, dot.errors
+            ),
+        );
+    }
+    if let Some(doh) = doh_snapshot {
+        logging::info(
+            "doh_stats",
+            &format!(
+                "connections={} handshakes={} http_requests={} queries={} responses={} errors={}",
+                doh.connections,
+                doh.handshakes,
+                doh.http_requests,
+                doh.queries,
+                doh.responses,
+                doh.errors
+            ),
+        );
+    }
+    if let Some(dnscrypt) = dnscrypt_snapshot {
+        logging::info(
+            "dnscrypt_stats",
+            &format!(
+                "received={} sent={} dropped={}",
+                dnscrypt.total.packets_received,
+                dnscrypt.total.packets_sent,
+                dnscrypt.total.responses_dropped
+            ),
+        );
+    }
     match shutdown_result {
         Ok(()) => {
             logging::info("shutdown", "stopped cleanly");
@@ -175,6 +286,26 @@ pub(crate) fn run() -> ExitCode {
             logging::error("shutdown", &error.to_string());
             ExitCode::from(1)
         }
+    }
+}
+
+fn reload_tls(server: &Server, source: &str) {
+    if server.dot_addr().is_none() && server.doh_addr().is_none() {
+        logging::warn(
+            "tls",
+            &format!("{source}: TLS is not configured; reload skipped"),
+        );
+        return;
+    }
+    match server.reload_tls() {
+        Ok(()) => logging::info(
+            "tls",
+            &format!("{source}: certificate reloaded for new connections"),
+        ),
+        Err(error) => logging::error(
+            "tls",
+            &format!("{source}: certificate reload failed: {error}"),
+        ),
     }
 }
 
@@ -264,6 +395,44 @@ fn import_zone(matches: &ArgMatches) -> ExitCode {
         Err(error) => {
             logging::error("import", &error);
             ExitCode::from(1)
+        }
+    }
+}
+
+fn dnscrypt_gencert(matches: &ArgMatches) -> ExitCode {
+    let Some(out_dir) = matches.get_one::<PathBuf>("out").cloned() else {
+        logging::error("dnscrypt-gencert", "--out is required");
+        return ExitCode::from(2);
+    };
+    let Some(provider_name) = matches.get_one::<String>("provider-name").cloned() else {
+        logging::error("dnscrypt-gencert", "--provider-name is required");
+        return ExitCode::from(2);
+    };
+    let options = GenCertOptions {
+        out_dir,
+        provider_name,
+        serial: matches.get_one::<u32>("serial").copied().unwrap_or(1),
+        validity_days: matches
+            .get_one::<u32>("validity-days")
+            .copied()
+            .unwrap_or(365),
+        force: matches.get_flag("force"),
+    };
+    match generate_certificate(&options) {
+        Ok(generated) => {
+            println!("provider: {}", generated.provider_name);
+            println!("provider_public_key: {}", generated.provider_public_key);
+            println!("provider_key: {}", generated.provider_key.display());
+            println!("resolver_key: {}", generated.resolver_key.display());
+            println!("certificate: {}", generated.cert.display());
+            println!("txt_file: {}", generated.txt.display());
+            println!();
+            print!("{}", generated.txt_records);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            logging::error("dnscrypt-gencert", &error.to_string());
+            ExitCode::from(2)
         }
     }
 }
@@ -389,7 +558,9 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
         | ServerError::Tcp(_)
         | ServerError::Udp(_)
         | ServerError::Notify(_)
-        | ServerError::Secondary(_) => ExitCode::from(1),
+        | ServerError::Secondary(_)
+        | ServerError::Tls(_)
+        | ServerError::Dnscrypt(_) => ExitCode::from(1),
     }
 }
 
@@ -397,7 +568,7 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
 fn command() -> Command {
     Command::new("pulsed")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("Authoritative DNS server (MVP): pulse-zonefile, UDP/TCP")
+        .about("Authoritative DNS server: UDP/TCP, DoT, DoH/1.1, DNSCrypt, pulse-zonefile")
         .arg(
             Arg::new("config")
                 .long("config")
@@ -419,6 +590,82 @@ fn command() -> Command {
                 .value_name("ADDR")
                 .value_parser(value_parser!(SocketAddr))
                 .help("Override TCP listen address, e.g. 0.0.0.0:53"),
+        )
+        .arg(
+            Arg::new("dot-listen")
+                .long("dot-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNS-over-TLS (RFC 7858), e.g. 0.0.0.0:853"),
+        )
+        .arg(
+            Arg::new("doh-listen")
+                .long("doh-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNS-over-HTTPS/1.1 (RFC 8484), e.g. 0.0.0.0:443"),
+        )
+        .arg(
+            Arg::new("tls-cert")
+                .long("tls-cert")
+                .value_name("PATH")
+                .value_parser(value_parser!(PathBuf))
+                .help("PEM certificate chain for DoT/DoH"),
+        )
+        .arg(
+            Arg::new("tls-key")
+                .long("tls-key")
+                .value_name("PATH")
+                .value_parser(value_parser!(PathBuf))
+                .help("PEM private key for DoT/DoH (mode 0600)"),
+        )
+        .arg(
+            Arg::new("tls-reload-secs")
+                .long("tls-reload-secs")
+                .value_name("SECONDS")
+                .value_parser(value_parser!(u64))
+                .help("Reload the TLS certificate every N seconds (SIGHUP always works)"),
+        )
+        .arg(
+            Arg::new("tls-allow-from")
+                .long("tls-allow-from")
+                .value_name("CIDR")
+                .action(ArgAction::Append)
+                .help("Allow DoT/DoH only from this IP/CIDR; repeatable"),
+        )
+        .arg(
+            Arg::new("dnscrypt-listen")
+                .long("dnscrypt-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable DNSCrypt v2 over UDP, e.g. 0.0.0.0:443"),
+        )
+        .arg(
+            Arg::new("dnscrypt-provider-key")
+                .long("dnscrypt-provider-key")
+                .value_name("PATH")
+                .value_parser(value_parser!(PathBuf))
+                .help("Ed25519 provider seed file (hex, mode 0600)"),
+        )
+        .arg(
+            Arg::new("dnscrypt-resolver-key")
+                .long("dnscrypt-resolver-key")
+                .value_name("PATH")
+                .value_parser(value_parser!(PathBuf))
+                .help("X25519 resolver secret file (hex, mode 0600)"),
+        )
+        .arg(
+            Arg::new("dnscrypt-cert")
+                .long("dnscrypt-cert")
+                .value_name("PATH")
+                .value_parser(value_parser!(PathBuf))
+                .help("Signed DNSCrypt certificate JSON from dnscrypt-gencert"),
+        )
+        .arg(
+            Arg::new("dnscrypt-provider-name")
+                .long("dnscrypt-provider-name")
+                .value_name("NAME")
+                .help("Full DNSCrypt provider name, e.g. 2.dnscrypt-cert.example.com."),
         )
         .arg(
             Arg::new("workers")
@@ -488,6 +735,46 @@ fn command() -> Command {
                 .value_name("ORIGIN")
                 .action(ArgAction::Append)
                 .help("Per-zone API allowlist (exact origin or *.suffix.); repeatable"),
+        )
+        .subcommand(
+            Command::new("dnscrypt-gencert")
+                .about("Generate DNSCrypt provider/resolver keys and a signed certificate")
+                .arg(
+                    Arg::new("out")
+                        .long("out")
+                        .short('o')
+                        .value_name("DIR")
+                        .required(true)
+                        .value_parser(value_parser!(PathBuf))
+                        .help("Output directory for keys and certificate (created with 0700)"),
+                )
+                .arg(
+                    Arg::new("provider-name")
+                        .long("provider-name")
+                        .value_name("NAME")
+                        .required(true)
+                        .help("Full provider name, e.g. 2.dnscrypt-cert.example.com."),
+                )
+                .arg(
+                    Arg::new("serial")
+                        .long("serial")
+                        .value_name("N")
+                        .value_parser(value_parser!(u32))
+                        .help("Certificate serial number (default 1)"),
+                )
+                .arg(
+                    Arg::new("validity-days")
+                        .long("validity-days")
+                        .value_name("DAYS")
+                        .value_parser(value_parser!(u32))
+                        .help("Certificate validity in days (default 365)"),
+                )
+                .arg(
+                    Arg::new("force")
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help("Overwrite existing key/certificate files"),
+                ),
         )
         .subcommand(
             Command::new("import")

@@ -45,6 +45,9 @@ pub struct RunningServer {
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
+/// Дополнительный источник Prometheus-метрик (например, счётчики транспортов).
+pub type MetricsProvider = Arc<dyn Fn() -> String + Send + Sync + 'static>;
+
 impl RunningServer {
     /// Фактический адрес прослушивания (полезно при bind на порт 0).
     pub fn addr(&self) -> SocketAddr {
@@ -87,6 +90,23 @@ pub fn serve<Z: ZoneAdmin>(
     config: ApiConfig,
     store: Arc<Z>,
 ) -> Result<RunningServer, ApiServerError> {
+    serve_with_metrics(config, store, None)
+}
+
+/// Запускает API-сервер с дополнительным источником метрик.
+///
+/// `extra_metrics` вызывается на каждый `GET /metrics`; его вывод
+/// добавляется к метрикам `pulse-api` и `pulse-zonefile`.
+///
+/// # Errors
+///
+/// [`ApiServerError`] при некорректной конфигурации, занятом адресе или
+/// невозможности запустить поток.
+pub fn serve_with_metrics<Z: ZoneAdmin>(
+    config: ApiConfig,
+    store: Arc<Z>,
+    extra_metrics: Option<MetricsProvider>,
+) -> Result<RunningServer, ApiServerError> {
     let authenticator = config.validate()?;
     let bind = config.bind;
     let listener =
@@ -102,7 +122,7 @@ pub fn serve<Z: ZoneAdmin>(
     };
     let max_connections = config.max_connections;
     let store: Arc<dyn ZoneAdmin> = store;
-    let api = Arc::new(Api::new(&config, store, authenticator));
+    let api = Arc::new(Api::new(&config, store, authenticator, extra_metrics));
     let shutdown = Arc::new(AtomicBool::new(false));
     let workers = Arc::new(Mutex::new(Vec::new()));
     let accept = {

@@ -243,6 +243,131 @@ curl -sS -X POST -H "Authorization: Bearer $PULSED_API_TOKEN" \
 делегирования и glue ниже cut не подписываются; после изменения зоны через
 REST вызовите `POST /sign`, иначе подписи/NSEC-цепочка устареют.
 
+## Защищённые транспорты: DoT, DoH/1.1 и DNSCrypt
+
+`pulsed` умеет одновременно обслуживать UDP/TCP, DNS-over-TLS (RFC 7858),
+DNS-over-HTTPS/1.1 (RFC 8484) и DNSCrypt v2 по UDP. Все они используют один и
+тот же путь ответа: `decode → QueryEngine (mmap snapshot) → encode`, поэтому
+данные из `--data` и REST-правки видны сразу на всех транспортах.
+
+Пример конфигурации — `examples/transports.json`:
+
+```json
+{
+  "listen_udp": "127.0.0.1:5353",
+  "listen_tcp": "127.0.0.1:5353",
+  "zonefile": "/tmp/pulse-dns.zonefile",
+  "dot_listen": "127.0.0.1:8853",
+  "doh_listen": "127.0.0.1:8443",
+  "tls_cert": "/tmp/pulsed-tls/cert.pem",
+  "tls_key": "/tmp/pulsed-tls/key.pem",
+  "tls_reload_secs": 300,
+  "tls_allow_from": ["127.0.0.0/8", "::1"],
+  "dnscrypt_listen": "127.0.0.1:5443",
+  "dnscrypt_provider_key": "/tmp/pulsed-tls/dnscrypt-provider.key",
+  "dnscrypt_resolver_key": "/tmp/pulsed-tls/dnscrypt-resolver.key",
+  "dnscrypt_cert": "/tmp/pulsed-tls/dnscrypt-cert.json",
+  "dnscrypt_provider_name": "2.dnscrypt-cert.example.com."
+}
+```
+
+`dot_listen`/`doh_listen` требуют **оба** `tls_cert` и `tls_key`; при
+`dnscrypt_listen` обязательны `dnscrypt_provider_key`, `dnscrypt_resolver_key` и
+`dnscrypt_cert`. Приватные ключи должны иметь режим `0600` (иначе запуск
+завершается ошибкой), секреты не попадают в логи и `/metrics`.
+
+### TLS-сертификат и hot-reload
+
+Для локальной проверки подойдёт self-signed сертификат:
+
+```bash
+mkdir -p /tmp/pulsed-tls && chmod 700 /tmp/pulsed-tls
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout /tmp/pulsed-tls/key.pem -out /tmp/pulsed-tls/cert.pem \
+  -days 365 -nodes -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+chmod 600 /tmp/pulsed-tls/key.pem
+```
+
+Сертификат перечитывается для **новых** соединений по `SIGHUP` или каждые
+`tls_reload_secs` секунд; уже открытые TLS-сессии продолжают работать со старой
+парой. ALPN: `dot` для DoT и `http/1.1` для DoH (HTTP/2 и HTTP/3 не
+поддерживаются: preface HTTP/2 получает `505`).
+
+```bash
+kill -HUP "$(pgrep pulsed)"   # перечитать cert.pem/key.pem
+```
+
+Проверка через `kdig` из knot-dnsutils:
+
+```bash
+kdig @127.0.0.1 -p 8853 +tls +tls-ca=/tmp/pulsed-tls/cert.pem \
+  +tls-hostname=localhost www.example.com. A
+kdig @127.0.0.1 -p 8443 +https +tls-ca=/tmp/pulsed-tls/cert.pem \
+  +tls-hostname=localhost www.example.com. A
+```
+
+DoH также можно проверить `curl` (только HTTP/1.1, POST
+`application/dns-message`):
+
+```bash
+# 33-байтовый запрос A www.example.com. (ID 0x1234)
+python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex("12340100000100000000000003777777076578616d706c6503636f6d0000010001"))' > /tmp/dns-query.bin
+curl -sS --http1.1 --cacert /tmp/pulsed-tls/cert.pem \
+  -H 'content-type: application/dns-message' \
+  --data-binary @/tmp/dns-query.bin \
+  https://127.0.0.1:8443/dns-query | xxd
+curl -sS --http1.1 --cacert /tmp/pulsed-tls/cert.pem \
+  https://127.0.0.1:8443/healthz
+```
+
+ACL `tls_allow_from` (IP/CIDR) и лимиты `dot_max_connections`/
+`doh_max_connections` действуют только на настроенных адресах.
+
+### DNSCrypt: ключи, сертификат и TXT
+
+Генератор создаёт provider/resolver ключи, подписанный сертификат и файл с
+готовыми TXT-записями. Приватные файлы — `0600`, новый каталог — `0700`;
+приватные ключи **не** печатаются:
+
+```bash
+cargo run -p pulsed -- dnscrypt-gencert \
+  --out /tmp/pulsed-tls \
+  --provider-name 2.dnscrypt-cert.example.com. \
+  --serial 1 --validity-days 365
+```
+
+Вывод содержит `provider_public_key`, пути к файлам и TXT-записи:
+
+- `2.pubkey.2.dnscrypt-cert.example.com. TXT "<provider-pk-hex>"`;
+- `2.dnscrypt-cert.example.com. TXT "\068..."` — бинарный сертификат,
+  экранированный по RFC 1035.
+
+Публикация TXT автоматически не выполняется. Добавьте строки из
+`dnscrypt-cert.txt` в master-файл зоны и переимпортируйте её (`pulsed import
+--replace`), либо опубликуйте вручную в родительской зоне. Без TXT клиент
+DNSCrypt не сможет получить сертификат (можно передать его вручную в
+конфигурации клиента).
+
+Проверка клиентом `pulse-dnscrypt`/dnscrypt-proxy: сервер слушает
+`dnscrypt_listen` (UDP), сертификат и ключи берутся из файлов выше. Ограничение
+MVP: DNSCrypt TCP-порт не поднимается; большие UDP-ответы усекаются с `TC`.
+
+### Метрики
+
+`GET /metrics` REST API дополнен счётчиками транспортов:
+
+```bash
+curl -sS -H "Authorization: Bearer $PULSED_API_TOKEN" \
+  http://127.0.0.1:8080/metrics \
+  | grep -E '^(dot|doh|dnscrypt|pulsed_tls)'
+```
+
+Префиксы: `dot_*` (connections, handshakes, queries, responses, bytes,
+errors), `doh_*` (то же + `doh_http_requests_total`/`doh_http_errors_total`),
+`dnscrypt_*` (packets, queries, responses, errors, dropped),
+`pulsed_tls_reload_total`/`pulsed_tls_reload_errors_total`.
+
 ## Primary + secondary (AXFR/IXFR, TSIG, NOTIFY)
 
 Сначала импортируйте зону в файл primary (конфиг указывает `./primary.pulse`):

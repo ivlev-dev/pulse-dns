@@ -449,6 +449,32 @@ pub struct Config {
     pub listen_udp: Option<SocketAddr>,
     /// Адрес TCP-транспорта; `null` отключает TCP.
     pub listen_tcp: Option<SocketAddr>,
+    /// Адрес DNS-over-TLS (RFC 7858); `null` отключает DoT.
+    pub dot_listen: Option<SocketAddr>,
+    /// Адрес DNS-over-HTTPS/1.1 (RFC 8484); `null` отключает DoH.
+    pub doh_listen: Option<SocketAddr>,
+    /// PEM-сертификат (цепочка) для DoT/DoH.
+    pub tls_cert: Option<PathBuf>,
+    /// PEM-закрытый ключ для DoT/DoH (права 0600).
+    pub tls_key: Option<PathBuf>,
+    /// Перечитывать TLS-сертификат каждые N секунд; `null` — только SIGHUP.
+    pub tls_reload_secs: Option<u64>,
+    /// IP/CIDR allowlist для DoT/DoH; пусто — разрешены все адреса.
+    pub tls_allow_from: Vec<String>,
+    /// Максимум одновременных DoT-соединений.
+    pub dot_max_connections: usize,
+    /// Максимум одновременных DoH-соединений.
+    pub doh_max_connections: usize,
+    /// Адрес DNSCrypt (UDP); `null` отключает DNSCrypt.
+    pub dnscrypt_listen: Option<SocketAddr>,
+    /// Файл Ed25519 seed провайдера (hex, 32 байта, права 0600).
+    pub dnscrypt_provider_key: Option<PathBuf>,
+    /// Файл X25519 secret резолвера (hex, 32 байта, права 0600).
+    pub dnscrypt_resolver_key: Option<PathBuf>,
+    /// Подписанный сертификат из `pulsed dnscrypt-gencert` (JSON).
+    pub dnscrypt_cert: Option<PathBuf>,
+    /// Полное имя провайдера, например `2.dnscrypt-cert.example.com.`.
+    pub dnscrypt_provider_name: Option<String>,
     /// Число UDP worker'ов; `0` — по числу доступных ядер.
     pub workers: usize,
     /// Уровень логирования.
@@ -486,6 +512,19 @@ impl Default for Config {
         Self {
             listen_udp: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5353)),
             listen_tcp: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5353)),
+            dot_listen: None,
+            doh_listen: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_reload_secs: None,
+            tls_allow_from: Vec::new(),
+            dot_max_connections: 1024,
+            doh_max_connections: 1024,
+            dnscrypt_listen: None,
+            dnscrypt_provider_key: None,
+            dnscrypt_resolver_key: None,
+            dnscrypt_cert: None,
+            dnscrypt_provider_name: None,
             workers: 0,
             log_level: LogLevel::Info,
             tcp: TcpConfig::default(),
@@ -541,11 +580,19 @@ impl Config {
     /// worker'ов выходит за разумные пределы или параметры TCP некорректны.
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.listen_udp.is_none() && self.listen_tcp.is_none() {
+        if self.listen_udp.is_none()
+            && self.listen_tcp.is_none()
+            && self.dot_listen.is_none()
+            && self.doh_listen.is_none()
+            && self.dnscrypt_listen.is_none()
+        {
             return Err(ConfigError::Invalid(
-                "at least one of listen_udp/listen_tcp must be set".to_owned(),
+                "at least one of listen_udp/listen_tcp/dot_listen/doh_listen/dnscrypt_listen must be set"
+                    .to_owned(),
             ));
         }
+        self.validate_tls()?;
+        self.validate_dnscrypt()?;
         if self.workers > 1024 {
             return Err(ConfigError::Invalid(format!(
                 "workers must be in 0..=1024, got {}",
@@ -700,6 +747,97 @@ impl Config {
         Ok(())
     }
 
+    /// Проверяет параметры DoT/DoH.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`], если включён DoT/DoH без TLS-пары, лимиты
+    /// выходят за допустимые пределы или ACL содержит некорректный CIDR.
+    pub fn validate_tls(&self) -> Result<(), ConfigError> {
+        let enabled = self.dot_listen.is_some() || self.doh_listen.is_some();
+        if enabled && (self.tls_cert.is_none() || self.tls_key.is_none()) {
+            return Err(ConfigError::Invalid(
+                "dot_listen/doh_listen require both tls_cert and tls_key".to_owned(),
+            ));
+        }
+        if let Some(path) = &self.tls_cert
+            && path.as_os_str().is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "tls_cert path must not be empty".to_owned(),
+            ));
+        }
+        if let Some(path) = &self.tls_key
+            && path.as_os_str().is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "tls_key path must not be empty".to_owned(),
+            ));
+        }
+        if let Some(seconds) = self.tls_reload_secs
+            && !(1..=86_400).contains(&seconds)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "tls_reload_secs must be in 1..=86400, got {seconds}"
+            )));
+        }
+        if !(1..=65_535).contains(&self.dot_max_connections) {
+            return Err(ConfigError::Invalid(format!(
+                "dot_max_connections must be in 1..=65535, got {}",
+                self.dot_max_connections
+            )));
+        }
+        if !(1..=65_535).contains(&self.doh_max_connections) {
+            return Err(ConfigError::Invalid(format!(
+                "doh_max_connections must be in 1..=65535, got {}",
+                self.doh_max_connections
+            )));
+        }
+        pulse_tls::Acl::from_cidrs(&self.tls_allow_from).map_err(|error| {
+            ConfigError::Invalid(format!("tls_allow_from: invalid CIDR: {error}"))
+        })?;
+        Ok(())
+    }
+
+    /// Проверяет параметры DNSCrypt.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`], если включён DNSCrypt без ключей/сертификата
+    /// или имя провайдера некорректно.
+    pub fn validate_dnscrypt(&self) -> Result<(), ConfigError> {
+        if let Some(name) = &self.dnscrypt_provider_name {
+            let parsed = Name::parse(name.trim()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "dnscrypt_provider_name {name:?} is not a valid DNS name: {error}"
+                ))
+            })?;
+            if parsed == Name::root() || parsed.labels().any(|label| label == b"*") {
+                return Err(ConfigError::Invalid(format!(
+                    "dnscrypt_provider_name {name:?} must be a non-root name without wildcards"
+                )));
+            }
+        }
+        if self.dnscrypt_listen.is_none() {
+            return Ok(());
+        }
+        for (field, value) in [
+            ("dnscrypt_provider_key", &self.dnscrypt_provider_key),
+            ("dnscrypt_resolver_key", &self.dnscrypt_resolver_key),
+            ("dnscrypt_cert", &self.dnscrypt_cert),
+        ] {
+            match value {
+                Some(path) if !path.as_os_str().is_empty() => {}
+                _ => {
+                    return Err(ConfigError::Invalid(format!(
+                        "dnscrypt_listen requires {field}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Добавляет ключ подписи зоны (CLI `--dnssec-key`).
     ///
     /// Повторные ключи для той же зоны дополняют набор; порядок ключей
@@ -734,6 +872,39 @@ impl Config {
         if let Some(addr) = overrides.listen_tcp {
             self.listen_tcp = Some(addr);
         }
+        if let Some(addr) = overrides.dot_listen {
+            self.dot_listen = Some(addr);
+        }
+        if let Some(addr) = overrides.doh_listen {
+            self.doh_listen = Some(addr);
+        }
+        if let Some(path) = &overrides.tls_cert {
+            self.tls_cert = Some(path.clone());
+        }
+        if let Some(path) = &overrides.tls_key {
+            self.tls_key = Some(path.clone());
+        }
+        if let Some(seconds) = overrides.tls_reload_secs {
+            self.tls_reload_secs = Some(seconds);
+        }
+        if !overrides.tls_allow_from.is_empty() {
+            self.tls_allow_from.clone_from(&overrides.tls_allow_from);
+        }
+        if let Some(addr) = overrides.dnscrypt_listen {
+            self.dnscrypt_listen = Some(addr);
+        }
+        if let Some(path) = &overrides.dnscrypt_provider_key {
+            self.dnscrypt_provider_key = Some(path.clone());
+        }
+        if let Some(path) = &overrides.dnscrypt_resolver_key {
+            self.dnscrypt_resolver_key = Some(path.clone());
+        }
+        if let Some(path) = &overrides.dnscrypt_cert {
+            self.dnscrypt_cert = Some(path.clone());
+        }
+        if let Some(name) = &overrides.dnscrypt_provider_name {
+            self.dnscrypt_provider_name = Some(name.clone());
+        }
         if let Some(workers) = overrides.workers {
             self.workers = workers;
         }
@@ -759,6 +930,28 @@ pub struct Overrides {
     pub listen_udp: Option<SocketAddr>,
     /// Новый адрес TCP.
     pub listen_tcp: Option<SocketAddr>,
+    /// Новый адрес DoT.
+    pub dot_listen: Option<SocketAddr>,
+    /// Новый адрес DoH.
+    pub doh_listen: Option<SocketAddr>,
+    /// Новый PEM-сертификат DoT/DoH.
+    pub tls_cert: Option<PathBuf>,
+    /// Новый PEM-ключ DoT/DoH.
+    pub tls_key: Option<PathBuf>,
+    /// Новый период перечитывания TLS-сертификата.
+    pub tls_reload_secs: Option<u64>,
+    /// Новый IP/CIDR allowlist DoT/DoH.
+    pub tls_allow_from: Vec<String>,
+    /// Новый адрес DNSCrypt.
+    pub dnscrypt_listen: Option<SocketAddr>,
+    /// Новый файл provider-ключа DNSCrypt.
+    pub dnscrypt_provider_key: Option<PathBuf>,
+    /// Новый файл resolver-ключа DNSCrypt.
+    pub dnscrypt_resolver_key: Option<PathBuf>,
+    /// Новый файл сертификата DNSCrypt.
+    pub dnscrypt_cert: Option<PathBuf>,
+    /// Новое имя DNSCrypt-провайдера.
+    pub dnscrypt_provider_name: Option<String>,
     /// Новое число UDP worker'ов.
     pub workers: Option<usize>,
     /// Новый уровень логирования.
@@ -836,6 +1029,17 @@ mod tests {
         config.apply_overrides(&Overrides {
             listen_udp: Some(addr),
             listen_tcp: None,
+            dot_listen: None,
+            doh_listen: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_reload_secs: None,
+            tls_allow_from: Vec::new(),
+            dnscrypt_listen: None,
+            dnscrypt_provider_key: None,
+            dnscrypt_resolver_key: None,
+            dnscrypt_cert: None,
+            dnscrypt_provider_name: None,
             workers: Some(3),
             log_level: Some(LogLevel::Debug),
             zonefile: None,
@@ -918,5 +1122,109 @@ mod tests {
         let mut config = Config::default();
         config.transfer.notify_tsig_key = Some("missing.key.".to_owned());
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn dot_requires_certificate_pair() {
+        let mut config = Config {
+            listen_udp: None,
+            listen_tcp: None,
+            dot_listen: Some("127.0.0.1:8853".parse().unwrap()),
+            ..Config::default()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("require both tls_cert and tls_key"),
+            "{error}"
+        );
+
+        config.tls_cert = Some(PathBuf::from("cert.pem"));
+        assert!(config.validate().is_err());
+        config.tls_key = Some(PathBuf::from("key.pem"));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn doh_only_configuration_is_accepted() {
+        let config = Config {
+            listen_udp: None,
+            listen_tcp: None,
+            doh_listen: Some("127.0.0.1:8443".parse().unwrap()),
+            tls_cert: Some(PathBuf::from("cert.pem")),
+            tls_key: Some(PathBuf::from("key.pem")),
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn tls_acl_and_limits_are_validated() {
+        let mut config = Config {
+            tls_cert: Some(PathBuf::from("cert.pem")),
+            tls_key: Some(PathBuf::from("key.pem")),
+            dot_listen: Some("127.0.0.1:8853".parse().unwrap()),
+            ..Config::default()
+        };
+        config.tls_allow_from = vec!["192.0.2.0/24".to_owned()];
+        assert!(config.validate().is_ok());
+        config.tls_allow_from = vec!["not-a-cidr".to_owned()];
+        assert!(config.validate().is_err());
+        config.tls_allow_from.clear();
+        config.dot_max_connections = 0;
+        assert!(config.validate().is_err());
+        config.dot_max_connections = 1024;
+        config.tls_reload_secs = Some(0);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn dnscrypt_requires_material() {
+        let mut config = Config {
+            listen_udp: None,
+            listen_tcp: None,
+            dnscrypt_listen: Some("127.0.0.1:5443".parse().unwrap()),
+            ..Config::default()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("dnscrypt_provider_key"), "{error}");
+
+        config.dnscrypt_provider_key = Some(PathBuf::from("provider.key"));
+        config.dnscrypt_resolver_key = Some(PathBuf::from("resolver.key"));
+        config.dnscrypt_cert = Some(PathBuf::from("cert.json"));
+        assert!(config.validate().is_ok());
+
+        config.dnscrypt_provider_name = Some("bad..name".to_owned());
+        assert!(config.validate().is_err());
+        config.dnscrypt_provider_name = Some("2.dnscrypt-cert.example.com.".to_owned());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn transports_config_parses_from_json() {
+        let config = Config::from_json_str(
+            r#"{
+                "listen_udp": null,
+                "listen_tcp": null,
+                "dot_listen": "127.0.0.1:8853",
+                "doh_listen": "127.0.0.1:8443",
+                "tls_cert": "cert.pem",
+                "tls_key": "key.pem",
+                "tls_reload_secs": 60,
+                "tls_allow_from": ["127.0.0.0/8"],
+                "dnscrypt_listen": "127.0.0.1:5443",
+                "dnscrypt_provider_key": "provider.key",
+                "dnscrypt_resolver_key": "resolver.key",
+                "dnscrypt_cert": "cert.json",
+                "dnscrypt_provider_name": "2.dnscrypt-cert.example.com."
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.dot_listen, Some("127.0.0.1:8853".parse().unwrap()));
+        assert_eq!(config.tls_allow_from, vec!["127.0.0.0/8"]);
+        assert_eq!(
+            config.dnscrypt_provider_name.as_deref(),
+            Some("2.dnscrypt-cert.example.com.")
+        );
+        assert!(config.validate().is_ok());
     }
 }

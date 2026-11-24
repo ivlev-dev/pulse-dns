@@ -48,6 +48,13 @@
   NOTIFY-in, secondary-зоны (bootstrap AXFR, периодический SOA-refresh,
   IXFR-in/AXFR fallback, persist в zonefile, retry/expire → SERVFAIL,
   read-only для REST).
+- `pulsed` защищённые транспорты: DoT (RFC 7858, ALPN `dot`), DoH/1.1
+  (RFC 8484, ALPN `http/1.1`, только HTTP/1.1), DNSCrypt v2 по UDP; общий путь
+  `decode → QueryEngine (mmap) → encode`, `tls_allow_from` (IP/CIDR) и лимиты
+  соединений, TLS hot-reload по SIGHUP/`tls_reload_secs`, `pulsed
+  dnscrypt-gencert` (ключи 0600, каталог 0700, TXT-записи, без печати
+  секретов), метрики `dot_*`/`doh_*`/`dnscrypt_*` в `GET /metrics`,
+  graceful shutdown вместе с DNS.
 - `pulseresolved` — бинарник резолвера: JSON-конфиг, forward/iterative,
   UDP на `pulse-runtime` (N worker) и TCP (length-prefix, idle timeout, лимит
   соединений, graceful shutdown), EDNS/TC, REFUSED для AXFR/IXFR, FORMERR на
@@ -66,6 +73,14 @@
   файле, AXFR после импорта и после REST-правки.
 - DNSSEC: подпись в zonefile при старте и `/sign`, DO=1 отдаёт RRSIG из mmap,
   проверка `pulse-dnssec`; secondary AXFR-in → ответы из mmap → рестарт.
+- Защищённые транспорты: реальные клиенты (`rustls`/`pulse-dnscrypt`) получают
+  A-ответ по DoT, DoH POST/GET и DNSCrypt UDP; все три транспорта работают
+  параллельно на разных портах; неверный provider-ключ и испорченный
+  сертификат отклоняются; большие ответы DoT/DoH не усекаются, DNSCrypt UDP
+  отдаёт `TC`; TLS hot-reload меняет сертификат для новых соединений;
+  graceful shutdown закрывает порты; `dnscrypt-gencert` создаёт файлы
+  0600/0700, не печатает секреты и не перезаписывает их без `--force`;
+  `/metrics` содержит `dot_*`/`doh_*`/`dnscrypt_*`.
 - REST-сценарий: PUT зоны → SOA/NS/A → UDP отвечает → PATCH → ответ меняется →
   DELETE → NODATA/REFUSED.
 - Резолвер (`pulseresolved`): реальный прогон бинарника против mock upstream —
@@ -90,9 +105,10 @@
   пин снапшота, данные не материализуются.
 
 **P1 (безопасность/транспорт/протокол):**
-- DNSSEC-крипто (подпись/валидация) и привязка RRSIG; DNSCrypt.
+- DNSSEC-крипто (подпись/валидация) и привязка RRSIG.
 - Резолвер: нет RRL, DoT/DoH/DoQ-апстримов и RFC 5011 (anchors статические).
-- DoT/DoH/DoQ.
+- DoQ; DNSCrypt TCP-транспорт (сейчас только UDP); HTTP/2/3 для DoH
+  (сейчас только HTTP/1.1).
 - TLS для API (только loopback).
 - Полноценный RRL.
 - 0x20 echo.

@@ -3,8 +3,9 @@
 //! Крейт является **composition root** для авторитетного процесса: читает
 //! JSON-настройки сервера, открывает `pulse-zonefile` (`--data`) как
 //! единственный источник истины зон, поднимает UDP (`pulse-runtime`,
-//! io_uring), TCP (std) и опциональный REST API (`pulse-api`) и обслуживает
-//! `SIGTERM`/`SIGINT`.
+//! io_uring), TCP (std), DoT/DoH (`pulse-tls`), DNSCrypt v2 (`pulse-dnscrypt`)
+//! и опциональный REST API (`pulse-api`) и обслуживает
+//! `SIGTERM`/`SIGINT`/`SIGHUP`.
 //!
 //! DNS-ответы читаются из mmap: движок держит один пин снапшота и выполняет
 //! точечные поиски RRset, не загружая зоны в память. REST-мутации выполняют
@@ -23,6 +24,8 @@
 //! - `master` — импорт RFC 1035 master-файлов (`pulsed import`).
 //! - `dnssec` — загрузка ключей и DNSSEC-подпись зон в zonefile.
 //! - `transfer` — AXFR/IXFR-out из zonefile, TSIG/ACL, IXFR-история и NOTIFY.
+//! - `tls` — DoT/DoH-серверы и hot-reload сертификата.
+//! - `dnscrypt` — DNSCrypt UDP, загрузка ключей и `dnscrypt-gencert`.
 //! - [`server`] — запуск и остановка DNS/API.
 //! - [`stats`] — атомарные счётчики без блокировок на горячем пути.
 //!
@@ -51,12 +54,16 @@
 
 mod cli;
 mod dns;
+mod dnscrypt;
 mod dnssec;
 mod logging;
 mod master;
+mod metrics;
+mod perms;
 mod secondary;
 mod store;
 mod tcp;
+mod tls;
 mod transfer;
 mod udp;
 mod zonefile;
@@ -64,6 +71,9 @@ mod zonefile;
 pub mod config;
 pub mod server;
 pub mod stats;
+
+pub use dnscrypt::DnscryptError;
+pub use tls::TlsError;
 
 use std::process::ExitCode;
 

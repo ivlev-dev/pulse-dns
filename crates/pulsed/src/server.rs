@@ -1,4 +1,5 @@
-//! Запуск и остановка UDP/TCP транспортов и встроенного REST API.
+//! Запуск и остановка DNS-транспортов (UDP/TCP/DoT/DoH/DNSCrypt) и
+//! встроенного REST API.
 
 use std::fmt;
 use std::io;
@@ -7,16 +8,19 @@ use std::sync::Arc;
 
 use pulse_api::auth::TokenConfig;
 use pulse_api::config::ApiConfig;
-use pulse_api::server::{ApiServerError, RunningServer, serve};
+use pulse_api::server::{ApiServerError, RunningServer, serve_with_metrics};
 use pulse_server::StatsSnapshot as QueryStatsSnapshot;
 use thiserror::Error;
 
 use crate::config::{Config, ConfigError};
+use crate::dnscrypt::{DnscryptError, DnscryptService};
 use crate::dnssec::{self, DnssecError};
+use crate::metrics::TransportMetrics;
 use crate::secondary::SecondaryScheduler;
 use crate::stats::{Stats, StatsSnapshot};
 use crate::store::{self, SharedZoneAdmin};
 use crate::tcp::TcpService;
+use crate::tls::{TlsError, TlsTransports};
 use crate::transfer::{self, NotifyDispatcher};
 use crate::udp::UdpService;
 
@@ -49,8 +53,11 @@ impl fmt::Debug for ApiOptions {
 pub struct Server {
     admin: Arc<SharedZoneAdmin>,
     stats: Arc<Stats>,
+    metrics: Arc<TransportMetrics>,
     udp: Option<UdpService>,
     tcp: Option<TcpService>,
+    tls: Option<TlsTransports>,
+    dnscrypt: Option<DnscryptService>,
     api: Option<RunningServer>,
     secondary: Option<SecondaryScheduler>,
 }
@@ -131,6 +138,27 @@ impl Server {
             None
         };
         let stats = Arc::new(Stats::new());
+        let metrics = Arc::new(TransportMetrics::new(
+            config.dot_listen.is_some(),
+            config.doh_listen.is_some(),
+            config.dnscrypt_listen.is_some(),
+        ));
+        let tls = TlsTransports::start(
+            config,
+            Arc::clone(&admin),
+            Arc::clone(&stats),
+            Arc::clone(&metrics),
+        )?;
+        let dnscrypt = match config.dnscrypt_listen {
+            Some(addr) => Some(DnscryptService::start(
+                config,
+                addr,
+                Arc::clone(&admin),
+                Arc::clone(&stats),
+                Arc::clone(&metrics),
+            )?),
+            None => None,
+        };
 
         let tcp = match config.listen_tcp {
             Some(addr) => Some(
@@ -168,7 +196,15 @@ impl Server {
                 }];
                 let mut api_config = ApiConfig::new(tokens);
                 api_config.bind = options.listen;
-                Some(serve(api_config, Arc::clone(&admin))?)
+                let metric_source = {
+                    let metrics = Arc::clone(&metrics);
+                    Arc::new(move || metrics.render())
+                };
+                Some(serve_with_metrics(
+                    api_config,
+                    Arc::clone(&admin),
+                    Some(metric_source),
+                )?)
             }
             None => None,
         };
@@ -176,8 +212,11 @@ impl Server {
         Ok(Self {
             admin,
             stats,
+            metrics,
             udp,
             tcp,
+            tls,
+            dnscrypt,
             api,
             secondary,
         })
@@ -193,6 +232,89 @@ impl Server {
     #[must_use]
     pub fn tcp_addr(&self) -> Option<SocketAddr> {
         self.tcp.as_ref().map(TcpService::local_addr)
+    }
+
+    /// Фактический DoT-адрес (полезен при `port = 0`).
+    #[must_use]
+    pub fn dot_addr(&self) -> Option<SocketAddr> {
+        self.tls.as_ref().and_then(TlsTransports::dot_addr)
+    }
+
+    /// Фактический DoH-адрес (полезен при `port = 0`).
+    #[must_use]
+    pub fn doh_addr(&self) -> Option<SocketAddr> {
+        self.tls.as_ref().and_then(TlsTransports::doh_addr)
+    }
+
+    /// Фактический DNSCrypt-адрес (полезен при `port = 0`).
+    #[must_use]
+    pub fn dnscrypt_addr(&self) -> Option<SocketAddr> {
+        self.dnscrypt.as_ref().map(DnscryptService::local_addr)
+    }
+
+    /// Снимок счётчиков DoT, если DoT запущен.
+    #[must_use]
+    pub fn dot_stats(&self) -> Option<pulse_tls::StatsSnapshot> {
+        self.tls.as_ref().and_then(TlsTransports::dot_stats)
+    }
+
+    /// Снимок счётчиков DoH, если DoH запущен.
+    #[must_use]
+    pub fn doh_stats(&self) -> Option<pulse_tls::StatsSnapshot> {
+        self.tls.as_ref().and_then(TlsTransports::doh_stats)
+    }
+
+    /// Снимок счётчиков DNSCrypt UDP, если DNSCrypt запущен.
+    #[must_use]
+    pub fn dnscrypt_stats(&self) -> Option<pulse_runtime::ServerStats> {
+        self.dnscrypt.as_ref().map(DnscryptService::stats)
+    }
+
+    /// Имя DNSCrypt-провайдера из конфигурации.
+    #[must_use]
+    pub fn dnscrypt_provider_name(&self) -> Option<&str> {
+        self.dnscrypt
+            .as_ref()
+            .and_then(DnscryptService::provider_name)
+    }
+
+    /// Серийный номер загруженного DNSCrypt-сертификата.
+    #[must_use]
+    pub fn dnscrypt_serial(&self) -> Option<u32> {
+        self.dnscrypt.as_ref().map(DnscryptService::serial)
+    }
+
+    /// Конец действия DNSCrypt-сертификата (Unix-время).
+    #[must_use]
+    pub fn dnscrypt_valid_until(&self) -> Option<u32> {
+        self.dnscrypt.as_ref().map(DnscryptService::valid_until)
+    }
+
+    /// Число DNSCrypt UDP worker'ов.
+    #[must_use]
+    pub fn dnscrypt_workers(&self) -> Option<usize> {
+        self.dnscrypt.as_ref().map(DnscryptService::workers)
+    }
+
+    /// Перечитывает TLS-сертификат для новых DoT/DoH-соединений.
+    ///
+    /// # Errors
+    ///
+    /// [`TlsError`] при ошибке чтения или парсинга PEM. Если TLS не
+    /// настроен, вызов ничего не делает.
+    pub fn reload_tls(&self) -> Result<(), TlsError> {
+        match &self.tls {
+            Some(tls) => tls.reload(),
+            None => Ok(()),
+        }
+    }
+
+    /// Рендер счётчиков DoT/DoH/DNSCrypt в формате Prometheus.
+    ///
+    /// Те же строки добавляются к `GET /metrics` встроенного REST API.
+    #[must_use]
+    pub fn transport_metrics(&self) -> String {
+        self.metrics.render()
     }
 
     /// Фактический адрес API (полезен при `port = 0`).
@@ -260,10 +382,20 @@ impl Server {
             secondary.shutdown();
         }
         let mut first_error = None;
+        if let Some(mut tls) = self.tls.take()
+            && let Err(error) = tls.shutdown()
+        {
+            first_error = Some(ServerError::Tls(error));
+        }
+        if let Some(dnscrypt) = self.dnscrypt.take()
+            && let Err(error) = dnscrypt.shutdown()
+        {
+            first_error.get_or_insert(ServerError::Dnscrypt(DnscryptError::Runtime(error)));
+        }
         if let Some(mut tcp) = self.tcp.take()
             && let Err(error) = tcp.shutdown()
         {
-            first_error = Some(ServerError::Tcp(error.to_string()));
+            first_error.get_or_insert(ServerError::Tcp(error.to_string()));
         }
         if let Some(udp) = self.udp.take()
             && let Err(error) = udp.shutdown()
@@ -291,6 +423,12 @@ pub enum ServerError {
     /// Некорректная конфигурация.
     #[error(transparent)]
     Config(#[from] ConfigError),
+    /// Ошибка запуска/остановки DoT или DoH.
+    #[error(transparent)]
+    Tls(#[from] TlsError),
+    /// Ошибка запуска/остановки DNSCrypt.
+    #[error(transparent)]
+    Dnscrypt(#[from] DnscryptError),
     /// Ошибка загрузки зон в store или построения DNS-снапшота.
     #[error("zone store error: {0}")]
     Store(String),

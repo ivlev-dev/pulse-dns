@@ -119,4 +119,4 @@ pub use port::{
     RrsetPatchOutcome, RrsetView, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneFileMetrics, ZoneId,
     ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, ZoneView,
 };
-pub use server::{ApiServerError, RunningServer, serve};
+pub use server::{ApiServerError, MetricsProvider, RunningServer, serve, serve_with_metrics};

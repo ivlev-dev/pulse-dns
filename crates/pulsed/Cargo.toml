@@ -22,10 +22,12 @@ clap = { version = "4", default-features = false, features = ["std", "help", "us
 hex = "0.4"
 pulse-api = { path = "../pulse-api" }
 pulse-dns = { path = "../pulse-dns" }
+pulse-dnscrypt = { path = "../pulse-dnscrypt" }
 pulse-dnssec = { path = "../pulse-dnssec" }
 pulse-master = { path = "../pulse-master" }
 pulse-runtime = { path = "../pulse-runtime" }
 pulse-server = { path = "../pulse-server", features = ["testkit"] }
+pulse-tls = { path = "../pulse-tls" }
 pulse-transfer = { path = "../pulse-transfer" }
 pulse-zonefile = { path = "../pulse-zonefile" }
 serde = { version = "1", features = ["derive"] }
@@ -35,6 +37,8 @@ signal-hook = "0.3"
 thiserror = "2"
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
+rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 tempfile = "3"
 
 [lints]
