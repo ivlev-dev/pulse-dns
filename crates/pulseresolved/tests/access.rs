@@ -10,6 +10,7 @@ use pulseresolved::config::{Config, RateLimitAction, RateLimitSetting};
 use pulseresolved::server::Server;
 use pulseresolved::stats::StatsSnapshot;
 
+use support::e2e::{self, SOCKET_TIMEOUT};
 use support::{MockUpstream, a_record, base_config, make_query, positive_response};
 
 fn upstream() -> MockUpstream {
@@ -30,15 +31,9 @@ fn udp_from(
         .set_read_timeout(Some(timeout))
         .expect("read timeout");
     let bytes = request.encode(&EncodeOptions::default()).expect("encode");
-    socket.send_to(&bytes, server).expect("send");
+    e2e::send_to(&socket, &bytes, server).expect("send");
     let mut buffer = [0_u8; 4096];
-    let length = loop {
-        match socket.recv_from(&mut buffer) {
-            Ok((length, _)) => break length,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
-        }
-    };
+    let (length, _) = e2e::recv_from(&socket, &mut buffer).ok()?;
     Message::decode(buffer.get(..length)?, &DecodeLimits::default()).ok()
 }
 
@@ -58,13 +53,13 @@ fn acl_refuses_non_allowed_client_and_counts_metric() {
     let address = server.udp_addr().expect("udp");
     let request = make_query("example.com", pulse_dns::Rtype::A, None);
 
-    let allowed = udp_from("127.0.0.1:0", address, &request, Duration::from_secs(1))
-        .expect("allowed response");
+    let allowed =
+        udp_from("127.0.0.1:0", address, &request, SOCKET_TIMEOUT).expect("allowed response");
     assert_eq!(allowed.rcode(), Rcode::NOERROR);
     assert_eq!(allowed.answers().len(), 1);
 
-    let refused = udp_from("127.0.0.2:0", address, &request, Duration::from_secs(1))
-        .expect("refused response");
+    let refused =
+        udp_from("127.0.0.2:0", address, &request, SOCKET_TIMEOUT).expect("refused response");
     assert_eq!(refused.rcode(), Rcode::REFUSED);
 
     let stats: StatsSnapshot = server.stats();
@@ -98,24 +93,22 @@ fn rate_limit_isolated_per_source_ip() {
     let address = server.udp_addr().expect("udp");
     let request = make_query("flood.example.com", pulse_dns::Rtype::A, None);
 
-    let first = udp_from("127.0.0.2:0", address, &request, Duration::from_secs(1)).expect("first");
-    let second =
-        udp_from("127.0.0.2:0", address, &request, Duration::from_secs(1)).expect("second");
+    let first = udp_from("127.0.0.2:0", address, &request, SOCKET_TIMEOUT).expect("first");
+    let second = udp_from("127.0.0.2:0", address, &request, SOCKET_TIMEOUT).expect("second");
     assert_eq!(first.rcode(), Rcode::NOERROR);
     assert_eq!(second.rcode(), Rcode::NOERROR, "burst must pass");
 
     let mut limited = 0_usize;
     for _ in 0..4 {
-        let response = udp_from("127.0.0.2:0", address, &request, Duration::from_secs(1))
-            .expect("limited response");
+        let response =
+            udp_from("127.0.0.2:0", address, &request, SOCKET_TIMEOUT).expect("limited response");
         if response.rcode() == Rcode::REFUSED {
             limited += 1;
         }
     }
     assert_eq!(limited, 4, "flood from one source must be limited");
 
-    let other =
-        udp_from("127.0.0.3:0", address, &request, Duration::from_secs(1)).expect("other source");
+    let other = udp_from("127.0.0.3:0", address, &request, SOCKET_TIMEOUT).expect("other source");
     assert_eq!(
         other.rcode(),
         Rcode::NOERROR,
@@ -144,7 +137,7 @@ fn rate_limit_drop_policy_sends_nothing() {
     let request = make_query("drop.example.com", pulse_dns::Rtype::A, None);
 
     assert!(
-        udp_from("127.0.0.4:0", address, &request, Duration::from_secs(1)).is_some(),
+        udp_from("127.0.0.4:0", address, &request, SOCKET_TIMEOUT).is_some(),
         "burst token is available"
     );
     assert!(
@@ -170,10 +163,9 @@ fn rate_limit_truncate_policy_sets_tc() {
     let address = server.udp_addr().expect("udp");
     let request = make_query("trace.example.com", pulse_dns::Rtype::A, None);
 
-    let first = udp_from("127.0.0.5:0", address, &request, Duration::from_secs(1)).expect("first");
+    let first = udp_from("127.0.0.5:0", address, &request, SOCKET_TIMEOUT).expect("first");
     assert!(!first.flags().tc());
-    let limited =
-        udp_from("127.0.0.5:0", address, &request, Duration::from_secs(1)).expect("limited");
+    let limited = udp_from("127.0.0.5:0", address, &request, SOCKET_TIMEOUT).expect("limited");
     assert!(limited.flags().tc(), "truncate policy must set TC");
     assert_eq!(limited.answers().len(), 0);
     assert!(server.stats().rate_limit_truncated >= 1);

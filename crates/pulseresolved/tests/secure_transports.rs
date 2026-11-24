@@ -6,7 +6,7 @@
 //! всех транспортов, SIGHUP-перезагрузка TLS-пары, graceful shutdown и
 //! метрики по транспортам.
 
-#![allow(clippy::doc_markdown)]
+#![allow(clippy::doc_markdown, clippy::too_many_lines)]
 
 mod support;
 
@@ -28,13 +28,14 @@ use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
 use tokio::net::TcpStream as TokioTcpStream;
 use tokio_rustls::TlsConnector;
 
+use support::e2e::{Attempt, SOCKET_TIMEOUT, assert_counter, retry, retry_async};
 use support::{
-    DnscryptFixture, MockUpstream, TestPki, TestTlsClient, a_record, aaaa_record,
-    dnscrypt_tcp_query, dnscrypt_udp_query, make_query, nxdomain_response, positive_response,
-    tls_client_config, txt_records, udp_query, write_secret,
+    DnscryptFixture, DnscryptTcpClient, DnscryptUdpClient, HttpsResponse, MockUpstream, TestPki,
+    TestTlsClient, a_record, aaaa_record, make_query, nxdomain_response, positive_response,
+    server_diagnostics, tls_client_config, txt_records, udp_query, udp_query_retry,
+    wait_dnscrypt_udp_listening, write_secret,
 };
 
-const TIMEOUT: Duration = Duration::from_secs(5);
 const BIG_RECORDS: usize = 25;
 
 fn upstream() -> MockUpstream {
@@ -131,6 +132,141 @@ fn assert_a(message: &Message, address: Ipv4Addr) {
     assert_eq!(*found, address);
 }
 
+// ------------------------------------------------- retrying TLS sessions
+
+/// DoT-сессия: переиспользует соединение, при обрыве переподключается.
+struct DotSession {
+    addr: SocketAddr,
+    cert_der: Vec<u8>,
+    alpn: Vec<u8>,
+    client: Option<TestTlsClient>,
+    connections: u64,
+    sent: u64,
+}
+
+impl DotSession {
+    fn new(addr: SocketAddr, cert_der: &[u8], alpn: &[u8]) -> Self {
+        Self {
+            addr,
+            cert_der: cert_der.to_vec(),
+            alpn: alpn.to_vec(),
+            client: None,
+            connections: 0,
+            sent: 0,
+        }
+    }
+
+    fn connect_once(&mut self) -> Attempt<()> {
+        let client = TestTlsClient::connect(self.addr, &self.cert_der, &self.alpn)
+            .ok_or_else(|| format!("DoT {}: TCP/TLS handshake не удался", self.addr))?;
+        self.client = Some(client);
+        self.connections = self.connections.saturating_add(1);
+        Ok(())
+    }
+
+    fn connect(&mut self, label: &str, diagnostics: impl Fn() -> String) {
+        retry(label, diagnostics, || self.connect_once());
+    }
+
+    fn negotiated_alpn(&self) -> Option<Vec<u8>> {
+        self.client
+            .as_ref()
+            .and_then(TestTlsClient::negotiated_alpn)
+    }
+
+    fn query(&mut self, wire: &[u8], label: &str, diagnostics: impl Fn() -> String) -> Vec<u8> {
+        retry(label, diagnostics, || {
+            if self.client.is_none() {
+                self.connect_once()?;
+            }
+            self.sent = self.sent.saturating_add(1);
+            let Some(client) = self.client.as_mut() else {
+                return Err("DoT client отсутствует после connect".to_owned());
+            };
+            if let Some(response) = client.dot_query(wire) {
+                Ok(response)
+            } else {
+                self.client = None;
+                Err(format!("DoT {}: нет ответа", self.addr))
+            }
+        })
+    }
+}
+
+enum DohCall<'a> {
+    Post(&'a [u8]),
+    Get(&'a str),
+}
+
+/// DoH/1.1-сессия с переподключением при transient-ошибках.
+struct DohSession {
+    addr: SocketAddr,
+    cert_der: Vec<u8>,
+    alpn: Vec<u8>,
+    client: Option<TestTlsClient>,
+    connections: u64,
+    sent: u64,
+}
+
+impl DohSession {
+    fn new(addr: SocketAddr, cert_der: &[u8], alpn: &[u8]) -> Self {
+        Self {
+            addr,
+            cert_der: cert_der.to_vec(),
+            alpn: alpn.to_vec(),
+            client: None,
+            connections: 0,
+            sent: 0,
+        }
+    }
+
+    fn connect_once(&mut self) -> Attempt<()> {
+        let client = TestTlsClient::connect(self.addr, &self.cert_der, &self.alpn)
+            .ok_or_else(|| format!("DoH {}: TCP/TLS handshake не удался", self.addr))?;
+        self.client = Some(client);
+        self.connections = self.connections.saturating_add(1);
+        Ok(())
+    }
+
+    fn connect(&mut self, label: &str, diagnostics: impl Fn() -> String) {
+        retry(label, diagnostics, || self.connect_once());
+    }
+
+    fn negotiated_alpn(&self) -> Option<Vec<u8>> {
+        self.client
+            .as_ref()
+            .and_then(TestTlsClient::negotiated_alpn)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn call(
+        &mut self,
+        call: DohCall<'_>,
+        label: &str,
+        diagnostics: impl Fn() -> String,
+    ) -> HttpsResponse {
+        retry(label, diagnostics, || {
+            if self.client.is_none() {
+                self.connect_once()?;
+            }
+            self.sent = self.sent.saturating_add(1);
+            let Some(client) = self.client.as_mut() else {
+                return Err("DoH client отсутствует после connect".to_owned());
+            };
+            let response = match &call {
+                DohCall::Post(body) => client.https_post("/dns-query", body),
+                DohCall::Get(target) => client.https_get(target),
+            };
+            if let Some(response) = response {
+                Ok(response)
+            } else {
+                self.client = None;
+                Err(format!("DoH {}: нет HTTP-ответа", self.addr))
+            }
+        })
+    }
+}
+
 // ------------------------------------------------------------------ DoT
 
 #[test]
@@ -150,45 +286,47 @@ fn dot_answers_a_aaaa_nxdomain_blocklist_and_override() {
     }];
     let server = Server::start(&config).expect("server");
     let addr = server.dot_addr().expect("dot addr");
-    let mut client = TestTlsClient::connect(addr, &pki.cert_der, b"dot").expect("DoT connect");
+    let diag = || server_diagnostics(&server);
+    let mut client = DotSession::new(addr, &pki.cert_der, b"dot");
+    client.connect("DoT connect", diag);
     assert_eq!(
         client.negotiated_alpn().as_deref(),
         Some(b"dot".as_slice()),
         "ALPN dot"
     );
 
-    let response = client
-        .dot_query(&query("dot.secure.test", Rtype::A))
-        .expect("A response");
+    let response = client.query(&query("dot.secure.test", Rtype::A), "DoT A", diag);
     assert_a(&decode(&response), Ipv4Addr::new(192, 0, 2, 10));
 
-    let response = client
-        .dot_query(&query("dot.secure.test", Rtype::AAAA))
-        .expect("AAAA response");
+    let response = client.query(&query("dot.secure.test", Rtype::AAAA), "DoT AAAA", diag);
     let message = decode(&response);
     assert_eq!(message.rcode(), Rcode::NOERROR);
     assert_eq!(message.answers()[0].rr_type(), Rtype::AAAA);
 
-    let response = client
-        .dot_query(&query("missing.secure.test", Rtype::A))
-        .expect("NXDOMAIN");
+    let response = client.query(
+        &query("missing.secure.test", Rtype::A),
+        "DoT NXDOMAIN",
+        diag,
+    );
     assert_eq!(decode(&response).rcode(), Rcode::NXDOMAIN);
 
-    let response = client
-        .dot_query(&query("blocked.secure.test", Rtype::A))
-        .expect("blocked");
+    let response = client.query(
+        &query("blocked.secure.test", Rtype::A),
+        "DoT blocklist",
+        diag,
+    );
     assert_eq!(decode(&response).rcode(), Rcode::NXDOMAIN);
     assert!(server.resolver_stats().blocked >= 1);
 
-    let response = client
-        .dot_query(&query("router.secure.test", Rtype::A))
-        .expect("override");
+    let response = client.query(&query("router.secure.test", Rtype::A), "DoT override", diag);
     assert_a(&decode(&response), Ipv4Addr::new(192, 168, 1, 1));
 
     let counters = server.stats();
-    assert_eq!(counters.dot_queries, 5);
-    assert_eq!(counters.dot_responses, 5);
-    assert_eq!(server.dot_stats().expect("dot stats").queries, 5);
+    assert_counter("dot_queries", counters.dot_queries, 5, client.sent);
+    assert_counter("dot_responses", counters.dot_responses, 5, client.sent);
+    let tls = server.dot_stats().expect("dot stats");
+    assert_counter("dot tls queries", tls.queries, 5, client.sent);
+    assert_eq!(tls.handshakes, client.connections);
 }
 
 #[test]
@@ -200,10 +338,10 @@ fn dot_large_response_is_not_truncated() {
     config.dot_listen = Some("127.0.0.1:0".parse().expect("addr"));
     let server = Server::start(&config).expect("server");
     let addr = server.dot_addr().expect("dot addr");
-    let mut client = TestTlsClient::connect(addr, &pki.cert_der, b"dot").expect("DoT connect");
-    let response = client
-        .dot_query(&query("big.secure.test", Rtype::TXT))
-        .expect("big response");
+    let diag = || server_diagnostics(&server);
+    let mut client = DotSession::new(addr, &pki.cert_der, b"dot");
+    client.connect("DoT connect", diag);
+    let response = client.query(&query("big.secure.test", Rtype::TXT), "DoT big TXT", diag);
     assert!(
         response.len() > 2_000,
         "response is {} bytes",
@@ -226,7 +364,9 @@ fn doh_http1_answers_post_get_and_large_response() {
     config.doh_listen = Some("127.0.0.1:0".parse().expect("addr"));
     let server = Server::start(&config).expect("server");
     let addr = server.doh_addr().expect("doh addr");
-    let mut client = TestTlsClient::connect(addr, &pki.cert_der, b"http/1.1").expect("DoH connect");
+    let diag = || server_diagnostics(&server);
+    let mut client = DohSession::new(addr, &pki.cert_der, b"http/1.1");
+    client.connect("DoH connect", diag);
     assert_eq!(
         client.negotiated_alpn().as_deref(),
         Some(b"http/1.1".as_slice()),
@@ -234,7 +374,7 @@ fn doh_http1_answers_post_get_and_large_response() {
     );
 
     let wire = query("doh.secure.test", Rtype::A);
-    let response = client.https_post("/dns-query", &wire).expect("POST");
+    let response = client.call(DohCall::Post(&wire), "DoH POST", diag);
     assert_eq!(response.status, 200);
     assert_eq!(
         response.content_type.as_deref(),
@@ -243,99 +383,203 @@ fn doh_http1_answers_post_get_and_large_response() {
     assert_a(&decode(&response.body), Ipv4Addr::new(192, 0, 2, 10));
 
     let encoded = URL_SAFE_NO_PAD.encode(&wire);
-    let response = client
-        .https_get(&format!("/dns-query?dns={encoded}"))
-        .expect("GET");
+    let response = client.call(
+        DohCall::Get(&format!("/dns-query?dns={encoded}")),
+        "DoH GET",
+        diag,
+    );
     assert_eq!(response.status, 200);
     assert_a(&decode(&response.body), Ipv4Addr::new(192, 0, 2, 10));
 
     let wire = query("big.secure.test", Rtype::TXT);
-    let response = client.https_post("/dns-query", &wire).expect("big POST");
+    let response = client.call(DohCall::Post(&wire), "DoH big POST", diag);
     assert_eq!(response.status, 200);
     assert!(response.body.len() > 2_000);
     let message = decode(&response.body);
     assert!(!message.flags().tc());
     assert_eq!(message.answers().len(), BIG_RECORDS);
 
-    let response = client
-        .https_post("/dns-query", &query("doh.secure.test", Rtype::AAAA))
-        .expect("AAAA");
+    let response = client.call(
+        DohCall::Post(&query("doh.secure.test", Rtype::AAAA)),
+        "DoH AAAA",
+        diag,
+    );
     assert_eq!(response.status, 200);
     assert_aaaa(&decode(&response.body));
 
-    let response = client
-        .https_post("/dns-query", &query("missing.secure.test", Rtype::A))
-        .expect("NXDOMAIN");
+    let response = client.call(
+        DohCall::Post(&query("missing.secure.test", Rtype::A)),
+        "DoH NXDOMAIN",
+        diag,
+    );
     assert_eq!(decode(&response.body).rcode(), Rcode::NXDOMAIN);
 
-    let response = client
-        .https_post("/dns-query", &query("blocked.secure.test", Rtype::A))
-        .expect("blocked");
+    let response = client.call(
+        DohCall::Post(&query("blocked.secure.test", Rtype::A)),
+        "DoH blocklist",
+        diag,
+    );
     assert_eq!(decode(&response.body).rcode(), Rcode::NXDOMAIN);
 
-    let response = client
-        .https_post("/dns-query", &query("router.secure.test", Rtype::A))
-        .expect("override");
+    let response = client.call(
+        DohCall::Post(&query("router.secure.test", Rtype::A)),
+        "DoH override",
+        diag,
+    );
     assert_a(&decode(&response.body), Ipv4Addr::new(192, 168, 1, 1));
 
-    let response = client.https_post("/dns-query", b"").expect("bad");
+    let response = client.call(DohCall::Post(b""), "DoH bad query", diag);
     assert_eq!(response.status, 400);
 
     let counters = server.stats();
-    assert_eq!(counters.doh_queries, 7);
-    assert_eq!(counters.doh_responses, 7);
+    assert_counter("doh_queries", counters.doh_queries, 7, client.sent);
+    assert_counter("doh_responses", counters.doh_responses, 7, client.sent);
     let tls = server.doh_stats().expect("doh stats");
-    assert_eq!(tls.queries, 7);
-    assert!(tls.http_requests >= 8);
+    assert_counter("doh tls queries", tls.queries, 7, client.sent);
+    assert!(
+        tls.http_requests >= 8,
+        "http_requests: {}",
+        tls.http_requests
+    );
+    assert_eq!(tls.handshakes, client.connections);
 }
 
 // ---------------------------------------------------------------- DoH/2
 
 struct H2Client {
+    addr: SocketAddr,
+    cert_der: Vec<u8>,
+    inner: Option<H2Inner>,
+    connections: u64,
+    sent: u64,
+}
+
+struct H2Inner {
     send: h2::client::SendRequest<Bytes>,
     _driver: tokio::task::JoinHandle<()>,
 }
 
 impl H2Client {
-    async fn connect(addr: SocketAddr, cert_der: &[u8]) -> Self {
-        let config = tls_client_config(cert_der, b"h2");
-        let connector = TlsConnector::from(Arc::new(config));
-        let stream = TokioTcpStream::connect(addr).await.expect("tcp connect");
-        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
-        let tls = connector
-            .connect(name, stream)
-            .await
-            .expect("TLS handshake");
-        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
-        let (send, connection) = h2::client::handshake(tls).await.expect("h2 handshake");
-        let driver = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+    fn new(addr: SocketAddr, cert_der: &[u8]) -> Self {
         Self {
-            send,
-            _driver: driver,
+            addr,
+            cert_der: cert_der.to_vec(),
+            inner: None,
+            connections: 0,
+            sent: 0,
         }
     }
 
-    async fn request(&mut self, uri: String, body: &[u8]) -> (u16, Vec<u8>) {
+    async fn connect_once(&mut self) -> Attempt<()> {
+        let config = tls_client_config(&self.cert_der, b"h2");
+        let connector = TlsConnector::from(Arc::new(config));
+        let stream = TokioTcpStream::connect(self.addr)
+            .await
+            .map_err(|error| format!("h2 tcp connect {}: {error}", self.addr))?;
+        let name = rustls::pki_types::ServerName::try_from("localhost")
+            .map_err(|error| format!("server name: {error}"))?;
+        let tls = connector
+            .connect(name, stream)
+            .await
+            .map_err(|error| format!("h2 TLS handshake: {error}"))?;
+        let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        if alpn.as_deref() != Some(b"h2".as_slice()) {
+            return Err(format!("h2 ALPN mismatch: {alpn:?}"));
+        }
+        let (send, connection) = h2::client::handshake(tls)
+            .await
+            .map_err(|error| format!("h2 handshake: {error}"))?;
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        self.inner = Some(H2Inner {
+            send,
+            _driver: driver,
+        });
+        self.connections = self.connections.saturating_add(1);
+        Ok(())
+    }
+
+    async fn call_once(
+        &mut self,
+        method: Method,
+        uri: &str,
+        body: &[u8],
+    ) -> Attempt<(u16, Vec<u8>)> {
+        if self.inner.is_none() {
+            self.connect_once().await?;
+        }
+        self.sent = self.sent.saturating_add(1);
+        let Some(inner) = self.inner.as_mut() else {
+            return Err("h2 client отсутствует после connect".to_owned());
+        };
+        let end_stream = method == Method::GET;
         let request = http::Request::builder()
-            .method(Method::POST)
+            .method(method)
             .uri(uri)
             .header("content-type", "application/dns-message")
             .body(())
-            .expect("request");
-        let (response, mut stream) = self.send.send_request(request, false).expect("send");
-        stream
-            .send_data(Bytes::copy_from_slice(body), true)
-            .expect("send body");
-        let response = response.await.expect("response");
+            .map_err(|error| format!("h2 request: {error}"))?;
+        let (response, mut stream) = inner
+            .send
+            .send_request(request, end_stream)
+            .map_err(|error| format!("h2 send_request: {error}"))?;
+        if !end_stream {
+            stream
+                .send_data(Bytes::copy_from_slice(body), true)
+                .map_err(|error| format!("h2 send_data: {error}"))?;
+        }
+        let response = match response.await {
+            Ok(response) => response,
+            Err(error) => {
+                self.inner = None;
+                return Err(format!("h2 response: {error}"));
+            }
+        };
         let status = response.status().as_u16();
         let mut recv = response.into_body();
         let mut out = Vec::new();
         while let Some(chunk) = recv.data().await {
-            out.extend_from_slice(&chunk.expect("body chunk"));
+            match chunk {
+                Ok(chunk) => out.extend_from_slice(&chunk),
+                Err(error) => {
+                    self.inner = None;
+                    return Err(format!("h2 body: {error}"));
+                }
+            }
         }
-        (status, out)
+        Ok((status, out))
+    }
+
+    async fn call(
+        &mut self,
+        method: Method,
+        uri: &str,
+        body: &[u8],
+        label: &str,
+        diagnostics: impl Fn() -> String,
+    ) -> (u16, Vec<u8>) {
+        let deadline = tokio::time::Instant::now() + support::e2e::E2E_DEADLINE;
+        let mut backoff = Duration::from_millis(50);
+        let mut attempts = 0_u32;
+        loop {
+            attempts = attempts.saturating_add(1);
+            match self.call_once(method.clone(), uri, body).await {
+                Ok(value) => return value,
+                Err(error) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "{label}: не удалось за {attempts} попыток; последняя ошибка: \
+                         {error}; диагностика: {}",
+                        diagnostics()
+                    );
+                    self.inner = None;
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(backoff.min(remaining)).await;
+            backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
+        }
     }
 }
 
@@ -349,28 +593,43 @@ async fn doh_http2_answers_and_large_response() {
     config.doh2_listen = Some("127.0.0.1:0".parse().expect("addr"));
     let server = Server::start(&config).expect("server");
     let addr = server.doh2_addr().expect("doh2 addr");
-    let mut client = H2Client::connect(addr, &pki.cert_der).await;
+    let diag = || server_diagnostics(&server);
+    let mut client = H2Client::new(addr, &pki.cert_der);
 
     let wire = query("doh2.secure.test", Rtype::A);
     let (status, body) = client
-        .request("https://localhost/dns-query".to_owned(), &wire)
+        .call(
+            Method::POST,
+            "https://localhost/dns-query",
+            &wire,
+            "DoH/2 A",
+            diag,
+        )
         .await;
     assert_eq!(status, 200);
     assert_a(&decode(&body), Ipv4Addr::new(192, 0, 2, 10));
 
     let encoded = URL_SAFE_NO_PAD.encode(&wire);
-    let request = http::Request::builder()
-        .method(Method::GET)
-        .uri(format!("https://localhost/dns-query?dns={encoded}"))
-        .body(())
-        .expect("request");
-    let (response, _stream) = client.send.send_request(request, true).expect("send");
-    let response = response.await.expect("response");
-    assert_eq!(response.status().as_u16(), 200);
+    let (status, _body) = client
+        .call(
+            Method::GET,
+            &format!("https://localhost/dns-query?dns={encoded}"),
+            &[],
+            "DoH/2 GET",
+            diag,
+        )
+        .await;
+    assert_eq!(status, 200);
 
     let wire = query("big.secure.test", Rtype::TXT);
     let (status, body) = client
-        .request("https://localhost/dns-query".to_owned(), &wire)
+        .call(
+            Method::POST,
+            "https://localhost/dns-query",
+            &wire,
+            "DoH/2 big TXT",
+            diag,
+        )
         .await;
     assert_eq!(status, 200);
     assert!(body.len() > 2_000);
@@ -379,44 +638,75 @@ async fn doh_http2_answers_and_large_response() {
     assert_eq!(message.answers().len(), BIG_RECORDS);
 
     let (status, body) = client
-        .request(
-            "https://localhost/dns-query".to_owned(),
+        .call(
+            Method::POST,
+            "https://localhost/dns-query",
             &query("doh2.secure.test", Rtype::AAAA),
+            "DoH/2 AAAA",
+            diag,
         )
         .await;
     assert_eq!(status, 200);
     assert_aaaa(&decode(&body));
 
     let (status, body) = client
-        .request(
-            "https://localhost/dns-query".to_owned(),
+        .call(
+            Method::POST,
+            "https://localhost/dns-query",
             &query("missing.secure.test", Rtype::A),
+            "DoH/2 NXDOMAIN",
+            diag,
         )
         .await;
     assert_eq!(status, 200);
     assert_eq!(decode(&body).rcode(), Rcode::NXDOMAIN);
 
     let (status, body) = client
-        .request(
-            "https://localhost/dns-query".to_owned(),
+        .call(
+            Method::POST,
+            "https://localhost/dns-query",
             &query("blocked.secure.test", Rtype::A),
+            "DoH/2 blocklist",
+            diag,
         )
         .await;
     assert_eq!(status, 200);
     assert_eq!(decode(&body).rcode(), Rcode::NXDOMAIN);
 
     let (status, body) = client
-        .request(
-            "https://localhost/dns-query".to_owned(),
+        .call(
+            Method::POST,
+            "https://localhost/dns-query",
             &query("router.secure.test", Rtype::A),
+            "DoH/2 override",
+            diag,
         )
         .await;
     assert_eq!(status, 200);
     assert_a(&decode(&body), Ipv4Addr::new(192, 168, 1, 1));
 
     let counters = server.stats();
-    assert_eq!(counters.doh_http2_queries, 7);
-    assert_eq!(counters.doh_http2_responses, 7);
+    assert_counter(
+        "doh_http2_queries",
+        counters.doh_http2_queries,
+        7,
+        client.sent,
+    );
+    assert_counter(
+        "doh_http2_responses",
+        counters.doh_http2_responses,
+        7,
+        client.sent,
+    );
+    let tls = server.doh2_stats().expect("doh2 stats");
+    // h2-handshake может не дойти до клиента после успешного TLS-handshake,
+    // поэтому серверных рукопожатий может быть не меньше клиентских.
+    assert!(
+        tls.handshakes >= client.connections,
+        "h2 handshakes {} < client connections {}",
+        tls.handshakes,
+        client.connections
+    );
 }
 
 // ------------------------------------------------------------------ DoQ
@@ -437,18 +727,132 @@ fn quic_client_config(cert_der: &[u8]) -> quinn::ClientConfig {
     quinn::ClientConfig::new(Arc::new(crypto))
 }
 
-async fn doq_query(connection: &quinn::Connection, wire: &[u8]) -> Vec<u8> {
-    let (mut send, mut recv) = connection.open_bi().await.expect("open stream");
-    let length = u16::try_from(wire.len()).expect("fits");
-    send.write_all(&length.to_be_bytes()).await.expect("length");
-    send.write_all(wire).await.expect("message");
-    send.finish().expect("finish");
+async fn doq_query_result(connection: &quinn::Connection, wire: &[u8]) -> Attempt<Vec<u8>> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| format!("doq open_bi: {error}"))?;
+    let length = u16::try_from(wire.len()).map_err(|_| "DoQ query too large".to_owned())?;
+    send.write_all(&length.to_be_bytes())
+        .await
+        .map_err(|error| format!("doq length: {error}"))?;
+    send.write_all(wire)
+        .await
+        .map_err(|error| format!("doq message: {error}"))?;
+    send.finish()
+        .map_err(|error| format!("doq finish: {error}"))?;
     let mut prefix = [0_u8; 2];
-    recv.read_exact(&mut prefix).await.expect("prefix");
+    recv.read_exact(&mut prefix)
+        .await
+        .map_err(|error| format!("doq prefix: {error}"))?;
     let length = usize::from(u16::from_be_bytes(prefix));
     let mut response = vec![0_u8; length];
-    recv.read_exact(&mut response).await.expect("response");
-    response
+    recv.read_exact(&mut response)
+        .await
+        .map_err(|error| format!("doq response: {error}"))?;
+    Ok(response)
+}
+
+/// DoQ-сессия: соединение пересоздаётся при transient-ошибках.
+struct DoqSession {
+    endpoint: quinn::Endpoint,
+    addr: SocketAddr,
+    connection: Option<quinn::Connection>,
+    connections: u64,
+    sent: u64,
+}
+
+impl DoqSession {
+    fn new(addr: SocketAddr, cert_der: &[u8]) -> Self {
+        let mut endpoint =
+            quinn::Endpoint::client("127.0.0.1:0".parse().expect("client addr")).expect("endpoint");
+        endpoint.set_default_client_config(quic_client_config(cert_der));
+        Self {
+            endpoint,
+            addr,
+            connection: None,
+            connections: 0,
+            sent: 0,
+        }
+    }
+
+    async fn connect_once(&mut self) -> Attempt<()> {
+        let connecting = self
+            .endpoint
+            .connect(self.addr, "localhost")
+            .map_err(|error| format!("doq connect: {error}"))?;
+        let connection = connecting
+            .await
+            .map_err(|error| format!("doq handshake: {error}"))?;
+        self.connection = Some(connection);
+        self.connections = self.connections.saturating_add(1);
+        Ok(())
+    }
+
+    async fn connect(&mut self, label: &str, diagnostics: impl Fn() -> String) {
+        let endpoint = self.endpoint.clone();
+        let addr = self.addr;
+        let connection = retry_async(label, diagnostics, || {
+            let endpoint = endpoint.clone();
+            async move {
+                let connecting = endpoint
+                    .connect(addr, "localhost")
+                    .map_err(|error| format!("doq connect: {error}"))?;
+                connecting
+                    .await
+                    .map_err(|error| format!("doq handshake: {error}"))
+            }
+        })
+        .await;
+        self.connection = Some(connection);
+        self.connections = self.connections.saturating_add(1);
+    }
+
+    async fn query(
+        &mut self,
+        wire: &[u8],
+        label: &str,
+        diagnostics: impl Fn() -> String,
+    ) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + support::e2e::E2E_DEADLINE;
+        let mut backoff = Duration::from_millis(50);
+        let mut attempts = 0_u32;
+        let mut last = String::new();
+        loop {
+            attempts = attempts.saturating_add(1);
+            if self.connection.is_none()
+                && let Err(error) = self.connect_once().await
+            {
+                last = error;
+            }
+            if let Some(connection) = self.connection.as_ref() {
+                self.sent = self.sent.saturating_add(1);
+                match doq_query_result(connection, wire).await {
+                    Ok(response) => return response,
+                    Err(error) => {
+                        last = error;
+                        self.connection = None;
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{label}: не удалось за {attempts} попыток; последняя ошибка: {last}; \
+                 диагностика: {}",
+                diagnostics()
+            );
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(backoff.min(remaining)).await;
+            backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
+        }
+    }
+
+    async fn close(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.close(0_u32.into(), b"done");
+        }
+        self.endpoint.wait_idle().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -461,42 +865,71 @@ async fn doq_answers_and_large_response() {
     config.doq_listen = Some("127.0.0.1:0".parse().expect("addr"));
     let server = Server::start(&config).expect("server");
     let addr = server.doq_addr().expect("doq addr");
+    let diag = || server_diagnostics(&server);
+    let mut session = DoqSession::new(addr, &pki.cert_der);
+    session.connect("DoQ connect", diag).await;
 
-    let mut endpoint =
-        quinn::Endpoint::client("127.0.0.1:0".parse().expect("client addr")).expect("endpoint");
-    endpoint.set_default_client_config(quic_client_config(&pki.cert_der));
-    let connection = endpoint
-        .connect(addr, "localhost")
-        .expect("connect")
-        .await
-        .expect("QUIC handshake");
-
-    let response = doq_query(&connection, &doq_wire("doq.secure.test", Rtype::A)).await;
+    let response = session
+        .query(&doq_wire("doq.secure.test", Rtype::A), "DoQ A", diag)
+        .await;
     assert_a(&decode(&response), Ipv4Addr::new(192, 0, 2, 10));
 
-    let response = doq_query(&connection, &doq_wire("missing.secure.test", Rtype::A)).await;
+    let response = session
+        .query(
+            &doq_wire("missing.secure.test", Rtype::A),
+            "DoQ NXDOMAIN",
+            diag,
+        )
+        .await;
     assert_eq!(decode(&response).rcode(), Rcode::NXDOMAIN);
 
-    let response = doq_query(&connection, &doq_wire("big.secure.test", Rtype::TXT)).await;
+    let response = session
+        .query(
+            &doq_wire("big.secure.test", Rtype::TXT),
+            "DoQ big TXT",
+            diag,
+        )
+        .await;
     assert!(response.len() > 2_000);
     let message = decode(&response);
     assert!(!message.flags().tc(), "DoQ must not truncate");
     assert_eq!(message.answers().len(), BIG_RECORDS);
 
-    let response = doq_query(&connection, &doq_wire("doq.secure.test", Rtype::AAAA)).await;
+    let response = session
+        .query(&doq_wire("doq.secure.test", Rtype::AAAA), "DoQ AAAA", diag)
+        .await;
     assert_aaaa(&decode(&response));
 
-    let response = doq_query(&connection, &doq_wire("blocked.secure.test", Rtype::A)).await;
+    let response = session
+        .query(
+            &doq_wire("blocked.secure.test", Rtype::A),
+            "DoQ blocklist",
+            diag,
+        )
+        .await;
     assert_eq!(decode(&response).rcode(), Rcode::NXDOMAIN);
 
-    let response = doq_query(&connection, &doq_wire("router.secure.test", Rtype::A)).await;
+    let response = session
+        .query(
+            &doq_wire("router.secure.test", Rtype::A),
+            "DoQ override",
+            diag,
+        )
+        .await;
     assert_a(&decode(&response), Ipv4Addr::new(192, 168, 1, 1));
 
     let counters = server.stats();
-    assert_eq!(counters.doq_queries, 6);
-    assert_eq!(counters.doq_responses, 6);
-    connection.close(0_u32.into(), b"done");
-    endpoint.wait_idle().await;
+    assert_counter("doq_queries", counters.doq_queries, 6, session.sent);
+    assert_counter("doq_responses", counters.doq_responses, 6, session.sent);
+    let tls = server.doq_stats().expect("doq stats");
+    // Как и в h2: сервер мог завершить QUIC-handshake, а клиент — не успеть.
+    assert!(
+        tls.handshakes >= session.connections,
+        "doq handshakes {} < client connections {}",
+        tls.handshakes,
+        session.connections
+    );
+    session.close().await;
 }
 
 // -------------------------------------------------------------- DNSCrypt
@@ -513,78 +946,71 @@ fn dnscrypt_udp_answers_and_truncates_large_response() {
     let server = Server::start(&config).expect("server");
     let addr = server.dnscrypt_udp_addr().expect("dnscrypt udp");
 
-    let response = dnscrypt_udp_query(
-        addr,
-        &fixture.client,
-        &Message::decode(
-            &query("dnscrypt.secure.test", Rtype::A),
-            &DecodeLimits::default(),
-        )
-        .expect("query"),
-        TIMEOUT,
-    )
-    .expect("A response");
+    // Убеждаемся, что UDP-сокет действительно читает пакеты. Проба заведомо
+    // некорректна: она увеличивает только счётчик ошибок, не queries.
+    wait_dnscrypt_udp_listening(addr, || server.stats().dnscrypt_udp_errors);
+
+    let diag = || server_diagnostics(&server);
+    let mut client = DnscryptUdpClient::new(addr, &fixture.client);
+
+    let response = client.query(
+        &decode(&query("dnscrypt.secure.test", Rtype::A)),
+        "DNSCrypt UDP A",
+        diag,
+    );
     assert_a(&response, Ipv4Addr::new(192, 0, 2, 10));
 
-    let nxdomain = dnscrypt_udp_query(
-        addr,
-        &fixture.client,
-        &Message::decode(
-            &query("missing.secure.test", Rtype::A),
-            &DecodeLimits::default(),
-        )
-        .expect("query"),
-        TIMEOUT,
-    )
-    .expect("NXDOMAIN");
+    let nxdomain = client.query(
+        &decode(&query("missing.secure.test", Rtype::A)),
+        "DNSCrypt UDP NXDOMAIN",
+        diag,
+    );
     assert_eq!(nxdomain.rcode(), Rcode::NXDOMAIN);
 
-    let big = dnscrypt_udp_query(
-        addr,
-        &fixture.client,
-        &Message::decode(
-            &query("big.secure.test", Rtype::TXT),
-            &DecodeLimits::default(),
-        )
-        .expect("query"),
-        TIMEOUT,
-    )
-    .expect("big response");
+    let big = client.query(
+        &decode(&query("big.secure.test", Rtype::TXT)),
+        "DNSCrypt UDP big TXT",
+        diag,
+    );
     assert!(
         big.flags().tc(),
         "DNSCrypt UDP must truncate oversized answer"
     );
 
-    let aaaa = dnscrypt_udp_query(
-        addr,
-        &fixture.client,
+    let aaaa = client.query(
         &decode(&query("dnscrypt.secure.test", Rtype::AAAA)),
-        TIMEOUT,
-    )
-    .expect("AAAA");
+        "DNSCrypt UDP AAAA",
+        diag,
+    );
     assert_aaaa(&aaaa);
 
-    let blocked = dnscrypt_udp_query(
-        addr,
-        &fixture.client,
+    let blocked = client.query(
         &decode(&query("blocked.secure.test", Rtype::A)),
-        TIMEOUT,
-    )
-    .expect("blocked");
+        "DNSCrypt UDP blocklist",
+        diag,
+    );
     assert_eq!(blocked.rcode(), Rcode::NXDOMAIN);
 
-    let overridden = dnscrypt_udp_query(
-        addr,
-        &fixture.client,
+    let overridden = client.query(
         &decode(&query("router.secure.test", Rtype::A)),
-        TIMEOUT,
-    )
-    .expect("override");
+        "DNSCrypt UDP override",
+        diag,
+    );
     assert_a(&overridden, Ipv4Addr::new(192, 168, 1, 1));
 
     let counters = server.stats();
-    assert_eq!(counters.dnscrypt_udp_queries, 6);
-    assert_eq!(counters.dnscrypt_udp_responses, 6);
+    assert_counter(
+        "dnscrypt_udp_queries",
+        counters.dnscrypt_udp_queries,
+        6,
+        client.sent(),
+    );
+    assert_counter(
+        "dnscrypt_udp_responses",
+        counters.dnscrypt_udp_responses,
+        6,
+        client.sent(),
+    );
 }
 
 #[test]
@@ -598,8 +1024,9 @@ fn dnscrypt_tcp_answers_multiple_queries_and_no_truncation() {
     config.dnscrypt_tcp_listen = Some("127.0.0.1:0".parse().expect("addr"));
     let server = Server::start(&config).expect("server");
     let addr = server.dnscrypt_tcp_addr().expect("dnscrypt tcp");
-    let mut stream = TcpStream::connect(addr).expect("connect");
-    stream.set_nodelay(true).expect("nodelay");
+    let diag = || server_diagnostics(&server);
+    let mut client = DnscryptTcpClient::new(addr, &fixture.client);
+    client.ensure_connected("DNSCrypt TCP connect", diag);
 
     for (name, rtype) in [
         ("dnscrypt-tcp.secure.test", Rtype::A),
@@ -607,8 +1034,7 @@ fn dnscrypt_tcp_answers_multiple_queries_and_no_truncation() {
         ("missing.secure.test", Rtype::A),
     ] {
         let request = decode(&query(name, rtype));
-        let response =
-            dnscrypt_tcp_query(&mut stream, &fixture.client, &request, TIMEOUT).expect("response");
+        let response = client.query(&request, "DNSCrypt TCP query", diag);
         match rtype {
             Rtype::A if name.starts_with("dnscrypt-tcp") => {
                 assert_a(&response, Ipv4Addr::new(192, 0, 2, 10));
@@ -619,26 +1045,37 @@ fn dnscrypt_tcp_answers_multiple_queries_and_no_truncation() {
     }
 
     let request = decode(&query("big.secure.test", Rtype::TXT));
-    let response =
-        dnscrypt_tcp_query(&mut stream, &fixture.client, &request, TIMEOUT).expect("big");
+    let response = client.query(&request, "DNSCrypt TCP big TXT", diag);
     assert!(!response.flags().tc(), "DNSCrypt TCP must not truncate");
     assert_eq!(response.answers().len(), BIG_RECORDS);
 
     for name in ["blocked.secure.test", "missing.secure.test"] {
         let request = decode(&query(name, Rtype::A));
-        let response =
-            dnscrypt_tcp_query(&mut stream, &fixture.client, &request, TIMEOUT).expect("negative");
+        let response = client.query(&request, "DNSCrypt TCP negative", diag);
         assert_eq!(response.rcode(), Rcode::NXDOMAIN);
     }
     let request = decode(&query("router.secure.test", Rtype::A));
-    let response =
-        dnscrypt_tcp_query(&mut stream, &fixture.client, &request, TIMEOUT).expect("override");
+    let response = client.query(&request, "DNSCrypt TCP override", diag);
     assert_a(&response, Ipv4Addr::new(192, 168, 1, 1));
 
     let counters = server.stats();
-    assert_eq!(counters.dnscrypt_tcp_queries, 7);
-    assert_eq!(counters.dnscrypt_tcp_responses, 7);
-    assert_eq!(counters.dnscrypt_tcp_connections, 1);
+    assert_counter(
+        "dnscrypt_tcp_queries",
+        counters.dnscrypt_tcp_queries,
+        7,
+        client.sent(),
+    );
+    assert_counter(
+        "dnscrypt_tcp_responses",
+        counters.dnscrypt_tcp_responses,
+        7,
+        client.sent(),
+    );
+    assert_eq!(counters.dnscrypt_tcp_connections, client.connections());
+    // Без повторов все 7 запросов должны идти по одному соединению.
+    if client.sent() == 7 {
+        assert_eq!(client.connections(), 1, "queries must share one connection");
+    }
 }
 
 // ------------------------------------------------------- ACL / lifecycle
@@ -662,80 +1099,106 @@ async fn acl_refuses_clients_on_every_transport() {
     config.allow_from = vec!["192.0.2.0/24".to_owned()];
     let server = Server::start(&config).expect("server");
     assert!(server.udp_addr().is_some());
+    let diag = || server_diagnostics(&server);
 
     // UDP.
     let request = make_query("acl.secure.test", Rtype::A, None);
-    let response =
-        udp_query(server.udp_addr().expect("udp"), &request, TIMEOUT).expect("udp response");
+    let mut udp_attempts = 0_u64;
+    let response = retry("ACL UDP", diag, || {
+        udp_attempts = udp_attempts.saturating_add(1);
+        udp_query(server.udp_addr().expect("udp"), &request, SOCKET_TIMEOUT)
+            .ok_or_else(|| "нет UDP-ответа".to_owned())
+    });
     assert_eq!(response.rcode(), Rcode::REFUSED);
 
     // DoT.
-    let mut dot = TestTlsClient::connect(server.dot_addr().expect("dot"), &pki.cert_der, b"dot")
-        .expect("DoT connect");
-    let response = dot
-        .dot_query(&query("acl.secure.test", Rtype::A))
-        .expect("DoT response");
+    let mut dot = DotSession::new(server.dot_addr().expect("dot"), &pki.cert_der, b"dot");
+    dot.connect("ACL DoT connect", diag);
+    let response = dot.query(&query("acl.secure.test", Rtype::A), "ACL DoT query", diag);
     assert_eq!(decode(&response).rcode(), Rcode::REFUSED);
 
     // DoH/1.1.
-    let mut doh =
-        TestTlsClient::connect(server.doh_addr().expect("doh"), &pki.cert_der, b"http/1.1")
-            .expect("DoH connect");
-    let response = doh
-        .https_post("/dns-query", &query("acl.secure.test", Rtype::A))
-        .expect("DoH response");
+    let mut doh = DohSession::new(server.doh_addr().expect("doh"), &pki.cert_der, b"http/1.1");
+    doh.connect("ACL DoH connect", diag);
+    let response = doh.call(
+        DohCall::Post(&query("acl.secure.test", Rtype::A)),
+        "ACL DoH query",
+        diag,
+    );
     assert_eq!(response.status, 200);
     assert_eq!(decode(&response.body).rcode(), Rcode::REFUSED);
 
     // DoH/2.
-    let mut h2 = H2Client::connect(server.doh2_addr().expect("doh2"), &pki.cert_der).await;
+    let mut h2 = H2Client::new(server.doh2_addr().expect("doh2"), &pki.cert_der);
     let (status, body) = h2
-        .request(
-            "https://localhost/dns-query".to_owned(),
+        .call(
+            Method::POST,
+            "https://localhost/dns-query",
             &query("acl.secure.test", Rtype::A),
+            "ACL DoH/2 query",
+            diag,
         )
         .await;
     assert_eq!(status, 200);
     assert_eq!(decode(&body).rcode(), Rcode::REFUSED);
 
     // DoQ.
-    let mut endpoint =
-        quinn::Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("endpoint");
-    endpoint.set_default_client_config(quic_client_config(&pki.cert_der));
-    let connection = endpoint
-        .connect(server.doq_addr().expect("doq"), "localhost")
-        .expect("connect")
-        .await
-        .expect("QUIC handshake");
-    let response = doq_query(&connection, &doq_wire("acl.secure.test", Rtype::A)).await;
+    let mut doq = DoqSession::new(server.doq_addr().expect("doq"), &pki.cert_der);
+    doq.connect("ACL DoQ connect", diag).await;
+    let response = doq
+        .query(
+            &doq_wire("acl.secure.test", Rtype::A),
+            "ACL DoQ query",
+            diag,
+        )
+        .await;
     assert_eq!(decode(&response).rcode(), Rcode::REFUSED);
-    connection.close(0_u32.into(), b"done");
-    endpoint.wait_idle().await;
 
     // DNSCrypt UDP.
-    let request = decode(&query("acl.secure.test", Rtype::A));
-    let response = dnscrypt_udp_query(
+    wait_dnscrypt_udp_listening(server.dnscrypt_udp_addr().expect("dnscrypt udp"), || {
+        server.stats().dnscrypt_udp_errors
+    });
+    let mut dnscrypt_udp = DnscryptUdpClient::new(
         server.dnscrypt_udp_addr().expect("dnscrypt udp"),
         &fixture.client,
-        &request,
-        TIMEOUT,
-    )
-    .expect("DNSCrypt UDP response");
+    );
+    let response = dnscrypt_udp.query(
+        &decode(&query("acl.secure.test", Rtype::A)),
+        "ACL DNSCrypt UDP",
+        diag,
+    );
     assert_eq!(response.rcode(), Rcode::REFUSED);
 
     // DNSCrypt TCP.
-    let mut stream =
-        TcpStream::connect(server.dnscrypt_tcp_addr().expect("dnscrypt tcp")).expect("connect");
-    let response = dnscrypt_tcp_query(&mut stream, &fixture.client, &request, TIMEOUT)
-        .expect("DNSCrypt TCP response");
+    let mut dnscrypt_tcp = DnscryptTcpClient::new(
+        server.dnscrypt_tcp_addr().expect("dnscrypt tcp"),
+        &fixture.client,
+    );
+    dnscrypt_tcp.ensure_connected("ACL DNSCrypt TCP connect", diag);
+    let response = dnscrypt_tcp.query(
+        &decode(&query("acl.secure.test", Rtype::A)),
+        "ACL DNSCrypt TCP",
+        diag,
+    );
     assert_eq!(response.rcode(), Rcode::REFUSED);
 
     let counters = server.stats();
-    assert_eq!(counters.refused_acl, 7, "one REFUSED per transport");
+    let transport_attempts = udp_attempts
+        + dot.sent
+        + doh.sent
+        + h2.sent
+        + doq.sent
+        + dnscrypt_udp.sent()
+        + dnscrypt_tcp.sent();
+    assert_eq!(
+        counters.refused_acl, transport_attempts,
+        "one REFUSED per transport attempt"
+    );
     assert!(
         server.resolver_stats().queries == 0,
         "ACL must run before the resolver"
     );
+    doq.close().await;
 }
 
 #[test]
@@ -749,19 +1212,21 @@ fn tls_allow_from_overrides_common_acl() {
     config.allow_from = vec!["127.0.0.0/8".to_owned()];
     config.tls_allow_from = vec!["192.0.2.0/24".to_owned()];
     let server = Server::start(&config).expect("server");
+    let diag = || server_diagnostics(&server);
 
     let request = make_query("plain.secure.test", Rtype::A, None);
-    let response =
-        udp_query(server.udp_addr().expect("udp"), &request, TIMEOUT).expect("udp response");
+    let response = udp_query_retry(server.udp_addr().expect("udp"), &request, "ACL UDP allowed");
     assert_eq!(response.rcode(), Rcode::NOERROR);
 
-    let mut dot = TestTlsClient::connect(server.dot_addr().expect("dot"), &pki.cert_der, b"dot")
-        .expect("DoT connect");
-    let response = dot
-        .dot_query(&query("plain.secure.test", Rtype::A))
-        .expect("DoT response");
+    let mut dot = DotSession::new(server.dot_addr().expect("dot"), &pki.cert_der, b"dot");
+    dot.connect("tls_allow_from DoT connect", diag);
+    let response = dot.query(
+        &query("plain.secure.test", Rtype::A),
+        "tls_allow_from DoT query",
+        diag,
+    );
     assert_eq!(decode(&response).rcode(), Rcode::REFUSED);
-    assert_eq!(server.stats().refused_acl, 1);
+    assert_eq!(server.stats().refused_acl, dot.sent);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -795,58 +1260,64 @@ async fn all_transports_run_together_and_shutdown_gracefully() {
 
     // UDP и TCP.
     let request = make_query("all.secure.test", Rtype::A, None);
-    let response = udp_query(plain_udp, &request, TIMEOUT).expect("udp");
+    let response = udp_query_retry(plain_udp, &request, "all UDP");
     assert_eq!(response.rcode(), Rcode::NOERROR);
-    let response = support::tcp_query(plain_tcp, &request, TIMEOUT).expect("tcp");
+    let response = support::tcp_query_retry(plain_tcp, &request, "all TCP");
     assert_eq!(response.rcode(), Rcode::NOERROR);
 
+    let diag = || server_diagnostics(&server);
+
     // DoT.
-    let mut dot = TestTlsClient::connect(dot_port, &pki.cert_der, b"dot").expect("dot");
-    let response = dot
-        .dot_query(&query("all.secure.test", Rtype::A))
-        .expect("dot response");
+    let mut dot = DotSession::new(dot_port, &pki.cert_der, b"dot");
+    let response = dot.query(&query("all.secure.test", Rtype::A), "all DoT", diag);
     assert_a(&decode(&response), Ipv4Addr::new(192, 0, 2, 10));
 
     // DoH/1.1.
-    let mut doh = TestTlsClient::connect(doh1_port, &pki.cert_der, b"http/1.1").expect("doh");
-    let response = doh
-        .https_post("/dns-query", &query("all.secure.test", Rtype::A))
-        .expect("doh response");
+    let mut doh = DohSession::new(doh1_port, &pki.cert_der, b"http/1.1");
+    let response = doh.call(
+        DohCall::Post(&query("all.secure.test", Rtype::A)),
+        "all DoH",
+        diag,
+    );
     assert_a(&decode(&response.body), Ipv4Addr::new(192, 0, 2, 10));
 
     // DoH/2.
-    let mut h2 = H2Client::connect(doh2_port, &pki.cert_der).await;
+    let mut h2 = H2Client::new(doh2_port, &pki.cert_der);
     let (status, body) = h2
-        .request(
-            "https://localhost/dns-query".to_owned(),
+        .call(
+            Method::POST,
+            "https://localhost/dns-query",
             &query("all.secure.test", Rtype::A),
+            "all DoH/2",
+            diag,
         )
         .await;
     assert_eq!(status, 200);
     assert_a(&decode(&body), Ipv4Addr::new(192, 0, 2, 10));
 
     // DoQ.
-    let mut endpoint =
-        quinn::Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("endpoint");
-    endpoint.set_default_client_config(quic_client_config(&pki.cert_der));
-    let connection = endpoint
-        .connect(quic_port, "localhost")
-        .expect("connect")
-        .await
-        .expect("QUIC handshake");
-    let response = doq_query(&connection, &doq_wire("all.secure.test", Rtype::A)).await;
+    let mut doq = DoqSession::new(quic_port, &pki.cert_der);
+    doq.connect("all DoQ connect", diag).await;
+    let response = doq
+        .query(&doq_wire("all.secure.test", Rtype::A), "all DoQ", diag)
+        .await;
     assert_a(&decode(&response), Ipv4Addr::new(192, 0, 2, 10));
-    connection.close(0_u32.into(), b"done");
-    endpoint.wait_idle().await;
 
     // DNSCrypt UDP/TCP.
-    let request = decode(&query("all.secure.test", Rtype::A));
-    let response =
-        dnscrypt_udp_query(dnscrypt_udp, &fixture.client, &request, TIMEOUT).expect("dnscrypt udp");
+    wait_dnscrypt_udp_listening(dnscrypt_udp, || server.stats().dnscrypt_udp_errors);
+    let mut dnscrypt_udp_client = DnscryptUdpClient::new(dnscrypt_udp, &fixture.client);
+    let response = dnscrypt_udp_client.query(
+        &decode(&query("all.secure.test", Rtype::A)),
+        "all DNSCrypt UDP",
+        diag,
+    );
     assert_a(&response, Ipv4Addr::new(192, 0, 2, 10));
-    let mut stream = TcpStream::connect(dnscrypt_tcp).expect("dnscrypt tcp");
-    let response =
-        dnscrypt_tcp_query(&mut stream, &fixture.client, &request, TIMEOUT).expect("dnscrypt tcp");
+    let mut dnscrypt_tcp_client = DnscryptTcpClient::new(dnscrypt_tcp, &fixture.client);
+    let response = dnscrypt_tcp_client.query(
+        &decode(&query("all.secure.test", Rtype::A)),
+        "all DNSCrypt TCP",
+        diag,
+    );
     assert_a(&response, Ipv4Addr::new(192, 0, 2, 10));
 
     // Метрики по транспортам.
@@ -866,8 +1337,21 @@ async fn all_transports_run_together_and_shutdown_gracefully() {
             "missing metrics for {transport}"
         );
     }
-    assert!(metrics.contains("pulseresolved_dot_handshakes_total 1"));
-    assert!(metrics.contains("pulseresolved_dnscrypt_tcp_connections_total 1"));
+    assert!(
+        metrics.contains(&format!(
+            "pulseresolved_dot_handshakes_total {}",
+            dot.connections
+        )),
+        "dot handshakes metric mismatch: {metrics}"
+    );
+    assert!(
+        metrics.contains(&format!(
+            "pulseresolved_dnscrypt_tcp_connections_total {}",
+            dnscrypt_tcp_client.connections()
+        )),
+        "dnscrypt tcp connections metric mismatch: {metrics}"
+    );
+    doq.close().await;
 
     server.shutdown().expect("shutdown");
     for addr in [dot_port, doh1_port, doh2_port, dnscrypt_tcp] {
@@ -891,11 +1375,14 @@ fn tls_reload_replaces_certificate_for_new_connections() {
     config.dot_listen = Some("127.0.0.1:0".parse().expect("addr"));
     let server = Server::start(&config).expect("server");
     let addr = server.dot_addr().expect("dot addr");
+    let diag = || server_diagnostics(&server);
 
-    let mut client = TestTlsClient::connect(addr, &pki.cert_der, b"dot").expect("first");
-    let response = client
-        .dot_query(&query("reload.secure.test", Rtype::A))
-        .expect("first response");
+    let mut client = DotSession::new(addr, &pki.cert_der, b"dot");
+    let response = client.query(
+        &query("reload.secure.test", Rtype::A),
+        "reload first DoT query",
+        diag,
+    );
     assert_eq!(decode(&response).rcode(), Rcode::NOERROR);
 
     let replacement = TestPki::generate();
@@ -904,11 +1391,12 @@ fn tls_reload_replaces_certificate_for_new_connections() {
     server.reload_tls().expect("reload tls");
     assert_eq!(server.stats().tls_reloads, 1);
 
-    let mut client =
-        TestTlsClient::connect(addr, &replacement.cert_der, b"dot").expect("new certificate");
-    let response = client
-        .dot_query(&query("reload.secure.test", Rtype::A))
-        .expect("second response");
+    let mut client = DotSession::new(addr, &replacement.cert_der, b"dot");
+    let response = client.query(
+        &query("reload.secure.test", Rtype::A),
+        "reload second DoT query",
+        diag,
+    );
     assert_eq!(decode(&response).rcode(), Rcode::NOERROR);
 
     assert!(
@@ -920,12 +1408,25 @@ fn tls_reload_replaces_certificate_for_new_connections() {
 // ---------------------------------------------------------------- helpers
 
 fn http_get(addr: SocketAddr, path: &str) -> String {
-    let mut stream = TcpStream::connect(addr).expect("metrics connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("timeout");
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write");
-    let mut response = String::new();
-    stream.read_to_string(&mut response).expect("read");
-    response
+    retry(
+        "metrics GET",
+        || format!("metrics {addr}"),
+        || {
+            let mut stream = TcpStream::connect(addr)
+                .map_err(|error| format!("metrics connect {addr}: {error}"))?;
+            stream
+                .set_read_timeout(Some(SOCKET_TIMEOUT))
+                .map_err(|error| format!("metrics timeout: {error}"))?;
+            write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .map_err(|error| format!("metrics write: {error}"))?;
+            stream
+                .flush()
+                .map_err(|error| format!("metrics flush: {error}"))?;
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .map_err(|error| format!("metrics read: {error}"))?;
+            Ok(response)
+        },
+    )
 }

@@ -13,11 +13,12 @@ use pulseresolved::config::{
 };
 use pulseresolved::server::Server;
 
+use support::e2e::SOCKET_TIMEOUT;
 use support::{
     MockUpstream, a_record, make_query, nxdomain_response, positive_response, udp_query,
 };
 
-const SHORT: Duration = Duration::from_millis(180);
+const SHORT: Duration = SOCKET_TIMEOUT;
 
 fn nxdomain_upstream() -> MockUpstream {
     MockUpstream::start(|request| Some(nxdomain_response(request, "example.test")))
@@ -201,14 +202,24 @@ fn metrics_expose_rrl_classes() {
 }
 
 fn http_get(addr: SocketAddr, path: &str) -> String {
-    let mut stream = TcpStream::connect(addr).expect("connect metrics");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("timeout");
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("request");
-    let mut response = String::new();
-    stream.read_to_string(&mut response).expect("response");
-    response
+    support::e2e::retry(
+        "rrl metrics GET",
+        || format!("metrics {addr}"),
+        || {
+            let mut stream = TcpStream::connect(addr)
+                .map_err(|error| format!("metrics connect {addr}: {error}"))?;
+            stream
+                .set_read_timeout(Some(SOCKET_TIMEOUT))
+                .map_err(|error| format!("metrics timeout: {error}"))?;
+            write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .map_err(|error| format!("metrics write: {error}"))?;
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .map_err(|error| format!("metrics read: {error}"))?;
+            Ok(response)
+        },
+    )
 }
 
 #[test]

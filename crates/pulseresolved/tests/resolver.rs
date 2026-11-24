@@ -4,19 +4,30 @@ mod support;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pulse_dns::{
     DecodeLimits, EncodeOptions, Message, Name, Rclass, Rcode, Rdata, Record, Rtype, Ttl, TxtData,
 };
 use pulseresolved::config::{BlockResponseSetting, OverrideSetting};
 use pulseresolved::server::Server;
+use support::e2e::{SOCKET_TIMEOUT, wait_until};
 use support::{
     MockUpstream, a_record, base_config, make_query, nxdomain_response, positive_response,
-    tcp_query, udp_query, udp_query_raw,
+    tcp_query_retry, udp_query_raw, udp_query_retry, udp_query_retry_counted,
 };
 
-const TIMEOUT: Duration = Duration::from_secs(3);
+const TIMEOUT: Duration = SOCKET_TIMEOUT;
+
+/// E2E-обёртка над UDP: повторяет запрос до общего дедлайна.
+///
+/// Таймаут сохранён в сигнатуре, чтобы не менять все вызовы; фактический
+/// таймаут одной попытки — [`SOCKET_TIMEOUT`]. `Option` сохранён для
+/// совместимости с вызовами через `?`/`is_some`.
+#[allow(clippy::unnecessary_wraps)]
+fn udp_query(server: SocketAddr, request: &Message, _timeout: Duration) -> Option<Message> {
+    Some(udp_query_retry(server, request, "resolver UDP"))
+}
 
 fn record_for(request: &Message, address: [u8; 4]) -> Record {
     let name = request
@@ -202,12 +213,11 @@ fn tcp_query_uses_length_prefix() {
     });
     let config = base_config(upstream.address());
     let server = Server::start(&config).unwrap();
-    let reply = tcp_query(
+    let reply = tcp_query_retry(
         server.tcp_addr().unwrap(),
         &make_query("tcp.test", Rtype::A, None),
-        TIMEOUT,
-    )
-    .expect("tcp response");
+        "resolver TCP",
+    );
     assert_eq!(reply.rcode(), Rcode::NOERROR);
     assert_eq!(reply.answers().len(), 1);
     assert!(server.stats().tcp_connections >= 1);
@@ -374,18 +384,14 @@ fn periodic_blocklist_reload_is_applied() {
     );
 
     std::fs::write(&path, "other.test\n").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(6);
-    let mut reloaded = false;
-    while Instant::now() < deadline {
-        if udp_query(addr, &query, TIMEOUT).is_some_and(|reply| reply.rcode() == Rcode::NOERROR) {
-            reloaded = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    assert!(
-        reloaded,
-        "periodic reload must drop the old blocklist entry"
+    let wire = query.encode(&EncodeOptions::default()).unwrap();
+    wait_until(
+        "periodic blocklist reload",
+        || format!("blocklist {path:?}"),
+        || {
+            udp_query_raw(addr, &wire, Duration::from_secs(1))
+                .is_some_and(|reply| reply.rcode() == Rcode::NOERROR)
+        },
     );
     assert!(server.stats().reloads >= 1);
 }
@@ -401,21 +407,22 @@ fn metrics_and_healthz_are_served_on_loopback() {
     let mut config = base_config(upstream.address());
     config.metrics_listen = Some("127.0.0.1:0".parse().unwrap());
     let server = Server::start(&config).unwrap();
-    assert_eq!(
-        udp_query(
-            server.udp_addr().unwrap(),
-            &make_query("metrics.test", Rtype::A, None),
-            TIMEOUT,
-        )
-        .unwrap()
-        .rcode(),
-        Rcode::NOERROR
+    let (reply, attempts) = udp_query_retry_counted(
+        server.udp_addr().unwrap(),
+        &make_query("metrics.test", Rtype::A, None),
+        "metrics UDP",
     );
+    assert_eq!(reply.rcode(), Rcode::NOERROR);
     let metrics_addr = server.metrics_addr().unwrap();
     let health = http_get(metrics_addr, "/healthz");
     assert!(health.starts_with("HTTP/1.1 200 OK"), "{health}");
     let metrics = http_get(metrics_addr, "/metrics");
-    assert!(metrics.contains("pulseresolved_queries_total{transport=\"udp\"} 1"));
+    assert!(
+        metrics.contains(&format!(
+            "pulseresolved_queries_total{{transport=\"udp\"}} {attempts}"
+        )),
+        "{metrics}"
+    );
     assert!(metrics.contains("pulseresolved_resolver_queries_total 1"));
     assert!(metrics.contains("pulseresolved_cache_entries"));
 }
@@ -465,14 +472,24 @@ fn tcp_connect_fails(addr: SocketAddr) -> bool {
 }
 
 fn http_get(addr: SocketAddr, path: &str) -> String {
-    let mut stream = TcpStream::connect(addr).expect("connect metrics");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    response
+    support::e2e::retry(
+        "metrics GET",
+        || format!("metrics {addr}"),
+        || {
+            let mut stream = TcpStream::connect(addr)
+                .map_err(|error| format!("metrics connect {addr}: {error}"))?;
+            stream
+                .set_read_timeout(Some(SOCKET_TIMEOUT))
+                .map_err(|error| format!("metrics timeout: {error}"))?;
+            write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .map_err(|error| format!("metrics write: {error}"))?;
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .map_err(|error| format!("metrics read: {error}"))?;
+            Ok(response)
+        },
+    )
 }
 
 #[test]

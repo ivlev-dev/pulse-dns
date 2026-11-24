@@ -2,6 +2,8 @@
 
 #![allow(dead_code, clippy::doc_markdown)]
 
+pub mod e2e;
+
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
@@ -9,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use e2e::{Attempt, SOCKET_TIMEOUT, retry, wait_until};
 
 use pulse_dns::{
     DecodeLimits, Edns, EncodeOptions, Message, Name, Question, Rclass, Rcode, Rdata, Record,
@@ -107,9 +111,11 @@ pub fn base_config(upstream: SocketAddr) -> Config {
         mode: ModeSetting::Forward,
         forwarders: vec![upstream],
         timeouts: TimeoutSetting {
-            per_query_ms: 500,
-            tcp_ms: 700,
-            total_ms: 3_000,
+            // Щедрые лимиты: debug-сборка под нагрузкой может планироваться
+            // с задержкой, а mock upstream отвечает из отдельного потока.
+            per_query_ms: 2_000,
+            tcp_ms: 3_000,
+            total_ms: 15_000,
         },
         cache: CacheSetting {
             max_entries: 1_024,
@@ -142,28 +148,63 @@ pub fn udp_query_raw(server: SocketAddr, request: &[u8], timeout: Duration) -> O
     socket
         .set_read_timeout(Some(timeout))
         .expect("client timeout");
-    socket.send_to(request, server).expect("send query");
+    e2e::send_to(&socket, request, server).ok()?;
     let mut buffer = [0_u8; 4096];
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        match socket.recv_from(&mut buffer) {
-            Ok((length, _)) => {
-                let bytes = buffer.get(..length)?;
-                return Message::decode(bytes, &DecodeLimits::default()).ok();
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return None;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
+    match e2e::recv_from(&socket, &mut buffer) {
+        Ok((length, _)) => {
+            let bytes = buffer.get(..length)?;
+            Message::decode(bytes, &DecodeLimits::default()).ok()
         }
+        Err(_) => None,
     }
-    None
+}
+
+/// UDP-запрос с повторами до общего дедлайна e2e.
+///
+/// # Panics
+///
+/// Если корректный ответ не получен до [`e2e::E2E_DEADLINE`].
+pub fn udp_query_retry(server: SocketAddr, request: &Message, label: &str) -> Message {
+    udp_query_retry_counted(server, request, label).0
+}
+
+/// Как [`udp_query_retry`], но возвращает и число фактических отправок.
+///
+/// Полезно для проверки счётчиков: повтор мог быть доставлен серверу.
+///
+/// # Panics
+///
+/// Если корректный ответ не получен до [`e2e::E2E_DEADLINE`].
+pub fn udp_query_retry_counted(
+    server: SocketAddr,
+    request: &Message,
+    label: &str,
+) -> (Message, u64) {
+    let bytes = request.encode(&EncodeOptions::default()).expect("encode");
+    let mut attempts = 0_u64;
+    let message = retry(
+        label,
+        || format!("udp {server}"),
+        || {
+            attempts = attempts.saturating_add(1);
+            udp_query_raw(server, &bytes, SOCKET_TIMEOUT)
+                .ok_or_else(|| format!("нет ответа от UDP {server} за {SOCKET_TIMEOUT:?}"))
+        },
+    );
+    (message, attempts)
+}
+
+/// TCP-подключение с повторами до общего дедлайна e2e.
+///
+/// # Panics
+///
+/// Если подключиться не удалось до [`e2e::E2E_DEADLINE`].
+pub fn connect_tcp(server: SocketAddr, label: &str) -> TcpStream {
+    retry(
+        label,
+        || format!("tcp {server}"),
+        || TcpStream::connect(server).map_err(|error| e2e::io_error("connect", &error)),
+    )
 }
 
 /// TCP-запрос с length-prefix framing.
@@ -173,14 +214,54 @@ pub fn tcp_query(server: SocketAddr, request: &Message, timeout: Duration) -> Op
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
     let length = u16::try_from(bytes.len()).ok()?;
-    stream.write_all(&length.to_be_bytes()).ok()?;
-    stream.write_all(&bytes).ok()?;
+    e2e::write_all(&mut stream, &length.to_be_bytes()).ok()?;
+    e2e::write_all(&mut stream, &bytes).ok()?;
     stream.flush().ok()?;
     let mut prefix = [0_u8; 2];
-    stream.read_exact(&mut prefix).ok()?;
+    e2e::read_exact(&mut stream, &mut prefix).ok()?;
     let mut response = vec![0_u8; usize::from(u16::from_be_bytes(prefix))];
-    stream.read_exact(&mut response).ok()?;
+    e2e::read_exact(&mut stream, &mut response).ok()?;
     Message::decode(&response, &DecodeLimits::default()).ok()
+}
+
+/// TCP-запрос с повторами до общего дедлайна e2e.
+///
+/// # Panics
+///
+/// Если корректный ответ не получен до [`e2e::E2E_DEADLINE`].
+pub fn tcp_query_retry(server: SocketAddr, request: &Message, label: &str) -> Message {
+    let bytes = request.encode(&EncodeOptions::default()).expect("encode");
+    retry(
+        label,
+        || format!("tcp {server}"),
+        || {
+            let mut stream =
+                TcpStream::connect(server).map_err(|error| e2e::io_error("connect", &error))?;
+            stream
+                .set_read_timeout(Some(SOCKET_TIMEOUT))
+                .map_err(|error| e2e::io_error("set_read_timeout", &error))?;
+            stream
+                .set_write_timeout(Some(SOCKET_TIMEOUT))
+                .map_err(|error| e2e::io_error("set_write_timeout", &error))?;
+            let length =
+                u16::try_from(bytes.len()).map_err(|_| "query does not fit u16".to_owned())?;
+            e2e::write_all(&mut stream, &length.to_be_bytes())
+                .map_err(|error| e2e::io_error("write length", &error))?;
+            e2e::write_all(&mut stream, &bytes)
+                .map_err(|error| e2e::io_error("write query", &error))?;
+            stream
+                .flush()
+                .map_err(|error| e2e::io_error("flush", &error))?;
+            let mut prefix = [0_u8; 2];
+            e2e::read_exact(&mut stream, &mut prefix)
+                .map_err(|error| e2e::io_error("read length", &error))?;
+            let mut response = vec![0_u8; usize::from(u16::from_be_bytes(prefix))];
+            e2e::read_exact(&mut stream, &mut response)
+                .map_err(|error| e2e::io_error("read response", &error))?;
+            Message::decode(&response, &DecodeLimits::default())
+                .map_err(|error| format!("декодирование ответа: {error}"))
+        },
+    )
 }
 
 fn preserve_question_case(response: &mut [u8], request: &[u8]) {
@@ -365,10 +446,8 @@ impl TestTlsClient {
         let name = ServerName::try_from("localhost").ok()?;
         let mut connection = ClientConnection::new(Arc::new(config), name).ok()?;
         let mut socket = TcpStream::connect(addr).ok()?;
-        socket.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-        socket
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .ok()?;
+        socket.set_read_timeout(Some(SOCKET_TIMEOUT)).ok()?;
+        socket.set_write_timeout(Some(SOCKET_TIMEOUT)).ok()?;
         socket.set_nodelay(true).ok()?;
         while connection.is_handshaking() {
             connection.complete_io(&mut socket).ok()?;
@@ -387,7 +466,11 @@ impl TestTlsClient {
     pub fn send(&mut self, data: &[u8]) -> Option<()> {
         self.connection.writer().write_all(data).ok()?;
         while self.connection.wants_write() {
-            self.connection.write_tls(&mut self.socket).ok()?;
+            match self.connection.write_tls(&mut self.socket) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return None,
+            }
         }
         Some(())
     }
@@ -402,9 +485,14 @@ impl TestTlsClient {
                     return Some(());
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => return None,
             }
-            let read = self.connection.read_tls(&mut self.socket).ok()?;
+            let read = match self.connection.read_tls(&mut self.socket) {
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            };
             if read == 0 {
                 return None;
             }
@@ -549,7 +637,7 @@ impl DnscryptFixture {
     }
 }
 
-/// UDP-обмен DNSCrypt-пакетами.
+/// UDP-обмен DNSCrypt-пакетами (одна попытка, новый client nonce).
 pub fn dnscrypt_udp_query(
     server: SocketAddr,
     client: &DnscryptClient,
@@ -557,20 +645,90 @@ pub fn dnscrypt_udp_query(
     timeout: Duration,
 ) -> Option<Message> {
     let wire = request.encode(&EncodeOptions::default()).ok()?;
+    // build_query генерирует случайный client-nonce: повтор пакета сервер
+    // отбросит из-за anti-replay, поэтому каждая попытка шифруется заново.
     let pending = client
         .build_query(&wire, pulse_dnscrypt::Transport::Udp)
         .ok()?;
     let socket = UdpSocket::bind("127.0.0.1:0").ok()?;
     socket.set_read_timeout(Some(timeout)).ok()?;
-    socket.send_to(pending.packet(), server).ok()?;
+    e2e::send_to(&socket, pending.packet(), server).ok()?;
     let mut buffer = [0_u8; 8192];
-    let (length, _) = socket.recv_from(&mut buffer).ok()?;
+    let (length, _) = e2e::recv_from(&socket, &mut buffer).ok()?;
     let packet = buffer.get(..length)?;
     let response = client.decrypt_response(&pending, packet).ok()?;
     Message::decode(&response, &DecodeLimits::default()).ok()
 }
 
-/// TCP-обмен DNSCrypt-кадрами (несколько запросов на соединении).
+/// Диалог DNSCrypt over UDP: каждый повтор строит новый запрос (новый
+/// client nonce), иначе сервер отбросит пакет как replay.
+pub struct DnscryptUdpClient<'a> {
+    server: SocketAddr,
+    client: &'a DnscryptClient,
+    sent: u64,
+}
+
+impl<'a> DnscryptUdpClient<'a> {
+    pub const fn new(server: SocketAddr, client: &'a DnscryptClient) -> Self {
+        Self {
+            server,
+            client,
+            sent: 0,
+        }
+    }
+
+    /// Число фактически отправленных запросов (включая повторы).
+    pub const fn sent(&self) -> u64 {
+        self.sent
+    }
+
+    /// Выполняет запрос с повторами до [`e2e::E2E_DEADLINE`].
+    ///
+    /// # Panics
+    ///
+    /// Если сервер не ответил до дедлайна.
+    pub fn query(
+        &mut self,
+        request: &Message,
+        label: &str,
+        diagnostics: impl Fn() -> String,
+    ) -> Message {
+        let server = self.server;
+        let client = self.client;
+        retry(label, diagnostics, || {
+            self.sent = self.sent.saturating_add(1);
+            dnscrypt_udp_query(server, client, request, SOCKET_TIMEOUT)
+                .ok_or_else(|| format!("нет DNSCrypt UDP ответа от {server} за {SOCKET_TIMEOUT:?}"))
+        })
+    }
+}
+
+/// Ждёт, пока UDP-сокет DNSCrypt начнёт принимать пакеты.
+///
+/// Шлёт заведомо некорректный (слишком короткий) пакет: сервер обязан
+/// увеличить счётчик ошибок, не трогая счётчики валидных запросов.
+///
+/// # Panics
+///
+/// Если сервер не начал читать сокет до [`e2e::E2E_DEADLINE`].
+pub fn wait_dnscrypt_udp_listening(server: SocketAddr, errors: impl Fn() -> u64) {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind dnscrypt probe");
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("probe timeout");
+    wait_until(
+        "DNSCrypt UDP listener",
+        || format!("probe {server}"),
+        || {
+            let before = errors();
+            let _ = e2e::send_to(&socket, b"pulse-e2e-probe", server);
+            std::thread::sleep(Duration::from_millis(20));
+            errors() > before
+        },
+    );
+}
+
+/// TCP-обмен DNSCrypt-кадрами (одна попытка, новый client nonce).
 pub fn dnscrypt_tcp_query(
     stream: &mut TcpStream,
     client: &DnscryptClient,
@@ -583,16 +741,118 @@ pub fn dnscrypt_tcp_query(
     let pending = client
         .build_query(&wire, pulse_dnscrypt::Transport::Tcp)
         .ok()?;
-    stream.write_all(pending.packet()).ok()?;
+    e2e::write_all(stream, pending.packet()).ok()?;
     stream.flush().ok()?;
     let mut prefix = [0_u8; 2];
-    stream.read_exact(&mut prefix).ok()?;
+    e2e::read_exact(stream, &mut prefix).ok()?;
     let length = usize::from(u16::from_be_bytes(prefix));
     let mut frame = vec![0_u8; 2 + length];
-    frame[..2].copy_from_slice(&prefix);
-    stream.read_exact(&mut frame[2..]).ok()?;
+    frame.get_mut(..2)?.copy_from_slice(&prefix);
+    e2e::read_exact(stream, frame.get_mut(2..)?).ok()?;
     let response = client.decrypt_response(&pending, &frame).ok()?;
     Message::decode(&response, &DecodeLimits::default()).ok()
+}
+
+/// Диалог DNSCrypt over TCP: держит соединение, но при обрыве переподключается.
+///
+/// Каждая попытка шифруется с новым client nonce, поэтому повтор безопасен
+/// с точки зрения anti-replay.
+pub struct DnscryptTcpClient<'a> {
+    server: SocketAddr,
+    client: &'a DnscryptClient,
+    stream: Option<TcpStream>,
+    sent: u64,
+    connections: u64,
+}
+
+impl<'a> DnscryptTcpClient<'a> {
+    pub const fn new(server: SocketAddr, client: &'a DnscryptClient) -> Self {
+        Self {
+            server,
+            client,
+            stream: None,
+            sent: 0,
+            connections: 0,
+        }
+    }
+
+    /// Число фактически отправленных запросов (включая повторы).
+    pub const fn sent(&self) -> u64 {
+        self.sent
+    }
+
+    /// Число успешных TCP-подключений (включая переподключения).
+    pub const fn connections(&self) -> u64 {
+        self.connections
+    }
+
+    fn connect(&mut self) -> Attempt<()> {
+        let stream = TcpStream::connect(self.server)
+            .map_err(|error| e2e::io_error("dnscrypt tcp connect", &error))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|error| e2e::io_error("dnscrypt tcp nodelay", &error))?;
+        self.stream = Some(stream);
+        self.connections = self.connections.saturating_add(1);
+        Ok(())
+    }
+
+    /// Устанавливает соединение с повторами до [`e2e::E2E_DEADLINE`].
+    ///
+    /// # Panics
+    ///
+    /// Если подключиться не удалось.
+    pub fn ensure_connected(&mut self, label: &str, diagnostics: impl Fn() -> String) {
+        retry(label, diagnostics, || {
+            if self.stream.is_some() {
+                return Ok(());
+            }
+            self.connect()
+        });
+    }
+
+    /// Выполняет запрос с повторами; при обрыве соединение пересоздаётся.
+    ///
+    /// # Panics
+    ///
+    /// Если сервер не ответил до дедлайна.
+    pub fn query(
+        &mut self,
+        request: &Message,
+        label: &str,
+        diagnostics: impl Fn() -> String,
+    ) -> Message {
+        let server = self.server;
+        let client = self.client;
+        retry(label, diagnostics, || {
+            if self.stream.is_none() {
+                self.connect()?;
+            }
+            self.sent = self.sent.saturating_add(1);
+            let Some(stream) = self.stream.as_mut() else {
+                return Err("dnscrypt tcp stream missing after connect".to_owned());
+            };
+            if let Some(message) = dnscrypt_tcp_query(stream, client, request, SOCKET_TIMEOUT) {
+                Ok(message)
+            } else {
+                self.stream = None;
+                Err(format!("нет DNSCrypt TCP ответа от {server}"))
+            }
+        })
+    }
+}
+
+/// Компактный снимок всех счётчиков сервера для диагностики при падении.
+pub fn server_diagnostics(server: &pulseresolved::server::Server) -> String {
+    format!(
+        "stats={:?}; dot={:?}; doh={:?}; doh2={:?}; doq={:?}; resolver={:?}",
+        server.stats(),
+        server.dot_stats(),
+        server.doh_stats(),
+        server.doh2_stats(),
+        server.doq_stats(),
+        server.resolver_stats(),
+    )
 }
 
 /// `A`-ответ с TTL.

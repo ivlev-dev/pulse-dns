@@ -11,7 +11,10 @@ use pulseresolved::config::{Config, ControlSetting, ControlToken, RrlSetting, Tr
 use pulseresolved::server::Server;
 use serde_json::Value;
 
-use support::{MockUpstream, a_record, base_config, make_query, positive_response, udp_query};
+use support::e2e::{SOCKET_TIMEOUT, retry};
+use support::{
+    MockUpstream, a_record, base_config, make_query, positive_response, udp_query_retry,
+};
 
 const TOKEN: &str = "test-control-token";
 
@@ -52,6 +55,14 @@ fn request(
     request_with_id(addr, method, path, body, token, None)
 }
 
+fn control_connect(addr: SocketAddr) -> TcpStream {
+    retry(
+        "control connect",
+        || format!("control {addr}"),
+        || TcpStream::connect(addr).map_err(|error| format!("connect {addr}: {error}")),
+    )
+}
+
 fn request_with_id(
     addr: SocketAddr,
     method: &str,
@@ -60,12 +71,12 @@ fn request_with_id(
     token: Option<&str>,
     request_id: Option<&str>,
 ) -> RawResponse {
-    let mut stream = TcpStream::connect(addr).expect("connect control");
+    let mut stream = control_connect(addr);
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
         .expect("read timeout");
     stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(SOCKET_TIMEOUT))
         .expect("write timeout");
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n",
@@ -89,9 +100,9 @@ fn request_with_id(
 }
 
 fn raw_request(addr: SocketAddr, bytes: &[u8]) -> RawResponse {
-    let mut stream = TcpStream::connect(addr).expect("connect control");
+    let mut stream = control_connect(addr);
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
         .expect("read timeout");
     stream.write_all(bytes).expect("write raw");
     stream.flush().expect("flush");
@@ -215,7 +226,7 @@ fn cache_stats_and_purge_by_name_and_type() {
     let dns = server.udp_addr().expect("udp");
 
     let query = make_query("first.example", Rtype::A, None);
-    let response = udp_query(dns, &query, Duration::from_secs(2)).expect("dns response");
+    let response = udp_query_retry(dns, &query, "control cache DNS");
     assert_eq!(response.rcode(), Rcode::NOERROR);
 
     let stats = request(addr, "GET", "/api/v1/cache/stats", &[], Some(TOKEN));
@@ -233,7 +244,7 @@ fn cache_stats_and_purge_by_name_and_type() {
     assert!(purge.json()["purged"].as_u64().is_some_and(|n| n >= 1));
 
     let query = make_query("second.example", Rtype::A, None);
-    let _ = udp_query(dns, &query, Duration::from_secs(2)).expect("dns response");
+    let _ = udp_query_retry(dns, &query, "control cache second DNS");
     let purge = request(
         addr,
         "POST",
@@ -285,7 +296,7 @@ fn blocklist_reload_applies_new_file() {
 
     let dns = server.udp_addr().expect("udp");
     let query = make_query("second.test", Rtype::A, None);
-    let response = udp_query(dns, &query, Duration::from_secs(2)).expect("dns response");
+    let response = udp_query_retry(dns, &query, "control blocklist DNS");
     assert_eq!(response.rcode(), Rcode::NXDOMAIN);
     drop(server);
 }

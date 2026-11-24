@@ -13,9 +13,15 @@ use pulseresolved::config::{Config, ModeSetting, UpstreamPoolSetting, UpstreamSe
 use pulseresolved::server::Server;
 use rcgen::{CertificateParams, KeyPair};
 
-use support::{make_query, udp_query};
+use support::{make_query, udp_query_retry};
 
-const TIMEOUT: Duration = Duration::from_secs(3);
+const TIMEOUT: Duration = support::e2e::SOCKET_TIMEOUT;
+
+/// E2E-обёртка: повторяет запрос до общего дедлайна.
+#[allow(clippy::unnecessary_wraps)]
+fn udp_query(server: SocketAddr, request: &Message, _timeout: Duration) -> Option<Message> {
+    Some(udp_query_retry(server, request, "secure upstream UDP"))
+}
 
 struct TestCert {
     cert_pem: String,

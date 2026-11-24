@@ -5,15 +5,26 @@ mod support;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pulse_dns::{
-    Name, NsecData, Rclass, Rcode, Rdata, Record, Rrset, RrsigData, Rtype, Serial, SoaData, Ttl,
-    TypeBitmap,
+    Message, Name, NsecData, Rclass, Rcode, Rdata, Record, Rrset, RrsigData, Rtype, Serial,
+    SoaData, Ttl, TypeBitmap,
 };
 use pulse_dnssec::{Algorithm, DsPolicy, PrivateKey, SignOptions, ds_from_dnskey, sign_rrset};
 use pulseresolved::config::TrustAnchorSetting;
 use pulseresolved::server::Server;
-use support::{MockUpstream, base_config, make_query, udp_query};
+use support::{MockUpstream, base_config, make_query, udp_query_retry};
 
-const TIMEOUT: Duration = Duration::from_secs(3);
+const TIMEOUT: Duration = support::e2e::SOCKET_TIMEOUT;
+
+/// E2E-обёртка: повторяет запрос до общего дедлайна, таймаут сохранён
+/// в сигнатуре для единообразия с остальными тестами.
+#[allow(clippy::unnecessary_wraps)]
+fn udp_query(
+    server: std::net::SocketAddr,
+    request: &Message,
+    _timeout: Duration,
+) -> Option<Message> {
+    Some(udp_query_retry(server, request, "dnssec UDP"))
+}
 
 struct SignedZone {
     zone: Name,
