@@ -299,7 +299,7 @@ fn api_mutations_are_visible_to_dns() {
     let deleted = request(
         api,
         "DELETE",
-        ZONE_PATH,
+        &format!("{ZONE_PATH}?confirm_origin={ORIGIN}"),
         &[("Authorization", &bearer), ("If-Match", &zone_etag)],
         None,
     );
@@ -348,4 +348,153 @@ fn api_mutations_are_visible_to_dns() {
         recv_from(&socket, &mut buffer).is_err(),
         "UDP listener must close"
     );
+}
+
+fn wait_http_job(api: SocketAddr, location: &str) -> serde_json::Value {
+    for _ in 0..200 {
+        let response = request(api, "GET", location, &[("Authorization", &auth())], None);
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let job = response.json();
+        if matches!(job["state"].as_str(), Some("done" | "failed" | "cancelled")) {
+            return job;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("job did not finish");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn api_post_serial_import_and_audit() {
+    let (_zone, config) = test_config();
+    let mut server = Server::start_with_api(
+        &config,
+        Some(ApiOptions {
+            listen: "127.0.0.1:0".parse().expect("api"),
+            token: TOKEN.to_owned(),
+            scopes: Vec::new(),
+        }),
+    )
+    .expect("start DNS+API");
+    let api = server.api_addr().expect("api enabled");
+    let bearer = auth();
+
+    let created = request(
+        api,
+        "POST",
+        "/api/v1/zones",
+        &[
+            ("Authorization", &bearer),
+            ("Idempotency-Key", "pulsed-post-zone-1"),
+        ],
+        Some(br#"{"origin":"imported.test.","kind":"primary","default_ttl":3600}"#),
+    );
+    assert_eq!(
+        created.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&created.body)
+    );
+    assert_eq!(
+        created.header("location"),
+        Some("/api/v1/zones/imported.test.")
+    );
+
+    let zonefile = "$TTL 3600\n\
+        @ IN SOA ns1.imported.test. hostmaster.imported.test. 7 3600 600 604800 300\n\
+        @ IN NS ns1.imported.test.\n\
+        www IN A 192.0.2.77\n";
+    let accepted = request(
+        api,
+        "POST",
+        "/api/v1/zones/imported.test./import",
+        &[
+            ("Authorization", &bearer),
+            ("Content-Type", "text/plain"),
+            ("Idempotency-Key", "pulsed-import-1"),
+        ],
+        Some(zonefile.as_bytes()),
+    );
+    assert_eq!(
+        accepted.status,
+        202,
+        "{}",
+        String::from_utf8_lossy(&accepted.body)
+    );
+    let location = accepted
+        .header("location")
+        .expect("job location")
+        .to_owned();
+    let job = wait_http_job(api, &location);
+    assert_eq!(job["state"], "done");
+    assert_eq!(job["result"]["applied"], true);
+    assert_eq!(job["result"]["serial"], 7);
+
+    let response = dns_query(&server, "www.imported.test.", Rtype::A);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    assert_eq!(
+        response.answers().first().map(pulse_dns::Record::rdata),
+        Some(&Rdata::A("192.0.2.77".parse().expect("ipv4")))
+    );
+
+    let serial = request(
+        api,
+        "GET",
+        "/api/v1/zones/imported.test./serial",
+        &[("Authorization", &bearer)],
+        None,
+    );
+    assert_eq!(serial.status, 200);
+    assert_eq!(serial.json()["serial"], 7);
+
+    let incremented = request(
+        api,
+        "POST",
+        "/api/v1/zones/imported.test./serial",
+        &[("Authorization", &bearer)],
+        Some(br#"{"mode":"increment"}"#),
+    );
+    assert_eq!(incremented.status, 200);
+    assert_eq!(incremented.json()["new_serial"], 8);
+
+    let outgoing = request(
+        api,
+        "POST",
+        "/api/v1/zones/imported.test./transfers",
+        &[("Authorization", &bearer)],
+        Some(br#"{"kind":"axfr"}"#),
+    );
+    assert_eq!(outgoing.status, 200);
+    assert_eq!(outgoing.json()["outgoing"], true);
+
+    let transfers = request(
+        api,
+        "GET",
+        "/api/v1/zones/imported.test./transfers",
+        &[("Authorization", &bearer)],
+        None,
+    );
+    assert_eq!(transfers.status, 200);
+    assert_eq!(transfers.json()["zone"], "imported.test.");
+
+    let audit = request(
+        api,
+        "GET",
+        "/api/v1/audit?limit=5",
+        &[("Authorization", &bearer)],
+        None,
+    );
+    assert_eq!(audit.status, 200);
+    assert!(
+        audit.json()["items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+
+    server.shutdown().expect("shutdown");
 }

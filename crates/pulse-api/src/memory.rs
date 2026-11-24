@@ -18,14 +18,17 @@ use crate::base64url;
 use crate::error::{AdminError, InvariantViolation};
 use crate::etag::{normalize_tag, rrset_etag, zone_etag};
 use crate::port::{
-    Denial, ListRrsets, ListZones, Precondition, Preconditions, RrsetInput, RrsetPage, RrsetPatch,
-    RrsetPatchOutcome, RrsetView, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneId, ZoneKind,
-    ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, ZoneView,
+    Denial, ImportMode, ImportReport, KeyRotationKeyView, KeyRotationView, ListRrsets, ListZones,
+    Precondition, Preconditions, RolloverRequest, RrsetInput, RrsetPage, RrsetPatch,
+    RrsetPatchOutcome, RrsetView, SerialState, SerialUpdate, SerialUpdateResult, TransferRequest,
+    TransferResult, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneId, ZoneKind, ZoneMetaInput, ZonePage,
+    ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, ZoneView, next_serial,
 };
 use crate::rdata_text::is_managed_type;
 
 type RrsetKey = (String, u16);
 
+#[derive(Clone)]
 struct RrsetRecord {
     rrset: Rrset,
     etag: String,
@@ -142,6 +145,8 @@ pub struct InMemoryZoneAdmin {
     next_id: AtomicU32,
     next_txn: AtomicU64,
     ready: AtomicBool,
+    /// Синтетическое состояние ротации ключей для тестов/`pulsed` без DNSSEC.
+    rotation: Mutex<HashMap<String, KeyRotationView>>,
 }
 
 impl InMemoryZoneAdmin {
@@ -152,6 +157,7 @@ impl InMemoryZoneAdmin {
             next_id: AtomicU32::new(1),
             next_txn: AtomicU64::new(1),
             ready: AtomicBool::new(true),
+            rotation: Mutex::new(HashMap::new()),
         }
     }
 
@@ -846,6 +852,276 @@ impl ZoneAdmin for InMemoryZoneAdmin {
         Ok(data.view())
     }
 
+    fn create_zone(&self, origin: &Name, meta: &ZoneMetaInput) -> Result<ZoneView, AdminError> {
+        if origin == &Name::root() || origin.labels().any(|label| label == b"*") {
+            return Err(AdminError::invariant(
+                "/origin",
+                "invalid-origin",
+                "zone origin must be a non-root name without wildcards",
+            ));
+        }
+        let key = Self::zone_key(origin);
+        let mut catalog = self.catalog.write().unwrap_or_else(PoisonError::into_inner);
+        if catalog.contains_key(&key) {
+            return Err(AdminError::Conflict(crate::error::Conflict::ZoneExists));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let txn = self.next_txn();
+        let now = std::time::SystemTime::now();
+        let data = ZoneData {
+            id: ZoneId::new(id),
+            origin: origin.clone(),
+            kind: meta.kind,
+            serial: Serial::new(1),
+            version: 1,
+            txn,
+            default_ttl: meta.default_ttl,
+            denial: meta.denial,
+            rrsets: BTreeMap::new(),
+            nodes: HashSet::from([origin.clone()]),
+            created_at: now,
+            updated_at: now,
+        };
+        let view = data.view();
+        catalog.insert(key, Arc::new(Mutex::new(data)));
+        Ok(view)
+    }
+
+    fn get_serial(&self, origin: &Name) -> Result<SerialState, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let data = lock_zone(&zone);
+        Ok(SerialState {
+            zone: origin.clone(),
+            serial: zone_serial(&data),
+            version: data.version,
+            etag: data.etag(),
+            updated_at: data.updated_at,
+        })
+    }
+
+    fn update_serial(
+        &self,
+        origin: &Name,
+        update: SerialUpdate,
+        preconditions: &Preconditions,
+    ) -> Result<SerialUpdateResult, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let mut data = lock_zone(&zone);
+        self.check_writable(&data)?;
+        check_optional_existing(preconditions, &data.etag(), data.version)?;
+        let old_serial = zone_serial(&data);
+        let new_serial = next_serial(old_serial, update)?;
+        if let Some(record) = data
+            .rrsets
+            .get(&Self::rrset_key(origin, Rtype::SOA))
+            .cloned()
+            && let Some(Rdata::Soa(soa)) = record.rrset.rdatas().first()
+        {
+            let mut next_soa = soa.clone();
+            next_soa.serial = new_serial;
+            let rrset = Rrset::new(
+                origin.clone(),
+                Rtype::SOA,
+                Rclass::IN,
+                record.rrset.ttl(),
+                [Rdata::Soa(next_soa)],
+            )
+            .map_err(map_rrset_error)?;
+            let etag = rrset_etag(&rrset);
+            data.rrsets.insert(
+                Self::rrset_key(origin, Rtype::SOA),
+                RrsetRecord {
+                    rrset,
+                    etag,
+                    updated_at: std::time::SystemTime::now(),
+                },
+            );
+        }
+        data.serial = new_serial;
+        data.version = data.version.saturating_add(1);
+        data.txn = self.next_txn();
+        data.updated_at = std::time::SystemTime::now();
+        Ok(SerialUpdateResult {
+            zone: origin.clone(),
+            old_serial,
+            new_serial,
+            version: data.version,
+            etag: data.etag(),
+            updated_at: data.updated_at,
+        })
+    }
+
+    fn trigger_transfer(
+        &self,
+        origin: &Name,
+        request: &TransferRequest,
+    ) -> Result<TransferResult, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let data = lock_zone(&zone);
+        match data.kind {
+            ZoneKind::Primary => Ok(TransferResult {
+                zone: origin.clone(),
+                kind: request.kind,
+                mode_used: request.kind,
+                serial: Some(zone_serial(&data)),
+                rrsets: Some(u32::try_from(data.rrsets.len()).unwrap_or(u32::MAX)),
+                bytes: None,
+                peer: request.peer.clone(),
+                outgoing: true,
+            }),
+            ZoneKind::Secondary => {
+                if let Some(from_serial) = request.from_serial
+                    && Serial::new(from_serial).is_newer_than(zone_serial(&data)) != Some(false)
+                {
+                    return Err(AdminError::invariant(
+                        "/from_serial",
+                        "serial-not-older",
+                        "from_serial must be older than the current serial",
+                    ));
+                }
+                Ok(TransferResult {
+                    zone: origin.clone(),
+                    kind: request.kind,
+                    mode_used: request.kind,
+                    serial: Some(zone_serial(&data)),
+                    rrsets: Some(u32::try_from(data.rrsets.len()).unwrap_or(u32::MAX)),
+                    bytes: Some(0),
+                    peer: request.peer.clone(),
+                    outgoing: false,
+                })
+            }
+            ZoneKind::Forward => Err(AdminError::Conflict(
+                crate::error::Conflict::InvalidZoneState,
+            )),
+        }
+    }
+
+    fn import_zone(
+        &self,
+        origin: &Name,
+        text: &str,
+        mode: ImportMode,
+    ) -> Result<ImportReport, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let mut data = lock_zone(&zone);
+        self.check_writable(&data)?;
+        let parsed = pulse_master::parse_zone(origin.clone(), text).map_err(|error| {
+            AdminError::invariant("/body", "invalid-zonefile", error.to_string())
+        })?;
+        let warnings: Vec<String> = parsed
+            .warnings
+            .iter()
+            .map(|warning| warning.kind.to_string())
+            .collect();
+        let imported = rrsets_from_parsed(&parsed)?;
+        let mut rrsets = if mode == ImportMode::Merge {
+            data.rrsets
+                .values()
+                .map(|record| record.rrset.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for rrset in imported {
+            let key = (rrset.owner().to_string(), rrset.rr_type().as_u16());
+            rrsets.retain(|existing| {
+                (existing.owner().to_string(), existing.rr_type().as_u16()) != key
+            });
+            rrsets.push(rrset);
+        }
+        let (records, nodes, serial) =
+            build_zone_records(origin, rrsets, std::time::SystemTime::now())?;
+        let count = u32::try_from(records.len()).unwrap_or(u32::MAX);
+        if mode == ImportMode::Check {
+            return Ok(ImportReport {
+                zone: origin.clone(),
+                mode,
+                rrsets: count,
+                serial: Some(serial),
+                warnings,
+                applied: false,
+            });
+        }
+        data.rrsets = records;
+        data.nodes = nodes;
+        data.serial = serial;
+        data.version = data.version.saturating_add(1);
+        data.txn = self.next_txn();
+        data.updated_at = std::time::SystemTime::now();
+        Ok(ImportReport {
+            zone: origin.clone(),
+            mode,
+            rrsets: count,
+            serial: Some(serial),
+            warnings,
+            applied: true,
+        })
+    }
+
+    fn rollover_keys(
+        &self,
+        origin: &Name,
+        request: &RolloverRequest,
+    ) -> Result<KeyRotationView, AdminError> {
+        let (_catalog, zone) = self.zone_handle(origin)?;
+        let _data = lock_zone(&zone);
+        let role = match request.role.as_str() {
+            "ksk" => "ksk",
+            "zsk" => "zsk",
+            _ => {
+                return Err(AdminError::invariant(
+                    "/role",
+                    "invalid-role",
+                    "role must be ksk or zsk",
+                ));
+            }
+        };
+        let now = unix_now();
+        let mut rotation = self.rotation.lock().unwrap_or_else(PoisonError::into_inner);
+        let view = rotation
+            .entry(Self::zone_key(origin))
+            .or_insert_with(|| KeyRotationView {
+                keys: vec![
+                    KeyRotationKeyView {
+                        key_tag: 1,
+                        role: "ksk".to_owned(),
+                        state: "active".to_owned(),
+                        created_at: now,
+                        next_transition: None,
+                    },
+                    KeyRotationKeyView {
+                        key_tag: 2,
+                        role: "zsk".to_owned(),
+                        state: "active".to_owned(),
+                        created_at: now,
+                        next_transition: None,
+                    },
+                ],
+                next_event_at: None,
+            });
+        if view.keys.iter().any(|key| {
+            key.role == role && matches!(key.state.as_str(), "pre_publish" | "double_sign")
+        }) {
+            return Err(AdminError::Conflict(crate::error::Conflict::ZoneBusy));
+        }
+        let next_transition = now.saturating_add(request.overlap.max(1));
+        let key_tag = u16::try_from(view.keys.len().saturating_add(3)).unwrap_or(3);
+        view.keys.push(KeyRotationKeyView {
+            key_tag,
+            role: role.to_owned(),
+            state: "pre_publish".to_owned(),
+            created_at: now,
+            next_transition: Some(next_transition),
+        });
+        view.next_event_at = view.keys.iter().filter_map(|key| key.next_transition).min();
+        Ok(view.clone())
+    }
+
+    fn key_rotation(&self, origin: &Name) -> Result<Option<KeyRotationView>, AdminError> {
+        let rotation = self.rotation.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(rotation.get(&Self::zone_key(origin)).cloned())
+    }
+
     fn put_zone(
         &self,
         origin: &Name,
@@ -1216,6 +1492,84 @@ fn decode_rrset_cursor(cursor: &str) -> Result<(String, u16), AdminError> {
         .parse::<u16>()
         .map_err(|_| AdminError::InvalidCursor)?;
     Ok((owner.to_owned(), rr_type))
+}
+
+fn zone_serial(data: &ZoneData) -> Serial {
+    data.rrsets
+        .get(&(data.origin.to_string(), Rtype::SOA.as_u16()))
+        .and_then(|record| match record.rrset.rdatas().first() {
+            Some(Rdata::Soa(soa)) => Some(soa.serial),
+            _ => None,
+        })
+        .unwrap_or(data.serial)
+}
+
+fn check_optional_existing(
+    preconditions: &Preconditions,
+    current_etag: &str,
+    version: u64,
+) -> Result<(), AdminError> {
+    if let Some(condition) = &preconditions.if_none_match
+        && condition_matches(condition, current_etag)
+    {
+        return Err(AdminError::PreconditionFailed {
+            current_etag: Some(current_etag.to_owned()),
+            current_version: Some(version),
+        });
+    }
+    if let Some(condition) = &preconditions.if_match
+        && !condition_matches(condition, current_etag)
+    {
+        return Err(AdminError::PreconditionFailed {
+            current_etag: Some(current_etag.to_owned()),
+            current_version: Some(version),
+        });
+    }
+    Ok(())
+}
+
+fn rrsets_from_parsed(parsed: &pulse_master::ParsedZone) -> Result<Vec<Rrset>, AdminError> {
+    let mut groups: HashMap<(Name, Rtype), (Ttl, Vec<Rdata>)> = HashMap::new();
+    for record in &parsed.records {
+        let key = (record.owner().clone(), record.rr_type());
+        match groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 != record.ttl() {
+                    return Err(AdminError::invariant(
+                        "/body",
+                        "ttl-mismatch",
+                        "records of one RRset must share the TTL",
+                    ));
+                }
+                entry.get_mut().1.push(record.rdata().clone());
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((record.ttl(), vec![record.rdata().clone()]));
+            }
+        }
+    }
+    let mut entries: Vec<((Name, Rtype), (Ttl, Vec<Rdata>))> = groups.into_iter().collect();
+    entries.sort_by(|(left, _), (right, _)| {
+        left.0
+            .to_string()
+            .cmp(&right.0.to_string())
+            .then_with(|| left.1.as_u16().cmp(&right.1.as_u16()))
+    });
+    entries
+        .into_iter()
+        .map(|((owner, rr_type), (ttl, rdata))| {
+            Rrset::new(owner, rr_type, Rclass::IN, ttl, rdata)
+                .map_err(|error| AdminError::invariant("/body", "invalid-rrset", error.to_string()))
+        })
+        .collect()
+}
+
+fn unix_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u32::try_from(duration.as_secs()).unwrap_or(u32::MAX)
+        })
 }
 
 #[cfg(test)]

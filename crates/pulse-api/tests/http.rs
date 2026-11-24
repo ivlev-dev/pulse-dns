@@ -355,7 +355,7 @@ fn zone_crud_and_etag() {
     let deleted = request(
         addr,
         "DELETE",
-        "/api/v1/zones/example.com.",
+        "/api/v1/zones/example.com.?confirm_origin=example.com.",
         &[("Authorization", &bearer(ADMIN)), ("If-Match", &new_etag)],
         None,
     );
@@ -1038,4 +1038,577 @@ fn aliases_and_rrset_listing() {
     );
     assert_eq!(filtered.status, 200);
     assert_eq!(filtered.json()["items"].as_array().unwrap().len(), 1);
+}
+
+fn create_zone_post(addr: SocketAddr, origin: &str, key: &str) -> Response {
+    let body = format!(r#"{{"origin":"{origin}","kind":"primary","default_ttl":3600}}"#);
+    request(
+        addr,
+        "POST",
+        "/api/v1/zones",
+        &[("Authorization", &bearer(ADMIN)), ("Idempotency-Key", key)],
+        Some(body.as_bytes()),
+    )
+}
+
+fn wait_job(addr: SocketAddr, location: &str) -> Value {
+    for _ in 0..200 {
+        let response = request(
+            addr,
+            "GET",
+            location,
+            &[("Authorization", &bearer(ADMIN))],
+            None,
+        );
+        assert_eq!(response.status, 200, "{}", response.text());
+        let job = response.json();
+        if matches!(job["state"].as_str(), Some("done" | "failed" | "cancelled")) {
+            return job;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("job did not finish");
+}
+
+#[test]
+fn post_zone_create_is_idempotent_and_scoped() {
+    let server = TestServer::start();
+    let addr = server.addr();
+    let created = create_zone_post(addr, "post.test.", "create-post-zone-1");
+    assert_eq!(created.status, 201, "{}", created.text());
+    assert_eq!(created.json()["origin"], "post.test.");
+    assert_eq!(created.header("location"), Some("/api/v1/zones/post.test."));
+    assert!(created.header("etag").is_some());
+
+    let replay = create_zone_post(addr, "post.test.", "create-post-zone-1");
+    assert_eq!(replay.status, 201);
+    assert_eq!(replay.header("idempotent-replay"), Some("true"));
+
+    let conflict = create_zone_post(addr, "post.test.", "create-post-zone-2");
+    assert_eq!(conflict.status, 409);
+    assert_eq!(conflict.problem_code(), "zone-exists");
+
+    let unauthorized = request(
+        addr,
+        "POST",
+        "/api/v1/zones",
+        &[],
+        Some(br#"{"origin":"post2.test."}"#),
+    );
+    assert_eq!(unauthorized.status, 401);
+
+    let forbidden = request(
+        addr,
+        "POST",
+        "/api/v1/zones",
+        &[("Authorization", &bearer(READER))],
+        Some(br#"{"origin":"post3.test."}"#),
+    );
+    assert_eq!(forbidden.status, 403);
+    assert_eq!(forbidden.problem_code(), "forbidden");
+
+    let invalid = request(
+        addr,
+        "POST",
+        "/api/v1/zones",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(br#"{"kind":"primary"}"#),
+    );
+    assert_eq!(invalid.status, 422);
+    assert_eq!(invalid.problem_code(), "validation-failed");
+}
+
+#[test]
+fn serial_get_set_and_rfc1982() {
+    let server = TestServer::start();
+    let addr = server.addr();
+    assert_eq!(create_zone(addr, "serial.test.").status, 201);
+    let soa = "ns1.serial.test. hostmaster.serial.test. 10 3600 600 604800 300";
+    let put = request(
+        addr,
+        "PUT",
+        "/api/v1/zones/serial.test./records/@/SOA",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(format!(r#"{{"ttl":3600,"records":["{soa}"]}}"#).as_bytes()),
+    );
+    assert_eq!(put.status, 201, "{}", put.text());
+
+    let serial = request(
+        addr,
+        "GET",
+        "/api/v1/zones/serial.test./serial",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(serial.status, 200);
+    assert_eq!(serial.json()["serial"], 10);
+    let etag = serial.header("etag").expect("etag").to_owned();
+
+    let incremented = request(
+        addr,
+        "POST",
+        "/api/v1/zones/serial.test./serial",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(br#"{"mode":"increment"}"#),
+    );
+    assert_eq!(incremented.status, 200, "{}", incremented.text());
+    assert_eq!(incremented.json()["old_serial"], 10);
+    assert_eq!(incremented.json()["new_serial"], 11);
+
+    let stale = request(
+        addr,
+        "POST",
+        "/api/v1/zones/serial.test./serial",
+        &[("Authorization", &bearer(ADMIN)), ("If-Match", &etag)],
+        Some(br#"{"mode":"set","value":100}"#),
+    );
+    assert_eq!(stale.status, 412);
+    assert_eq!(stale.problem_code(), "precondition-failed");
+
+    let not_newer = request(
+        addr,
+        "POST",
+        "/api/v1/zones/serial.test./serial",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(br#"{"mode":"set","value":5}"#),
+    );
+    assert_eq!(not_newer.status, 409);
+    assert_eq!(not_newer.problem_code(), "serial-not-newer");
+
+    let ambiguous_value = 11_u32 + 0x8000_0000;
+    let ambiguous = request(
+        addr,
+        "POST",
+        "/api/v1/zones/serial.test./serial",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(format!(r#"{{"mode":"set","value":{ambiguous_value}}}"#).as_bytes()),
+    );
+    assert_eq!(ambiguous.status, 409);
+    assert_eq!(ambiguous.problem_code(), "serial-ambiguous");
+
+    let missing = request(
+        addr,
+        "GET",
+        "/api/v1/zones/missing.test./serial",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(missing.status, 404);
+
+    let secondary = request(
+        addr,
+        "POST",
+        "/api/v1/zones",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(br#"{"origin":"secondary.test.","kind":"secondary"}"#),
+    );
+    assert_eq!(secondary.status, 201, "{}", secondary.text());
+    let read_only = request(
+        addr,
+        "POST",
+        "/api/v1/zones/secondary.test./serial",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(br#"{"mode":"increment"}"#),
+    );
+    assert_eq!(read_only.status, 409);
+    assert_eq!(read_only.problem_code(), "zone-read-only");
+}
+
+#[test]
+fn transfers_and_jobs_lifecycle() {
+    let server = TestServer::start();
+    let addr = server.addr();
+    assert_eq!(create_zone(addr, "primary-xfr.test.").status, 201);
+    assert_eq!(
+        request(
+            addr,
+            "POST",
+            "/api/v1/zones",
+            &[("Authorization", &bearer(ADMIN))],
+            Some(br#"{"origin":"secondary-xfr.test.","kind":"secondary"}"#),
+        )
+        .status,
+        201
+    );
+
+    let outgoing = request(
+        addr,
+        "POST",
+        "/api/v1/zones/primary-xfr.test./transfers",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(br#"{"kind":"axfr"}"#),
+    );
+    assert_eq!(outgoing.status, 200, "{}", outgoing.text());
+    assert_eq!(outgoing.json()["outgoing"], true);
+    assert_eq!(outgoing.json()["mode"], "axfr");
+
+    let accepted = request(
+        addr,
+        "POST",
+        "/api/v1/zones/secondary-xfr.test./transfers",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(br#"{"kind":"ixfr","peer":"192.0.2.53:53"}"#),
+    );
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
+    let location = accepted
+        .header("location")
+        .expect("job location")
+        .to_owned();
+    assert!(location.starts_with("/api/v1/jobs/job_"));
+    let job = wait_job(addr, &location);
+    assert_eq!(job["state"], "done");
+    assert_eq!(job["kind"], "zone_transfer");
+    assert_eq!(job["result"]["mode"], "ixfr");
+
+    let by_transfer = request(
+        addr,
+        "GET",
+        &location.replace("/api/v1/jobs/", "/api/v1/transfers/"),
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(by_transfer.status, 200);
+    assert_eq!(by_transfer.json()["state"], "done");
+
+    let history = request(
+        addr,
+        "GET",
+        "/api/v1/zones/secondary-xfr.test./transfers?limit=10",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(history.status, 200);
+    assert_eq!(history.json()["zone"], "secondary-xfr.test.");
+    assert!(
+        history.json()["items"]
+            .as_array()
+            .is_some_and(|items| items.len() == 1)
+    );
+
+    let cancelled = request(
+        addr,
+        "DELETE",
+        &location.replace("/api/v1/jobs/", "/api/v1/transfers/"),
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(cancelled.status, 200, "{}", cancelled.text());
+    assert_eq!(cancelled.json()["state"], "done");
+
+    let unknown = request(
+        addr,
+        "GET",
+        "/api/v1/jobs/job_missing",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(unknown.status, 404);
+    assert_eq!(unknown.problem_code(), "job-not-found");
+
+    let forbidden = request(
+        addr,
+        "GET",
+        "/api/v1/jobs",
+        &[("Authorization", &bearer(READER))],
+        None,
+    );
+    assert_eq!(forbidden.status, 403);
+}
+
+#[test]
+fn import_runs_as_job_with_modes() {
+    let server = TestServer::start();
+    let addr = server.addr();
+    assert_eq!(create_zone(addr, "import.test.").status, 201);
+    let zonefile = "$TTL 3600\n\
+        @ IN SOA ns1.import.test. hostmaster.import.test. 42 3600 600 604800 300\n\
+        @ IN NS ns1.import.test.\n\
+        www IN A 192.0.2.42\n";
+
+    let accepted = request(
+        addr,
+        "POST",
+        "/api/v1/zones/import.test./import",
+        &[
+            ("Authorization", &bearer(ADMIN)),
+            ("Content-Type", "text/plain"),
+        ],
+        Some(zonefile.as_bytes()),
+    );
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
+    let location = accepted.header("location").expect("location").to_owned();
+    let job = wait_job(addr, &location);
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(job["result"]["applied"], true);
+    assert_eq!(job["result"]["rrsets"], 3);
+
+    let rrset = request(
+        addr,
+        "GET",
+        "/api/v1/zones/import.test./records/www.import.test./A",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(rrset.status, 200);
+    assert_eq!(rrset.json()["records"][0], "192.0.2.42");
+
+    let check = request(
+        addr,
+        "POST",
+        "/api/v1/zones/import.test./import?mode=check",
+        &[
+            ("Authorization", &bearer(ADMIN)),
+            ("Content-Type", "text/plain"),
+        ],
+        Some(zonefile.as_bytes()),
+    );
+    assert_eq!(check.status, 202);
+    let check_job = wait_job(addr, check.header("location").expect("check location"));
+    assert_eq!(check_job["result"]["applied"], false);
+
+    let bad_mode = request(
+        addr,
+        "POST",
+        "/api/v1/zones/import.test./import?mode=bogus",
+        &[
+            ("Authorization", &bearer(ADMIN)),
+            ("Content-Type", "text/plain"),
+        ],
+        Some(zonefile.as_bytes()),
+    );
+    assert_eq!(bad_mode.status, 400);
+
+    let bad_media = request(
+        addr,
+        "POST",
+        "/api/v1/zones/import.test./import",
+        &[
+            ("Authorization", &bearer(ADMIN)),
+            ("Content-Type", "application/json"),
+        ],
+        Some(zonefile.as_bytes()),
+    );
+    assert_eq!(bad_media.status, 415);
+
+    let empty = request(
+        addr,
+        "POST",
+        "/api/v1/zones/import.test./import",
+        &[
+            ("Authorization", &bearer(ADMIN)),
+            ("Content-Type", "text/plain"),
+        ],
+        Some(b""),
+    );
+    assert_eq!(empty.status, 422);
+}
+
+#[test]
+fn audit_is_paginated_and_scoped() {
+    let server = TestServer::start();
+    let addr = server.addr();
+    assert_eq!(create_zone(addr, "audit.test.").status, 201);
+    let _ = request(
+        addr,
+        "PUT",
+        "/api/v1/zones/audit.test./records/www.audit.test./A",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(br#"{"ttl":60,"records":["192.0.2.7"]}"#),
+    );
+
+    let first = request(
+        addr,
+        "GET",
+        "/api/v1/audit?limit=1",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(first.status, 200);
+    assert_eq!(first.json()["items"].as_array().map(Vec::len), Some(1));
+    assert!(first.json()["next_cursor"].is_string());
+    let first_action = first.json()["items"][0]["action"].clone();
+    assert!(first.json()["items"][0]["at"].is_string());
+    assert!(first.json()["items"][0].get("principal").is_some());
+
+    let first_body = first.json();
+    let cursor = first_body["next_cursor"]
+        .as_str()
+        .expect("cursor")
+        .to_owned();
+    let second = request(
+        addr,
+        "GET",
+        &format!("/api/v1/audit?limit=1&cursor={cursor}"),
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(second.status, 200);
+    assert_eq!(second.json()["items"].as_array().map(Vec::len), Some(1));
+    assert_ne!(second.json()["items"][0]["action"], first_action);
+
+    let invalid_cursor = request(
+        addr,
+        "GET",
+        "/api/v1/audit?cursor=not-base64",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(invalid_cursor.status, 400);
+    assert_eq!(invalid_cursor.problem_code(), "bad-request");
+
+    let forbidden = request(
+        addr,
+        "GET",
+        "/api/v1/audit",
+        &[("Authorization", &bearer(READER))],
+        None,
+    );
+    assert_eq!(forbidden.status, 403);
+}
+
+#[test]
+fn keys_rollover_and_status() {
+    let server = TestServer::start();
+    let addr = server.addr();
+    assert_eq!(create_zone(addr, "rollover.test.").status, 201);
+    let accepted = request(
+        addr,
+        "POST",
+        "/api/v1/zones/rollover.test./keys/rollover",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(br#"{"role":"ksk","scheme":"pre_publish","overlap":"7d","retire_after":"30d"}"#),
+    );
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
+    let location = accepted.header("location").expect("location").to_owned();
+    let job = wait_job(addr, &location);
+    assert_eq!(job["state"], "done");
+    assert_eq!(job["kind"], "key_rollover");
+    assert!(
+        job["result"]["keys"]
+            .as_array()
+            .is_some_and(|keys| !keys.is_empty())
+    );
+
+    let status = request(
+        addr,
+        "GET",
+        "/api/v1/zones/rollover.test./keys/status",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(status.status, 200);
+    assert_eq!(status.json()["zone"], "rollover.test.");
+    assert!(
+        status.json()["rotation"]["keys"]
+            .as_array()
+            .is_some_and(|keys| !keys.is_empty())
+    );
+    assert!(status.json()["next_event_at"].is_number());
+
+    let invalid_role = request(
+        addr,
+        "POST",
+        "/api/v1/zones/rollover.test./keys/rollover",
+        &[("Authorization", &bearer(ADMIN))],
+        Some(br#"{"role":"csk"}"#),
+    );
+    assert_eq!(invalid_role.status, 422);
+
+    let missing = request(
+        addr,
+        "GET",
+        "/api/v1/zones/missing.test./keys/status",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(missing.status, 404);
+}
+
+#[test]
+fn delete_primary_requires_confirmation() {
+    let server = TestServer::start();
+    let addr = server.addr();
+    assert_eq!(create_zone(addr, "confirm.test.").status, 201);
+    let zone = request(
+        addr,
+        "GET",
+        "/api/v1/zones/confirm.test.",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    let etag = zone.header("etag").expect("etag").to_owned();
+
+    let missing = request(
+        addr,
+        "DELETE",
+        "/api/v1/zones/confirm.test.",
+        &[("Authorization", &bearer(ADMIN)), ("If-Match", &etag)],
+        None,
+    );
+    assert_eq!(missing.status, 422);
+    assert_eq!(missing.problem_code(), "validation-failed");
+
+    let wrong = request(
+        addr,
+        "DELETE",
+        "/api/v1/zones/confirm.test.?confirm_origin=other.test.",
+        &[("Authorization", &bearer(ADMIN)), ("If-Match", &etag)],
+        None,
+    );
+    assert_eq!(wrong.status, 422);
+
+    let no_precondition = request(
+        addr,
+        "DELETE",
+        "/api/v1/zones/confirm.test.?confirm_origin=confirm.test.",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(no_precondition.status, 428);
+
+    let confirmed = request(
+        addr,
+        "DELETE",
+        "/api/v1/zones/confirm.test.?confirm_origin=confirm.test.",
+        &[("Authorization", &bearer(ADMIN)), ("If-Match", &etag)],
+        None,
+    );
+    assert_eq!(confirmed.status, 204, "{}", confirmed.text());
+}
+
+#[test]
+fn sign_prefer_async_returns_job() {
+    let server = TestServer::start();
+    let addr = server.addr();
+    assert_eq!(create_zone(addr, "async-sign.test.").status, 201);
+    let accepted = request(
+        addr,
+        "POST",
+        "/api/v1/zones/async-sign.test./sign",
+        &[
+            ("Authorization", &bearer(ADMIN)),
+            ("Prefer", "respond-async"),
+        ],
+        Some(b"{}"),
+    );
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
+    let location = accepted.header("location").expect("location").to_owned();
+    let job = wait_job(addr, &location);
+    // In-memory store has no DNSSEC keys, so the async sign job fails cleanly.
+    assert_eq!(job["state"], "failed");
+    assert_eq!(job["kind"], "zone_sign");
+
+    let list = request(
+        addr,
+        "GET",
+        "/api/v1/jobs?kind=zone_sign&state=failed",
+        &[("Authorization", &bearer(ADMIN))],
+        None,
+    );
+    assert_eq!(list.status, 200);
+    assert!(
+        list.json()["items"]
+            .as_array()
+            .is_some_and(|items| items.len() == 1)
+    );
 }

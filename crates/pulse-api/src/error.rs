@@ -28,6 +28,18 @@ pub enum Conflict {
     /// Запись в secondary/forward-зону запрещена.
     #[error("zone is read-only")]
     ZoneReadOnly,
+    /// Запрошенный serial не новее текущего (RFC 1982).
+    #[error("serial is not newer than the current one")]
+    SerialNotNewer,
+    /// Разница serial ровно `2^31` (RFC 1982).
+    #[error("serial is ambiguous under RFC 1982")]
+    SerialAmbiguous,
+    /// Повторный запуск трансфера при уже идущем.
+    #[error("a transfer is already in progress")]
+    TransferInProgress,
+    /// Операция недопустима в текущем состоянии зоны.
+    #[error("operation is not allowed in the current zone state")]
+    InvalidZoneState,
 }
 
 /// Field-level ошибка валидации (RFC 9457 `errors[]`).

@@ -12,6 +12,7 @@ pub(crate) struct LoadedZone {
     pub(crate) origin: Name,
     pub(crate) default_ttl: Ttl,
     pub(crate) rrsets: Vec<Rrset>,
+    pub(crate) warnings: Vec<String>,
 }
 
 type RrsetKey = (Name, Rtype);
@@ -43,18 +44,53 @@ pub(crate) fn load_zone_file(origin: &str, path: &std::path::Path) -> Result<Loa
         include_root: Some(include_root),
         ..ParseOptions::default()
     };
-    let parsed = parse_zone_with_options(origin, &text, &options)
-        .map_err(|error| format_parse_error(path, &error))?;
+    load_zone_text_with_options(
+        &origin.to_string(),
+        &text,
+        &path.display().to_string(),
+        &options,
+    )
+}
+
+/// Разбирает master-текст (REST import). `$INCLUDE` запрещён.
+pub(crate) fn load_zone_text(origin: &str, text: &str, source: &str) -> Result<LoadedZone, String> {
+    let options = ParseOptions {
+        include_root: None,
+        ..ParseOptions::default()
+    };
+    load_zone_text_with_options(origin, text, source, &options)
+}
+
+fn load_zone_text_with_options(
+    origin: &str,
+    text: &str,
+    source: &str,
+    options: &ParseOptions,
+) -> Result<LoadedZone, String> {
+    let origin = Name::parse(origin.trim())
+        .map_err(|error| format!("invalid origin {origin:?} for zone source {source}: {error}"))?;
+    if origin == Name::root() || origin.labels().any(|label| label == b"*") {
+        return Err(format!(
+            "origin {origin} must be a non-root name without wildcards"
+        ));
+    }
+    let parsed = parse_zone_with_options(origin, text, options)
+        .map_err(|error| format_parse_error_source(source, &error))?;
     for warning in &parsed.warnings {
         logging::warn(
             "zone_import",
             &format!(
                 "{}: warning: {}",
-                format_location(path, &warning.location),
+                format_location_source(source, &warning.location),
                 warning.kind
             ),
         );
     }
+    let warnings: Vec<String> = parsed
+        .warnings
+        .iter()
+        .map(|warning| warning.kind.to_string())
+        .collect();
     let default_ttl = parsed.default_ttl.unwrap_or_else(|| Ttl::from_wire(3600));
     let mut groups: HashMap<RrsetKey, PendingRrset> = HashMap::new();
     for record in parsed.records {
@@ -63,8 +99,7 @@ pub(crate) fn load_zone_file(origin: &str, path: &std::path::Path) -> Result<Loa
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 if entry.get().0 != record.ttl() {
                     return Err(format!(
-                        "{}: TTL mismatch for {} {}: {} and {}",
-                        path.display(),
+                        "{source}: TTL mismatch for {} {}: {} and {}",
                         record.owner(),
                         record.rr_type(),
                         entry.get().0,
@@ -87,33 +122,29 @@ pub(crate) fn load_zone_file(origin: &str, path: &std::path::Path) -> Result<Loa
     });
     let mut rrsets = Vec::with_capacity(entries.len());
     for ((owner, rr_type), (ttl, rdatas)) in entries {
-        let rrset =
-            Rrset::new(owner.clone(), rr_type, Rclass::IN, ttl, rdatas).map_err(|error| {
-                format!(
-                    "{}: cannot build RRset {owner} {rr_type}: {error}",
-                    path.display()
-                )
-            })?;
+        let rrset = Rrset::new(owner.clone(), rr_type, Rclass::IN, ttl, rdatas)
+            .map_err(|error| format!("{source}: cannot build RRset {owner} {rr_type}: {error}"))?;
         rrsets.push(rrset);
     }
     Ok(LoadedZone {
         origin: parsed.origin,
         default_ttl,
         rrsets,
+        warnings,
     })
 }
 
-fn format_parse_error(path: &std::path::Path, error: &ParseError) -> String {
+fn format_parse_error_source(source: &str, error: &ParseError) -> String {
     format!(
         "{}: {}",
-        format_location(path, error.location()),
+        format_location_source(source, error.location()),
         error.kind()
     )
 }
 
-fn format_location(path: &std::path::Path, location: &Location) -> String {
+fn format_location_source(source: &str, location: &Location) -> String {
     let source = if matches!(location.source.as_str(), "<input>" | "<zone>") {
-        path.display().to_string()
+        source.to_owned()
     } else {
         location.source.clone()
     };

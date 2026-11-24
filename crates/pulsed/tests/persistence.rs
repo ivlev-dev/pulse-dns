@@ -321,7 +321,7 @@ fn api_mutations_survive_reopen() {
     let deleted = http(
         api,
         "DELETE",
-        ZONE_PATH,
+        &format!("{ZONE_PATH}?confirm_origin=persist.test."),
         &[("Authorization", &auth()), ("If-Match", &zone_etag)],
         None,
     );
@@ -387,7 +387,7 @@ fn zone_can_be_recreated_after_delete_and_reopen() {
     let deleted = http(
         api,
         "DELETE",
-        ZONE_PATH,
+        &format!("{ZONE_PATH}?confirm_origin=persist.test."),
         &[("Authorization", &auth()), ("If-Match", &zone_etag)],
         None,
     );

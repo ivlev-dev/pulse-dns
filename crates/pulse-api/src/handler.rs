@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use pulse_dns::{Name, Rdata, Rtype, Ttl};
@@ -13,20 +13,24 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::audit::{AuditLog, AuditQuery};
 use crate::auth::{Authenticator, Principal};
 use crate::codec::{hex_lower, parse_rtype};
-use crate::config::ApiConfig;
-use crate::error::{AdminError, FieldIssue, NotFound};
+use crate::config::{ApiConfig, MAX_IMPORT_BYTES};
+use crate::error::{AdminError, Conflict, FieldIssue, NotFound};
 use crate::etag::{header_matches, normalize_tag};
 use crate::http::{HttpRequest, HttpResponse, Method};
 use crate::idempotency::{Begin, IdempotencyStore};
+use crate::jobs::{CancelOutcome, JobFailure, JobQuery, JobRecord, JobRegistry, JobState};
 use crate::journal::{
     Begin as JournalBegin, Journal, JournalOp, body_hash_hex, crash_point, intent as journal_intent,
 };
 use crate::metrics::Metrics;
 use crate::port::{
-    AllowAll, Denial, ListRrsets, ListZones, Precondition, Preconditions, RrsetInput, RrsetPatch,
-    RrsetPatchOutcome, ZoneAdmin, ZoneAllow, ZoneKind, ZoneMetaInput, ZoneSettingsPatch, ZoneView,
+    AllowAll, Denial, ImportMode, KeyRotationView, ListRrsets, ListZones, Precondition,
+    Preconditions, RolloverRequest, RrsetInput, RrsetPatch, RrsetPatchOutcome, SerialUpdate,
+    TransferKind, TransferRequest, ZoneAdmin, ZoneAllow, ZoneKind, ZoneMetaInput,
+    ZoneSettingsPatch, ZoneView,
 };
 use crate::problem::Problem;
 use crate::query::{Query, decode_path_segments, parse_limit};
@@ -49,6 +53,8 @@ pub(crate) struct Api {
     limiter: RateLimiter,
     idempotency: IdempotencyStore,
     journal: Option<Arc<Journal>>,
+    jobs: Arc<JobRegistry>,
+    audit_log: Arc<AuditLog>,
     max_body_bytes: usize,
     request_counter: AtomicU64,
     op_counter: AtomicU64,
@@ -71,6 +77,8 @@ impl Api {
             limiter: RateLimiter::new(config.rate_limit_per_sec),
             idempotency: IdempotencyStore::new(config.idempotency_ttl, config.idempotency_capacity),
             journal,
+            jobs: Arc::new(JobRegistry::new(Duration::from_hours(24), 4096)),
+            audit_log: Arc::new(AuditLog::new(4096)),
             max_body_bytes: config.max_body_bytes,
             request_counter: AtomicU64::new(1),
             op_counter: AtomicU64::new(1),
@@ -243,7 +251,7 @@ impl Api {
                         request_id,
                         &principal.token_id,
                         route.action(&request.method),
-                        &route.target(),
+                        &audit_target(&route, instance),
                         "success",
                         None,
                         peer,
@@ -258,7 +266,7 @@ impl Api {
                         request_id,
                         &principal.token_id,
                         route.action(&request.method),
-                        &route.target(),
+                        &audit_target(&route, instance),
                         "failed",
                         Some(problem.code()),
                         peer,
@@ -360,7 +368,10 @@ impl Api {
         instance: &str,
         request_id: &str,
     ) -> Result<Option<String>, Problem> {
-        if !matches!(request.method, Method::Put | Method::Patch | Method::Delete) {
+        if !matches!(
+            request.method,
+            Method::Put | Method::Patch | Method::Delete | Method::Post
+        ) {
             return Ok(None);
         }
         let Some(value) = request.header("idempotency-key") else {
@@ -540,11 +551,33 @@ impl Api {
         match route {
             Route::Health | Route::Ready | Route::Metrics => Err(internal(instance, request_id)),
             Route::OpenApi => Ok(HttpResponse::json(200, crate::openapi::document())),
-            Route::Zones => self.list_zones(request, principal, request_id, instance),
+            Route::Zones => match request.method {
+                Method::Get => self.list_zones(request, principal, request_id, instance),
+                Method::Post => self.create_zone(request, principal, request_id, instance),
+                _ => Err(internal(instance, request_id)),
+            },
             Route::Zone(origin) => match request.method {
                 Method::Get => self.get_zone(request, origin, request_id, instance),
                 Method::Put => self.put_zone(request, origin, request_id, instance, mutation),
                 Method::Delete => self.delete_zone(request, origin, request_id, instance, mutation),
+                _ => Err(internal(instance, request_id)),
+            },
+            Route::ZoneSerial(origin) => match request.method {
+                Method::Get => self.get_serial(origin, request_id, instance),
+                Method::Post => self.update_serial(request, origin, request_id, instance),
+                _ => Err(internal(instance, request_id)),
+            },
+            Route::ZoneTransfers(origin) => match request.method {
+                Method::Get => {
+                    self.list_transfers(request, origin, principal, request_id, instance)
+                }
+                Method::Post => {
+                    self.trigger_transfer(request, origin, principal, request_id, instance)
+                }
+                _ => Err(internal(instance, request_id)),
+            },
+            Route::ZoneImport(origin) => match request.method {
+                Method::Post => self.import_zone(request, origin, request_id, instance),
                 _ => Err(internal(instance, request_id)),
             },
             Route::ZoneSettings(origin) => match request.method {
@@ -555,7 +588,23 @@ impl Api {
                 _ => Err(internal(instance, request_id)),
             },
             Route::ZoneKeys(origin) => self.get_zone_keys(origin, request_id, instance),
-            Route::ZoneSign(origin) => self.sign_zone(origin, request_id, instance),
+            Route::ZoneKeysStatus(origin) => self.get_keys_status(origin, request_id, instance),
+            Route::ZoneRollover(origin) => {
+                self.rollover_keys(request, origin, request_id, instance)
+            }
+            Route::ZoneSign(origin) => self.sign_zone(request, origin, request_id, instance),
+            Route::Jobs => self.list_jobs(request, principal, request_id, instance),
+            Route::Job(job_id) => match request.method {
+                Method::Get => self.get_job(job_id, principal, request_id, instance),
+                Method::Delete => self.cancel_job(job_id, principal, request_id, instance, false),
+                _ => Err(internal(instance, request_id)),
+            },
+            Route::TransferJob(job_id) => match request.method {
+                Method::Get => self.get_job(job_id, principal, request_id, instance),
+                Method::Delete => self.cancel_job(job_id, principal, request_id, instance, true),
+                _ => Err(internal(instance, request_id)),
+            },
+            Route::Audit => self.list_audit(request, request_id, instance),
             Route::RrsetList(origin) => self.list_rrsets(request, origin, request_id, instance),
             Route::Rrset {
                 origin,
@@ -679,10 +728,47 @@ impl Api {
 
     fn sign_zone(
         &self,
+        request: &HttpRequest,
         origin: &Name,
         request_id: &str,
         instance: &str,
     ) -> Result<HttpResponse, Problem> {
+        self.store
+            .get_zone(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        if prefers_async(request) {
+            let job_id = self.jobs.create(
+                "zone_sign",
+                &zone_resource(origin),
+                Some(origin.to_string()),
+                false,
+            );
+            self.jobs.start(&job_id);
+            let jobs = Arc::clone(&self.jobs);
+            let store = Arc::clone(&self.store);
+            let origin = origin.clone();
+            let job = job_id.clone();
+            let spawn = std::thread::Builder::new()
+                .name("pulse-job-sign".to_owned())
+                .spawn(move || {
+                    let outcome = store.sign_zone(&origin).map_or_else(
+                        |error| Err(admin_failure(error)),
+                        |zone| Ok(zone_json(&zone)),
+                    );
+                    jobs.finish(&job, outcome);
+                });
+            if spawn.is_err() {
+                self.jobs.finish(
+                    &job_id,
+                    Err(JobFailure::new(
+                        "internal-error",
+                        "cannot start background job",
+                        true,
+                    )),
+                );
+            }
+            return Ok(self.accepted_job(&job_id, instance));
+        }
         let zone = self
             .store
             .sign_zone(origin)
@@ -690,6 +776,738 @@ impl Api {
         let mut response = HttpResponse::json(200, zone_json(&zone));
         response.set_header("ETag", zone.etag);
         Ok(response)
+    }
+
+    fn create_zone(
+        &self,
+        request: &HttpRequest,
+        principal: &Principal,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let value = self.json_body(request, instance, request_id)?;
+        let body: ZoneWriteBody = deserialize(value, instance, request_id)?;
+        let origin_text = body.origin.ok_or_else(|| {
+            validation(
+                instance,
+                request_id,
+                "/origin",
+                "required",
+                "origin is required",
+            )
+        })?;
+        let origin = Name::parse(origin_text.trim()).map_err(|_| {
+            validation(
+                instance,
+                request_id,
+                "/origin",
+                "invalid-name",
+                "origin must be a valid DNS name",
+            )
+        })?;
+        if origin == Name::root() || origin.labels().any(|label| label == b"*") {
+            return Err(validation(
+                instance,
+                request_id,
+                "/origin",
+                "invalid-origin",
+                "zone origin must be a non-root name without wildcards",
+            ));
+        }
+        if !principal.zone_allowed(&origin) {
+            return Err(Problem::new(
+                403,
+                "forbidden",
+                "The token does not allow this zone.",
+                instance,
+                request_id,
+            ));
+        }
+        let kind = match body.kind.as_deref() {
+            None => ZoneKind::Primary,
+            Some(value) => ZoneKind::parse(value).ok_or_else(|| {
+                validation(
+                    instance,
+                    request_id,
+                    "/kind",
+                    "invalid-kind",
+                    "kind must be primary, secondary or forward",
+                )
+            })?,
+        };
+        let default_ttl = match body.default_ttl {
+            None => Ttl::new(3600).map_err(|_| internal(instance, request_id))?,
+            Some(value) => Ttl::new(value).map_err(|_| {
+                validation(
+                    instance,
+                    request_id,
+                    "/default_ttl",
+                    "ttl-out-of-range",
+                    "ttl must be in 0..=2147483647",
+                )
+            })?,
+        };
+        let denial = match body.denial.as_deref() {
+            None => Denial::Nsec,
+            Some(value) => Denial::parse(value).ok_or_else(|| {
+                validation(
+                    instance,
+                    request_id,
+                    "/denial",
+                    "invalid-denial",
+                    "denial must be nsec or nsec3",
+                )
+            })?,
+        };
+        let meta = ZoneMetaInput {
+            kind,
+            default_ttl,
+            denial,
+        };
+        let zone = self
+            .store
+            .create_zone(&origin, &meta)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let mut response = HttpResponse::json(201, zone_json(&zone));
+        response.set_header("ETag", zone.etag.clone());
+        response.set_header("Location", zone_resource(&origin));
+        Ok(response)
+    }
+
+    fn get_serial(
+        &self,
+        origin: &Name,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let state = self
+            .store
+            .get_serial(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let mut response = HttpResponse::json(
+            200,
+            json!({
+                "zone": state.zone.to_string(),
+                "serial": state.serial.as_u32(),
+                "version": state.version,
+                "updated_at": rfc3339(state.updated_at),
+            }),
+        );
+        response.set_header("ETag", state.etag);
+        Ok(response)
+    }
+
+    fn update_serial(
+        &self,
+        request: &HttpRequest,
+        origin: &Name,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let value = self.json_body(request, instance, request_id)?;
+        let body: SerialBody = deserialize(value, instance, request_id)?;
+        let mode = body.mode.ok_or_else(|| {
+            validation(
+                instance,
+                request_id,
+                "/mode",
+                "required",
+                "mode is required",
+            )
+        })?;
+        let update = match mode.as_str() {
+            "increment" => {
+                if body.value.is_some() {
+                    return Err(validation(
+                        instance,
+                        request_id,
+                        "/value",
+                        "unexpected-field",
+                        "value is not allowed with mode=increment",
+                    ));
+                }
+                SerialUpdate::Increment
+            }
+            "set" => SerialUpdate::Set(body.value.ok_or_else(|| {
+                validation(
+                    instance,
+                    request_id,
+                    "/value",
+                    "required",
+                    "value is required with mode=set",
+                )
+            })?),
+            _ => {
+                return Err(validation(
+                    instance,
+                    request_id,
+                    "/mode",
+                    "invalid-mode",
+                    "mode must be increment or set",
+                ));
+            }
+        };
+        let preconditions = preconditions(request, instance, request_id)?;
+        let result = self
+            .store
+            .update_serial(origin, update, &preconditions)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let mut response = HttpResponse::json(
+            200,
+            json!({
+                "zone": result.zone.to_string(),
+                "old_serial": result.old_serial.as_u32(),
+                "new_serial": result.new_serial.as_u32(),
+                "commit_id": format!("c_{}", result.version),
+                "version": result.version,
+                "updated_at": rfc3339(result.updated_at),
+            }),
+        );
+        response.set_header("ETag", result.etag);
+        Ok(response)
+    }
+
+    fn list_transfers(
+        &self,
+        request: &HttpRequest,
+        origin: &Name,
+        principal: &Principal,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let zone = self
+            .store
+            .get_zone(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let query = Query::parse(&request.query_string)
+            .ok_or_else(|| bad_request("The query string is malformed.", instance, request_id))?;
+        let limit = parse_limit(&query)
+            .map_err(|detail| Problem::new(400, "bad-request", detail, instance, request_id))?;
+        let state = match query.get("state") {
+            Some(value) => Some(parse_job_state(value).ok_or_else(|| {
+                Problem::new(
+                    400,
+                    "bad-request",
+                    "Unknown job state.",
+                    instance,
+                    request_id,
+                )
+            })?),
+            None => None,
+        };
+        if let Some(cursor) = query.get("cursor")
+            && !valid_seq_cursor(cursor)
+        {
+            return Err(bad_request(
+                "The pagination cursor is invalid.",
+                instance,
+                request_id,
+            ));
+        }
+        let page = self.jobs.list(&JobQuery {
+            limit,
+            cursor: query.get("cursor").map(str::to_owned),
+            state,
+            kind: Some("zone_transfer".to_owned()),
+            zone: Some(origin.to_string()),
+        });
+        let items: Vec<Value> = page.items.iter().map(job_json).collect();
+        let _ = principal;
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "zone": zone.origin.to_string(),
+                "kind": zone.kind.as_str(),
+                "serial": zone.serial.as_u32(),
+                "items": items,
+                "history": page.items.iter().map(job_json).collect::<Vec<_>>(),
+                "next_cursor": page.next_cursor,
+                "has_more": page.has_more,
+            }),
+        ))
+    }
+
+    fn trigger_transfer(
+        &self,
+        request: &HttpRequest,
+        origin: &Name,
+        principal: &Principal,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let zone = self
+            .store
+            .get_zone(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        if zone.kind == ZoneKind::Forward {
+            return Err(Problem::new(
+                409,
+                "zone-read-only",
+                "Forward zones do not support transfers.",
+                instance,
+                request_id,
+            ));
+        }
+        let value = self.json_body(request, instance, request_id)?;
+        let body: TransferBody = deserialize(value, instance, request_id)?;
+        let kind = body
+            .kind
+            .as_deref()
+            .and_then(TransferKind::parse)
+            .ok_or_else(|| {
+                validation(
+                    instance,
+                    request_id,
+                    "/kind",
+                    "invalid-kind",
+                    "kind must be axfr or ixfr",
+                )
+            })?;
+        let transfer = TransferRequest {
+            kind,
+            peer: body.peer,
+            tsig_key: body.tsig_key,
+            from_serial: body.from_serial,
+        };
+        let _ = principal;
+        if zone.kind == ZoneKind::Primary {
+            let result = self
+                .store
+                .trigger_transfer(origin, &transfer)
+                .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+            return Ok(HttpResponse::json(200, transfer_json(&result)));
+        }
+        let job_id = self.jobs.create(
+            "zone_transfer",
+            &zone_resource(origin),
+            Some(origin.to_string()),
+            true,
+        );
+        self.jobs.start(&job_id);
+        let jobs = Arc::clone(&self.jobs);
+        let store = Arc::clone(&self.store);
+        let origin = origin.clone();
+        let job = job_id.clone();
+        let spawn = std::thread::Builder::new()
+            .name("pulse-job-transfer".to_owned())
+            .spawn(move || {
+                let outcome = store.trigger_transfer(&origin, &transfer).map_or_else(
+                    |error| Err(admin_failure(error)),
+                    |result| Ok(transfer_json(&result)),
+                );
+                jobs.finish(&job, outcome);
+            });
+        if spawn.is_err() {
+            self.jobs.finish(
+                &job_id,
+                Err(JobFailure::new(
+                    "internal-error",
+                    "cannot start background job",
+                    true,
+                )),
+            );
+        }
+        Ok(self.accepted_job(&job_id, instance))
+    }
+
+    fn import_zone(
+        &self,
+        request: &HttpRequest,
+        origin: &Name,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let zone = self
+            .store
+            .get_zone(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        if zone.kind != ZoneKind::Primary {
+            return Err(Problem::new(
+                409,
+                "zone-read-only",
+                "Only primary zones can be imported.",
+                instance,
+                request_id,
+            ));
+        }
+        let content_type = request.header("content-type").unwrap_or("");
+        let media_type = content_type.split(';').next().unwrap_or("").trim();
+        if !media_type.eq_ignore_ascii_case("text/plain")
+            && !media_type.eq_ignore_ascii_case("text/dns")
+        {
+            return Err(Problem::new(
+                415,
+                "unsupported-media-type",
+                "Content-Type must be text/plain.",
+                instance,
+                request_id,
+            ));
+        }
+        let limit = MAX_IMPORT_BYTES;
+        if request.body.len() > limit {
+            return Err(Problem::new(
+                413,
+                "payload-too-large",
+                "Import body exceeds the configured limit.",
+                instance,
+                request_id,
+            ));
+        }
+        if request.body.is_empty() {
+            return Err(validation(
+                instance,
+                request_id,
+                "/body",
+                "required",
+                "zone text is required",
+            ));
+        }
+        let text = std::str::from_utf8(&request.body)
+            .map_err(|_| bad_request("Import body must be valid UTF-8.", instance, request_id))?;
+        let query = Query::parse(&request.query_string)
+            .ok_or_else(|| bad_request("The query string is malformed.", instance, request_id))?;
+        let mode = match query.get("mode") {
+            None => ImportMode::Replace,
+            Some(value) => ImportMode::parse(value).ok_or_else(|| {
+                Problem::new(
+                    400,
+                    "bad-request",
+                    "mode must be replace, merge or check.",
+                    instance,
+                    request_id,
+                )
+            })?,
+        };
+        let job_id = self.jobs.create(
+            "zone_import",
+            &zone_resource(origin),
+            Some(origin.to_string()),
+            true,
+        );
+        self.jobs.start(&job_id);
+        let jobs = Arc::clone(&self.jobs);
+        let store = Arc::clone(&self.store);
+        let origin = origin.clone();
+        let job = job_id.clone();
+        let text = text.to_owned();
+        let spawn = std::thread::Builder::new()
+            .name("pulse-job-import".to_owned())
+            .spawn(move || {
+                let outcome = store.import_zone(&origin, &text, mode).map_or_else(
+                    |error| Err(admin_failure(error)),
+                    |report| Ok(import_json(&report)),
+                );
+                jobs.finish(&job, outcome);
+            });
+        if spawn.is_err() {
+            self.jobs.finish(
+                &job_id,
+                Err(JobFailure::new(
+                    "internal-error",
+                    "cannot start background job",
+                    true,
+                )),
+            );
+        }
+        Ok(self.accepted_job(&job_id, instance))
+    }
+
+    fn get_keys_status(
+        &self,
+        origin: &Name,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let zone = self
+            .store
+            .get_zone(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let rotation = self
+            .store
+            .key_rotation(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let dnskeys = self.store.get_rrset(origin, origin, Rtype::DNSKEY).ok();
+        let mut ksk = 0_u32;
+        let mut zsk = 0_u32;
+        if let Some(rrset) = &dnskeys {
+            for rdata in &rrset.rdata {
+                if let Rdata::Dnskey(key) = rdata {
+                    if key.flags() & DNSKEY_FLAG_SEP != 0 {
+                        ksk = ksk.saturating_add(1);
+                    } else {
+                        zsk = zsk.saturating_add(1);
+                    }
+                }
+            }
+        }
+        let rotation_json = rotation.as_ref().map_or(Value::Null, rotation_json);
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "zone": zone.origin.to_string(),
+                "signed": dnskeys.is_some(),
+                "denial": zone.denial.as_str(),
+                "keys": { "ksk": ksk, "zsk": zsk, "csk": 0 },
+                "rotation": rotation_json,
+                "next_event_at": rotation.as_ref().and_then(|rotation| rotation.next_event_at),
+                "next_event": rotation
+                    .as_ref()
+                    .and_then(|rotation| rotation.next_event_at)
+                    .map(|seconds| rfc3339(unix_time(seconds))),
+                "signature_valid_until": Value::Null,
+                "last_signed_at": Value::Null,
+                "issues": [],
+            }),
+        ))
+    }
+
+    fn rollover_keys(
+        &self,
+        request: &HttpRequest,
+        origin: &Name,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        self.store
+            .get_zone(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let value = self.json_body(request, instance, request_id)?;
+        let body: RolloverBody = deserialize(value, instance, request_id)?;
+        let role = body.role.ok_or_else(|| {
+            validation(
+                instance,
+                request_id,
+                "/role",
+                "required",
+                "role is required",
+            )
+        })?;
+        if !matches!(role.as_str(), "ksk" | "zsk") {
+            return Err(validation(
+                instance,
+                request_id,
+                "/role",
+                "invalid-role",
+                "role must be ksk or zsk",
+            ));
+        }
+        let scheme = body.scheme.unwrap_or_else(|| "pre_publish".to_owned());
+        if !matches!(scheme.as_str(), "pre_publish" | "double_sign") {
+            return Err(validation(
+                instance,
+                request_id,
+                "/scheme",
+                "invalid-scheme",
+                "scheme must be pre_publish or double_sign",
+            ));
+        }
+        let overlap = match body.overlap.as_ref() {
+            None => 7 * 86_400,
+            Some(value) => duration_from_value(value).ok_or_else(|| {
+                validation(
+                    instance,
+                    request_id,
+                    "/overlap",
+                    "invalid-duration",
+                    "overlap must be seconds or a duration like 7d",
+                )
+            })?,
+        };
+        let retire_after = match body.retire_after.as_ref() {
+            None => None,
+            Some(value) => Some(duration_from_value(value).ok_or_else(|| {
+                validation(
+                    instance,
+                    request_id,
+                    "/retire_after",
+                    "invalid-duration",
+                    "retire_after must be seconds or a duration like 30d",
+                )
+            })?),
+        };
+        let rollover = RolloverRequest {
+            role,
+            scheme,
+            overlap,
+            retire_after,
+        };
+        let rotation = self
+            .store
+            .rollover_keys(origin, &rollover)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let job_id = self.jobs.create(
+            "key_rollover",
+            &zone_resource(origin),
+            Some(origin.to_string()),
+            false,
+        );
+        self.jobs.start(&job_id);
+        self.jobs.finish(&job_id, Ok(rotation_json(&rotation)));
+        Ok(self.accepted_job(&job_id, instance))
+    }
+
+    fn list_jobs(
+        &self,
+        request: &HttpRequest,
+        principal: &Principal,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let query = Query::parse(&request.query_string)
+            .ok_or_else(|| bad_request("The query string is malformed.", instance, request_id))?;
+        let limit = parse_limit(&query)
+            .map_err(|detail| Problem::new(400, "bad-request", detail, instance, request_id))?;
+        let state = match query.get("state") {
+            Some(value) => Some(parse_job_state(value).ok_or_else(|| {
+                Problem::new(
+                    400,
+                    "bad-request",
+                    "Unknown job state.",
+                    instance,
+                    request_id,
+                )
+            })?),
+            None => None,
+        };
+        if let Some(cursor) = query.get("cursor")
+            && !valid_seq_cursor(cursor)
+        {
+            return Err(bad_request(
+                "The pagination cursor is invalid.",
+                instance,
+                request_id,
+            ));
+        }
+        let page = self.jobs.list(&JobQuery {
+            limit,
+            cursor: query.get("cursor").map(str::to_owned),
+            state,
+            kind: query.get("kind").map(str::to_owned),
+            zone: None,
+        });
+        let items: Vec<Value> = page
+            .items
+            .iter()
+            .filter(|job| job_visible(job, principal))
+            .map(job_json)
+            .collect();
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "items": items,
+                "next_cursor": page.next_cursor,
+                "has_more": page.has_more,
+            }),
+        ))
+    }
+
+    fn get_job(
+        &self,
+        job_id: &str,
+        principal: &Principal,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let Some(job) = self.jobs.get(job_id) else {
+            return Err(job_not_found(instance, request_id));
+        };
+        if !job_visible(&job, principal) {
+            return Err(job_not_found(instance, request_id));
+        }
+        Ok(HttpResponse::json(200, job_json(&job)))
+    }
+
+    fn cancel_job(
+        &self,
+        job_id: &str,
+        principal: &Principal,
+        request_id: &str,
+        instance: &str,
+        transfer_only: bool,
+    ) -> Result<HttpResponse, Problem> {
+        let Some(job) = self.jobs.get(job_id) else {
+            return Err(job_not_found(instance, request_id));
+        };
+        if !job_visible(&job, principal) || (transfer_only && job.kind != "zone_transfer") {
+            return Err(job_not_found(instance, request_id));
+        }
+        match self.jobs.cancel(job_id) {
+            CancelOutcome::Accepted(job) => {
+                let mut response = HttpResponse::json(202, job_json(&job));
+                response.set_header("Location", format!("/api/v1/jobs/{}", job.id));
+                response.set_header("Retry-After", "1");
+                Ok(response)
+            }
+            CancelOutcome::Terminal(job) => Ok(HttpResponse::json(200, job_json(&job))),
+            CancelOutcome::NotFound => Err(job_not_found(instance, request_id)),
+        }
+    }
+
+    fn list_audit(
+        &self,
+        request: &HttpRequest,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let query = Query::parse(&request.query_string)
+            .ok_or_else(|| bad_request("The query string is malformed.", instance, request_id))?;
+        let limit = parse_limit(&query)
+            .map_err(|detail| Problem::new(400, "bad-request", detail, instance, request_id))?;
+        if let Some(cursor) = query.get("cursor")
+            && !valid_seq_cursor(cursor)
+        {
+            return Err(bad_request(
+                "The pagination cursor is invalid.",
+                instance,
+                request_id,
+            ));
+        }
+        let page = self.audit_log.list(&AuditQuery {
+            limit,
+            cursor: query.get("cursor").map(str::to_owned),
+            principal: query.get("principal").map(str::to_owned),
+            action: query.get("action").map(str::to_owned),
+            result: query.get("result").map(str::to_owned),
+        });
+        let items: Vec<Value> = page
+            .items
+            .iter()
+            .map(|entry| {
+                json!({
+                    "at": rfc3339(entry.at),
+                    "principal": entry.principal,
+                    "action": entry.action,
+                    "resource": entry.resource,
+                    "result": entry.result,
+                    "reason": entry.reason,
+                    "request_id": entry.request_id,
+                })
+            })
+            .collect();
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "items": items,
+                "next_cursor": page.next_cursor,
+                "has_more": page.has_more,
+            }),
+        ))
+    }
+
+    fn accepted_job(&self, job_id: &str, instance: &str) -> HttpResponse {
+        let record = self.jobs.get(job_id);
+        let mut response = record.as_ref().map_or_else(
+            || {
+                HttpResponse::json(
+                    202,
+                    json!({ "job_id": job_id, "state": "pending", "resource": instance }),
+                )
+            },
+            |job| HttpResponse::json(202, job_json(job)),
+        );
+        response.set_header("Location", format!("/api/v1/jobs/{job_id}"));
+        response.set_header("Retry-After", "1");
+        response
     }
 
     fn list_zones(
@@ -884,6 +1702,52 @@ impl Api {
         instance: &str,
         mutation: &MutationContext,
     ) -> Result<HttpResponse, Problem> {
+        let zone = self
+            .store
+            .get_zone(origin)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        if let Some(value) = request.header("if-match") {
+            if value.trim() != "*" && !header_matches(&zone.etag, value) {
+                return Err(Problem::from_admin(
+                    AdminError::PreconditionFailed {
+                        current_etag: Some(zone.etag.clone()),
+                        current_version: Some(zone.version),
+                    },
+                    instance,
+                    request_id,
+                ));
+            }
+        }
+        if zone.kind == ZoneKind::Primary {
+            let query = Query::parse(&request.query_string).ok_or_else(|| {
+                bad_request("The query string is malformed.", instance, request_id)
+            })?;
+            let confirm = query
+                .get("confirm_origin")
+                .map(str::to_owned)
+                .or_else(|| confirm_origin_from_body(&request.body));
+            match confirm {
+                Some(value) if Name::parse(value.trim()).as_ref() == Ok(origin) => {}
+                Some(_) => {
+                    return Err(validation(
+                        instance,
+                        request_id,
+                        "/confirm_origin",
+                        "origin-mismatch",
+                        "confirm_origin does not match the zone origin",
+                    ));
+                }
+                None => {
+                    return Err(validation(
+                        instance,
+                        request_id,
+                        "/confirm_origin",
+                        "required",
+                        "deleting a primary zone requires confirm_origin",
+                    ));
+                }
+            }
+        }
         let preconditions = preconditions(request, instance, request_id)?;
         let operation = JournalOp::DeleteZone {
             origin: origin.to_string(),
@@ -1408,6 +2272,14 @@ impl Api {
     ) {
         let timestamp = rfc3339(SystemTime::now());
         let code = code.unwrap_or("-");
+        self.audit_log.record(
+            token_id,
+            action,
+            target,
+            result,
+            (code != "-").then_some(code),
+            request_id,
+        );
         eprintln!(
             "audit ts={} request_id={} token={} action={} target={} result={} code={} peer={}",
             audit_value(&timestamp),
@@ -1690,9 +2562,18 @@ enum Route {
     OpenApi,
     Zones,
     Zone(Name),
+    ZoneSerial(Name),
+    ZoneTransfers(Name),
+    ZoneImport(Name),
     ZoneSettings(Name),
     ZoneKeys(Name),
+    ZoneKeysStatus(Name),
+    ZoneRollover(Name),
     ZoneSign(Name),
+    Jobs,
+    Job(String),
+    TransferJob(String),
+    Audit,
     RrsetList(Name),
     Rrset {
         origin: Name,
@@ -1710,9 +2591,18 @@ impl Route {
             Self::OpenApi => "/api/v1/openapi.json",
             Self::Zones => "/api/v1/zones",
             Self::Zone(_) => "/api/v1/zones/{origin}",
+            Self::ZoneSerial(_) => "/api/v1/zones/{origin}/serial",
+            Self::ZoneTransfers(_) => "/api/v1/zones/{origin}/transfers",
+            Self::ZoneImport(_) => "/api/v1/zones/{origin}/import",
             Self::ZoneSettings(_) => "/api/v1/zones/{origin}/settings",
             Self::ZoneKeys(_) => "/api/v1/zones/{origin}/keys",
+            Self::ZoneKeysStatus(_) => "/api/v1/zones/{origin}/keys/status",
+            Self::ZoneRollover(_) => "/api/v1/zones/{origin}/keys/rollover",
             Self::ZoneSign(_) => "/api/v1/zones/{origin}/sign",
+            Self::Jobs => "/api/v1/jobs",
+            Self::Job(_) => "/api/v1/jobs/{job_id}",
+            Self::TransferJob(_) => "/api/v1/transfers/{job_id}",
+            Self::Audit => "/api/v1/audit",
             Self::RrsetList(_) => "/api/v1/zones/{origin}/rrsets",
             Self::Rrset { .. } => "/api/v1/zones/{origin}/records/{name}/{type}",
         }
@@ -1721,8 +2611,13 @@ impl Route {
     fn origin(&self) -> Option<&Name> {
         match self {
             Self::Zone(origin)
+            | Self::ZoneSerial(origin)
+            | Self::ZoneTransfers(origin)
+            | Self::ZoneImport(origin)
             | Self::ZoneSettings(origin)
             | Self::ZoneKeys(origin)
+            | Self::ZoneKeysStatus(origin)
+            | Self::ZoneRollover(origin)
             | Self::ZoneSign(origin)
             | Self::RrsetList(origin) => Some(origin),
             Self::Rrset { origin, .. } => Some(origin),
@@ -1732,11 +2627,17 @@ impl Route {
 
     fn allowed_methods(&self) -> &'static [&'static str] {
         match self {
-            Self::Health | Self::Ready | Self::Metrics | Self::OpenApi | Self::Zones => &["GET"],
+            Self::Health | Self::Ready | Self::Metrics | Self::OpenApi => &["GET"],
+            Self::Zones => &["GET", "POST"],
             Self::Zone(_) => &["GET", "PUT", "DELETE"],
+            Self::ZoneSerial(_) => &["GET", "POST"],
+            Self::ZoneTransfers(_) => &["GET", "POST"],
+            Self::ZoneImport(_) => &["POST"],
             Self::ZoneSettings(_) => &["GET", "PATCH"],
-            Self::ZoneKeys(_) => &["GET"],
-            Self::ZoneSign(_) => &["POST"],
+            Self::ZoneKeys(_) | Self::ZoneKeysStatus(_) => &["GET"],
+            Self::ZoneRollover(_) | Self::ZoneSign(_) => &["POST"],
+            Self::Jobs | Self::Audit => &["GET"],
+            Self::Job(_) | Self::TransferJob(_) => &["GET", "DELETE"],
             Self::Rrset { .. } => &["GET", "PUT", "PATCH", "DELETE"],
             Self::RrsetList(_) => &["GET"],
         }
@@ -1745,21 +2646,34 @@ impl Route {
     fn target(&self) -> String {
         match self {
             Self::Zone(origin)
+            | Self::ZoneSerial(origin)
+            | Self::ZoneTransfers(origin)
+            | Self::ZoneImport(origin)
             | Self::ZoneSettings(origin)
             | Self::ZoneKeys(origin)
+            | Self::ZoneKeysStatus(origin)
+            | Self::ZoneRollover(origin)
             | Self::ZoneSign(origin)
             | Self::RrsetList(origin) => origin.to_string(),
             Self::Rrset { origin, .. } => origin.to_string(),
+            Self::Job(job_id) | Self::TransferJob(job_id) => job_id.clone(),
             _ => "-".to_owned(),
         }
     }
 
     fn action(&self, method: &Method) -> &'static str {
         match (self, method) {
+            (Self::Zones, Method::Post) => "zone.create",
             (Self::Zone(_), Method::Put) => "zone.put",
             (Self::Zone(_), Method::Delete) => "zone.delete",
+            (Self::ZoneSerial(_), Method::Post) => "zone.serial.set",
+            (Self::ZoneTransfers(_), Method::Post) => "zone.transfer.start",
+            (Self::ZoneImport(_), Method::Post) => "zone.import",
             (Self::ZoneSettings(_), Method::Patch) => "zone.settings.patch",
+            (Self::ZoneKeysStatus(_), _) => "zone.keys.status",
+            (Self::ZoneRollover(_), Method::Post) => "zone.keys.rollover",
             (Self::ZoneSign(_), Method::Post) => "zone.sign",
+            (Self::Job(_) | Self::TransferJob(_), Method::Delete) => "job.cancel",
             (Self::Rrset { .. }, Method::Put) => "rrset.put",
             (Self::Rrset { .. }, Method::Patch) => "rrset.patch",
             (Self::Rrset { .. }, Method::Delete) => "rrset.delete",
@@ -1783,6 +2697,63 @@ fn parse_route(request: &HttpRequest, instance: &str, request_id: &str) -> Resul
         }
         [api, version, zones, origin] if api == "api" && version == "v1" && zones == "zones" => {
             Ok(Route::Zone(parse_origin(origin, instance, request_id)?))
+        }
+        [api, version, zones, origin, serial]
+            if api == "api" && version == "v1" && zones == "zones" && serial == "serial" =>
+        {
+            Ok(Route::ZoneSerial(parse_origin(
+                origin, instance, request_id,
+            )?))
+        }
+        [api, version, zones, origin, transfers]
+            if api == "api" && version == "v1" && zones == "zones" && transfers == "transfers" =>
+        {
+            Ok(Route::ZoneTransfers(parse_origin(
+                origin, instance, request_id,
+            )?))
+        }
+        [api, version, zones, origin, import]
+            if api == "api" && version == "v1" && zones == "zones" && import == "import" =>
+        {
+            Ok(Route::ZoneImport(parse_origin(
+                origin, instance, request_id,
+            )?))
+        }
+        [api, version, zones, origin, keys, status]
+            if api == "api"
+                && version == "v1"
+                && zones == "zones"
+                && keys == "keys"
+                && status == "status" =>
+        {
+            Ok(Route::ZoneKeysStatus(parse_origin(
+                origin, instance, request_id,
+            )?))
+        }
+        [api, version, zones, origin, keys, rollover]
+            if api == "api"
+                && version == "v1"
+                && zones == "zones"
+                && keys == "keys"
+                && rollover == "rollover" =>
+        {
+            Ok(Route::ZoneRollover(parse_origin(
+                origin, instance, request_id,
+            )?))
+        }
+        [api, version, jobs] if api == "api" && version == "v1" && jobs == "jobs" => {
+            Ok(Route::Jobs)
+        }
+        [api, version, jobs, job_id] if api == "api" && version == "v1" && jobs == "jobs" => {
+            Ok(Route::Job(job_id.clone()))
+        }
+        [api, version, transfers, job_id]
+            if api == "api" && version == "v1" && transfers == "transfers" =>
+        {
+            Ok(Route::TransferJob(job_id.clone()))
+        }
+        [api, version, audit] if api == "api" && version == "v1" && audit == "audit" => {
+            Ok(Route::Audit)
         }
         [api, version, zones, origin, settings]
             if api == "api" && version == "v1" && zones == "zones" && settings == "settings" =>
@@ -1857,14 +2828,26 @@ fn parse_origin(value: &str, instance: &str, request_id: &str) -> Result<Name, P
 fn required_scope(route: &Route, method: &Method) -> Option<&'static str> {
     match (route, method) {
         (Route::OpenApi, _) => None,
+        (Route::Zones, Method::Post) => Some("zones:write"),
         (Route::Zones, _)
         | (Route::Zone(_), Method::Get)
-        | (Route::ZoneSettings(_), Method::Get)
-        | (Route::ZoneKeys(_), _) => Some("zones:read"),
+        | (Route::ZoneSerial(_), Method::Get)
+        | (Route::ZoneSettings(_), Method::Get) => Some("zones:read"),
+        (Route::ZoneKeys(_), _) | (Route::ZoneKeysStatus(_), _) => Some("keys:read"),
         (Route::Zone(_), Method::Delete) => Some("zones:delete"),
         (Route::Zone(_), Method::Put)
+        | (Route::ZoneSerial(_), Method::Post)
+        | (Route::ZoneImport(_), _)
         | (Route::ZoneSettings(_), Method::Patch)
         | (Route::ZoneSign(_), _) => Some("zones:write"),
+        (Route::ZoneTransfers(_), Method::Get) => Some("replication:read"),
+        (Route::ZoneTransfers(_), _) => Some("replication:manage"),
+        (Route::ZoneRollover(_), _) => Some("keys:write"),
+        (Route::Jobs, _) | (Route::Job(_), Method::Get) | (Route::TransferJob(_), Method::Get) => {
+            Some("jobs:read")
+        }
+        (Route::Job(_), _) | (Route::TransferJob(_), _) => Some("jobs:cancel"),
+        (Route::Audit, _) => Some("audit:read"),
         (Route::RrsetList(_), _) | (Route::Rrset { .. }, Method::Get) => Some("zones:read"),
         (Route::Rrset { .. }, _) => Some("zones:write"),
         _ => None,
@@ -1887,6 +2870,51 @@ fn route_label(path: &str) -> &'static str {
         }
         [api, version, zones, _] if api == "api" && version == "v1" && zones == "zones" => {
             "/api/v1/zones/{origin}"
+        }
+        [api, version, jobs] if api == "api" && version == "v1" && jobs == "jobs" => "/api/v1/jobs",
+        [api, version, jobs, _] if api == "api" && version == "v1" && jobs == "jobs" => {
+            "/api/v1/jobs/{job_id}"
+        }
+        [api, version, transfers, _]
+            if api == "api" && version == "v1" && transfers == "transfers" =>
+        {
+            "/api/v1/transfers/{job_id}"
+        }
+        [api, version, audit] if api == "api" && version == "v1" && audit == "audit" => {
+            "/api/v1/audit"
+        }
+        [api, version, zones, _, collection]
+            if api == "api" && version == "v1" && zones == "zones" && collection == "serial" =>
+        {
+            "/api/v1/zones/{origin}/serial"
+        }
+        [api, version, zones, _, collection]
+            if api == "api" && version == "v1" && zones == "zones" && collection == "transfers" =>
+        {
+            "/api/v1/zones/{origin}/transfers"
+        }
+        [api, version, zones, _, collection]
+            if api == "api" && version == "v1" && zones == "zones" && collection == "import" =>
+        {
+            "/api/v1/zones/{origin}/import"
+        }
+        [api, version, zones, _, collection, sub]
+            if api == "api"
+                && version == "v1"
+                && zones == "zones"
+                && collection == "keys"
+                && sub == "status" =>
+        {
+            "/api/v1/zones/{origin}/keys/status"
+        }
+        [api, version, zones, _, collection, sub]
+            if api == "api"
+                && version == "v1"
+                && zones == "zones"
+                && collection == "keys"
+                && sub == "rollover" =>
+        {
+            "/api/v1/zones/{origin}/keys/rollover"
         }
         [api, version, zones, _, settings]
             if api == "api" && version == "v1" && zones == "zones" && settings == "settings" =>
@@ -1950,9 +2978,219 @@ struct SettingsPatchBody {
     denial: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SerialBody {
+    mode: Option<String>,
+    value: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransferBody {
+    kind: Option<String>,
+    peer: Option<String>,
+    tsig_key: Option<String>,
+    from_serial: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RolloverBody {
+    role: Option<String>,
+    scheme: Option<String>,
+    overlap: Option<Value>,
+    retire_after: Option<Value>,
+}
+
 fn with_replay_header(mut response: HttpResponse) -> HttpResponse {
     response.set_header("Idempotent-Replay", "true");
     response
+}
+
+fn audit_target(route: &Route, instance: &str) -> String {
+    let target = route.target();
+    if target == "-" {
+        instance.to_owned()
+    } else {
+        target
+    }
+}
+
+fn zone_resource(origin: &Name) -> String {
+    format!("/api/v1/zones/{}", encode_segment(&origin.to_string()))
+}
+
+fn prefers_async(request: &HttpRequest) -> bool {
+    request.header("prefer").is_some_and(|value| {
+        value.split(',').any(|token| {
+            token
+                .trim()
+                .split(';')
+                .next()
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("respond-async"))
+        })
+    })
+}
+
+fn confirm_origin_from_body(body: &[u8]) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(body).ok()?;
+    value
+        .get("confirm_origin")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn parse_duration(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (digits, multiplier) = match trimmed.as_bytes().last().copied() {
+        Some(b's') => (trimmed.get(..trimmed.len().saturating_sub(1))?, 1_u64),
+        Some(b'm') => (trimmed.get(..trimmed.len().saturating_sub(1))?, 60),
+        Some(b'h') => (trimmed.get(..trimmed.len().saturating_sub(1))?, 3_600),
+        Some(b'd') => (trimmed.get(..trimmed.len().saturating_sub(1))?, 86_400),
+        _ => (trimmed, 1),
+    };
+    let number = digits.parse::<u64>().ok()?;
+    u32::try_from(number.saturating_mul(multiplier)).ok()
+}
+
+fn duration_from_value(value: &Value) -> Option<u32> {
+    match value {
+        Value::String(text) => parse_duration(text),
+        Value::Number(number) => number
+            .as_u64()
+            .and_then(|seconds| u32::try_from(seconds).ok()),
+        _ => None,
+    }
+}
+
+fn valid_seq_cursor(cursor: &str) -> bool {
+    crate::base64url::decode(cursor)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| text.parse::<u64>().ok())
+        .is_some()
+}
+
+fn parse_job_state(value: &str) -> Option<JobState> {
+    match value {
+        "pending" | "queued" => Some(JobState::Pending),
+        "running" => Some(JobState::Running),
+        "done" | "succeeded" => Some(JobState::Done),
+        "failed" => Some(JobState::Failed),
+        "cancelled" | "canceled" => Some(JobState::Cancelled),
+        _ => None,
+    }
+}
+
+fn unix_time(seconds: u32) -> SystemTime {
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(u64::from(seconds)))
+        .unwrap_or(UNIX_EPOCH)
+}
+
+fn job_json(job: &JobRecord) -> Value {
+    json!({
+        "job_id": job.id,
+        "kind": job.kind,
+        "state": job.state.as_str(),
+        "status": job.state.as_str(),
+        "resource": job.resource,
+        "zone": job.zone,
+        "progress": Value::Null,
+        "result": job.result,
+        "error": job.error.as_ref().map(|error| json!({
+            "kind": error.kind,
+            "detail": error.detail,
+            "retryable": error.retryable,
+        })),
+        "created_at": rfc3339(job.created_at),
+        "started_at": job.started_at.map(rfc3339),
+        "finished_at": job.finished_at.map(rfc3339),
+        "cancellable": job.cancellable,
+        "expires_at": job.expires_at.map(rfc3339),
+    })
+}
+
+fn job_visible(job: &JobRecord, principal: &Principal) -> bool {
+    match &job.zone {
+        Some(zone) => Name::parse(zone).is_ok_and(|name| principal.zone_allowed(&name)),
+        None => true,
+    }
+}
+
+fn job_not_found(instance: &str, request_id: &str) -> Problem {
+    Problem::new(
+        404,
+        "job-not-found",
+        "The job does not exist or has expired.",
+        instance,
+        request_id,
+    )
+}
+
+fn admin_failure(error: AdminError) -> JobFailure {
+    let (kind, retryable) = match &error {
+        AdminError::NotFound(_) => ("not-found", false),
+        AdminError::Conflict(Conflict::ZoneExists) => ("zone-exists", false),
+        AdminError::Conflict(Conflict::RrsetExists) => ("rrset-exists", false),
+        AdminError::Conflict(Conflict::ZoneBusy) | AdminError::Busy => ("zone-busy", true),
+        AdminError::Conflict(Conflict::ZoneReadOnly) => ("zone-read-only", false),
+        AdminError::Conflict(Conflict::SerialNotNewer) => ("serial-not-newer", false),
+        AdminError::Conflict(Conflict::SerialAmbiguous) => ("serial-ambiguous", false),
+        AdminError::Conflict(Conflict::TransferInProgress) => ("transfer-in-progress", true),
+        AdminError::Conflict(Conflict::InvalidZoneState) => ("invalid-zone-state", false),
+        AdminError::PreconditionFailed { .. } => ("precondition-failed", false),
+        AdminError::PreconditionRequired => ("precondition-required", false),
+        AdminError::InvariantViolation(_) => ("validation-failed", false),
+        AdminError::InvalidCursor => ("bad-request", false),
+        AdminError::Internal | AdminError::Storage(_) => ("internal-error", true),
+    };
+    JobFailure::new(kind, "The background operation failed.", retryable)
+}
+
+fn transfer_json(result: &crate::port::TransferResult) -> Value {
+    json!({
+        "zone": result.zone.to_string(),
+        "kind": result.kind.as_str(),
+        "mode": result.mode_used.as_str(),
+        "mode_used": result.mode_used.as_str(),
+        "serial": result.serial.map(pulse_dns::Serial::as_u32),
+        "rrsets": result.rrsets,
+        "bytes": result.bytes,
+        "peer": result.peer,
+        "outgoing": result.outgoing,
+    })
+}
+
+fn import_json(report: &crate::port::ImportReport) -> Value {
+    json!({
+        "zone": report.zone.to_string(),
+        "mode": report.mode.as_str(),
+        "rrsets": report.rrsets,
+        "serial": report.serial.map(pulse_dns::Serial::as_u32),
+        "warnings": report.warnings,
+        "applied": report.applied,
+    })
+}
+
+fn rotation_json(rotation: &KeyRotationView) -> Value {
+    json!({
+        "next_event_at": rotation.next_event_at,
+        "keys": rotation
+            .keys
+            .iter()
+            .map(|key| json!({
+                "key_tag": key.key_tag,
+                "role": key.role,
+                "state": key.state,
+                "created_at": key.created_at,
+                "next_transition": key.next_transition,
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn journal_failure(

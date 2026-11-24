@@ -52,6 +52,7 @@
 //! ```
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "512"]
 #![cfg_attr(
     not(test),
     deny(
@@ -98,12 +99,14 @@ pub mod memory;
 pub mod port;
 pub mod server;
 
+mod audit;
 mod base64url;
 mod codec;
 mod etag;
 mod handler;
 mod http;
 mod idempotency;
+mod jobs;
 mod metrics;
 mod openapi;
 mod problem;
@@ -121,10 +124,12 @@ pub use journal::{
 };
 pub use memory::{InMemoryZoneAdmin, StoreSnapshot, ZoneSnapshot};
 pub use port::{
-    Denial, KeyRotationKeyView, KeyRotationView, ListRrsets, ListZones, Precondition,
-    Preconditions, RrsetInput, RrsetPage, RrsetPatch, RrsetPatchOutcome, RrsetView, WriteOutcome,
-    ZoneAdmin, ZoneAllow, ZoneFileMetrics, ZoneId, ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings,
-    ZoneSettingsPatch, ZoneSettingsView, ZoneView,
+    Denial, ImportMode, ImportReport, KeyRotationKeyView, KeyRotationView, ListRrsets, ListZones,
+    Precondition, Preconditions, RolloverRequest, RrsetInput, RrsetPage, RrsetPatch,
+    RrsetPatchOutcome, RrsetView, SerialState, SerialUpdate, SerialUpdateResult, TransferKind,
+    TransferRequest, TransferResult, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneFileMetrics, ZoneId,
+    ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, ZoneView,
+    next_serial,
 };
 pub use server::{
     ApiServerError, MetricsProvider, RunningServer, serve, serve_with_journal, serve_with_metrics,

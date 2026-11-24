@@ -11,10 +11,11 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use pulse_api::{
-    AdminError, Conflict, Denial, KeyRotationKeyView, KeyRotationView, ListRrsets, ListZones,
-    Precondition, Preconditions, RrsetInput, RrsetPatch, RrsetPatchOutcome, RrsetView,
-    WriteOutcome, ZoneAdmin, ZoneAllow, ZoneFileMetrics, ZoneKind, ZoneMetaInput, ZonePage,
-    ZoneSettings, ZoneSettingsPatch, ZoneSettingsView,
+    AdminError, Conflict, Denial, ImportMode, ImportReport, KeyRotationKeyView, KeyRotationView,
+    ListRrsets, ListZones, Precondition, Preconditions, RolloverRequest, RrsetInput, RrsetPatch,
+    RrsetPatchOutcome, RrsetView, SerialState, SerialUpdate, SerialUpdateResult, TransferRequest,
+    TransferResult, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneFileMetrics, ZoneKind, ZoneMetaInput,
+    ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, next_serial,
 };
 use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype, Serial, Ttl};
 use pulse_server::{DenialKind, QueryEngine, QueryStats, ZoneState as ServerZoneState, ZoneView};
@@ -263,6 +264,103 @@ impl SharedZoneAdmin {
                     );
                 }
             }
+        }
+    }
+
+    pub(crate) fn run_transfer(
+        &self,
+        origin: &Name,
+        request: &TransferRequest,
+    ) -> Result<TransferResult, AdminError> {
+        let store = self.require_store()?;
+        let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? else {
+            return Err(AdminError::zone_not_found());
+        };
+        let kind = kind_from_flags(entry.flags);
+        let view = zone_view(store, origin)?;
+        match kind {
+            ZoneKind::Primary => {
+                if let Some(from_serial) = request.from_serial
+                    && Serial::new(from_serial).is_newer_than(view.serial) != Some(false)
+                {
+                    return Err(AdminError::invariant(
+                        "/from_serial",
+                        "serial-not-older",
+                        "from_serial must be older than the current serial",
+                    ));
+                }
+                logging::info(
+                    "transfer",
+                    &format!(
+                        "{origin}: outgoing {} requested via API",
+                        request.kind.as_str()
+                    ),
+                );
+                Ok(TransferResult {
+                    zone: origin.clone(),
+                    kind: request.kind,
+                    mode_used: request.kind,
+                    serial: Some(view.serial),
+                    rrsets: Some(view.rrset_count),
+                    bytes: None,
+                    peer: request.peer.clone(),
+                    outgoing: true,
+                })
+            }
+            ZoneKind::Secondary => {
+                if let Some(from_serial) = request.from_serial
+                    && Serial::new(from_serial).is_newer_than(view.serial) != Some(false)
+                {
+                    return Err(AdminError::invariant(
+                        "/from_serial",
+                        "serial-not-older",
+                        "from_serial must be older than the current serial",
+                    ));
+                }
+                let Some(zone) = self.secondary.get(origin) else {
+                    return Err(AdminError::Conflict(Conflict::InvalidZoneState));
+                };
+                let Some(_lease) = zone.try_lease() else {
+                    return Err(AdminError::Conflict(Conflict::TransferInProgress));
+                };
+                let local = store.zone_snapshot(origin).ok().flatten();
+                let update =
+                    zone.fetch(local.as_ref(), self.transfer.limits())
+                        .map_err(|error| {
+                            logging::warn(
+                                "transfer",
+                                &format!("zone {origin}: incoming transfer failed: {error}"),
+                            );
+                            AdminError::Storage("incoming transfer failed".to_owned())
+                        })?;
+                let serial = match update.soa().rdata() {
+                    Rdata::Soa(soa) => Some(soa.serial),
+                    _ => None,
+                };
+                if let SecondaryUpdate::Zone(_) = &update {
+                    self.apply_secondary_update(origin, &update, local.as_ref())
+                        .map_err(|error| {
+                            logging::error(
+                                "transfer",
+                                &format!("zone {origin}: cannot apply transfer: {error}"),
+                            );
+                            AdminError::Storage("cannot apply incoming transfer".to_owned())
+                        })?;
+                }
+                zone.note_success(update.soa(), Instant::now());
+                let refreshed = zone_view(store, origin)?;
+                Ok(TransferResult {
+                    zone: origin.clone(),
+                    kind: request.kind,
+                    mode_used: request.kind,
+                    serial,
+                    rrsets: Some(refreshed.rrset_count),
+                    bytes: None,
+                    peer: request.peer.clone(),
+                    outgoing: false,
+                })
+            }
+            ZoneKind::Forward => Err(AdminError::Conflict(Conflict::InvalidZoneState)),
         }
     }
 
@@ -660,6 +758,30 @@ fn check_create(preconditions: &Preconditions) -> Result<(), AdminError> {
     Ok(())
 }
 
+fn check_optional_existing(
+    preconditions: &Preconditions,
+    current_etag: &str,
+    version: u64,
+) -> Result<(), AdminError> {
+    if let Some(condition) = &preconditions.if_none_match
+        && condition_matches(condition, current_etag)
+    {
+        return Err(AdminError::PreconditionFailed {
+            current_etag: Some(current_etag.to_owned()),
+            current_version: Some(version),
+        });
+    }
+    if let Some(condition) = &preconditions.if_match
+        && !condition_matches(condition, current_etag)
+    {
+        return Err(AdminError::PreconditionFailed {
+            current_etag: Some(current_etag.to_owned()),
+            current_version: Some(version),
+        });
+    }
+    Ok(())
+}
+
 fn map_rrset_error(error: &pulse_dns::RrsetError) -> AdminError {
     AdminError::invariant("/records", "invalid-rrset", error.to_string())
 }
@@ -869,6 +991,263 @@ impl ZoneAdmin for SharedZoneAdmin {
 
     fn get_zone(&self, origin: &Name) -> Result<pulse_api::ZoneView, AdminError> {
         zone_view(self.require_store()?, origin)
+    }
+
+    fn create_zone(
+        &self,
+        origin: &Name,
+        meta: &ZoneMetaInput,
+    ) -> Result<pulse_api::ZoneView, AdminError> {
+        if origin == &Name::root() || origin.labels().any(|label| label == b"*") {
+            return Err(AdminError::invariant(
+                "/origin",
+                "invalid-origin",
+                "zone origin must be a non-root name without wildcards",
+            ));
+        }
+        let store = self.require_store()?;
+        let _guard = self.catalog.lock().unwrap_or_else(PoisonError::into_inner);
+        if store
+            .zone_entry(origin)
+            .map_err(AdminError::Storage)?
+            .is_some()
+        {
+            return Err(AdminError::Conflict(Conflict::ZoneExists));
+        }
+        store
+            .create_zone(origin, meta.kind, meta.default_ttl, meta.denial)
+            .map_err(AdminError::Storage)?;
+        self.after_commit(origin, None);
+        zone_view(store, origin)
+    }
+
+    fn get_serial(&self, origin: &Name) -> Result<SerialState, AdminError> {
+        let view = zone_view(self.require_store()?, origin)?;
+        Ok(SerialState {
+            zone: view.origin,
+            serial: view.serial,
+            version: view.version,
+            etag: view.etag,
+            updated_at: view.updated_at,
+        })
+    }
+
+    fn update_serial(
+        &self,
+        origin: &Name,
+        update: SerialUpdate,
+        preconditions: &Preconditions,
+    ) -> Result<SerialUpdateResult, AdminError> {
+        let store = self.require_store()?;
+        let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? else {
+            return Err(AdminError::zone_not_found());
+        };
+        if !kind_from_flags(entry.flags).is_writable() {
+            return Err(AdminError::Conflict(Conflict::ZoneReadOnly));
+        }
+        let origin_rle =
+            name_to_rle(origin).map_err(|error| AdminError::Storage(error.to_string()))?;
+        let mut writer = store.open_writer(origin).map_err(AdminError::Storage)?;
+        let base = writer.version().max(1);
+        check_optional_existing(preconditions, &zone_etag(entry.zone_seq, base, base), base)?;
+        let current = writer
+            .lookup(&origin_rle, Rtype::SOA.as_u16(), 0)
+            .map_err(|error| AdminError::Storage(error.to_string()))?;
+        let current_serial = match &current {
+            Some(record) => {
+                let view = pulse_zonefile::RrsetView {
+                    ttl: record.ttl,
+                    flags: record.flags,
+                    rdata: record.rdata.clone(),
+                };
+                let rrset = crate::zonefile::rrset_from_stored(origin, Rtype::SOA, &view)
+                    .map_err(|error| AdminError::Storage(error.to_string()))?;
+                soa_serial(Some(&rrset)).unwrap_or_else(|| Serial::new(writer.soa_serial()))
+            }
+            None => Serial::new(writer.soa_serial()),
+        };
+        let new_serial = next_serial(current_serial, update)?;
+        if current.is_some() {
+            let view = pulse_zonefile::RrsetView {
+                ttl: current.as_ref().map_or(0, |record| record.ttl),
+                flags: current.as_ref().map_or(0, |record| record.flags),
+                rdata: current
+                    .as_ref()
+                    .map_or_else(Vec::new, |record| record.rdata.clone()),
+            };
+            let mut rrset = crate::zonefile::rrset_from_stored(origin, Rtype::SOA, &view)
+                .map_err(|error| AdminError::Storage(error.to_string()))?;
+            let Some(Rdata::Soa(mut soa)) = rrset.rdatas().first().cloned() else {
+                return Err(AdminError::Internal);
+            };
+            soa.serial = new_serial;
+            rrset = Rrset::new(
+                origin.clone(),
+                Rtype::SOA,
+                Rclass::IN,
+                rrset.ttl(),
+                [Rdata::Soa(soa)],
+            )
+            .map_err(|error| map_rrset_error(&error))?;
+            write_rrset(&mut writer, &rrset).map_err(AdminError::Storage)?;
+        }
+        writer.set_soa_serial(new_serial.as_u32());
+        let previous = self.previous_snapshot(origin, store);
+        store
+            .commit_writer(&mut writer)
+            .map_err(AdminError::Storage)?;
+        self.after_commit(origin, previous.as_ref());
+        drop(writer);
+        let view = zone_view(store, origin)?;
+        Ok(SerialUpdateResult {
+            zone: origin.clone(),
+            old_serial: current_serial,
+            new_serial,
+            version: view.version,
+            etag: view.etag,
+            updated_at: view.updated_at,
+        })
+    }
+
+    fn trigger_transfer(
+        &self,
+        origin: &Name,
+        request: &TransferRequest,
+    ) -> Result<TransferResult, AdminError> {
+        self.run_transfer(origin, request)
+    }
+
+    fn import_zone(
+        &self,
+        origin: &Name,
+        text: &str,
+        mode: ImportMode,
+    ) -> Result<ImportReport, AdminError> {
+        let store = self.require_store()?;
+        let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? else {
+            return Err(AdminError::zone_not_found());
+        };
+        let kind = kind_from_flags(entry.flags);
+        if kind != ZoneKind::Primary {
+            return Err(AdminError::Conflict(Conflict::ZoneReadOnly));
+        }
+        let loaded = crate::master::load_zone_text(&origin.to_string(), text, "api-import")
+            .map_err(|error| AdminError::invariant("/body", "invalid-zonefile", error))?;
+        let mut rrsets = if mode == ImportMode::Merge {
+            store.zone_rrsets(origin).map_err(AdminError::Storage)?
+        } else {
+            Vec::new()
+        };
+        for rrset in loaded.rrsets {
+            let same = |existing: &Rrset| {
+                existing.owner() == rrset.owner() && existing.rr_type() == rrset.rr_type()
+            };
+            rrsets.retain(|existing| !same(existing));
+            rrsets.push(rrset);
+        }
+        let (rrsets, denial) = if self.dnssec.is_configured(origin) {
+            let signed_zone = self
+                .dnssec
+                .sign(origin, &rrsets, dnssec::now_unix())
+                .map_err(|error| {
+                    logging::error(
+                        "zone_import",
+                        &format!("zone {origin}: cannot sign after import: {error}"),
+                    );
+                    AdminError::Internal
+                })?;
+            (signed_zone.rrsets, denial_from_kind(signed_zone.denial))
+        } else {
+            (rrsets, Denial::Nsec)
+        };
+        let serial = rrsets
+            .iter()
+            .find(|rrset| rrset.rr_type() == Rtype::SOA)
+            .and_then(|rrset| soa_serial(Some(rrset)));
+        let count = u32::try_from(rrsets.len()).unwrap_or(u32::MAX);
+        let warnings = loaded.warnings.clone();
+        if mode == ImportMode::Check {
+            return Ok(ImportReport {
+                zone: origin.clone(),
+                mode,
+                rrsets: count,
+                serial,
+                warnings,
+                applied: false,
+            });
+        }
+        let default_ttl = loaded.default_ttl;
+        replace_zone_in_file(store, origin, kind, default_ttl, denial, &rrsets, &[])
+            .map_err(AdminError::Storage)?;
+        self.after_commit(origin, None);
+        Ok(ImportReport {
+            zone: origin.clone(),
+            mode,
+            rrsets: count,
+            serial,
+            warnings,
+            applied: true,
+        })
+    }
+
+    fn rollover_keys(
+        &self,
+        origin: &Name,
+        request: &RolloverRequest,
+    ) -> Result<KeyRotationView, AdminError> {
+        let _ = self.require_store()?;
+        let role = pulse_server::dnssec::KeyRole::parse(&request.role).ok_or_else(|| {
+            AdminError::invariant("/role", "invalid-role", "role must be ksk or zsk")
+        })?;
+        if !matches!(
+            role,
+            pulse_server::dnssec::KeyRole::Ksk | pulse_server::dnssec::KeyRole::Zsk
+        ) {
+            return Err(AdminError::invariant(
+                "/role",
+                "invalid-role",
+                "role must be ksk or zsk",
+            ));
+        }
+        let status = self
+            .dnssec
+            .rollover(origin, role, request.overlap, request.retire_after)
+            .map_err(|error| {
+                logging::error(
+                    "dnssec_rotation",
+                    &format!("zone {origin}: rollover failed: {error}"),
+                );
+                match error.as_ref() {
+                    crate::dnssec::DnssecError::InvalidRotation { .. } => AdminError::invariant(
+                        "/zone",
+                        "rotation-not-configured",
+                        "key rotation is not configured for this zone",
+                    ),
+                    crate::dnssec::DnssecError::Rotation { source, .. }
+                        if matches!(
+                            source.as_ref(),
+                            crate::rotation::RotationError::RolloverInProgress { .. }
+                        ) =>
+                    {
+                        AdminError::Conflict(Conflict::ZoneBusy)
+                    }
+                    _ => AdminError::Internal,
+                }
+            })?;
+        Ok(KeyRotationView {
+            next_event_at: status.next_event_at,
+            keys: status
+                .keys
+                .into_iter()
+                .map(|key| KeyRotationKeyView {
+                    key_tag: key.key_tag,
+                    role: key.role,
+                    state: key.stage.as_str().to_owned(),
+                    created_at: key.created_at,
+                    next_transition: key.next_transition,
+                })
+                .collect(),
+        })
     }
 
     fn put_zone(

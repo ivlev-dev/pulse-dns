@@ -137,6 +137,7 @@ pub fn serve_with_journal<Z: ZoneAdmin>(
     let addr = listener.local_addr().map_err(ApiServerError::Listener)?;
     let limits = HttpLimits {
         max_body_bytes: config.max_body_bytes,
+        import_max_body_bytes: crate::config::MAX_IMPORT_BYTES,
         request_timeout: config.request_timeout,
         write_timeout: config.write_timeout,
     };

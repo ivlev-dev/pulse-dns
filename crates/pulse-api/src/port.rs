@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use pulse_dns::{Name, Rdata, Rtype, Serial, Ttl};
 
-use crate::error::AdminError;
+use crate::error::{AdminError, Conflict};
 
 /// Стабильный идентификатор зоны (`docs/spec/domain-model.md` §2.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -440,6 +440,191 @@ pub struct KeyRotationView {
     pub next_event_at: Option<u32>,
 }
 
+/// Режим изменения serial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialUpdate {
+    /// Инкремент на 1 по RFC 1982.
+    Increment,
+    /// Установить точное значение (только если новее текущего).
+    Set(u32),
+}
+
+/// Состояние serial зоны.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialState {
+    /// Origin.
+    pub zone: Name,
+    /// Текущий serial.
+    pub serial: Serial,
+    /// Версия зоны.
+    pub version: u64,
+    /// ETag зоны.
+    pub etag: String,
+    /// Время последнего изменения.
+    pub updated_at: SystemTime,
+}
+
+/// Результат изменения serial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialUpdateResult {
+    /// Origin.
+    pub zone: Name,
+    /// Serial до изменения.
+    pub old_serial: Serial,
+    /// Serial после изменения.
+    pub new_serial: Serial,
+    /// Версия зоны после коммита.
+    pub version: u64,
+    /// ETag зоны после коммита.
+    pub etag: String,
+    /// Время коммита.
+    pub updated_at: SystemTime,
+}
+
+/// Вид трансфера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferKind {
+    /// Полный перенос зоны.
+    Axfr,
+    /// Инкрементальный перенос.
+    Ixfr,
+}
+
+impl TransferKind {
+    /// Строковое имя для API.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Axfr => "axfr",
+            Self::Ixfr => "ixfr",
+        }
+    }
+
+    /// Разбирает значение из API.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "axfr" => Some(Self::Axfr),
+            "ixfr" => Some(Self::Ixfr),
+            _ => None,
+        }
+    }
+}
+
+/// Запрос трансфера.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferRequest {
+    /// Запрошенный вид.
+    pub kind: TransferKind,
+    /// Peer/источник (диагностика и выбор master'а).
+    pub peer: Option<String>,
+    /// Имя TSIG-ключа (сам секрет не передаётся).
+    pub tsig_key: Option<String>,
+    /// Serial, от которого запрошен IXFR.
+    pub from_serial: Option<u32>,
+}
+
+/// Результат выполнения трансфера.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferResult {
+    /// Origin.
+    pub zone: Name,
+    /// Запрошенный вид.
+    pub kind: TransferKind,
+    /// Фактически использованный вид.
+    pub mode_used: TransferKind,
+    /// Serial после операции.
+    pub serial: Option<Serial>,
+    /// Сколько RRset перенесено/отдано.
+    pub rrsets: Option<u32>,
+    /// Объём в байтах, если известен.
+    pub bytes: Option<u64>,
+    /// Peer.
+    pub peer: Option<String>,
+    /// Для primary: трансфер исходящий и не является job.
+    pub outgoing: bool,
+}
+
+/// Режим импорта зоны.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportMode {
+    /// Полная замена содержимого.
+    Replace,
+    /// Слияние с существующими RRset.
+    Merge,
+    /// Только проверка без изменений.
+    Check,
+}
+
+impl ImportMode {
+    /// Строковое имя для API.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Merge => "merge",
+            Self::Check => "check",
+        }
+    }
+
+    /// Разбирает значение из API.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "replace" => Some(Self::Replace),
+            "merge" => Some(Self::Merge),
+            "check" => Some(Self::Check),
+            _ => None,
+        }
+    }
+}
+
+/// Отчёт об импорте зоны.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportReport {
+    /// Origin.
+    pub zone: Name,
+    /// Режим.
+    pub mode: ImportMode,
+    /// Сколько RRset в результате.
+    pub rrsets: u32,
+    /// Serial после импорта.
+    pub serial: Option<Serial>,
+    /// Некритичные предупреждения парсера.
+    pub warnings: Vec<String>,
+    /// Были ли изменения применены.
+    pub applied: bool,
+}
+
+/// Запрос rollover ключей.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloverRequest {
+    /// Роль (`ksk`/`zsk`).
+    pub role: String,
+    /// Схема (`pre_publish`/`double_sign`).
+    pub scheme: String,
+    /// Длительность перекрытия в секундах.
+    pub overlap: u32,
+    /// Через сколько секунд удалять retired-ключ.
+    pub retire_after: Option<u32>,
+}
+
+/// Вычисляет новый serial по RFC 1982.
+///
+/// # Errors
+///
+/// [`Conflict::SerialNotNewer`], если запрошенный serial не новее текущего,
+/// [`Conflict::SerialAmbiguous`] при разнице ровно `2^31`.
+pub fn next_serial(current: Serial, update: SerialUpdate) -> Result<Serial, AdminError> {
+    match update {
+        SerialUpdate::Increment => Ok(current.succ()),
+        SerialUpdate::Set(value) => {
+            let requested = Serial::new(value);
+            match requested.is_newer_than(current) {
+                Some(true) => Ok(requested),
+                Some(false) => Err(AdminError::Conflict(Conflict::SerialNotNewer)),
+                None => Err(AdminError::Conflict(Conflict::SerialAmbiguous)),
+            }
+        }
+    }
+}
+
 /// Порт администрирования зон.
 ///
 /// Реализации синхронные и `Send + Sync`.
@@ -519,6 +704,100 @@ pub trait ZoneAdmin: Send + Sync + 'static {
         patch: &ZoneSettingsPatch,
         preconditions: &Preconditions,
     ) -> Result<ZoneSettingsView, AdminError>;
+
+    /// Создаёт зону; существующая зона даёт `409 zone-exists`.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::Conflict`] с [`Conflict::ZoneExists`], если зона уже есть.
+    fn create_zone(&self, origin: &Name, meta: &ZoneMetaInput) -> Result<ZoneView, AdminError> {
+        match self.get_zone(origin) {
+            Ok(_) => Err(AdminError::Conflict(Conflict::ZoneExists)),
+            Err(AdminError::NotFound(crate::error::NotFound::Zone)) => self
+                .put_zone(origin, meta, &Preconditions::none())
+                .map(|outcome| outcome.value().clone()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Читает serial зоны.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::NotFound`] для отсутствующей зоны.
+    fn get_serial(&self, origin: &Name) -> Result<SerialState, AdminError> {
+        let zone = self.get_zone(origin)?;
+        Ok(SerialState {
+            zone: zone.origin,
+            serial: zone.serial,
+            version: zone.version,
+            etag: zone.etag,
+            updated_at: zone.updated_at,
+        })
+    }
+
+    /// Меняет serial с проверкой RFC 1982.
+    ///
+    /// # Errors
+    ///
+    /// [`Conflict::SerialNotNewer`], [`Conflict::SerialAmbiguous`],
+    /// [`Conflict::ZoneReadOnly`], [`AdminError::PreconditionFailed`].
+    fn update_serial(
+        &self,
+        origin: &Name,
+        update: SerialUpdate,
+        preconditions: &Preconditions,
+    ) -> Result<SerialUpdateResult, AdminError> {
+        let _ = (origin, update, preconditions);
+        Err(AdminError::Internal)
+    }
+
+    /// Запускает AXFR/IXFR и дожидается результата.
+    ///
+    /// Для primary это исходящий трансфер (проверка доступности и лог), для
+    /// secondary — реальный AXFR/IXFR-in с публикацией снапшота.
+    ///
+    /// # Errors
+    ///
+    /// [`Conflict::InvalidZoneState`], [`Conflict::TransferInProgress`].
+    fn trigger_transfer(
+        &self,
+        origin: &Name,
+        request: &TransferRequest,
+    ) -> Result<TransferResult, AdminError> {
+        let _ = (origin, request);
+        Err(AdminError::Internal)
+    }
+
+    /// Импортирует master-текст в зону.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::InvariantViolation`] при ошибке парсинга/инвариантов,
+    /// [`Conflict::ZoneReadOnly`] для secondary/forward.
+    fn import_zone(
+        &self,
+        origin: &Name,
+        text: &str,
+        mode: ImportMode,
+    ) -> Result<ImportReport, AdminError> {
+        let _ = (origin, text, mode);
+        Err(AdminError::Internal)
+    }
+
+    /// Принудительно запускает rollover ключей.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::InvariantViolation`], если ротация не настроена.
+    fn rollover_keys(
+        &self,
+        origin: &Name,
+        request: &RolloverRequest,
+    ) -> Result<KeyRotationView, AdminError> {
+        let _ = (origin, request);
+        Err(AdminError::Internal)
+    }
 
     /// Переподписывает зону текущими DNSSEC-ключами.
     ///

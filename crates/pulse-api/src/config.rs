@@ -8,7 +8,12 @@ use thiserror::Error;
 use crate::auth::{AuthConfigError, Authenticator, TokenConfig};
 
 /// Лимит тела запроса по умолчанию: 16 MiB (ADR 0004 SEC-API-005).
+///
+/// Импорт master-файла (`POST /zones/{origin}/import`) имеет отдельный лимит
+/// [`MAX_IMPORT_BYTES`] = 32 MiB.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Максимальный размер тела импорта зоны (`rest-v1.md` §7.4).
+pub const MAX_IMPORT_BYTES: usize = 32 * 1024 * 1024;
 /// Таймаут чтения запроса по умолчанию: 30 с (`rest-v1.md` §2.5).
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Таймаут записи ответа по умолчанию.

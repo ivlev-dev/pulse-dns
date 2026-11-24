@@ -193,6 +193,8 @@ impl HttpResponse {
 pub(crate) struct HttpLimits {
     /// Максимум тела.
     pub(crate) max_body_bytes: usize,
+    /// Максимум тела для `POST /zones/{origin}/import`.
+    pub(crate) import_max_body_bytes: usize,
     /// Дедлайн чтения.
     pub(crate) request_timeout: Duration,
     /// Таймаут записи.
@@ -384,8 +386,13 @@ pub(crate) fn read_request(
             }
         }
     }
+    let body_limit = if path.ends_with("/import") {
+        limits.import_max_body_bytes
+    } else {
+        limits.max_body_bytes
+    };
     if let Some(length) = content_length {
-        if length > limits.max_body_bytes {
+        if length > body_limit {
             return Err(RequestError::too_large());
         }
     }
@@ -398,7 +405,7 @@ pub(crate) fn read_request(
     }
 
     let body = if chunked {
-        read_chunked(&mut reader, limits.max_body_bytes)?
+        read_chunked(&mut reader, body_limit)?
     } else if let Some(length) = content_length {
         reader.take_exact(length)?
     } else {

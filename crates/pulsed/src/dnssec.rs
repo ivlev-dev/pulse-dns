@@ -125,6 +125,45 @@ impl DnssecSigners {
         inner.rotation.as_ref().map(RotationEngine::status)
     }
 
+    /// Запускает rollover роли; возвращает новое состояние ротации.
+    pub(crate) fn rollover(
+        &self,
+        origin: &Name,
+        role: KeyRole,
+        overlap: u32,
+        retire_after: Option<u32>,
+    ) -> Result<RotationStatus, Box<DnssecError>> {
+        let zone = self.zones.get(origin).ok_or_else(|| {
+            Box::new(DnssecError::NoKeys {
+                zone: origin.to_string(),
+            })
+        })?;
+        let mut inner = zone.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(rotation) = inner.rotation.as_mut() else {
+            return Err(Box::new(DnssecError::InvalidRotation {
+                zone: origin.to_string(),
+                reason: "key rotation is not configured".to_owned(),
+            }));
+        };
+        rotation
+            .force_rollover(role, overlap, retire_after, now_unix())
+            .map_err(|source| {
+                Box::new(DnssecError::Rotation {
+                    zone: origin.to_string(),
+                    source: Box::new(source),
+                })
+            })?;
+        let signer = rotation.signer().map_err(|source| {
+            Box::new(DnssecError::Rotation {
+                zone: origin.to_string(),
+                source: Box::new(source),
+            })
+        })?;
+        let status = rotation.status();
+        inner.signer = signer;
+        Ok(status)
+    }
+
     /// Настроенные origin'ы.
     pub(crate) fn origins(&self) -> impl Iterator<Item = &Name> {
         self.zones.keys()

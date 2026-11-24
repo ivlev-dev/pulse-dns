@@ -58,6 +58,28 @@ pub(crate) fn document() -> Value {
                         "401": { "$ref": "#/components/responses/Problem" },
                         "403": { "$ref": "#/components/responses/Problem" }
                     }
+                },
+                "post": {
+                    "summary": "Create a zone",
+                    "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }],
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ZoneWrite" } } }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Created",
+                            "headers": {
+                                "Location": { "schema": { "type": "string" } },
+                                "ETag": { "schema": { "type": "string" } }
+                            },
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Zone" } } }
+                        },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" },
+                        "409": { "$ref": "#/components/responses/Problem" },
+                        "422": { "$ref": "#/components/responses/Problem" }
+                    }
                 }
             },
             "/api/v1/zones/{origin}": {
@@ -102,6 +124,91 @@ pub(crate) fn document() -> Value {
                     }
                 }
             },
+            "/api/v1/zones/{origin}/serial": {
+                "parameters": [{ "$ref": "#/components/parameters/Origin" }],
+                "get": {
+                    "summary": "Read the zone serial",
+                    "responses": {
+                        "200": { "description": "Serial", "headers": { "ETag": { "schema": { "type": "string" } } } },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" },
+                        "404": { "$ref": "#/components/responses/Problem" }
+                    }
+                },
+                "post": {
+                    "summary": "Increment or set the serial (RFC 1982 monotonicity)",
+                    "parameters": [{ "$ref": "#/components/parameters/IfMatch" }],
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SerialUpdate" } } }
+                    },
+                    "responses": {
+                        "200": { "description": "Serial updated", "headers": { "ETag": { "schema": { "type": "string" } } } },
+                        "404": { "$ref": "#/components/responses/Problem" },
+                        "409": { "$ref": "#/components/responses/Problem" },
+                        "412": { "$ref": "#/components/responses/Problem" },
+                        "422": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
+            "/api/v1/zones/{origin}/transfers": {
+                "parameters": [{ "$ref": "#/components/parameters/Origin" }],
+                "get": {
+                    "summary": "List transfer jobs for the zone",
+                    "parameters": [
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 } },
+                        { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+                        { "name": "state", "in": "query", "schema": { "type": "string", "enum": ["pending", "running", "done", "failed", "cancelled"] } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Transfer jobs", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobList" } } } },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" },
+                        "404": { "$ref": "#/components/responses/Problem" }
+                    }
+                },
+                "post": {
+                    "summary": "Trigger AXFR/IXFR (primary: outgoing log, secondary: job)",
+                    "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }],
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransferRequest" } } }
+                    },
+                    "responses": {
+                        "200": { "description": "Primary outgoing transfer accepted (not a job)" },
+                        "202": { "description": "Transfer job accepted", "headers": { "Location": { "schema": { "type": "string" } }, "Retry-After": { "schema": { "type": "integer" } } } },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" },
+                        "404": { "$ref": "#/components/responses/Problem" },
+                        "409": { "$ref": "#/components/responses/Problem" },
+                        "422": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
+            "/api/v1/zones/{origin}/import": {
+                "parameters": [{ "$ref": "#/components/parameters/Origin" }],
+                "post": {
+                    "summary": "Import master text into a primary zone (async job)",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/IdempotencyKey" },
+                        { "name": "mode", "in": "query", "schema": { "type": "string", "enum": ["replace", "merge", "check"], "default": "replace" } }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": { "text/plain": { "schema": { "type": "string" } } }
+                    },
+                    "responses": {
+                        "202": { "description": "Import job accepted", "headers": { "Location": { "schema": { "type": "string" } } } },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" },
+                        "404": { "$ref": "#/components/responses/Problem" },
+                        "409": { "$ref": "#/components/responses/Problem" },
+                        "413": { "$ref": "#/components/responses/Problem" },
+                        "415": { "$ref": "#/components/responses/Problem" },
+                        "422": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
             "/api/v1/zones/{origin}/settings": {
                 "parameters": [{ "$ref": "#/components/parameters/Origin" }],
                 "get": {
@@ -130,6 +237,37 @@ pub(crate) fn document() -> Value {
                     "responses": {
                         "200": { "description": "DNSKEY and DS records" },
                         "404": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
+            "/api/v1/zones/{origin}/keys/status": {
+                "parameters": [{ "$ref": "#/components/parameters/Origin" }],
+                "get": {
+                    "summary": "DNSSEC key rotation state (no private material)",
+                    "responses": {
+                        "200": { "description": "Rotation status" },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" },
+                        "404": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
+            "/api/v1/zones/{origin}/keys/rollover": {
+                "parameters": [{ "$ref": "#/components/parameters/Origin" }],
+                "post": {
+                    "summary": "Start KSK/ZSK rollover",
+                    "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }],
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Rollover" } } }
+                    },
+                    "responses": {
+                        "202": { "description": "Rollover job accepted", "headers": { "Location": { "schema": { "type": "string" } } } },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" },
+                        "404": { "$ref": "#/components/responses/Problem" },
+                        "409": { "$ref": "#/components/responses/Problem" },
+                        "422": { "$ref": "#/components/responses/Problem" }
                     }
                 }
             },
@@ -223,6 +361,77 @@ pub(crate) fn document() -> Value {
                 "put": { "summary": "Alias of /records/{name}/{type}", "responses": { "200": { "description": "RRset" } } },
                 "patch": { "summary": "Alias of /records/{name}/{type}", "responses": { "200": { "description": "RRset" } } },
                 "delete": { "summary": "Alias of /records/{name}/{type}", "responses": { "204": { "description": "Deleted" } } }
+            },
+            "/api/v1/jobs": {
+                "get": {
+                    "summary": "List jobs of the token",
+                    "parameters": [
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 } },
+                        { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+                        { "name": "state", "in": "query", "schema": { "type": "string", "enum": ["pending", "running", "done", "failed", "cancelled"] } },
+                        { "name": "kind", "in": "query", "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Jobs", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobList" } } } },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
+            "/api/v1/jobs/{job_id}": {
+                "parameters": [{ "$ref": "#/components/parameters/JobId" }],
+                "get": {
+                    "summary": "Read a job",
+                    "responses": {
+                        "200": { "description": "Job", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Job" } } } },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" },
+                        "404": { "$ref": "#/components/responses/Problem" }
+                    }
+                },
+                "delete": {
+                    "summary": "Cancel a job",
+                    "responses": {
+                        "200": { "description": "Job already finished" },
+                        "202": { "description": "Cancellation accepted" },
+                        "404": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
+            "/api/v1/transfers/{job_id}": {
+                "parameters": [{ "$ref": "#/components/parameters/JobId" }],
+                "get": {
+                    "summary": "Read a transfer job",
+                    "responses": {
+                        "200": { "description": "Job" },
+                        "404": { "$ref": "#/components/responses/Problem" }
+                    }
+                },
+                "delete": {
+                    "summary": "Cancel a transfer job",
+                    "responses": {
+                        "200": { "description": "Job already finished" },
+                        "202": { "description": "Cancellation accepted" },
+                        "404": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
+            "/api/v1/audit": {
+                "get": {
+                    "summary": "Read the control-plane audit ring",
+                    "parameters": [
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 } },
+                        { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+                        { "name": "principal", "in": "query", "schema": { "type": "string" } },
+                        { "name": "action", "in": "query", "schema": { "type": "string" } },
+                        { "name": "result", "in": "query", "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Audit page" },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
             }
         },
         "components": {
@@ -234,7 +443,9 @@ pub(crate) fn document() -> Value {
                 "Owner": { "name": "name", "in": "path", "required": true, "schema": { "type": "string", "example": "www.example.com." } },
                 "Type": { "name": "type", "in": "path", "required": true, "schema": { "type": "string", "example": "A" } },
                 "IfMatch": { "name": "If-Match", "in": "header", "required": false, "schema": { "type": "string" } },
-                "IfNoneMatch": { "name": "If-None-Match", "in": "header", "required": false, "schema": { "type": "string" } }
+                "IfNoneMatch": { "name": "If-None-Match", "in": "header", "required": false, "schema": { "type": "string" } },
+                "IdempotencyKey": { "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "minLength": 8, "maxLength": 128 } },
+                "JobId": { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string", "example": "job_0000000000000001_00000001" } }
             },
             "responses": {
                 "Problem": {
@@ -325,6 +536,63 @@ pub(crate) fn document() -> Value {
                         "denial": { "type": "string", "enum": ["nsec", "nsec3"] }
                     }
                 },
+                "SerialUpdate": {
+                    "type": "object",
+                    "required": ["mode"],
+                    "properties": {
+                        "mode": { "type": "string", "enum": ["increment", "set"] },
+                        "value": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u64 }
+                    }
+                },
+                "TransferRequest": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["axfr", "ixfr"] },
+                        "peer": { "type": "string" },
+                        "tsig_key": { "type": "string" },
+                        "from_serial": { "type": "integer" }
+                    }
+                },
+                "Rollover": {
+                    "type": "object",
+                    "required": ["role"],
+                    "properties": {
+                        "role": { "type": "string", "enum": ["ksk", "zsk"] },
+                        "scheme": { "type": "string", "enum": ["pre_publish", "double_sign"] },
+                        "overlap": { "type": "string", "example": "7d" },
+                        "retire_after": { "type": "string", "example": "30d" }
+                    }
+                },
+                "Job": {
+                    "type": "object",
+                    "required": ["job_id", "kind", "state", "resource", "created_at"],
+                    "properties": {
+                        "job_id": { "type": "string" },
+                        "kind": { "type": "string" },
+                        "state": { "type": "string", "enum": ["pending", "running", "done", "failed", "cancelled"] },
+                        "status": { "type": "string" },
+                        "resource": { "type": "string" },
+                        "zone": { "type": ["string", "null"] },
+                        "progress": { "type": ["object", "null"] },
+                        "result": { "type": ["object", "null"] },
+                        "error": { "type": ["object", "null"] },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "started_at": { "type": ["string", "null"], "format": "date-time" },
+                        "finished_at": { "type": ["string", "null"], "format": "date-time" },
+                        "cancellable": { "type": "boolean" },
+                        "expires_at": { "type": ["string", "null"], "format": "date-time" }
+                    }
+                },
+                "JobList": {
+                    "type": "object",
+                    "required": ["items", "next_cursor", "has_more"],
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Job" } },
+                        "next_cursor": { "type": ["string", "null"] },
+                        "has_more": { "type": "boolean" }
+                    }
+                },
                 "Problem": {
                     "type": "object",
                     "required": ["type", "title", "status", "code"],
@@ -366,6 +634,12 @@ mod tests {
         let document = document();
         assert_eq!(document["openapi"], "3.1.0");
         assert!(document["paths"]["/api/v1/zones/{origin}"].is_object());
+        assert!(document["paths"]["/api/v1/zones/{origin}/serial"].is_object());
+        assert!(document["paths"]["/api/v1/zones/{origin}/transfers"].is_object());
+        assert!(document["paths"]["/api/v1/zones/{origin}/import"].is_object());
+        assert!(document["paths"]["/api/v1/jobs/{job_id}"].is_object());
+        assert!(document["paths"]["/api/v1/audit"].is_object());
+        assert!(document["paths"]["/api/v1/zones/{origin}/keys/status"].is_object());
         assert_eq!(
             document["components"]["securitySchemes"]["bearerAuth"]["scheme"],
             "bearer"

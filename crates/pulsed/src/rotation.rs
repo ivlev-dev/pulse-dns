@@ -355,6 +355,12 @@ pub enum RotationError {
         #[source]
         source: ZoneSignerError,
     },
+    /// Rollover уже идёт для этой роли.
+    #[error("a rollover for {role} is already in progress")]
+    RolloverInProgress {
+        /// Роль.
+        role: &'static str,
+    },
 }
 
 /// Движок ротации одной зоны.
@@ -691,6 +697,56 @@ impl RotationEngine {
         }
         ZoneSigner::new(keys, self.validity, self.inception_skew)
             .map_err(|source| RotationError::Signer { source })
+    }
+
+    /// Принудительно запускает rollover роли (pre-publish).
+    ///
+    /// Новый ключ публикуется сразу и активируется через `overlap` +
+    /// `double_sign`. Повторный rollover при уже идущем для той же роли
+    /// возвращает [`RotationError::RolloverInProgress`].
+    ///
+    /// # Errors
+    ///
+    /// [`RotationError::RolloverInProgress`], ошибки генерации/записи ключа.
+    pub fn force_rollover(
+        &mut self,
+        role: KeyRole,
+        overlap: u32,
+        retire_after: Option<u32>,
+        now: u32,
+    ) -> Result<(), RotationError> {
+        if !matches!(role, KeyRole::Ksk | KeyRole::Zsk) {
+            return Err(RotationError::InvalidPolicy {
+                reason: "rollover supports only ksk and zsk",
+            });
+        }
+        if self.state.keys.iter().any(|record| {
+            record.role() == Some(role)
+                && matches!(record.stage, KeyStage::PrePublish | KeyStage::DoubleSign)
+        }) {
+            return Err(RotationError::RolloverInProgress {
+                role: role.as_str(),
+            });
+        }
+        let overlap = overlap.max(1);
+        let pre_publish_until = now.saturating_add(overlap);
+        let activate_at = pre_publish_until.saturating_add(self.policy.double_sign);
+        let record = self.generate(
+            role,
+            now,
+            KeyStage::PrePublish,
+            pre_publish_until,
+            activate_at,
+        )?;
+        self.state.keys.push(record);
+        if let Some(retire_after) = retire_after {
+            for existing in &mut self.state.keys {
+                if existing.role() == Some(role) && existing.stage == KeyStage::Active {
+                    existing.retire_at = Some(now.saturating_add(retire_after));
+                }
+            }
+        }
+        self.persist()
     }
 
     /// Снимок состояния для `/keys`.
