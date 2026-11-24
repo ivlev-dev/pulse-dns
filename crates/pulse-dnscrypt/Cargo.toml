@@ -1,0 +1,30 @@
+[package]
+name = "pulse-dnscrypt"
+description = "DNSCrypt v2 certificates, X25519-XChaCha20-Poly1305 server and client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64 = "0.22"
+crypto_box = { version = "0.9.1", default-features = false, features = ["alloc", "chacha20"] }
+ed25519-dalek = "3"
+getrandom = "0.3"
+hex = "0.4"
+pulse-dns = { path = "../pulse-dns" }
+thiserror = "2"
+zeroize = { version = "1.9", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1"
+
+[[bench]]
+name = "dnscrypt"
+harness = false
+
+[lints]
+workspace = true

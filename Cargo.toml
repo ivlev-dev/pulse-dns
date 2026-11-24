@@ -2,6 +2,7 @@
 members = [
     "crates/pulse-dns",
     "crates/pulse-dnssec",
+    "crates/pulse-dnscrypt",
     "crates/pulse-runtime",
     "crates/pulse-server",
     "crates/pulse-resolver",
