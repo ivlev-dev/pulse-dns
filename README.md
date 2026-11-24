@@ -4,8 +4,9 @@
 
 Модульный высокопроизводительный DNS-сервер на Rust. Linux-first, edition 2024
 (stable). Текущее состояние — **authoritative MVP + кеширующий резолвер**:
-авторитетный сервер (`pulsed`) с UDP/TCP, REST API и `pulse-zonefile` как
-единственным источником истины зон (DNS читает mmap, REST коммитит в файл), а
+авторитетный сервер (`pulsed`) с UDP/TCP, REST API и `pulse-zonefile` v2 как
+единственным источником истины зон (DNS читает mmap, REST коммитит в файл;
+параллельная запись v2 является основной), а
 также резолвер (`pulseresolved`) с
 forward/iterative-резолюцией, кешем, blocklist, overrides и DNSSEC-валидацией.
 Это не полный продукт из ТЗ (нет DoQ, RRL и т.д.). DoT, DoH (HTTP/1.1) и
@@ -53,20 +54,22 @@ DNSCrypt v2 (авторитетный сервер) реализованы.
   SIGHUP/периодический reload, `GET /metrics` и `GET /healthz` на loopback,
   graceful shutdown по SIGTERM/SIGINT.
 
-**Не реализовано (см. `STATUS.md`):** commit/allocator/GC и параллельная запись
-по зонам в коде (только дизайн, ADR 0005/0006, spec parallel-writes-v2);
-journal/outbox и параллельная запись в zonefile; DoQ; DNSCrypt TCP-транспорт
-(только UDP); HTTP/2/3 для DoH; 0x20 echo; TLS
-для API и метрик (только loopback); fuzz/Miri/loom в CI; полноценный RRL; REST —
-MVP-подмножество спецификации. У резолвера нет RRL, DoT/DoH-апстримов и
-RFC 5011 (trust anchors статические).
+**Не реализовано (см. `STATUS.md`):** межпроцессная параллельная запись
+(N процессов; в v2.0 — один процесс-писатель, `LOCK_EX`); полный `fsck --repair`;
+WAL/journal для write-through; DoQ; DNSCrypt TCP-транспорт (только UDP);
+HTTP/2/3 для DoH (только HTTP/1.1); 0x20 echo; TLS для API и метрик
+(только loopback); fuzz/Miri/loom в CI; полноценный RRL; REST — MVP-подмножество
+спецификации; DNSSEC NSEC3-подпись и автоматическая ротация ключей. У резолвера
+нет RRL, DoT/DoH-апстримов и RFC 5011 (trust anchors статические).
 
 ## Архитектура
 
 | Крейт | Назначение |
 |---|---|
 | `pulse-dns` | Wire-формат DNS и RR-типы |
+| `pulse-dnssec` | DNSSEC: подпись/валидация alg 8/13/15, RRSIG, NSEC |
 | `pulse-master` | RFC 1035 master-файлы: парсер, валидация, экспорт |
+| `pulse-transfer` | TSIG, AXFR/IXFR, NOTIFY |
 | `pulse-zonefile` | Бинарный mmap-формат зон: reader, writer/commit, fsck, compact |
 | `pulse-runtime` | io_uring UDP-рантайм + epoll-фолбэк |
 | `pulse-server` | Авторитетный движок запросов |
@@ -198,7 +201,7 @@ curl -sS -X PUT "$API/api/v1/zones/dynamic.test." \
 cargo test --workspace
 ```
 
-Полный набор workspace-тестов (включая doctests) проходит. Также проходят
+Полный набор workspace-тестов (1083 теста, включая doctests) проходит. Также проходят
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` и
 rustdoc без warnings.
 
@@ -221,16 +224,26 @@ cargo deny check
 | RRset lookup при 1M | ~2–4.9 µs (цель 500 нс не достигнута) |
 | Insert | ~10 000/s |
 | Аллокации на warm lookup | 0 |
+| Lock-free аллокатор (reserve) | ~50M/s |
+| Per-zone commit (4 потока, B1, tmpfs) | 49 000 zone-commit/s |
+| Group commit (fsync на группу) | 2 fsync/группу; ускорение 2.4× (btrfs), 3.36× (эмуляция fsync 2 мс) |
+| p50 commit (btrfs) | 6.35 ms (group) vs 17.5 ms (per-zone) |
+| End-to-end q/s | 88 024 baseline; 72 088 при 8 писателях в 8 зон |
+| PageCache warm single-page | 418 нс; полный lookup ~1.06 µs |
 
 ## Ограничения и roadmap
 
-- Зоны хранятся в памяти (нет персистентности); commit/allocator и
-  параллельная запись по зонам — только в дизайне.
+- Зоны хранятся в одном бинарном mmap-файле (`--data`); JSON-зон нет. v2:
+  параллельная запись по зонам внутри одного процесса; межпроцессная запись
+  (N процессов) не реализована (`LOCK_EX`, один writer на файл); полный
+  `fsck --repair` не завершён; `map_size` задаётся при создании (по умолчанию
+  4 GiB); до 4096 зон, страницы 4096 байт.
 - DoT/DoH работают синхронно (поток на соединение), DoH — только HTTP/1.1;
   DNSCrypt реализован только по UDP (TCP-порт не поднимается, большие ответы
   усекаются с `TC`); DNSCrypt TXT-запись публикуется вручную.
-- REST — MVP-подмножество спецификации; API доступен только на loopback.
-- Roadmap: `docs/plan/roadmap.md` (M0 выполнено, M1 в работе).
+- REST — MVP-подмножество спецификации; API доступен только на loopback (без TLS).
+- DNSSEC: NSEC (NSEC3-подпись не реализована), автоматическая ротация ключей нет.
+- Roadmap: `docs/plan/roadmap.md` (M0–M4 выполнены, M5/M6 частично).
 
 ## Лицензия
 
