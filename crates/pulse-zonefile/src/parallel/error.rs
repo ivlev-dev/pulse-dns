@@ -30,6 +30,10 @@ pub enum V2CorruptKind {
     PageTxn,
     /// Chain: цикл, нарушение порядка или превышение лимита переходов.
     RootChain,
+    /// Достижимая страница за `page_limit_at_commit` версии.
+    PageLimit,
+    /// Некорректный уровень B+tree (`tree_level`/branch) или overflow-страница.
+    TreeLevel,
     /// Номер страницы/смещение вне файла.
     Bounds,
     /// Пересечение множеств страниц разных зон/дерева/пула (§9.2).

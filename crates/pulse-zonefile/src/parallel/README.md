@@ -239,6 +239,7 @@ cargo test -p pulse-zonefile --test v2_cache_alloc # B2a: 0 аллокаций w
 cargo test -p pulse-zonefile --test v2_reclaim  # B2a: пул/пины/GC/donation/10k
 cargo test -p pulse-zonefile --test v2_reclaim -- --ignored --nocapture # 10k+10k
 cargo test -p pulse-zonefile --test v2_group    # B2b: group commit, fsync/группу, backpressure
+cargo test -p pulse-zonefile --test v2_group -- --ignored --nocapture # нативный wall-clock замер
 cargo test -p pulse-zonefile --test v2_durability # B2b: Flush/Memory/sticky/sync, kill -9, torn
 cargo test -p pulse-zonefile --test v2_catalog_gc # B2b: tombstone-GC + recreate
 cargo test -p pulse-zonefile --test v2_leak     # B2b: leak sweep/repair/MAX_LEAK_RATIO

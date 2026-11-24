@@ -192,7 +192,13 @@ pub struct RepairReport {
     pub repaired_pages: u64,
     /// Остаток утечек после повторной проверки.
     pub remaining_leaks: u64,
-    /// Нет пересечений и утечек.
+    /// Утечки, которые нельзя вернуть безопасно: они лежат в диапазоне
+    /// повреждённых зон (пока зона в карантине, её страницы не трогаются).
+    pub deferred_leaks: u64,
+    /// Зоны, переведённые в read-only (`NEEDS_FSCK`) без правки данных.
+    pub quarantined_zones: Vec<u32>,
+    /// Нет пересечений; все утечки либо возвращены, либо отложены, а
+    /// повреждённые зоны изолированы.
     pub ok: bool,
     /// Диагностика.
     pub issues: Vec<String>,
@@ -592,6 +598,9 @@ impl ParallelStore {
                 *flag = AtomicU8::new(ZONE_DEGRADED | ZONE_NEEDS_FSCK);
             }
         }
+        // `fsck --repair` мог изолировать зону durable-флагом `NEEDS_FSCK`:
+        // после перезапуска она снова read-only до ручного разбора.
+        apply_root_flags(&mut zone_state, &recovered.heads);
         let zone_guard = allocate_u32(geometry.max_zones(), 0)?;
         let chain_depth = allocate_u32(geometry.max_zones(), CHAIN_UNKNOWN)?;
         let durable_versions = allocate_u64(geometry.max_zones(), 0)?;
@@ -2348,6 +2357,38 @@ impl ParallelStore {
     ///
     /// `Corrupt(PageOverlap)` — пересечение множеств; `ReadOnly`/`Io`/`MapFull`.
     pub fn repair_leaks(&self) -> Result<RepairReport, ParallelError> {
+        let initial = crate::parallel::verify::verify(self)?;
+        if let Some(kind) = initial.fatal {
+            self.note_fatal(kind);
+            return Err(ParallelError::Corrupt {
+                kind: V2CorruptKind::PageOverlap,
+                page: None,
+            });
+        }
+
+        // 1. Карантин: повреждённые зоны получают `NEEDS_FSCK` в durable-голове.
+        //    Пишутся только ячейки root directory; страницы данных не трогаются.
+        let mut quarantined = Vec::new();
+        let mut issues = initial.issues.clone();
+        if !initial.damaged_zones.is_empty() {
+            self.ensure_writable()?;
+            for &zone in &initial.damaged_zones {
+                let Some(head) = self.head_entry(zone) else {
+                    continue;
+                };
+                match self.quarantine_zone(zone, &head) {
+                    Ok(true) => quarantined.push(zone),
+                    Ok(false) => {
+                        issues.push(format!("zone {zone}: карантин не выставлен"));
+                    }
+                    Err(error) => {
+                        issues.push(format!("zone {zone}: карантин не выставлен: {error}"));
+                    }
+                }
+            }
+        }
+
+        // 2. Пересчёт после карантина: `sync()` мог сдвинуть `DP` до курсора.
         let graph = crate::parallel::verify::verify(self)?;
         if let Some(kind) = graph.fatal {
             self.note_fatal(kind);
@@ -2356,15 +2397,42 @@ impl ParallelStore {
                 page: None,
             });
         }
-        let leaked = graph.leaked_page_ids.clone();
+
+        // 3. Страницы ниже `page_limit_at_commit` повреждённой зоны могут
+        //    принадлежать её недоступному дереву: их нельзя дарить пулу, пока
+        //    зона в карантине. Безопасны только страницы выше всех таких лимитов.
+        let floor = graph
+            .damaged_zones
+            .iter()
+            .filter_map(|zone| self.head_entry(*zone))
+            .map(|head| head.page_limit_at_commit)
+            .max()
+            .unwrap_or(0);
+        let leaked: Vec<u32> = graph
+            .leaked_page_ids
+            .iter()
+            .copied()
+            .filter(|page| *page >= floor)
+            .collect();
+        let deferred = graph
+            .leaked_pages
+            .saturating_sub(u64::try_from(leaked.len()).unwrap_or(u64::MAX));
         if leaked.is_empty() {
+            let ok = graph.damaged_zones.len() == quarantined.len();
+            if !ok {
+                issues.push(format!("не изолированы зоны: {:?}", graph.damaged_zones));
+            }
             return Ok(RepairReport {
                 repaired_pages: 0,
-                remaining_leaks: 0,
-                ok: true,
-                issues: graph.issues,
+                remaining_leaks: graph.leaked_pages,
+                deferred_leaks: deferred,
+                quarantined_zones: quarantined,
+                ok,
+                issues,
             });
         }
+
+        // 4. Утечки — bucket-группа каталога (`owner_zone = 0`).
         self.ensure_writable()?;
         let head = self.catalog_head();
         let version = self.allocator.next_txn_exact()?;
@@ -2383,19 +2451,87 @@ impl ParallelStore {
         // дарить их нельзя (double-free: bucket уже ссылается на них).
         let _outcome = self.publish_root_with_drops(entry, &leaked)?;
         let after = crate::parallel::verify::verify(self)?;
-        let mut issues = after.issues.clone();
-        if after.leaked_pages != 0 {
-            issues.push(format!(
-                "после repair осталось {} утёкших страниц",
+        let mut final_issues = after.issues.clone();
+        final_issues.append(&mut issues);
+        if after.leaked_pages != deferred {
+            final_issues.push(format!(
+                "после repair осталось {} утёкших страниц (ожидалось {deferred})",
                 after.leaked_pages
             ));
         }
+        let ok = after.fatal.is_none()
+            && after.leaked_pages == deferred
+            && graph.damaged_zones.len() == quarantined.len();
         Ok(RepairReport {
             repaired_pages: u64::try_from(leaked.len()).unwrap_or(u64::MAX),
             remaining_leaks: after.leaked_pages,
-            ok: after.fatal.is_none() && after.leaked_pages == 0,
-            issues,
+            deferred_leaks: deferred,
+            quarantined_zones: quarantined,
+            ok,
+            issues: final_issues,
         })
+    }
+
+    /// Переводит зону в `NEEDS_FSCK` durable-записью корня.
+    ///
+    /// Пишутся только две копии `RootEntry`; дерево, overflow, chain и пулы
+    /// не читаются и не изменяются. Это позволяет изолировать зону с
+    /// zone-fatal повреждением, не усугубляя порчу.
+    ///
+    /// Возвращает `true`, если зона теперь помечена (или уже была помечена).
+    fn quarantine_zone(&self, zone: u32, head: &RootEntry) -> Result<bool, ParallelError> {
+        if zone == 0 {
+            // Каталог — file-fatal класс; его нельзя «изолировать» частично.
+            return Ok(false);
+        }
+        if head.flags.contains(RootFlags::NEEDS_FSCK) {
+            if let Some(flags) = self.zone_state.get(zone as usize) {
+                flags.fetch_or(ZONE_DEGRADED | ZONE_NEEDS_FSCK, Ordering::AcqRel);
+            }
+            return Ok(true);
+        }
+        self.ensure_writable()?;
+        let version = self.allocator.next_txn_exact()?;
+        let mut record = *head;
+        record.version = version;
+        record.flags = head.flags.union(RootFlags::NEEDS_FSCK);
+        if record.prev_record >= record.page_limit_at_commit {
+            record.prev_record = 0;
+        }
+        if record.free_head >= record.page_limit_at_commit {
+            record.free_head = 0;
+        }
+        if record.meta_root >= record.page_limit_at_commit {
+            record.meta_root = 0;
+        }
+        record
+            .check_fields(self.geometry.page_count_max())
+            .map_err(|_| ParallelError::InvalidArgument {
+                field: "quarantine root",
+            })?;
+        let slot = self.geometry.head_slot(zone)?;
+        let Some(guard_ref) = self.zone_guard.get(zone as usize) else {
+            return Err(ParallelError::InvalidArgument { field: "zone_seq" });
+        };
+        let guard = EpochGuard::enter(guard_ref);
+        let ring = Ring::new(&self.file, &self.geometry);
+        let written = ring
+            .write_cell(slot.page_a, slot.cell_offset(version), &record)
+            .and_then(|()| ring.write_cell(slot.page_b, slot.cell_offset(version), &record));
+        drop(guard);
+        written?;
+        self.fsync_data()?;
+        if let Some(block) = self.heads.get(zone as usize) {
+            block.store(&record);
+        }
+        if let Some(flags) = self.zone_state.get(zone as usize) {
+            flags.fetch_or(ZONE_DEGRADED | ZONE_NEEDS_FSCK, Ordering::AcqRel);
+        }
+        self.published_txn.fetch_max(version, Ordering::Release);
+        self.stats.publications.fetch_add(1, Ordering::Relaxed);
+        // Durable `ALLOC_RECORD.txn_limit` должен покрывать новую версию.
+        self.sync()?;
+        Ok(true)
     }
 
     fn ensure_writable(&self) -> Result<(), ParallelError> {
@@ -2881,6 +3017,18 @@ fn allocate_u8(max_zones: u32, initial: u8) -> Result<Box<[AtomicU8]>, ParallelE
         })?;
     values.resize_with(count, || AtomicU8::new(initial));
     Ok(values.into_boxed_slice())
+}
+
+/// Помечает зоны с durable `NEEDS_FSCK` как degraded (write-locked).
+fn apply_root_flags(zone_state: &mut [AtomicU8], heads: &[Option<RootEntry>]) {
+    for (index, head) in heads.iter().enumerate() {
+        if let Some(entry) = head
+            && entry.flags.contains(RootFlags::NEEDS_FSCK)
+            && let Some(flag) = zone_state.get_mut(index)
+        {
+            *flag = AtomicU8::new(ZONE_DEGRADED | ZONE_NEEDS_FSCK);
+        }
+    }
 }
 
 fn allocate_leases() -> Result<Box<[Mutex<()>]>, ParallelError> {
