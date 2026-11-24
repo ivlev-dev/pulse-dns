@@ -20,6 +20,7 @@
 //! - [`zone`] — загрузка JSON-зон и валидация инвариантов; master-файлы
 //!   разбирает `pulse-master` и импортирует тот же store.
 //! - `dnssec` — загрузка ключей и DNSSEC-подпись зон при старте.
+//! - `transfer` — AXFR/IXFR-out по TCP, TSIG/ACL, IXFR-история и NOTIFY.
 //! - [`server`] — запуск и остановка DNS/API, общий zone store.
 //! - [`stats`] — атомарные счётчики без блокировок на горячем пути.
 //!
@@ -56,6 +57,7 @@ mod persist;
 mod rdata;
 mod store;
 mod tcp;
+mod transfer;
 mod udp;
 
 pub mod config;

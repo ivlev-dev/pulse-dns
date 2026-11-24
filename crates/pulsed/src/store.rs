@@ -24,6 +24,7 @@ use crate::dnssec::{self, DnssecSigners};
 use crate::logging;
 use crate::master;
 use crate::persist::{PersistenceError, ZonePersistence};
+use crate::transfer::{NotifyDispatcher, TransferState};
 use crate::zone::{self, LoadedZone};
 
 /// Ошибка начального построения DNS-снапшота.
@@ -41,6 +42,7 @@ pub(crate) struct SharedZoneAdmin {
     mutation: Mutex<()>,
     persistence: Option<Mutex<ZonePersistence>>,
     dnssec: DnssecSigners,
+    transfer: TransferState,
 }
 
 impl SharedZoneAdmin {
@@ -48,9 +50,14 @@ impl SharedZoneAdmin {
         store: Arc<InMemoryZoneAdmin>,
         dnssec: DnssecSigners,
         persistence: Option<ZonePersistence>,
+        config: &Config,
+        notify: Option<Arc<NotifyDispatcher>>,
     ) -> Result<Self, StoreError> {
         let query_stats = Arc::new(QueryStats::new());
         let snapshot = store.snapshot();
+        let transfer =
+            TransferState::from_config(&config.transfer, &config.tsig_keys, &snapshot, notify)
+                .map_err(|error| StoreError(format!("cannot initialise transfer: {error}")))?;
         let engine = build_engine(&snapshot, Arc::clone(&query_stats)).map_err(StoreError)?;
         Ok(Self {
             store,
@@ -61,6 +68,7 @@ impl SharedZoneAdmin {
             mutation: Mutex::new(()),
             persistence: persistence.map(Mutex::new),
             dnssec,
+            transfer,
         })
     }
 
@@ -71,6 +79,16 @@ impl SharedZoneAdmin {
 
     pub(crate) fn query_stats(&self) -> Arc<QueryStats> {
         Arc::clone(&self.query_stats)
+    }
+
+    /// Подсистема AXFR/IXFR/NOTIFY.
+    pub(crate) fn transfer(&self) -> &TransferState {
+        &self.transfer
+    }
+
+    /// Зоны, помеченные входящим NOTIFY к обновлению.
+    pub(crate) fn pending_updates(&self) -> Vec<Name> {
+        self.transfer.pending_updates()
     }
 
     fn refresh(&self) -> Result<(), AdminError> {
@@ -84,6 +102,7 @@ impl SharedZoneAdmin {
             AdminError::Internal
         })?;
         *self.engine.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(engine);
+        self.transfer.refresh(&snapshot);
         self.revision.store(snapshot.revision, Ordering::Release);
         Ok(())
     }
@@ -119,6 +138,13 @@ impl SharedZoneAdmin {
             .iter()
             .find(|zone| &zone.origin == origin)
             .is_some_and(|zone| zone.rrsets.iter().any(|rrset| rrset.owner() == owner))
+    }
+
+    /// `sync()` persistence и остановка фонового NOTIFY.
+    pub(crate) fn shutdown(&self) -> Result<(), String> {
+        let result = self.sync_persistence();
+        self.transfer.shutdown_notify();
+        result
     }
 
     /// `sync()` persistence при graceful shutdown.

@@ -58,6 +58,17 @@ pub(crate) fn run() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    match tsig_keys(&matches) {
+        Ok(keys) => {
+            for (name, algorithm, secret) in keys {
+                config.add_tsig_key(name, algorithm, secret);
+            }
+        }
+        Err(error) => {
+            logging::error("config", &error);
+            return ExitCode::from(2);
+        }
+    }
     logging::init(config.log_level);
     if let Err(error) = config.validate() {
         logging::error("config", &error.to_string());
@@ -239,6 +250,37 @@ fn dnssec_keys(
     Ok(keys)
 }
 
+fn tsig_keys(matches: &ArgMatches) -> Result<Vec<(String, String, String)>, String> {
+    let mut keys = Vec::new();
+    let Some(values) = matches.get_many::<String>("tsig-key") else {
+        return Ok(keys);
+    };
+    for value in values {
+        let mut parts = value.splitn(3, ':');
+        let name = parts.next().unwrap_or_default().trim();
+        let algorithm = parts.next().unwrap_or_default().trim();
+        let secret = parts.next().unwrap_or_default().trim();
+        if name.is_empty() || algorithm.is_empty() || secret.is_empty() {
+            return Err(format!(
+                "--tsig-key expects <name>:<algorithm>:<base64-secret>, got {value:?}"
+            ));
+        }
+        let name = Name::parse(name)
+            .map_err(|error| format!("invalid --tsig-key name {name:?}: {error}"))?;
+        if name == Name::root() || name.labels().any(|label| label == b"*") {
+            return Err(format!(
+                "--tsig-key name {name} must be a non-root name without wildcards"
+            ));
+        }
+        keys.push((
+            name.to_string(),
+            algorithm.to_ascii_lowercase(),
+            secret.to_owned(),
+        ));
+    }
+    Ok(keys)
+}
+
 fn api_options(matches: &ArgMatches) -> Result<Option<ApiOptions>, String> {
     let listen = matches.get_one::<SocketAddr>("api-listen").copied();
     let token = matches
@@ -287,12 +329,14 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
             ApiServerError::Config(_) => ExitCode::from(2),
             _ => ExitCode::from(1),
         },
-        ServerError::TcpStart { .. } | ServerError::Tcp(_) | ServerError::Udp(_) => {
-            ExitCode::from(1)
-        }
+        ServerError::TcpStart { .. }
+        | ServerError::Tcp(_)
+        | ServerError::Udp(_)
+        | ServerError::Notify(_) => ExitCode::from(1),
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn command() -> Command {
     Command::new("pulsed")
         .version(env!("CARGO_PKG_VERSION"))
@@ -369,6 +413,13 @@ fn command() -> Command {
                 .help("Sign a zone with a BIND/PKCS#8 private key; repeatable, optional role: ZONE=[ksk|zsk|csk:]PATH"),
         )
         .arg(
+            Arg::new("tsig-key")
+                .long("tsig-key")
+                .value_name("NAME:ALG:SECRET")
+                .action(ArgAction::Append)
+                .help("Add a TSIG key for AXFR/IXFR/NOTIFY; secret is base64; repeatable"),
+        )
+        .arg(
             Arg::new("api-listen")
                 .long("api-listen")
                 .value_name("ADDR")
@@ -423,5 +474,25 @@ mod tests {
         assert!(dnssec_keys(&matches(&["--dnssec-key", "example.com."])).is_err());
         assert!(dnssec_keys(&matches(&["--dnssec-key", ".=keys/key.private"])).is_err());
         assert!(dnssec_keys(&matches(&["--dnssec-key", "bad..name=keys/key.private"])).is_err());
+    }
+
+    #[test]
+    fn tsig_key_parses_name_algorithm_and_secret() {
+        let keys = tsig_keys(&matches(&[
+            "--tsig-key",
+            "xfr-key.test.:hmac-sha512:c2VjcmV0",
+        ]))
+        .expect("keys parse");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "xfr-key.test.");
+        assert_eq!(keys[0].1, "hmac-sha512");
+        assert_eq!(keys[0].2, "c2VjcmV0");
+    }
+
+    #[test]
+    fn tsig_key_rejects_bad_input() {
+        assert!(tsig_keys(&matches(&["--tsig-key", "xfr-key.test.:c2VjcmV0"])).is_err());
+        assert!(tsig_keys(&matches(&["--tsig-key", ".:hmac-sha256:c2VjcmV0"])).is_err());
+        assert!(tsig_keys(&matches(&["--tsig-key", "xfr-key.test.:hmac-sha256:"])).is_err());
     }
 }

@@ -364,7 +364,7 @@ pub enum NotifyOutcome {
 /// NOTIFY-сервер: policy + TSIG + построение ответа.
 pub struct NotifyServer {
     policy: NotifyPolicy,
-    key: Option<TsigKey>,
+    key: Option<std::sync::Arc<TsigKey>>,
     require_tsig: bool,
 }
 
@@ -372,6 +372,16 @@ impl NotifyServer {
     /// Создаёт сервер.
     #[must_use]
     pub fn new(policy: NotifyPolicy, key: Option<TsigKey>) -> Self {
+        Self {
+            policy,
+            key: key.map(std::sync::Arc::new),
+            require_tsig: true,
+        }
+    }
+
+    /// Создаёт сервер с разделяемым ключом.
+    #[must_use]
+    pub fn with_shared_key(policy: NotifyPolicy, key: Option<std::sync::Arc<TsigKey>>) -> Self {
         Self {
             policy,
             key,
@@ -421,7 +431,7 @@ impl NotifyServer {
                         let response = build_tsig_error_response(
                             &request.to_message(),
                             Some(envelope.record()),
-                            Some(key),
+                            Some(key.as_ref()),
                             Some(envelope.record().mac()),
                             code,
                             now,
@@ -455,7 +465,7 @@ impl NotifyServer {
         now: u64,
     ) -> Result<NotifyOutcome, TransferError> {
         let signing_key = if request_mac.is_some() {
-            self.key.as_ref()
+            self.key.as_deref()
         } else {
             None
         };

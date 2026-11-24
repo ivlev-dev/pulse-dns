@@ -128,8 +128,9 @@ fn accept_loop(
 ) {
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _peer)) => spawn_connection(
+            Ok((stream, peer)) => spawn_connection(
                 stream,
+                peer,
                 max_connections,
                 idle_timeout,
                 admin,
@@ -150,8 +151,10 @@ fn accept_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_connection(
     stream: TcpStream,
+    peer: SocketAddr,
     max_connections: usize,
     idle_timeout: Duration,
     admin: &Arc<SharedZoneAdmin>,
@@ -185,7 +188,9 @@ fn spawn_connection(
         .name(format!("pulse-tcp-{id}"))
         .spawn(move || {
             let _guard = guard;
-            if let Err(error) = handle_connection(stream, &admin, &stats, &shutdown, idle_timeout) {
+            if let Err(error) =
+                handle_connection(stream, peer, &admin, &stats, &shutdown, idle_timeout)
+            {
                 stats.tcp_io_error();
                 logging::debug(
                     "tcp_connection",
@@ -219,6 +224,7 @@ impl Drop for ConnectionGuard {
 
 fn handle_connection(
     mut stream: TcpStream,
+    peer: SocketAddr,
     admin: &SharedZoneAdmin,
     stats: &Stats,
     shutdown: &AtomicBool,
@@ -241,17 +247,48 @@ fn handle_connection(
         if !read_exact_idle(&mut stream, &mut request)? {
             return Ok(());
         }
+        let now = crate::transfer::now_unix();
+        match admin.transfer().handle_notify_in(&request, peer.ip(), now) {
+            Some(crate::transfer::NotifyAction::Reply(response)) => {
+                write_frame(&mut stream, &response)?;
+                stats.response();
+                continue;
+            }
+            Some(crate::transfer::NotifyAction::Ignore) => return Ok(()),
+            None => {}
+        }
+        if let Some(result) =
+            admin
+                .transfer()
+                .handle_transfer(&mut stream, &request, peer.ip(), now)
+        {
+            stats.tcp_query();
+            match result {
+                Ok(()) => stats.response(),
+                Err(error) => {
+                    stats.tcp_io_error();
+                    logging::debug(
+                        "tcp_transfer",
+                        &format!("transfer from {} failed: {error}", peer.ip()),
+                    );
+                }
+            }
+            continue;
+        }
         let engine = admin.engine();
         let Some(response) = dns::respond(&request, Transport::Tcp, &engine, stats) else {
             continue;
         };
-        let length = u16::try_from(response.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "response exceeds 65535 bytes")
-        })?;
-        stream.write_all(&length.to_be_bytes())?;
-        stream.write_all(&response)?;
-        stream.flush()?;
+        write_frame(&mut stream, &response)?;
     }
+}
+
+fn write_frame(stream: &mut TcpStream, response: &[u8]) -> io::Result<()> {
+    let length = u16::try_from(response.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response exceeds 65535 bytes"))?;
+    stream.write_all(&length.to_be_bytes())?;
+    stream.write_all(response)?;
+    stream.flush()
 }
 
 fn read_prefix(stream: &mut TcpStream) -> io::Result<Option<u16>> {

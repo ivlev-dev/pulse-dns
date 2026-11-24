@@ -18,6 +18,7 @@ use crate::persist::{self, ZonePersistence};
 use crate::stats::{Stats, StatsSnapshot};
 use crate::store::{self, SharedZoneAdmin};
 use crate::tcp::TcpService;
+use crate::transfer::{self, NotifyDispatcher};
 use crate::udp::UdpService;
 use crate::zone::ZoneError;
 
@@ -81,6 +82,7 @@ impl Server {
     /// конфигурации, [`ServerError::Store`] при загрузке зон в store,
     /// [`ServerError::TcpStart`] / [`ServerError::Udp`] при ошибке транспорта,
     /// [`ServerError::Api`] при ошибке конфигурации или запуска API.
+    #[allow(clippy::too_many_lines)]
     pub fn start_with_api(config: &Config, api: Option<ApiOptions>) -> Result<Self, ServerError> {
         config.validate()?;
         let store = Arc::new(InMemoryZoneAdmin::new());
@@ -129,9 +131,20 @@ impl Server {
             store::load_config(&store, config, &dnssec).map_err(ServerError::Store)?;
             None
         };
-        let admin = Arc::new(SharedZoneAdmin::new(store, dnssec, persistence).map_err(
-            |error| ServerError::Store(format!("cannot build initial DNS snapshot: {error}")),
-        )?);
+        let notify = if config.transfer.notify.is_empty() {
+            None
+        } else {
+            let key = transfer::notify_key(&config.transfer, &config.tsig_keys)
+                .map_err(|error| ServerError::Store(error.to_string()))?;
+            Some(Arc::new(
+                NotifyDispatcher::start(&config.transfer, key).map_err(ServerError::Notify)?,
+            ))
+        };
+        let admin = Arc::new(
+            SharedZoneAdmin::new(store, dnssec, persistence, config, notify).map_err(|error| {
+                ServerError::Store(format!("cannot build initial DNS snapshot: {error}"))
+            })?,
+        );
         let stats = Arc::new(Stats::new());
 
         let tcp = match config.listen_tcp {
@@ -232,6 +245,12 @@ impl Server {
         self.udp.as_ref().map(UdpService::stats)
     }
 
+    /// Зоны, помеченные входящим NOTIFY к обновлению.
+    #[must_use]
+    pub fn pending_transfer_updates(&self) -> Vec<pulse_dns::Name> {
+        self.admin.pending_updates()
+    }
+
     /// Останавливает API, транспорты и дожидается завершения потоков.
     ///
     /// API останавливается первым, чтобы во время shutdown не появлялись новые
@@ -256,7 +275,7 @@ impl Server {
         {
             first_error.get_or_insert(ServerError::Udp(error));
         }
-        if let Err(error) = self.admin.sync_persistence() {
+        if let Err(error) = self.admin.shutdown() {
             first_error.get_or_insert(ServerError::Store(format!(
                 "cannot sync persistent zone file: {error}"
             )));
@@ -301,6 +320,9 @@ pub enum ServerError {
     /// Ошибка UDP-рантайма.
     #[error(transparent)]
     Udp(#[from] pulse_runtime::RuntimeError),
+    /// Не удалось запустить фоновый NOTIFY-воркер.
+    #[error("cannot start NOTIFY worker: {0}")]
+    Notify(#[source] io::Error),
     /// Ошибка встроенного API.
     #[error(transparent)]
     Api(#[from] ApiServerError),

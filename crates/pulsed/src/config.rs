@@ -24,6 +24,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use pulse_dns::Name;
+use pulse_transfer::TsigAlgorithm;
 use pulse_zonefile::SyncMode;
 use serde::Deserialize;
 use thiserror::Error;
@@ -153,6 +157,181 @@ impl TcpConfig {
     pub const fn idle_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.idle_timeout_ms)
     }
+}
+
+/// TSIG-ключ для AXFR/IXFR/NOTIFY.
+///
+/// `secret` — base64 (как в BIND `key`-файле). Секрет не печатается в
+/// `Debug` и не логируется.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TsigKeyConfig {
+    /// Имя ключа (абсолютное или относительное DNS-имя).
+    pub name: String,
+    /// Алгоритм: `hmac-sha1`, `hmac-sha224`, `hmac-sha256`, `hmac-sha384`,
+    /// `hmac-sha512` (по умолчанию `hmac-sha256`).
+    #[serde(default = "default_tsig_algorithm")]
+    pub algorithm: String,
+    /// Base64-секрет.
+    pub secret: String,
+}
+
+impl fmt::Debug for TsigKeyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TsigKeyConfig")
+            .field("name", &self.name)
+            .field("algorithm", &self.algorithm)
+            .field("secret", &"***")
+            .finish()
+    }
+}
+
+fn default_tsig_algorithm() -> String {
+    TsigAlgorithm::DEFAULT.name().to_owned()
+}
+
+/// Настройки входящих AXFR/IXFR и исходящих NOTIFY.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransferSettings {
+    /// Обслуживать AXFR/IXFR по TCP.
+    pub enabled: bool,
+    /// Требовать TSIG для трансферов и входящих NOTIFY.
+    pub require_tsig: bool,
+    /// IP-ACL для transfer/NOTIFY-in; пусто — любые источники.
+    pub allow_from: Vec<IpAddr>,
+    /// Разрешённые для transfer зоны; пусто — все загруженные зоны.
+    pub allow_zones: Vec<String>,
+    /// Сколько последних IXFR-дельт хранить в памяти.
+    pub history_deltas: usize,
+    /// Целевой размер сообщения AXFR/IXFR.
+    pub message_bytes: usize,
+    /// Максимум записей в одном трансфере.
+    pub max_records: usize,
+    /// Максимум байтов в одном трансфере.
+    pub max_bytes: u64,
+    /// Максимум сообщений в одном трансфере.
+    pub max_messages: usize,
+    /// Таймаут трансфера между операциями.
+    pub timeout_ms: u64,
+    /// Подписывать каждое N-е сообщение TSIG.
+    pub tsig_every: usize,
+    /// Разрешать IXFR fallback на AXFR.
+    pub allow_axfr_fallback: bool,
+    /// Адреса NOTIFY-out (UDP).
+    pub notify: Vec<SocketAddr>,
+    /// TSIG-ключ для NOTIFY-out (имя из `tsig_keys`).
+    pub notify_tsig_key: Option<String>,
+    /// Число повторов NOTIFY-out при ошибке отправки.
+    pub notify_retries: u32,
+    /// Таймаут одного NOTIFY-out в миллисекундах.
+    pub notify_timeout_ms: u64,
+    /// Ёмкость фоновой очереди NOTIFY-out.
+    pub notify_queue: usize,
+}
+
+impl Default for TransferSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            require_tsig: true,
+            allow_from: Vec::new(),
+            allow_zones: Vec::new(),
+            history_deltas: 32,
+            message_bytes: 16 * 1024,
+            max_records: 1_000_000,
+            max_bytes: 64 * 1024 * 1024,
+            max_messages: 100_000,
+            timeout_ms: 30_000,
+            tsig_every: 1,
+            allow_axfr_fallback: true,
+            notify: Vec::new(),
+            notify_tsig_key: None,
+            notify_retries: 3,
+            notify_timeout_ms: 2_000,
+            notify_queue: 1_024,
+        }
+    }
+}
+
+impl TransferSettings {
+    /// Проверяет числовые ограничения transfer/NOTIFY.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] при выходе параметров за допустимые пределы.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=10_000).contains(&self.history_deltas) {
+            return Err(ConfigError::Invalid(format!(
+                "transfer.history_deltas must be in 1..=10000, got {}",
+                self.history_deltas
+            )));
+        }
+        if self.message_bytes < 256 {
+            return Err(ConfigError::Invalid(format!(
+                "transfer.message_bytes must be at least 256, got {}",
+                self.message_bytes
+            )));
+        }
+        if !(1..=100).contains(&self.tsig_every) {
+            return Err(ConfigError::Invalid(format!(
+                "transfer.tsig_every must be in 1..=100, got {}",
+                self.tsig_every
+            )));
+        }
+        if !(100..=600_000).contains(&self.timeout_ms) {
+            return Err(ConfigError::Invalid(format!(
+                "transfer.timeout_ms must be in 100..=600000, got {}",
+                self.timeout_ms
+            )));
+        }
+        if self.max_records == 0 || self.max_bytes == 0 || self.max_messages == 0 {
+            return Err(ConfigError::Invalid(
+                "transfer limits must be non-zero".to_owned(),
+            ));
+        }
+        if self.notify_retries > 10 {
+            return Err(ConfigError::Invalid(format!(
+                "transfer.notify_retries must be in 0..=10, got {}",
+                self.notify_retries
+            )));
+        }
+        if !(1..=65_536).contains(&self.notify_queue) {
+            return Err(ConfigError::Invalid(format!(
+                "transfer.notify_queue must be in 1..=65536, got {}",
+                self.notify_queue
+            )));
+        }
+        if !(100..=600_000).contains(&self.notify_timeout_ms) {
+            return Err(ConfigError::Invalid(format!(
+                "transfer.notify_timeout_ms must be in 100..=600000, got {}",
+                self.notify_timeout_ms
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Разбирает строку алгоритма TSIG.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] для неизвестного алгоритма.
+pub fn parse_tsig_algorithm(value: &str) -> Result<TsigAlgorithm, ConfigError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let algorithm = match normalized.as_str() {
+        "hmac-sha1" | "sha1" => TsigAlgorithm::HmacSha1,
+        "hmac-sha224" | "sha224" => TsigAlgorithm::HmacSha224,
+        "hmac-sha256" | "sha256" => TsigAlgorithm::HmacSha256,
+        "hmac-sha384" | "sha384" => TsigAlgorithm::HmacSha384,
+        "hmac-sha512" | "sha512" => TsigAlgorithm::HmacSha512,
+        other => {
+            return Err(ConfigError::Invalid(format!(
+                "unknown TSIG algorithm {other:?}; expected hmac-sha1, hmac-sha224, hmac-sha256, hmac-sha384 or hmac-sha512"
+            )));
+        }
+    };
+    Ok(algorithm)
 }
 
 /// Запись зоны в конфигурации.
@@ -291,6 +470,12 @@ pub struct Config {
     /// DNSSEC-подпись зон при загрузке (origin → ключи/политика).
     #[serde(default)]
     pub dnssec: BTreeMap<String, DnssecZoneConfig>,
+    /// TSIG-ключи для transfer и NOTIFY.
+    #[serde(default)]
+    pub tsig_keys: Vec<TsigKeyConfig>,
+    /// Настройки AXFR/IXFR и NOTIFY.
+    #[serde(default)]
+    pub transfer: TransferSettings,
 }
 
 impl Default for Config {
@@ -307,6 +492,8 @@ impl Default for Config {
             zones: Vec::new(),
             zones_files: Vec::new(),
             dnssec: BTreeMap::new(),
+            tsig_keys: Vec::new(),
+            transfer: TransferSettings::default(),
         }
     }
 }
@@ -386,6 +573,59 @@ impl Config {
                 "map_size must be greater than zero".to_owned(),
             ));
         }
+        self.transfer.validate()?;
+        let mut key_names = std::collections::HashSet::with_capacity(self.tsig_keys.len());
+        for key in &self.tsig_keys {
+            let name = Name::parse(key.name.trim()).map_err(|error| {
+                ConfigError::Invalid(format!("tsig_keys: invalid name {:?}: {error}", key.name))
+            })?;
+            if name == Name::root() || name.labels().any(|label| label == b"*") {
+                return Err(ConfigError::Invalid(format!(
+                    "tsig_keys: name {:?} must be a non-root name without wildcards",
+                    key.name
+                )));
+            }
+            if !key_names.insert(name.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "tsig_keys: duplicate key {name}"
+                )));
+            }
+            parse_tsig_algorithm(&key.algorithm)?;
+            let secret = STANDARD.decode(key.secret.trim()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "tsig_keys: key {name} secret is not base64: {error}"
+                ))
+            })?;
+            if secret.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "tsig_keys: key {name} secret must not be empty"
+                )));
+            }
+        }
+        for origin in &self.transfer.allow_zones {
+            let name = Name::parse(origin.trim()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "transfer.allow_zones: invalid origin {origin:?}: {error}"
+                ))
+            })?;
+            if name == Name::root() || name.labels().any(|label| label == b"*") {
+                return Err(ConfigError::Invalid(format!(
+                    "transfer.allow_zones: origin {origin:?} must be a non-root name without wildcards"
+                )));
+            }
+        }
+        if let Some(key) = &self.transfer.notify_tsig_key {
+            let name = Name::parse(key.trim()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "transfer.notify_tsig_key: invalid name {key:?}: {error}"
+                ))
+            })?;
+            if !key_names.contains(&name) {
+                return Err(ConfigError::Invalid(format!(
+                    "transfer.notify_tsig_key: key {name} is not declared in tsig_keys"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -400,6 +640,18 @@ impl Config {
             path,
             algorithm: None,
             flags: None,
+        });
+    }
+
+    /// Добавляет TSIG-ключ (CLI `--tsig-key`).
+    ///
+    /// Секрет передаётся в base64. Повторное имя ключа обнаруживается
+    /// [`Config::validate`].
+    pub fn add_tsig_key(&mut self, name: String, algorithm: String, secret: String) {
+        self.tsig_keys.push(TsigKeyConfig {
+            name,
+            algorithm,
+            secret,
         });
     }
 
@@ -552,5 +804,49 @@ mod tests {
     fn log_level_parses_case_insensitively() {
         assert_eq!("WARN".parse::<LogLevel>().unwrap(), LogLevel::Warn);
         assert!("loud".parse::<LogLevel>().is_err());
+    }
+
+    #[test]
+    fn transfer_and_tsig_config_parse() {
+        let config = Config::from_json_str(
+            r#"{
+                "listen_udp": null,
+                "listen_tcp": "127.0.0.1:0",
+                "tsig_keys": [
+                    {"name": "xfr.key.", "algorithm": "hmac-sha256", "secret": "c2VjcmV0"}
+                ],
+                "transfer": {
+                    "require_tsig": true,
+                    "allow_from": ["127.0.0.1"],
+                    "allow_zones": ["example.com."],
+                    "notify": ["127.0.0.1:5354"],
+                    "notify_tsig_key": "xfr.key.",
+                    "history_deltas": 8
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.tsig_keys.len(), 1);
+        assert_eq!(config.transfer.history_deltas, 8);
+        assert_eq!(config.transfer.allow_from.len(), 1);
+        assert_eq!(config.transfer.notify.len(), 1);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_tsig_secret_and_notify_key() {
+        let config = Config {
+            tsig_keys: vec![TsigKeyConfig {
+                name: "xfr.key.".to_owned(),
+                algorithm: "hmac-sha256".to_owned(),
+                secret: "not base64!".to_owned(),
+            }],
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.transfer.notify_tsig_key = Some("missing.key.".to_owned());
+        assert!(config.validate().is_err());
     }
 }
