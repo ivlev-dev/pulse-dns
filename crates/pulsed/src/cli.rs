@@ -4,13 +4,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Arg, Command, value_parser};
+use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
+use pulse_api::server::ApiServerError;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::config::{Config, LogLevel, Overrides};
 use crate::logging;
-use crate::server::{Server, ServerError};
+use crate::server::{ApiOptions, Server, ServerError};
 
 #[allow(clippy::too_many_lines)] // Жизненный цикл процесса линеен и читается сверху вниз.
 pub(crate) fn run() -> ExitCode {
@@ -41,7 +42,14 @@ pub(crate) fn run() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let mut server = match Server::start(&config) {
+    let api = match api_options(&matches) {
+        Ok(api) => api,
+        Err(error) => {
+            logging::error("api", &error);
+            return ExitCode::from(2);
+        }
+    };
+    let mut server = match Server::start_with_api(&config, api) {
         Ok(server) => server,
         Err(error) => {
             logging::error("startup", &error.to_string());
@@ -51,10 +59,11 @@ pub(crate) fn run() -> ExitCode {
     logging::info(
         "startup",
         &format!(
-            "pulsed {} listening: udp={:?} tcp={:?} workers={:?} backend={:?}",
+            "pulsed {} listening: udp={:?} tcp={:?} api={:?} workers={:?} backend={:?}",
             env!("CARGO_PKG_VERSION"),
             server.udp_addr(),
             server.tcp_addr(),
+            server.api_addr(),
             server.udp_workers(),
             server.udp_backend()
         ),
@@ -140,9 +149,51 @@ pub(crate) fn run() -> ExitCode {
     }
 }
 
+fn api_options(matches: &ArgMatches) -> Result<Option<ApiOptions>, String> {
+    let listen = matches.get_one::<SocketAddr>("api-listen").copied();
+    let token = matches
+        .get_one::<String>("api-token")
+        .cloned()
+        .or_else(|| std::env::var("PULSED_API_TOKEN").ok())
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty());
+    let scopes: Vec<String> = matches
+        .get_many::<String>("api-scope")
+        .map(|values| {
+            values
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    match (listen, token) {
+        (Some(listen), Some(token)) => Ok(Some(ApiOptions {
+            listen,
+            token,
+            scopes,
+        })),
+        (Some(_), None) => Err(
+            "--api-listen requires --api-token or the PULSED_API_TOKEN environment variable"
+                .to_owned(),
+        ),
+        (None, Some(_)) => {
+            logging::warn(
+                "api",
+                "API token is set but --api-listen is missing; API stays disabled",
+            );
+            Ok(None)
+        }
+        (None, None) => Ok(None),
+    }
+}
+
 fn server_exit_code(error: &ServerError) -> ExitCode {
     match error {
-        ServerError::Config(_) | ServerError::Zone(_) => ExitCode::from(2),
+        ServerError::Config(_) | ServerError::Zone(_) | ServerError::Store(_) => ExitCode::from(2),
+        ServerError::Api(error) => match error {
+            ApiServerError::Config(_) => ExitCode::from(2),
+            _ => ExitCode::from(1),
+        },
         ServerError::TcpStart { .. } | ServerError::Tcp(_) | ServerError::Udp(_) => {
             ExitCode::from(1)
         }
@@ -188,5 +239,25 @@ fn command() -> Command {
                 .value_name("LEVEL")
                 .value_parser(value_parser!(LogLevel))
                 .help("Override log level: error, warn, info, debug or trace"),
+        )
+        .arg(
+            Arg::new("api-listen")
+                .long("api-listen")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Enable the REST API on a loopback address, e.g. 127.0.0.1:8080"),
+        )
+        .arg(
+            Arg::new("api-token")
+                .long("api-token")
+                .value_name("TOKEN")
+                .help("API bearer token (prefer the PULSED_API_TOKEN environment variable)"),
+        )
+        .arg(
+            Arg::new("api-scope")
+                .long("api-scope")
+                .value_name("ORIGIN")
+                .action(ArgAction::Append)
+                .help("Per-zone API allowlist (exact origin or *.suffix.); repeatable"),
         )
 }

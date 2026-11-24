@@ -34,19 +34,45 @@ impl ZoneError {
 /// `SOA`/`NS`, нарушена CNAME-эксклюзивность, обнаружен цикл CNAME или
 /// различаются TTL записей одного RRset.
 pub fn build_engine(zones: &[ZoneConfig]) -> Result<QueryEngine, ZoneError> {
-    let mut views: Vec<Arc<dyn ZoneView>> = Vec::with_capacity(zones.len());
-    let mut origins = HashSet::with_capacity(zones.len());
-    for config in zones {
-        let zone = build_zone(config)?;
-        if !origins.insert(zone.origin().clone()) {
-            return Err(ZoneError::new(format!(
-                "zone {} is declared more than once",
-                zone.origin()
-            )));
+    let loaded = load_zones(zones)?;
+    let mut views: Vec<Arc<dyn ZoneView>> = Vec::with_capacity(loaded.len());
+    for zone in loaded {
+        let mut view = InMemoryZone::new(zone.origin.clone());
+        for rrset in zone.rrsets {
+            view.insert(rrset).map_err(|error| {
+                ZoneError::new(format!(
+                    "zone {}: cannot insert RRset: {error}",
+                    zone.origin
+                ))
+            })?;
         }
-        views.push(Arc::new(zone));
+        views.push(Arc::new(view));
     }
     Ok(QueryEngine::new(views))
+}
+
+/// Зона, разобранная из конфигурации и готовая к загрузке в store.
+pub(crate) struct LoadedZone {
+    pub(crate) origin: Name,
+    pub(crate) default_ttl: Ttl,
+    pub(crate) rrsets: Vec<Rrset>,
+}
+
+/// Разбирает и валидирует все зоны конфигурации.
+pub(crate) fn load_zones(zones: &[ZoneConfig]) -> Result<Vec<LoadedZone>, ZoneError> {
+    let mut loaded = Vec::with_capacity(zones.len());
+    let mut origins = HashSet::with_capacity(zones.len());
+    for config in zones {
+        let zone = load_zone(config)?;
+        if !origins.insert(zone.origin.clone()) {
+            return Err(ZoneError::new(format!(
+                "zone {} is declared more than once",
+                zone.origin
+            )));
+        }
+        loaded.push(zone);
+    }
+    Ok(loaded)
 }
 
 struct Pending {
@@ -55,7 +81,7 @@ struct Pending {
 }
 
 #[allow(clippy::too_many_lines)]
-fn build_zone(config: &ZoneConfig) -> Result<InMemoryZone, ZoneError> {
+fn load_zone(config: &ZoneConfig) -> Result<LoadedZone, ZoneError> {
     let origin = Name::parse(config.origin.trim()).map_err(|error| {
         ZoneError::new(format!("invalid zone origin {:?}: {error}", config.origin))
     })?;
@@ -128,7 +154,6 @@ fn build_zone(config: &ZoneConfig) -> Result<InMemoryZone, ZoneError> {
     validate_apex(&origin, &groups)?;
     validate_cnames(&origin, &groups)?;
 
-    let mut zone = InMemoryZone::new(origin.clone());
     let mut entries: Vec<((Name, Rtype), Pending)> = groups.into_iter().collect();
     entries.sort_by(|(left_key, _), (right_key, _)| {
         left_key
@@ -137,6 +162,7 @@ fn build_zone(config: &ZoneConfig) -> Result<InMemoryZone, ZoneError> {
             .cmp(&right_key.0.to_string())
             .then_with(|| left_key.1.as_u16().cmp(&right_key.1.as_u16()))
     });
+    let mut rrsets = Vec::with_capacity(entries.len());
     for ((owner, rr_type), pending) in entries {
         let rrset = Rrset::new(
             owner.clone(),
@@ -150,13 +176,13 @@ fn build_zone(config: &ZoneConfig) -> Result<InMemoryZone, ZoneError> {
                 "zone {origin}: cannot build RRset {owner} {rr_type}: {error}"
             ))
         })?;
-        zone.insert(rrset).map_err(|error| {
-            ZoneError::new(format!(
-                "zone {origin}: cannot insert RRset {owner} {rr_type}: {error}"
-            ))
-        })?;
+        rrsets.push(rrset);
     }
-    Ok(zone)
+    Ok(LoadedZone {
+        origin,
+        default_ttl,
+        rrsets,
+    })
 }
 
 fn validate_apex(origin: &Name, groups: &HashMap<(Name, Rtype), Pending>) -> Result<(), ZoneError> {

@@ -97,6 +97,25 @@ impl InMemoryZone {
         self
     }
 
+    /// Регистрирует узел без RRset (empty node / empty non-terminal).
+    ///
+    /// Нужно адаптерам store-to-`ZoneView`: после удаления последнего RRset
+    /// имя может остаться существующим и отвечать `NODATA`, а не `NXDOMAIN`.
+    ///
+    /// # Errors
+    ///
+    /// [`MemoryZoneError::OwnerOutsideZone`], если имя вне origin зоны.
+    pub fn insert_node(&mut self, name: Name) -> Result<(), MemoryZoneError> {
+        if !name.is_subdomain_of(&self.origin) {
+            return Err(MemoryZoneError::OwnerOutsideZone {
+                owner: name,
+                origin: self.origin.clone(),
+            });
+        }
+        self.register_node(&name);
+        Ok(())
+    }
+
     /// Добавляет или заменяет RRset.
     ///
     /// # Errors
@@ -283,5 +302,33 @@ impl ZoneView for InMemoryZone {
 
     fn node_exists(&self, name: &Name) -> bool {
         self.nodes.contains(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_node_creates_empty_name() {
+        let origin = Name::parse("example.com.").unwrap();
+        let empty = Name::parse("empty.example.com.").unwrap();
+        let mut zone = InMemoryZone::new(origin);
+        zone.insert_node(empty.clone()).unwrap();
+        assert!(zone.node_exists(&empty));
+        assert!(matches!(
+            zone.lookup(&empty, Rtype::A),
+            LookupOutcome::NoData
+        ));
+    }
+
+    #[test]
+    fn insert_node_rejects_outside_owner() {
+        let mut zone = InMemoryZone::new(Name::parse("example.com.").unwrap());
+        let outside = Name::parse("outside.test.").unwrap();
+        assert!(matches!(
+            zone.insert_node(outside),
+            Err(MemoryZoneError::OwnerOutsideZone { .. })
+        ));
     }
 }

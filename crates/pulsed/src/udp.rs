@@ -4,10 +4,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use pulse_runtime::{BackendKind, Reply, RuntimeConfig, ServerStats, UdpServer};
-use pulse_server::{QueryEngine, Transport};
+use pulse_server::Transport;
 
 use crate::dns;
 use crate::stats::Stats;
+use crate::store::SharedZoneAdmin;
 
 /// Запущенный UDP-сервер.
 pub(crate) struct UdpService {
@@ -18,11 +19,12 @@ impl UdpService {
     pub(crate) fn start(
         addr: SocketAddr,
         workers: usize,
-        engine: Arc<QueryEngine>,
+        admin: Arc<SharedZoneAdmin>,
         stats: Arc<Stats>,
     ) -> Result<Self, pulse_runtime::RuntimeError> {
         let config = RuntimeConfig::default().with_workers(workers);
         let handler = move |request: &[u8], _peer: SocketAddr, out: &mut [u8]| -> Reply {
+            let engine = admin.engine();
             let Some(response) = dns::respond(request, Transport::Udp, &engine, &stats) else {
                 return Reply::Drop;
             };

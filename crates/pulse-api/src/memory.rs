@@ -8,7 +8,7 @@
 //! Порядок взятия блокировок всегда «каталог → зона»; обратный порядок
 //! запрещён (иначе возможен deadlock с удалением зоны).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 
@@ -42,6 +42,8 @@ struct ZoneData {
     default_ttl: Ttl,
     denial: Denial,
     rrsets: BTreeMap<RrsetKey, RrsetRecord>,
+    /// Существующие имена, включая узлы без RRset после удаления.
+    nodes: HashSet<Name>,
     created_at: std::time::SystemTime,
     updated_at: std::time::SystemTime,
 }
@@ -80,6 +82,58 @@ impl ZoneData {
             updated_at: self.updated_at,
         }
     }
+
+    fn snapshot(&self) -> ZoneSnapshot {
+        let mut nodes: Vec<Name> = self.nodes.iter().cloned().collect();
+        nodes.sort_by(|left, right| left.cmp_canonical(right));
+        ZoneSnapshot {
+            origin: self.origin.clone(),
+            kind: self.kind,
+            serial: self.serial,
+            version: self.version,
+            txn: self.txn,
+            default_ttl: self.default_ttl,
+            denial: self.denial,
+            rrsets: self
+                .rrsets
+                .values()
+                .map(|record| record.rrset.clone())
+                .collect(),
+            nodes,
+        }
+    }
+}
+
+/// Снимок одной зоны для DNS-адаптера.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZoneSnapshot {
+    /// Origin зоны.
+    pub origin: Name,
+    /// Тип зоны.
+    pub kind: ZoneKind,
+    /// Serial метаданных зоны.
+    pub serial: Serial,
+    /// Версия зоны.
+    pub version: u64,
+    /// Номер последнего коммита.
+    pub txn: u64,
+    /// TTL по умолчанию.
+    pub default_ttl: Ttl,
+    /// Политика denial-of-existence.
+    pub denial: Denial,
+    /// Все RRset зоны в детерминированном порядке.
+    pub rrsets: Vec<Rrset>,
+    /// Существующие имена, включая empty nodes.
+    pub nodes: Vec<Name>,
+}
+
+/// Атомарный снимок каталога зон.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreSnapshot {
+    /// Номер последнего коммита store.
+    pub revision: u64,
+    /// Зоны в каноническом порядке origin.
+    pub zones: Vec<ZoneSnapshot>,
 }
 
 /// In-memory store зон.
@@ -104,6 +158,160 @@ impl InMemoryZoneAdmin {
     /// Помечает store как готовый/неготовый (для `/readyz`).
     pub fn set_ready(&self, ready: bool) {
         self.ready.store(ready, Ordering::Release);
+    }
+
+    /// Возвращает согласованный по зонам снимок каталога.
+    ///
+    /// Блокировка каталога удерживается на чтение, каждой зоны — на время
+    /// клонирования её RRset. DNS-адаптер строит `ZoneView` по этому снимку,
+    /// поэтому запросы не держат блокировки store.
+    pub fn snapshot(&self) -> StoreSnapshot {
+        // Ревизия читается до копирования зон: если мутация попадёт в снимок
+        // или произойдёт во время копирования, её собственный `refresh()`
+        // увидит revision больше сохранённой и перестроит движок ещё раз.
+        let revision = self.revision();
+        let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
+        let mut zones: Vec<ZoneSnapshot> = Vec::with_capacity(catalog.len());
+        for zone in catalog.values() {
+            let data = lock_zone(zone);
+            zones.push(data.snapshot());
+        }
+        zones.sort_by(|left, right| left.origin.cmp_canonical(&right.origin));
+        StoreSnapshot { revision, zones }
+    }
+
+    /// Номер последнего коммита store.
+    pub fn revision(&self) -> u64 {
+        self.next_txn.load(Ordering::Acquire).saturating_sub(1)
+    }
+
+    /// Атомарно импортирует готовую зону (bootstrap из JSON-конфига).
+    ///
+    /// В отличие от HTTP RRset API, импорт допускает DNSSEC-записи
+    /// (`RRSIG`/`NSEC`/`NSEC3`): они приходят из проверенного конфигурационного
+    /// файла и не редактируются через control plane. Store-инварианты
+    /// (owner в зоне, единственный apex SOA, CNAME-эксклюзивность) проверяются.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::Conflict`], если зона уже существует,
+    /// [`AdminError::InvariantViolation`] при нарушении инвариантов.
+    pub fn import_zone(
+        &self,
+        origin: &Name,
+        meta: &ZoneMetaInput,
+        rrsets: Vec<Rrset>,
+    ) -> Result<ZoneView, AdminError> {
+        if origin == &Name::root() || origin.labels().any(|label| label == b"*") {
+            return Err(AdminError::invariant(
+                "/origin",
+                "invalid-origin",
+                "zone origin must be a non-root name without wildcards",
+            ));
+        }
+        let now = std::time::SystemTime::now();
+        let mut records: BTreeMap<RrsetKey, RrsetRecord> = BTreeMap::new();
+        let mut by_owner: HashMap<Name, Vec<Rtype>> = HashMap::new();
+        let mut nodes = HashSet::from([origin.clone()]);
+        let mut serial = Serial::new(1);
+        for rrset in rrsets {
+            let owner = rrset.owner();
+            if !owner.is_subdomain_of(origin) {
+                return Err(AdminError::invariant(
+                    "/owner",
+                    "owner-out-of-zone",
+                    "record owner must be inside the zone",
+                ));
+            }
+            if rrset.rr_type() == Rtype::SOA {
+                if owner != origin {
+                    return Err(AdminError::invariant(
+                        "/type",
+                        "soa-apex-only",
+                        "SOA is allowed only at the zone apex",
+                    ));
+                }
+                if rrset.len() != 1 {
+                    return Err(AdminError::invariant(
+                        "/records",
+                        "soa-single",
+                        "apex SOA must contain exactly one record",
+                    ));
+                }
+                if let Some(Rdata::Soa(data)) = rrset.rdatas().iter().next() {
+                    serial = data.serial;
+                }
+            }
+            if rrset.rr_type() == Rtype::CNAME && rrset.len() != 1 {
+                return Err(AdminError::invariant(
+                    "/records",
+                    "cname-single",
+                    "CNAME must contain exactly one target",
+                ));
+            }
+            let key = Self::rrset_key(owner, rrset.rr_type());
+            if records.contains_key(&key) {
+                return Err(AdminError::invariant(
+                    "/records",
+                    "duplicate-rrset",
+                    "zone import contains duplicate owner/type",
+                ));
+            }
+            by_owner
+                .entry(owner.clone())
+                .or_default()
+                .push(rrset.rr_type());
+            register_nodes_into(&mut nodes, origin, owner);
+            let etag = rrset_etag(&rrset);
+            records.insert(
+                key,
+                RrsetRecord {
+                    rrset,
+                    etag,
+                    updated_at: now,
+                },
+            );
+        }
+        for (owner, types) in &by_owner {
+            if !types.contains(&Rtype::CNAME) {
+                continue;
+            }
+            if owner == origin
+                || types
+                    .iter()
+                    .any(|rr_type| *rr_type != Rtype::CNAME && !is_dnssec_adjacent(*rr_type))
+            {
+                return Err(AdminError::invariant(
+                    "/owner",
+                    "cname-conflict",
+                    "CNAME cannot coexist with other data at the same owner",
+                ));
+            }
+        }
+
+        let mut catalog = self.catalog.write().unwrap_or_else(PoisonError::into_inner);
+        if catalog.contains_key(&Self::zone_key(origin)) {
+            return Err(AdminError::Conflict(crate::error::Conflict::ZoneExists));
+        }
+        let id = ZoneId::new(self.next_id.fetch_add(1, Ordering::SeqCst));
+        let txn = self.next_txn();
+        let data = ZoneData {
+            id,
+            origin: origin.clone(),
+            kind: meta.kind,
+            serial,
+            version: 1,
+            txn,
+            default_ttl: meta.default_ttl,
+            denial: meta.denial,
+            rrsets: records,
+            nodes,
+            created_at: now,
+            updated_at: now,
+        };
+        let view = data.view();
+        catalog.insert(Self::zone_key(origin), Arc::new(Mutex::new(data)));
+        Ok(view)
     }
 
     fn next_txn(&self) -> u64 {
@@ -182,18 +390,14 @@ impl InMemoryZoneAdmin {
             ));
         }
         if rr_type == Rtype::SOA {
-            if owner == &zone.origin {
+            if owner != &zone.origin {
                 return Err(AdminError::invariant(
                     "/type",
-                    "serial-managed",
-                    "SOA is managed by the serial/commit path and cannot be edited via the RRset API",
+                    "soa-apex-only",
+                    "SOA is allowed only at the zone apex",
                 ));
             }
-            return Err(AdminError::invariant(
-                "/type",
-                "soa-apex-only",
-                "SOA is allowed only at the zone apex",
-            ));
+            return Ok(());
         }
         if is_managed_type(rr_type) {
             return Err(AdminError::invariant(
@@ -280,6 +484,26 @@ impl Default for InMemoryZoneAdmin {
 
 fn lock_zone(zone: &Mutex<ZoneData>) -> MutexGuard<'_, ZoneData> {
     zone.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn register_nodes(zone: &mut ZoneData, owner: &Name) {
+    register_nodes_into(&mut zone.nodes, &zone.origin, owner);
+}
+
+fn register_nodes_into(nodes: &mut HashSet<Name>, origin: &Name, owner: &Name) {
+    let mut current = Some(owner.clone());
+    while let Some(name) = current {
+        let is_origin = &name == origin;
+        nodes.insert(name.clone());
+        if is_origin {
+            break;
+        }
+        current = name.parent();
+    }
+}
+
+fn is_dnssec_adjacent(rr_type: Rtype) -> bool {
+    matches!(rr_type, Rtype::RRSIG | Rtype::NSEC | Rtype::NSEC3)
 }
 
 fn tags_equal(left: &str, right: &str) -> bool {
@@ -485,6 +709,7 @@ impl ZoneAdmin for InMemoryZoneAdmin {
             default_ttl: meta.default_ttl,
             denial: meta.denial,
             rrsets: BTreeMap::new(),
+            nodes: HashSet::from([origin.clone()]),
             created_at: now,
             updated_at: now,
         };
@@ -505,6 +730,10 @@ impl ZoneAdmin for InMemoryZoneAdmin {
             check_existing(preconditions, &data.etag(), data.version)?;
         }
         catalog.remove(&key);
+        // Удаление зоны не меняет ни одной ZoneData, поэтому глобальную
+        // ревизию нужно продвинуть явно: DNS-адаптеры перестраивают снапшот
+        // по `revision`.
+        let _ = self.next_txn();
         Ok(())
     }
 
@@ -602,6 +831,13 @@ impl ZoneAdmin for InMemoryZoneAdmin {
             input.rdata.iter().cloned(),
         )
         .map_err(map_rrset_error)?;
+        if rr_type == Rtype::SOA && rrset.len() != 1 {
+            return Err(AdminError::invariant(
+                "/records",
+                "soa-single",
+                "apex SOA must contain exactly one record",
+            ));
+        }
         let key = Self::rrset_key(owner, rr_type);
         let existed = data.rrsets.contains_key(&key);
         if let Some(current) = data.rrsets.get(&key) {
@@ -619,6 +855,7 @@ impl ZoneAdmin for InMemoryZoneAdmin {
                 updated_at: now,
             },
         );
+        register_nodes(&mut data, owner);
         data.serial = data.serial.succ();
         data.version = data.version.saturating_add(1);
         data.txn = self.next_txn();
@@ -686,6 +923,13 @@ impl ZoneAdmin for InMemoryZoneAdmin {
         }
         let rrset = Rrset::new(owner.clone(), rr_type, Rclass::IN, ttl, next_set)
             .map_err(map_rrset_error)?;
+        if rr_type == Rtype::SOA && rrset.len() != 1 {
+            return Err(AdminError::invariant(
+                "/records",
+                "soa-single",
+                "apex SOA must contain exactly one record",
+            ));
+        }
         let etag = rrset_etag(&rrset);
         data.rrsets.insert(
             key,
@@ -695,6 +939,7 @@ impl ZoneAdmin for InMemoryZoneAdmin {
                 updated_at: now,
             },
         );
+        register_nodes(&mut data, owner);
         data.serial = data.serial.succ();
         data.version = data.version.saturating_add(1);
         data.txn = self.next_txn();
@@ -798,7 +1043,7 @@ fn decode_rrset_cursor(cursor: &str) -> Result<(String, u16), AdminError> {
 mod tests {
     use std::sync::{Arc, Barrier};
 
-    use pulse_dns::{Name, Rdata, Rtype, Ttl};
+    use pulse_dns::{Name, Rdata, Rtype, Serial, SoaData, Ttl};
 
     use super::*;
     use crate::port::AllowAll;
@@ -826,6 +1071,18 @@ mod tests {
 
     fn a_record(address: &str) -> Rdata {
         Rdata::A(address.parse().unwrap())
+    }
+
+    fn soa_record(serial: u32) -> Rdata {
+        Rdata::Soa(SoaData::new(
+            Name::parse("ns1.example.com.").unwrap(),
+            Name::parse("hostmaster.example.com.").unwrap(),
+            Serial::new(serial),
+            3600,
+            600,
+            604_800,
+            300,
+        ))
     }
 
     #[test]
@@ -1042,6 +1299,127 @@ mod tests {
                     rdata: vec![a_record("192.0.2.1")],
                 },
                 &Preconditions::none(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, AdminError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn snapshot_exposes_rrsets_and_preserves_empty_nodes() {
+        let (store, _) = store_with_zone();
+        let owner = Name::parse("www.example.com.").unwrap();
+        let created = store
+            .put_rrset(
+                &origin(),
+                &owner,
+                Rtype::A,
+                &RrsetInput {
+                    ttl: Ttl::new(300).unwrap(),
+                    rdata: vec![a_record("192.0.2.10")],
+                },
+                &Preconditions::none(),
+            )
+            .unwrap();
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.zones.len(), 1);
+        assert_eq!(snapshot.revision, snapshot.zones[0].txn);
+        assert_eq!(snapshot.zones[0].rrsets.len(), 1);
+        assert!(snapshot.zones[0].nodes.contains(&owner));
+
+        let etag = created.value().etag.clone();
+        store
+            .delete_rrset(&origin(), &owner, Rtype::A, &Preconditions::if_match(etag))
+            .unwrap();
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.zones[0].rrsets.len(), 0);
+        assert!(snapshot.zones[0].nodes.contains(&owner));
+    }
+
+    #[test]
+    fn import_zone_is_atomic_and_uses_soa_serial() {
+        let store = InMemoryZoneAdmin::new();
+        let origin = origin();
+        let owner = Name::parse("www.example.com.").unwrap();
+        let rrsets = vec![
+            Rrset::new(
+                origin.clone(),
+                Rtype::SOA,
+                Rclass::IN,
+                Ttl::new(3600).unwrap(),
+                [soa_record(7)],
+            )
+            .unwrap(),
+            Rrset::new(
+                origin.clone(),
+                Rtype::NS,
+                Rclass::IN,
+                Ttl::new(3600).unwrap(),
+                [Rdata::Ns(Name::parse("ns1.example.com.").unwrap())],
+            )
+            .unwrap(),
+            Rrset::new(
+                owner.clone(),
+                Rtype::A,
+                Rclass::IN,
+                Ttl::new(300).unwrap(),
+                [a_record("192.0.2.10")],
+            )
+            .unwrap(),
+        ];
+        let view = store.import_zone(&origin, &meta(), rrsets).unwrap();
+        assert_eq!(view.serial, Serial::new(7));
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.zones[0].rrsets.len(), 3);
+        assert!(snapshot.zones[0].nodes.contains(&owner));
+        assert!(matches!(
+            store.import_zone(&origin, &meta(), Vec::new()),
+            Err(AdminError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn soa_is_editable_at_apex_only_and_single() {
+        let (store, _) = store_with_zone();
+        let created = store
+            .put_rrset(
+                &origin(),
+                &origin(),
+                Rtype::SOA,
+                &RrsetInput {
+                    ttl: Ttl::new(3600).unwrap(),
+                    rdata: vec![soa_record(1)],
+                },
+                &Preconditions::none(),
+            )
+            .unwrap();
+        assert_eq!(created.value().rr_type, Rtype::SOA);
+
+        let non_apex = Name::parse("sub.example.com.").unwrap();
+        let error = store
+            .put_rrset(
+                &origin(),
+                &non_apex,
+                Rtype::SOA,
+                &RrsetInput {
+                    ttl: Ttl::new(3600).unwrap(),
+                    rdata: vec![soa_record(2)],
+                },
+                &Preconditions::none(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, AdminError::InvariantViolation(_)));
+
+        let etag = created.value().etag.clone();
+        let error = store
+            .put_rrset(
+                &origin(),
+                &origin(),
+                Rtype::SOA,
+                &RrsetInput {
+                    ttl: Ttl::new(3600).unwrap(),
+                    rdata: vec![soa_record(3), soa_record(4)],
+                },
+                &Preconditions::if_match(etag),
             )
             .unwrap_err();
         assert!(matches!(error, AdminError::InvariantViolation(_)));

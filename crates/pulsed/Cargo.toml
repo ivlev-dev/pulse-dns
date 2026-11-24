@@ -20,6 +20,7 @@ path = "src/main.rs"
 base64 = "0.22"
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
 hex = "0.4"
+pulse-api = { path = "../pulse-api" }
 pulse-dns = { path = "../pulse-dns" }
 pulse-runtime = { path = "../pulse-runtime" }
 pulse-server = { path = "../pulse-server", features = ["testkit"] }

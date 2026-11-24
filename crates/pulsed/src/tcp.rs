@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use pulse_server::{QueryEngine, Transport};
+use pulse_server::Transport;
 
 use crate::stats::Stats;
+use crate::store::SharedZoneAdmin;
 use crate::{dns, logging};
 
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
@@ -33,7 +34,7 @@ impl TcpService {
         addr: SocketAddr,
         max_connections: usize,
         idle_timeout: Duration,
-        engine: Arc<QueryEngine>,
+        admin: Arc<SharedZoneAdmin>,
         stats: Arc<Stats>,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
@@ -52,7 +53,7 @@ impl TcpService {
                         &listener,
                         max_connections,
                         idle_timeout,
-                        &engine,
+                        &admin,
                         &stats,
                         &shutdown,
                         &connections,
@@ -120,7 +121,7 @@ fn accept_loop(
     listener: &TcpListener,
     max_connections: usize,
     idle_timeout: Duration,
-    engine: &Arc<QueryEngine>,
+    admin: &Arc<SharedZoneAdmin>,
     stats: &Arc<Stats>,
     shutdown: &Arc<AtomicBool>,
     connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
@@ -131,7 +132,7 @@ fn accept_loop(
                 stream,
                 max_connections,
                 idle_timeout,
-                engine,
+                admin,
                 stats,
                 shutdown,
                 connections,
@@ -153,7 +154,7 @@ fn spawn_connection(
     stream: TcpStream,
     max_connections: usize,
     idle_timeout: Duration,
-    engine: &Arc<QueryEngine>,
+    admin: &Arc<SharedZoneAdmin>,
     stats: &Arc<Stats>,
     shutdown: &Arc<AtomicBool>,
     connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
@@ -177,15 +178,14 @@ fn spawn_connection(
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, tracked);
     }
-    let engine = Arc::clone(engine);
+    let admin = Arc::clone(admin);
     let stats = Arc::clone(stats);
     let shutdown = Arc::clone(shutdown);
     let spawned = thread::Builder::new()
         .name(format!("pulse-tcp-{id}"))
         .spawn(move || {
             let _guard = guard;
-            if let Err(error) = handle_connection(stream, &engine, &stats, &shutdown, idle_timeout)
-            {
+            if let Err(error) = handle_connection(stream, &admin, &stats, &shutdown, idle_timeout) {
                 stats.tcp_io_error();
                 logging::debug(
                     "tcp_connection",
@@ -219,7 +219,7 @@ impl Drop for ConnectionGuard {
 
 fn handle_connection(
     mut stream: TcpStream,
-    engine: &QueryEngine,
+    admin: &SharedZoneAdmin,
     stats: &Stats,
     shutdown: &AtomicBool,
     idle_timeout: Duration,
@@ -241,7 +241,8 @@ fn handle_connection(
         if !read_exact_idle(&mut stream, &mut request)? {
             return Ok(());
         }
-        let Some(response) = dns::respond(&request, Transport::Tcp, engine, stats) else {
+        let engine = admin.engine();
+        let Some(response) = dns::respond(&request, Transport::Tcp, &engine, stats) else {
             continue;
         };
         let length = u16::try_from(response.len()).map_err(|_| {

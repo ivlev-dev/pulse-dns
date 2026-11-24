@@ -1,15 +1,19 @@
 //! `pulsed` — авторитетный DNS-сервер (MVP).
 //!
 //! Крейт является **composition root** для авторитетного процесса: читает
-//! JSON-конфигурацию, собирает зоны в in-memory store, поднимает UDP
-//! (`pulse-runtime`, io_uring) и TCP (std) транспорты и обслуживает
-//! `SIGTERM`/`SIGINT`.
+//! JSON-конфигурацию, загружает зоны в общий `pulse-api::InMemoryZoneAdmin`,
+//! поднимает UDP (`pulse-runtime`, io_uring), TCP (std) и опциональный REST
+//! API (`pulse-api`) и обслуживает `SIGTERM`/`SIGINT`.
+//!
+//! API и DNS используют один store: после каждой успешной мутации адаптер
+//! перестраивает снапшот `QueryEngine`, поэтому изменения видны сразу, а
+//! DNS-запрос не удерживает блокировки store.
 //!
 //! # Состав
 //!
 //! - [`config`] — JSON-конфигурация и CLI-overrides.
 //! - [`zone`] — загрузка зон и валидация инвариантов.
-//! - [`server`] — запуск и остановка транспортов.
+//! - [`server`] — запуск и остановка DNS/API, общий zone store.
 //! - [`stats`] — атомарные счётчики без блокировок на горячем пути.
 //!
 //! # Пример
@@ -40,6 +44,7 @@ mod dns;
 mod logging;
 mod names;
 mod rdata;
+mod store;
 mod tcp;
 mod udp;
 
