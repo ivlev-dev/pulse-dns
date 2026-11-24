@@ -1,12 +1,76 @@
-# `pulse-zonefile::parallel` — параллельная запись v2.0 (фазы A, B1 и B2a)
+# `pulse-zonefile::parallel` — параллельная запись v2.0 (фазы A, B1, B2a и B2b)
 
 Модуль реализует **фазу A** нормативной раскладки
 [`docs/spec/parallel-writes-v2.md`](../../../../docs/spec/parallel-writes-v2.md) и
 решений ADR-0005 (D-A, D-C, F-8, F-9) / ADR-0006 (PW-I*, §9.2), а также
 **фазу B1** — B+tree поверх `ParallelStore`, per-zone commit и read snapshots.
+**Фаза B2b** — group commit (батчинг зон, ровно два `fdatasync` на группу),
+`Flush`/`Memory` и липкий `Sync`, tombstone-GC каталога, sweep утечек и
+offline `fsck --repair`.
 v1-модули, их публичный API и поведение не изменены: v2 — отдельные типы
 [`ParallelStore`], [`ParallelZones`], [`ParallelZone`], [`ZoneReader`] и
 отдельный файловый формат 2.0.
+
+## Что реализовано (фаза B2b): group commit, durability, GC каталога, repair
+
+| Раздел спеки | Реализация |
+|---|---|
+| §7.1 group commit | `GroupCommitter` (channel + фоновый координатор) батчит подготовленные коммиты разных зон: `MAX_BATCH_ZONES = 256`, `MAX_BATCH_BYTES = 1 МиБ`, `MAX_BATCH_DELAY = 1 мс`, bulk-коммит > `256 КиБ` — отдельной группой. Фаза 1: `ALLOC_RECORD` + chain/bucket всех зон → `fdatasync`; фаза 2: две копии `RootEntry` всех зон → `fdatasync`; затем публикация голов и ack. Синхронный вход — `ParallelStore::commit_group`. |
+| §7.1/§7.3 backpressure | Очередь координатора `QUEUE_ZONES = 1024` (bounded `sync_channel`) + байтовый шлюз `QUEUE_BYTES = 64 МиБ` (condvar). Писатель ждёт ack; ошибка I/O → `CommitUncertain` (`write_locked`) для **всех** зон группы и ни одной публикации; `ReaderContended` — per-zone retryable. |
+| §7.2 `Flush`/`Memory` | `commit_with(Durability)`/`commit_via_with`: `Sync` — 2 fsync и двигает `D_z`; `Flush` — fsync данных (фаза 1), корни без fsync, `D_z`/`DT` не двигаются; `Memory` — ни одного fsync. Липкий `Sync` (`DT > 1` или `sync_mode = Sync`) → слабее нельзя (`DurabilityBelowFileMode`). `sync()` — durable-чекпойнт: alloc + fsync, `D_z := head.version`, липкий `Sync`. Recovery учитывает режим: корни новее `ALLOC_RECORD` для `Flush`/`Memory` не file-fatal. |
+| §5.6/§6.5 tombstone-GC | `delete_zone` пишет tombstone; `ParallelZones::gc_catalog` удаляет каталог-запись **после** durable `deleted_txn`, после чего `zone_seq` переиспользуется `create_zone` (origin можно создать заново). Крах на любой стадии не оставляет каталог-запись на удалённую зону. |
+| §6.5/R4 утечки | `ParallelStore::leak_report` (leaked `[data_first, DP)`, aborted `[DP, cursor)`, `MAX_LEAK_RATIO = 1 %`); `repair_leaks` возвращает утёкшие страницы durable-free в bucket каталога, проверяет дизъюнктность и идемпотентность; `fsck_repair(path)` — offline `LOCK_EX`. Пересечение множеств (`PageOverlap`) — отказ, не «починка». |
+| §7.3 метрики | `StoreStats::{group_commits, group_members, group_fsyncs, group_max_members, group_aborted, aborted_pages_estimate}`, `GroupStats`, `LeakReport::{leaked_pages, ratio, max_ratio, exceeds_max_ratio}`. |
+
+### B2b API
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use std::sync::Arc;
+use pulse_zonefile::key::NameRle;
+use pulse_zonefile::parallel::{
+    Durability, GroupCommitter, ParallelStore, ParallelZones, RrsetData, StoreConfig,
+    ZoneCreateMeta,
+};
+
+let dir = tempfile::tempdir()?;
+let path = dir.path().join("zones.v2");
+let store = Arc::new(ParallelStore::create(&path, StoreConfig::small(64, 1 << 20))?);
+let mut zones = ParallelZones::open(&store)?;
+let apex = NameRle::from_ascii("example.com")?;
+zones.create_zone(&apex, ZoneCreateMeta { soa_serial: 1 })?;
+
+let committer = GroupCommitter::new(Arc::clone(&store))?;
+let mut writer = zones.writer(&apex)?;
+let www = NameRle::from_ascii("www.example.com")?;
+writer.upsert_rrset(&www, 1, 0, &RrsetData::from_slices(300, 0, &[&[192, 0, 2, 1]])?)?;
+let outcome = writer.commit_via(&committer)?;        // ack после публикации головы
+drop(writer);
+committer.shutdown();
+
+// `Flush`/`Memory` — только для файла, созданного в этом режиме.
+// `sync()` делает коммиты durable и включает липкий `Sync`.
+assert_eq!(store.effective_mode(), Durability::Sync);
+assert!(store.durable_version(outcome.zone) >= outcome.version);
+
+// Утечки и offline `fsck --repair`.
+let report = store.leak_report()?;
+let repaired = report.leaked_pages;
+let _ = repaired;
+drop(zones);
+drop(store);
+let repair = pulse_zonefile::parallel::fsck_repair(&path)?;
+assert!(repair.ok || repair.remaining_leaks == 0);
+# Ok(())
+# }
+```
+
+- `commit_via` батчится с другими зонами; одна зона без компании всё равно
+  получает 2 `fdatasync` (ожидаемая плата за ack-семантику).
+- `GroupCommitter::stats()` — собственные счётчики: `fsyncs == groups * 2` для
+  `Sync`, `max_members`, `aborted`.
+- `create_zone` переиспользует свободный tombstone-слот; каталог чистится
+  `gc_catalog` (после durable-удаления).
 
 ## Что реализовано (фаза B2a): кеш и рекламация
 
@@ -174,9 +238,16 @@ cargo test -p pulse-zonefile --test v2_cache    # B2a: общий кеш, COW, �
 cargo test -p pulse-zonefile --test v2_cache_alloc # B2a: 0 аллокаций warm lookup
 cargo test -p pulse-zonefile --test v2_reclaim  # B2a: пул/пины/GC/donation/10k
 cargo test -p pulse-zonefile --test v2_reclaim -- --ignored --nocapture # 10k+10k
+cargo test -p pulse-zonefile --test v2_group    # B2b: group commit, fsync/группу, backpressure
+cargo test -p pulse-zonefile --test v2_durability # B2b: Flush/Memory/sticky/sync, kill -9, torn
+cargo test -p pulse-zonefile --test v2_catalog_gc # B2b: tombstone-GC + recreate
+cargo test -p pulse-zonefile --test v2_leak     # B2b: leak sweep/repair/MAX_LEAK_RATIO
+cargo test -p pulse-zonefile --test v2_group_crash # B2b: kill -9 групп (random + точки)
+cargo test -p pulse-zonefile --test v2_group_prop  # B2b: proptest монотонности/выбора
 cargo bench -p pulse-zonefile --bench v2        # reserve/publish/pin/select
 cargo bench -p pulse-zonefile --bench v2_zones  # B1: commit ops/s 1/4/8 потоков, read ns
 cargo bench -p pulse-zonefile --bench v2_cache  # B2a: lookup ns, commit+GC, high_water
+cargo bench -p pulse-zonefile --bench v2_group  # B2b: group vs per-zone, fsync/группу, p50/p99
 ```
 
 `v2_crash` переиспользует собственный test-binary как child (без `unsafe`):
@@ -184,27 +255,38 @@ cargo bench -p pulse-zonefile --bench v2_cache  # B2a: lookup ns, commit+GC, hig
 ack-лог с `sync_data`, родитель убивает его `SIGKILL` (случайная задержка или
 детерминированная точка `CrashPoint`). После каждого краха проверяются
 `DP ≥ max acked page_limit`, `head.version ≥ max acked version`, отсутствие
-`Corrupt`/`fatal` и монотонность `DP` между итерациями.
+`Corrupt`/`fatal` и монотонность `DP` между итерациями. `v2_group_crash`
+делает то же для группового коммита: ack-лог после публикации головы, случайный
+`SIGKILL` и детерминированные точки фаз группы.
 
-## Остаток для фазы B2b
+### Замер B2b (8 потоков, 32 зоны, `COMMITS=16`)
 
-1. Group commit: batching зон, ровно два fsync на группу, backpressure-очередь,
-   `Flush`/`Memory` и sticky-`Sync`. Сейчас каждый `commit` — своя группа.
-2. Каталог: tombstone-GC (запись каталога и слот `zone_seq`), `MAX_LEAK_RATIO`
-   alert, `fsck --repair`.
-3. Слоты reader table в файле (межпроцессные пины, M3), writer registry/`LOCK_SH`.
-5. `fsck --repair`, `fsck --at-epoch`, дизъюнктность множеств страниц битсетом,
-   `MAX_LEAK_RATIO`, метрики/алерты.
-6. Страницы 8192/16384 (геометрия ring = 16 зон зафиксирована для 4096).
-7. Loom-модели, ARM64 CI, `dm-log-writes`-реплей, `perf c2c`.
+| Устройство | per-zone | group | ratio | p50 group | p99 group | fsync/группу |
+|---|---|---|---|---|---|---|
+| локальная btrfs (`fdatasync ≈ 30–60 µs`) | 38.6k z/s | 23.3k z/s | 0.60× | 204 µs | 530 µs | 2.00 |
+| модель durable-устройства (`fdatasync = 400 µs`, сериализован) | 1.05k z/s | 4.47k z/s | **4.28×** | 2.03 ms | 2.18 ms | 2.00 |
+
+На 4 потоках — 2.60×, на 1 потоке — 0.47× (батчинга нет, платится
+`MAX_BATCH_DELAY`). Нативный fsync на локальной ФС почти бесплатен, поэтому
+group commit там проигрывает на накладных расходах; выигрыш — на устройстве, где
+fsync доминирует (целевой режим спеки §7.4).
+
+## Остаток до фазы C
+
+1. Межпроцессная запись M3: слоты reader table в файле, writer registry/`LOCK_SH`,
+   выборный лидер, общий `ALLOC_RECORD`-курсор (отдельный ADR, Q7).
+2. `fsck --verify` уровня «полный scrub»: битсет-дизъюнктность на больших файлах,
+   `fsck --at-epoch`, проверка `page.txn ≤ version` по всем достижимым страницам.
+3. Страницы 8192/16384 (геометрия ring = 16 зон зафиксирована для 4096).
+4. Loom-модели, ARM64 CI, `dm-log-writes`-реплей, `perf c2c`, `strace -c`.
+5. Bulk-lane и шардирование координатора для потолка `fdatasync` (R7).
 
 ## Осознанные ограничения фазы A
 
 - Только `page_size = 4096`; v2-файл с другим размером отвергается.
-- Только режим `Sync`; `Flush`/`Memory` → `Unsupported`.
 - Txn-курсор и пины — в памяти процесса (M1); второй writer → `Busy`.
-- `publish_root` выполняет по два `fdatasync` на вызов (групповой батчинг —
-  фаза B), поэтому throughput упирается в fsync одного inode.
+- `publish_root` (низкоуровневый API фазы A) всегда выполняет два `fdatasync`;
+  группировка — `commit_group`/`GroupCommitter` (B2b).
 - `publish_root` принимает `version` от вызывающего и проверяет монотонность
   внутри зоны; глобальный `txn`-билет выдаёт `AllocHandle::next_txn`, привязка
   `Version = txn` выполняется коммитом фазы B (в фазе A `next_txn` не
@@ -230,12 +312,23 @@ ack-лог с `sync_data`, родитель убивает его `SIGKILL` (с�
 - **B1:** CRC v2-страницы не покрывает `owner_zone` (`reserved1`): владелец
   аутентифицируется сравнением с зоной, поэтому CRC остаётся совместимым с
   v1-энкодерами без пересчёта.
-- **B2a:** каждый `commit` — отдельная группа (2 `fdatasync`); группировка зон —
-  B2b. `free_page` собирает страницы в bucket коммита (COW-мусор возвращается
-  через `is_reclaimable`).
+- **B2a:** `free_page` собирает страницы в bucket коммита (COW-мусор
+  возвращается через `is_reclaimable`).
 - **B2a:** `ZoneReader` берёт валидированные страницы из `PageCacheV2` и узлы из
   v1 `PageCache`; холодный первый lookup читает с диска и валидирует CRC.
 - **B2a:** аллокатор сначала выдаёт durable-eligible страницы пула, затем
   bump-курсор (спека §6.5 допускает bump-first; выбран пул-first ради
-  стабилизации `high_water`). Утечки `< DP` (batch slack/крах) считает
-  `fsck_graph`, порог-алерт — B2b.
+  стабилизации `high_water`).
+- **B2b:** `LeakReport.leaked_pages` включает batch slack аллокатора (до 64
+  страниц на активный handle): это честная оценка `fsck`, а не порча.
+  `repair_leaks` — offline-операция (без активных писателей), иначе возможна
+  гонка с выдачей из батча.
+- **B2b:** `fsck_repair` возвращает утёкшие страницы в durable bucket каталога;
+  кросс-зонное перераспределение остаётся donation-ом (`ParallelZone::donate`).
+- **B2b:** один поток без компании платит `MAX_BATCH_DELAY` + два fsync за
+  коммит; выигрыш group commit начинается с ≥ 4 одновременных писателей и
+  заметного fsync (модельный замер — 4.3× на 8 потоках).
+- **B2b:** `ReaderContended` внутри группы отменяет только эту зону; уже
+  записанные в фазе 1 bucket/chain-образы остаются недостижимыми (утечка,
+  `group_aborted`), её возвращает `fsck --repair`. Публикации головы зоны при
+  этом не происходит.

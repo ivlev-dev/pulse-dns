@@ -32,6 +32,8 @@ pub enum V2CorruptKind {
     RootChain,
     /// Номер страницы/смещение вне файла.
     Bounds,
+    /// Пересечение множеств страниц разных зон/дерева/пула (§9.2).
+    PageOverlap,
     /// Файл усечён.
     Truncated,
 }
@@ -50,6 +52,7 @@ impl V2CorruptKind {
                 | Self::RingSlotMismatch
                 | Self::WatermarkRegression
                 | Self::PageTxn
+                | Self::PageOverlap
         )
     }
 }
@@ -203,6 +206,19 @@ pub enum ParallelError {
         /// Жёсткий лимит страниц.
         page_count_max: u32,
     },
+
+    /// Запрошенный режим durability слабее липкого/файлового (§7.2).
+    #[error("v2 durability below file mode: requested {requested:?}, effective {effective:?}")]
+    DurabilityBelowFileMode {
+        /// Запрошенный режим.
+        requested: crate::parallel::layout::SyncModeV2,
+        /// Эффективный (липкий) режим файла.
+        effective: crate::parallel::layout::SyncModeV2,
+    },
+
+    /// Канал координатора group commit закрыт (координатор завершился).
+    #[error("v2 group committer is closed")]
+    GroupClosed,
 }
 
 impl ParallelError {

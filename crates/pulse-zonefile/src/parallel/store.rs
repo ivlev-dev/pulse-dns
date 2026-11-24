@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{Mutex, MutexGuard};
 
 use rustix::fs::{FileType, Mode, OFlags, fdatasync, fstat, fsync, ftruncate, open as fs_open};
@@ -22,9 +22,10 @@ use crate::lock::WriterLock;
 use crate::parallel::alloc::{AllocHandle, AllocTicket, Allocator};
 use crate::parallel::consts::{
     ALLOC_RECORD_SEQ_FIRST, ALLOC_RECORD_SIZE, DEFAULT_MAX_ZONES, DEFAULT_PAGE_COUNT_MAX,
-    LAYOUT_HEAD_RECORD_SIZE, LEADER_TERM_M1, MAX_ROOT_CHAIN_HOPS, MAX_ROOT_CHAIN_PAGES,
-    PAGE_ALLOC_RECORD_A, PAGE_ALLOC_RECORD_B, PAGE_LAYOUT_HEAD_A, PAGE_LAYOUT_HEAD_B, PAGE_SIZE_V2,
-    PIN_ATTEMPTS, READER_SLOTS_V2, ROOT_ENTRY_SIZE, ROOT_VERSIONS,
+    LAYOUT_HEAD_RECORD_SIZE, LEADER_TERM_M1, MAX_LEAK_RATIO, MAX_ROOT_CHAIN_HOPS,
+    MAX_ROOT_CHAIN_PAGES, PAGE_ALLOC_RECORD_A, PAGE_ALLOC_RECORD_B, PAGE_LAYOUT_HEAD_A,
+    PAGE_LAYOUT_HEAD_B, PAGE_SIZE_V2, PIN_ATTEMPTS, READER_SLOTS_V2, ROOT_ENTRY_SIZE,
+    ROOT_VERSIONS,
 };
 use crate::parallel::error::{FatalKind, ParallelError, V2CorruptKind};
 use crate::parallel::freepool::{BucketImages, FreeChain};
@@ -112,6 +113,37 @@ pub trait CrashHook: Send + Sync {
     fn at(&self, point: CrashPoint);
 }
 
+/// Хук инъекции ошибок ввода-вывода (тестовый harness B2b).
+///
+/// Проверяется перед каждым `fdatasync`; `true` — синхронно вернуть `EIO`.
+pub trait IoFaultHook: Send + Sync {
+    /// Инжектировать отказ на текущем `fdatasync`.
+    fn fail_sync(&self) -> bool;
+}
+
+/// Запрос одной зоны для [`ParallelStore::commit_group`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupCommitRequest {
+    /// Запись корня (её `owner_zone`/`version` должны быть валидны).
+    pub entry: RootEntry,
+    /// Страницы, освобождённые этим коммитом (bucket `drop_txn = version`).
+    pub drops: Vec<u32>,
+    /// Режим durability; у всех запросов одной группы должен совпадать.
+    pub durability: SyncModeV2,
+}
+
+impl GroupCommitRequest {
+    /// Запрос без освобождённых страниц.
+    #[must_use]
+    pub fn new(entry: RootEntry, durability: SyncModeV2) -> Self {
+        Self {
+            entry,
+            drops: Vec::new(),
+            durability,
+        }
+    }
+}
+
 /// Итог публикации корня.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishOutcome {
@@ -125,6 +157,42 @@ pub struct PublishOutcome {
     pub prev_record: u32,
     /// Вытесненная в chain страница (если была).
     pub evicted_page: Option<u32>,
+}
+
+/// Отчёт об утечках (`[data_first, DP)` + aborted `[DP, cursor)`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeakReport {
+    /// Страницы `[data_first, DP)`, недостижимые из структур.
+    pub leaked_pages: u64,
+    /// Номера утёкших страниц.
+    pub leaked_page_ids: Vec<u32>,
+    /// Ёмкость проверенной области `[data_first, DP)`.
+    pub durable_pages: u64,
+    /// Оценка `[DP, cursor)` — выделено, но не опубликовано/не durable.
+    pub aborted_pages: u64,
+    /// `leaked_pages / durable_pages`.
+    pub ratio: f64,
+    /// Порог [`MAX_LEAK_RATIO`].
+    pub max_ratio: f64,
+    /// Доля утечек выше порога (алерт `pw_alloc_leaked_pages_estimate`).
+    pub exceeds_max_ratio: bool,
+    /// File-fatal причина (пересечение множеств).
+    pub fatal: Option<FatalKind>,
+    /// Диагностика.
+    pub issues: Vec<String>,
+}
+
+/// Итог `fsck --repair` (возврат утечек в пул).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairReport {
+    /// Страниц возвращено в durable free-пул.
+    pub repaired_pages: u64,
+    /// Остаток утечек после повторной проверки.
+    pub remaining_leaks: u64,
+    /// Нет пересечений и утечек.
+    pub ok: bool,
+    /// Диагностика.
+    pub issues: Vec<String>,
 }
 
 /// Снимок счётчиков стора.
@@ -154,6 +222,18 @@ pub struct StoreStats {
     pub page_cache_hits: u64,
     /// Промахов кеша валидированных страниц.
     pub page_cache_misses: u64,
+    /// Выполненных групп group commit.
+    pub group_commits: u64,
+    /// Зона-коммитов, прошедших через группы.
+    pub group_members: u64,
+    /// `fdatasync` в group commit (для `Sync` — ровно `2 * group_commits`).
+    pub group_fsyncs: u64,
+    /// Максимальный размер группы (зон).
+    pub group_max_members: u64,
+    /// Коммитов, отменённых в группе (retryable `ReaderContended`).
+    pub group_aborted: u64,
+    /// Оценка утечки `[DP, cursor)` (выделено, но не опубликовано).
+    pub aborted_pages_estimate: u64,
 }
 
 /// Открытый v2-стор.
@@ -171,6 +251,14 @@ pub struct ParallelStore {
     durable_page_limit: AtomicU64,
     durable_txn_limit: AtomicU64,
     published_txn: AtomicU64,
+    /// Per-zone `D_z` (durable version): двигается только `Sync`-группой или
+    /// `sync()`. `Flush`/`Memory` публикуют голову в памяти, но `D_z` не
+    /// трогают (§7.2).
+    durable_versions: Box<[AtomicU64]>,
+    /// Режим durability файла (superblock `sync_mode`).
+    file_mode: SyncModeV2,
+    /// Липкий `Sync`: выставляется после первой durable-группы/`sync()`.
+    sticky_sync: std::sync::atomic::AtomicBool,
     heads: Box<[PublishedHead]>,
     zone_guard: Box<[AtomicU32]>,
     zone_state: Box<[AtomicU8]>,
@@ -185,6 +273,11 @@ pub struct ParallelStore {
     fatal: Mutex<Option<FatalKind>>,
     read_only: bool,
     crash_hook: Option<Box<dyn CrashHook>>,
+    io_fault_hook: Option<Box<dyn IoFaultHook>>,
+    /// Моделируемая задержка `fdatasync` (тесты/бенчи; 0 — выключено).
+    sync_delay_ns: AtomicU64,
+    /// Сериализация моделируемого fsync (как у одного inode).
+    sync_delay_gate: Mutex<()>,
     stats: StatsCounters,
     report: RecoveryReport,
 }
@@ -227,6 +320,38 @@ struct ReclaimPrep {
     max_page: u32,
 }
 
+/// Подготовленный (но ещё не записанный) коммит зоны.
+///
+/// План создаётся в потоке писателя (lease зоны удерживается вызывающим) и
+/// выполняется координатором group commit: это позволяет собрать несколько зон
+/// в одну пару `fdatasync` (§7.1).
+pub(crate) struct PreparedPublish {
+    /// Зона.
+    pub zone: u32,
+    /// Итоговая запись корня (`free_head`/`prev_record`/лимит уже проставлены).
+    pub record: RootEntry,
+    /// Координаты ячейки ring.
+    pub slot: crate::parallel::geometry::ZoneSlot,
+    /// Вытеснение в chain: `(страница, вытесненная запись, evicted_txn)`.
+    chain_write: Option<(u32, RootEntry, u64)>,
+    /// Staging-пул, bucket-образы и `free_head`.
+    reclaim: ReclaimPrep,
+    /// Минимальный `page_limit_at_commit`.
+    minimum_limit: u64,
+    /// Прежняя ячейка ring (`version % 4`) на момент плана.
+    old: Option<RootEntry>,
+    /// Оценка байтов коммита для лимитов группы.
+    weight: u64,
+}
+
+impl PreparedPublish {
+    /// Оценка байтов запроса (для порогов группы и backpressure).
+    #[must_use]
+    pub const fn weight(&self) -> u64 {
+        self.weight
+    }
+}
+
 #[derive(Default)]
 struct StatsCounters {
     publications: AtomicU64,
@@ -236,6 +361,11 @@ struct StatsCounters {
     reclaimed_pages: AtomicU64,
     chain_freed_pages: AtomicU64,
     donated_pages: AtomicU64,
+    group_commits: AtomicU64,
+    group_members: AtomicU64,
+    group_fsyncs: AtomicU64,
+    group_max_members: AtomicU64,
+    group_aborted: AtomicU64,
 }
 
 const ZONE_DEGRADED: u8 = 1 << 0;
@@ -268,11 +398,6 @@ impl ParallelStore {
     /// `Busy` — lock занят; `Io` — файл существует/ошибка записи;
     /// `Unsupported` — режим не `Sync`; `MapFull`/`InvalidArgument` — геометрия.
     pub fn create(path: &Path, config: StoreConfig) -> Result<Self, ParallelError> {
-        if config.sync_mode != SyncModeV2::Sync {
-            return Err(ParallelError::Unsupported {
-                what: "sync mode (phase A implements Sync only)",
-            });
-        }
         let geometry = Geometry::new(
             config.max_zones,
             config.page_count_max,
@@ -282,7 +407,14 @@ impl ParallelStore {
         let lock = acquire_lock(path)?;
         let file = open_file(path, OFlags::CREATE | OFlags::EXCL)?;
         let lock_path = WriterLock::path_for(path);
-        let result = Self::create_locked(path, geometry, file, lock, config.page_cache_entries);
+        let result = Self::create_locked(
+            path,
+            geometry,
+            file,
+            lock,
+            config.page_cache_entries,
+            config.sync_mode,
+        );
         match result {
             Ok(store) => Ok(store),
             Err(error) => {
@@ -300,11 +432,12 @@ impl ParallelStore {
         file: File,
         lock: WriterLock,
         page_cache_entries: usize,
+        sync_mode: SyncModeV2,
     ) -> Result<Self, ParallelError> {
         ftruncate(&file, geometry.file_size()).map_err(std::io::Error::from)?;
         let uuid = new_instance_uuid();
-        let superblock_a = SuperblockV2::for_geometry(geometry, 0, uuid, SyncModeV2::Sync);
-        let superblock_b = SuperblockV2::for_geometry(geometry, 1, uuid, SyncModeV2::Sync);
+        let superblock_a = SuperblockV2::for_geometry(geometry, 0, uuid, sync_mode);
+        let superblock_b = SuperblockV2::for_geometry(geometry, 1, uuid, sync_mode);
         write_at(&file, 0, &superblock_a.encode())?;
         write_at(&file, u64::from(PAGE_SIZE_V2), &superblock_b.encode())?;
         let layout_a = LayoutHead::for_geometry(geometry, PAGE_LAYOUT_HEAD_A, 1, 1, 0);
@@ -351,6 +484,7 @@ impl ParallelStore {
         let zone_guard = allocate_u32(geometry.max_zones(), 0)?;
         let zone_state = allocate_u8(geometry.max_zones(), 0)?;
         let chain_depth = allocate_u32(geometry.max_zones(), CHAIN_UNKNOWN)?;
+        let durable_versions = allocate_u64(geometry.max_zones(), 0)?;
         let pins = PinTable::new(geometry.reader_slots().min(READER_SLOTS_V2))?;
         let gc = GcState::new(geometry.max_zones())?;
         let leases = allocate_leases()?;
@@ -391,6 +525,9 @@ impl ParallelStore {
             durable_page_limit: AtomicU64::new(dp),
             durable_txn_limit: AtomicU64::new(1),
             published_txn: AtomicU64::new(0),
+            durable_versions,
+            file_mode: sync_mode,
+            sticky_sync: AtomicBool::new(sync_mode == SyncModeV2::Sync),
             heads,
             zone_guard,
             zone_state,
@@ -405,6 +542,9 @@ impl ParallelStore {
             fatal: Mutex::new(None),
             read_only: false,
             crash_hook: None,
+            io_fault_hook: None,
+            sync_delay_ns: AtomicU64::new(0),
+            sync_delay_gate: Mutex::new(()),
             stats: StatsCounters::default(),
             report,
         })
@@ -451,6 +591,14 @@ impl ParallelStore {
         }
         let zone_guard = allocate_u32(geometry.max_zones(), 0)?;
         let chain_depth = allocate_u32(geometry.max_zones(), CHAIN_UNKNOWN)?;
+        let durable_versions = allocate_u64(geometry.max_zones(), 0)?;
+        for (index, head) in recovered.heads.iter().enumerate() {
+            if let Some(entry) = head
+                && let Some(slot) = durable_versions.get(index)
+            {
+                slot.store(entry.version, Ordering::Release);
+            }
+        }
         let pins = PinTable::new(geometry.reader_slots().min(READER_SLOTS_V2))?;
         let gc = GcState::new(geometry.max_zones())?;
         let leases = allocate_leases()?;
@@ -462,6 +610,8 @@ impl ParallelStore {
         )?;
         let published_txn = recovered.report.max_root_version;
         let fatal = recovered.report.fatal;
+        let file_mode = recovered.superblock.sync_mode;
+        let sticky = file_mode == SyncModeV2::Sync || recovered.durable_txn_limit > 1;
         Ok(Self {
             path: path.to_path_buf(),
             file,
@@ -478,6 +628,9 @@ impl ParallelStore {
             durable_page_limit: AtomicU64::new(recovered.durable_page_limit),
             durable_txn_limit: AtomicU64::new(recovered.durable_txn_limit),
             published_txn: AtomicU64::new(published_txn),
+            durable_versions,
+            file_mode,
+            sticky_sync: AtomicBool::new(sticky),
             heads,
             zone_guard,
             zone_state,
@@ -492,6 +645,9 @@ impl ParallelStore {
             fatal: Mutex::new(fatal),
             read_only: config.read_only,
             crash_hook: None,
+            io_fault_hook: None,
+            sync_delay_ns: AtomicU64::new(0),
+            sync_delay_gate: Mutex::new(()),
             stats: StatsCounters::default(),
             report: recovered.report,
         })
@@ -500,6 +656,22 @@ impl ParallelStore {
     /// Устанавливает crash-хук (только до публикации стора между потоками).
     pub fn set_crash_hook(&mut self, hook: Box<dyn CrashHook>) {
         self.crash_hook = Some(hook);
+    }
+
+    /// Устанавливает хук инъекции ошибок `fdatasync` (только тесты B2b).
+    pub fn set_io_fault_hook(&mut self, hook: Box<dyn IoFaultHook>) {
+        self.io_fault_hook = Some(hook);
+    }
+
+    /// Моделирует стоимость `fdatasync` (тесты/бенчи; production — 0).
+    ///
+    /// Позволяет измерить выигрыш group commit на устройстве, где fsync
+    /// доминирует, независимо от скорости локальной ФС.
+    pub fn set_sync_delay(&mut self, delay: std::time::Duration) {
+        self.sync_delay_ns.store(
+            u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
     }
 
     /// Путь файла.
@@ -607,7 +779,60 @@ impl ParallelStore {
             donated_pages: self.stats.donated_pages.load(Ordering::Relaxed),
             page_cache_hits,
             page_cache_misses,
+            group_commits: self.stats.group_commits.load(Ordering::Relaxed),
+            group_members: self.stats.group_members.load(Ordering::Relaxed),
+            group_fsyncs: self.stats.group_fsyncs.load(Ordering::Relaxed),
+            group_max_members: self.stats.group_max_members.load(Ordering::Relaxed),
+            group_aborted: self.stats.group_aborted.load(Ordering::Relaxed),
+            aborted_pages_estimate: self
+                .allocator
+                .leaked_pages(self.durable_page_limit.load(Ordering::Acquire)),
         }
+    }
+
+    /// Режим durability файла (superblock `sync_mode`).
+    #[must_use]
+    pub const fn file_mode(&self) -> SyncModeV2 {
+        self.file_mode
+    }
+
+    /// Эффективный режим с учётом липкого `Sync` (§7.2).
+    #[must_use]
+    pub fn effective_mode(&self) -> SyncModeV2 {
+        if self.sticky_sync.load(Ordering::Acquire) {
+            SyncModeV2::Sync
+        } else {
+            self.file_mode
+        }
+    }
+
+    /// `D_z` — durable-версия зоны (двигается только `Sync`/`sync()`).
+    #[must_use]
+    pub fn durable_version(&self, zone: u32) -> u64 {
+        self.durable_versions
+            .get(zone as usize)
+            .map_or(0, |value| value.load(Ordering::Acquire))
+    }
+
+    /// Включает липкий `Sync` (после durable-группы или `sync()`).
+    fn promote_sticky(&self) {
+        self.sticky_sync.store(true, Ordering::Release);
+    }
+
+    /// Проверяет, что `mode` не слабее эффективного режима файла.
+    ///
+    /// # Errors
+    ///
+    /// [`ParallelError::DurabilityBelowFileMode`].
+    pub fn check_durability(&self, mode: SyncModeV2) -> Result<(), ParallelError> {
+        let effective = self.effective_mode();
+        if mode.durability_rank() < effective.durability_rank() {
+            return Err(ParallelError::DurabilityBelowFileMode {
+                requested: mode,
+                effective,
+            });
+        }
+        Ok(())
     }
 
     /// Метрики кеша валидированных страниц (v2).
@@ -698,7 +923,7 @@ impl ParallelStore {
         zone: u32,
         current_version: u64,
     ) -> Result<Option<u32>, ParallelError> {
-        let durable = self.head(zone).map_or(0, |head| head.version);
+        let durable = self.durable_version(zone);
         let rv = self.gc.reclaim_version(zone, durable);
         {
             let mut shard = lock_unpoison(self.pool_shard(zone));
@@ -727,7 +952,7 @@ impl ParallelStore {
         current_version: u64,
         max_pages: u32,
     ) -> Result<Vec<u32>, ParallelError> {
-        let durable = self.head(zone).map_or(0, |head| head.version);
+        let durable = self.durable_version(zone);
         let rv = self.gc.reclaim_version(zone, durable);
         let mut pages = Vec::new();
         let mut shard = lock_unpoison(self.pool_shard(zone));
@@ -798,8 +1023,7 @@ impl ParallelStore {
     /// `RV_z = min(D_z − 1, MP(z), freeze_epoch)`.
     #[must_use]
     pub fn reclaim_version(&self, zone: u32) -> u64 {
-        let durable_version = self.head(zone).map_or(0, |entry| entry.version);
-        self.gc.reclaim_version(zone, durable_version)
+        self.gc.reclaim_version(zone, self.durable_version(zone))
     }
 
     /// Один GC-проход по грязным зонам (пересчёт `MP`).
@@ -918,17 +1142,33 @@ impl ParallelStore {
     /// `ReadOnly` — файл `write_locked`; `Io` — ошибка записи/fsync.
     pub fn sync(&self) -> Result<(u64, u64), ParallelError> {
         self.ensure_writable()?;
+        // Снимок голов ДО fsync: всё, что записано к этому моменту, попадёт в
+        // fdatasync; более новые публикации останутся неdurable (консервативно).
+        let mut durable_heads = Vec::new();
+        for (index, block) in self.heads.iter().enumerate() {
+            if let HeadRead::Stable(entry) = block.load()
+                && let Ok(zone) = u32::try_from(index)
+            {
+                durable_heads.push((zone, entry.version));
+            }
+        }
         let mut durable = lock_unpoison(&self.alloc_durable);
         let page_limit = durable.page_limit.max(self.allocator.cursor());
         let txn_limit = durable.txn_limit.max(self.published_txn());
         let seq = durable.seq.saturating_add(1);
         self.write_alloc_record(seq, page_limit, txn_limit)?;
-        retry_eintr(|| fdatasync(&self.file)).map_err(std::io::Error::from)?;
+        self.fsync_data()?;
         durable.seq = seq;
         durable.page_limit = page_limit;
         durable.txn_limit = txn_limit;
         self.durable_page_limit.store(page_limit, Ordering::Release);
         self.durable_txn_limit.store(txn_limit, Ordering::Release);
+        for (zone, version) in durable_heads {
+            if let Some(slot) = self.durable_versions.get(zone as usize) {
+                slot.store(version, Ordering::Release);
+            }
+        }
+        self.promote_sticky();
         Ok((page_limit, txn_limit))
     }
 
@@ -960,22 +1200,125 @@ impl ParallelStore {
         self.publish_root_with_drops(entry, &[])
     }
 
+    /// Публикует одну группу записей корней: **два** `fdatasync` на группу для
+    /// [`SyncModeV2::Sync`] (§7.1).
+    ///
+    /// Все запросы должны иметь одинаковый режим durability. Записи готовятся
+    /// последовательно, затем выполняются одной группой; `ReaderContended`
+    /// возвращается только проигравшей зоне.
+    ///
+    /// # Errors
+    ///
+    /// Ошибки — в элементах результата (в порядке входа).
+    pub fn commit_group(
+        &self,
+        requests: Vec<GroupCommitRequest>,
+    ) -> Vec<Result<PublishOutcome, ParallelError>> {
+        let count = requests.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        let mode = requests
+            .first()
+            .map_or(SyncModeV2::Sync, |request| request.durability);
+        if requests.iter().any(|request| request.durability != mode) {
+            return (0..count)
+                .map(|_| {
+                    Err(ParallelError::InvalidArgument {
+                        field: "group durability",
+                    })
+                })
+                .collect();
+        }
+        let mut prepared = Vec::with_capacity(count);
+        let mut slots: Vec<Option<Result<PublishOutcome, ParallelError>>> =
+            (0..count).map(|_| None).collect();
+        for (index, request) in requests.into_iter().enumerate() {
+            let weight = u64::try_from(request.drops.len()).unwrap_or(u64::MAX) * 4;
+            match self.prepare_publish(request.entry, &request.drops, weight) {
+                Ok(member) => prepared.push((index, member)),
+                Err(error) => {
+                    if let Some(slot) = slots.get_mut(index) {
+                        *slot = Some(Err(error));
+                    }
+                }
+            }
+        }
+        let mut indices = Vec::with_capacity(prepared.len());
+        let mut members = Vec::with_capacity(prepared.len());
+        for (index, member) in prepared {
+            indices.push(index);
+            members.push(member);
+        }
+        let outcomes = self.execute_group(members, mode);
+        for (index, outcome) in indices.into_iter().zip(outcomes) {
+            if let Some(slot) = slots.get_mut(index) {
+                *slot = Some(outcome);
+            }
+        }
+        slots
+            .into_iter()
+            .map(|slot| slot.unwrap_or(Err(ParallelError::InvalidArgument { field: "group" })))
+            .collect()
+    }
+
     /// Публикация с явным набором страниц, освобождённых в этом коммите.
     ///
     /// `drops` попадают в bucket-группу `drop_txn = version` и пишутся в фазе 1
     /// вместе с данными и chain (§4.5, §6.3). Вызывающий уже держит lease зоны.
+    /// Режим — `Sync` (низкоуровневый API фазы A); B2b-коммиты идут через
+    /// [`ParallelStore::publish_root_with_drops_mode`].
     ///
     /// # Errors
     ///
     /// `ReadOnly` — `write_locked`; `ZoneDegraded` — зона деградирована;
     /// `ZoneWriterStalled` — лимит chain; `ReaderContended` — retryable гонка
     /// с пином (публикация не выполнена); `MapFull`/`Io`/`InvalidArgument`.
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn publish_root_with_drops(
         &self,
         entry: RootEntry,
         drops: &[u32],
     ) -> Result<PublishOutcome, ParallelError> {
+        self.publish_root_with_drops_mode(entry, drops, SyncModeV2::Sync)
+    }
+
+    /// Публикация с явным режимом durability (`Sync`/`Flush`/`Memory`).
+    ///
+    /// # Errors
+    ///
+    /// См. [`ParallelStore::publish_root_with_drops`] и
+    /// [`ParallelError::DurabilityBelowFileMode`].
+    pub(crate) fn publish_root_with_drops_mode(
+        &self,
+        entry: RootEntry,
+        drops: &[u32],
+        mode: SyncModeV2,
+    ) -> Result<PublishOutcome, ParallelError> {
+        self.check_durability(mode)?;
+        let prepared = self.prepare_publish(entry, drops, 0)?;
+        match self.execute_group(vec![prepared], mode).pop() {
+            Some(outcome) => outcome,
+            None => Err(ParallelError::InvalidArgument { field: "group" }),
+        }
+    }
+
+    /// Проверяет и планирует коммит: версия, ring-ячейка, chain, bucket-образы.
+    ///
+    /// Ничего не пишет в файл: всё, что выделено, живёт в staging-копии пула и
+    /// попадает на диск только в фазе 1. План можно выполнить одиночной
+    /// публикацией или группой (§7.1).
+    ///
+    /// # Errors
+    ///
+    /// `ReadOnly`, `ZoneDegraded`, `ZoneWriterStalled`, `MapFull`,
+    /// `InvalidArgument`, `Corrupt`.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn prepare_publish(
+        &self,
+        entry: RootEntry,
+        drops: &[u32],
+        weight: u64,
+    ) -> Result<PreparedPublish, ParallelError> {
         self.ensure_writable()?;
         let zone = entry.owner_zone;
         let is_catalog = zone == 0;
@@ -1068,30 +1411,192 @@ impl ParallelStore {
             .map_err(|_| ParallelError::InvalidArgument {
                 field: "root entry",
             })?;
+        let weight = weight
+            .saturating_add(reclaim.images.iter().fold(0_u64, |acc, (_, image)| {
+                acc.saturating_add(u64::try_from(image.len()).unwrap_or(u64::MAX))
+            }))
+            .saturating_add(u64::try_from(drops.len()).unwrap_or(u64::MAX) * 4);
+        Ok(PreparedPublish {
+            zone,
+            record,
+            slot,
+            chain_write,
+            reclaim,
+            minimum_limit: u64::from(minimum_limit),
+            old,
+            weight,
+        })
+    }
 
-        // ФАЗА 1: ALLOC_RECORD + chain-страницы + bucket'ы, затем fdatasync.
-        let page_limit;
-        {
-            let mut durable = lock_unpoison(&self.alloc_durable);
-            let seq = durable.seq.saturating_add(1);
-            let candidate = durable
-                .page_limit
-                .max(u64::from(minimum_limit))
-                .max(self.allocator.cursor())
-                .max(max_allocated.saturating_add(1));
-            if candidate > u64::from(self.geometry.page_count_max()) {
-                return Err(ParallelError::MapFull {
-                    high_water: candidate,
-                    page_count_max: self.geometry.page_count_max(),
-                });
+    /// Выполняет подготовленную группу: **ровно два** `fdatasync` для `Sync`
+    /// (один для `Flush`, ни одного для `Memory`), публикация голов после
+    /// durable-фазы и ack-семантика на уровне вызывающего.
+    ///
+    /// Ошибка ввода-вывода переводит файл в `CommitUncertain` (`write_locked`) и
+    /// не публикует ни одной головы группы. `ReaderContended` — per-zone
+    /// retryable: зона не публикуется, остальные участники — да.
+    ///
+    /// # Errors
+    ///
+    /// Каждый элемент результата — успех публикации или ошибка этой зоны.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn execute_group(
+        &self,
+        members: Vec<PreparedPublish>,
+        mode: SyncModeV2,
+    ) -> Vec<Result<PublishOutcome, ParallelError>> {
+        let count = members.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut results: Vec<Option<Result<PublishOutcome, ParallelError>>> =
+            (0..count).map(|_| None).collect();
+        if let Err(error) = self.ensure_writable() {
+            let reason = match error {
+                ParallelError::ReadOnly { reason } => reason,
+                _ => FatalKind::CommitUncertain,
+            };
+            return (0..count)
+                .map(|_| Err(ParallelError::ReadOnly { reason }))
+                .collect();
+        }
+        if let Err(error) = self.check_durability(mode) {
+            let (requested, effective) = match error {
+                ParallelError::DurabilityBelowFileMode {
+                    requested,
+                    effective,
+                } => (requested, effective),
+                _ => (mode, self.effective_mode()),
+            };
+            return (0..count)
+                .map(|_| {
+                    Err(ParallelError::DurabilityBelowFileMode {
+                        requested,
+                        effective,
+                    })
+                })
+                .collect();
+        }
+        self.stats.group_commits.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .group_members
+            .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.stats
+            .group_max_members
+            .fetch_max(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+        let fsyncs = match mode {
+            SyncModeV2::Sync => 2,
+            SyncModeV2::Flush => 1,
+            SyncModeV2::Memory => 0,
+        };
+        self.stats.group_fsyncs.fetch_add(fsyncs, Ordering::Relaxed);
+
+        let page_limit = match self.phase1(&members, mode) {
+            Ok(limit) => limit,
+            Err(_error) => {
+                // Исход группы не определён: ни одна голова не публикуется.
+                self.mark_fatal(FatalKind::CommitUncertain);
+                return (0..count)
+                    .map(|_| {
+                        Err(ParallelError::ReadOnly {
+                            reason: FatalKind::CommitUncertain,
+                        })
+                    })
+                    .collect();
             }
-            let txn_limit = durable.txn_limit.max(record.version);
+        };
+        let mut pending: Vec<usize> = (0..count).collect();
+        if let Err(error) = self.phase2(&members, mode, &mut results, &mut pending) {
+            self.mark_fatal(FatalKind::CommitUncertain);
+            let reason = if let ParallelError::ReadOnly { reason } = error {
+                reason
+            } else {
+                FatalKind::CommitUncertain
+            };
+            return (0..count)
+                .map(|_| Err(ParallelError::ReadOnly { reason }))
+                .collect();
+        }
+        let aborted = count.saturating_sub(pending.len());
+        self.stats.group_aborted.fetch_add(
+            u64::try_from(aborted).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.publish_group(members, mode, page_limit, &pending, &mut results);
+        results
+            .into_iter()
+            .map(|slot| {
+                slot.unwrap_or(Err(ParallelError::ReadOnly {
+                    reason: FatalKind::CommitUncertain,
+                }))
+            })
+            .collect()
+    }
+
+    /// Фаза 1: `ALLOC_RECORD` (`Sync`) + chain/bucket-образы всех зон группы,
+    /// затем один `fdatasync` (кроме `Memory`).
+    fn phase1(&self, members: &[PreparedPublish], mode: SyncModeV2) -> Result<u64, ParallelError> {
+        let mut candidate = self.durable_page_limit.load(Ordering::Acquire);
+        for member in members {
+            candidate = candidate
+                .max(member.minimum_limit)
+                .max(u64::from(member.reclaim.max_page.saturating_add(1)));
+        }
+        if mode == SyncModeV2::Memory {
+            candidate = candidate.max(self.allocator.cursor());
             self.fire(CrashPoint::BeforeAllocRecord);
+            self.write_group_metadata(members)?;
+            self.fire(CrashPoint::AfterPhase1Writes);
+            self.fire(CrashPoint::AfterPhase1Fsync);
+            return Ok(candidate);
+        }
+        let mut durable = lock_unpoison(&self.alloc_durable);
+        candidate = candidate
+            .max(durable.page_limit)
+            .max(self.allocator.cursor());
+        if candidate > u64::from(self.geometry.page_count_max()) {
+            return Err(ParallelError::MapFull {
+                high_water: candidate,
+                page_count_max: self.geometry.page_count_max(),
+            });
+        }
+        let seq = durable.seq.saturating_add(1);
+        let txn_limit = if mode == SyncModeV2::Sync {
+            durable.txn_limit.max(
+                members
+                    .iter()
+                    .map(|member| member.record.version)
+                    .max()
+                    .unwrap_or(0),
+            )
+        } else {
+            durable.txn_limit
+        };
+        self.fire(CrashPoint::BeforeAllocRecord);
+        if mode == SyncModeV2::Sync {
             self.write_alloc_record(seq, candidate, txn_limit)?;
-            if let Some((page, previous, evicted_txn)) = chain_write {
+        }
+        self.write_group_metadata(members)?;
+        self.fire(CrashPoint::AfterPhase1Writes);
+        self.fsync_data()?;
+        self.fire(CrashPoint::AfterPhase1Fsync);
+        if mode == SyncModeV2::Sync {
+            durable.seq = seq;
+            durable.page_limit = candidate;
+            durable.txn_limit = txn_limit;
+            self.durable_page_limit.store(candidate, Ordering::Release);
+            self.durable_txn_limit.store(txn_limit, Ordering::Release);
+        }
+        Ok(candidate)
+    }
+
+    fn write_group_metadata(&self, members: &[PreparedPublish]) -> Result<(), ParallelError> {
+        let ring = Ring::new(&self.file, &self.geometry);
+        for member in members {
+            if let Some((page, previous, evicted_txn)) = member.chain_write {
                 let chain = crate::parallel::layout::ChainPage {
                     page_no: page,
-                    owner_zone: zone,
+                    owner_zone: member.zone,
                     evicted_txn,
                     entry: previous,
                 };
@@ -1100,93 +1605,131 @@ impl ParallelStore {
                     cache.invalidate(page);
                 }
             }
-            for (page, image) in &reclaim.images {
+            for (page, image) in &member.reclaim.images {
                 self.write_page_bytes(*page, image)?;
             }
-            self.fire(CrashPoint::AfterPhase1Writes);
-            let synced = retry_eintr(|| fdatasync(&self.file)).map_err(std::io::Error::from);
-            if let Err(error) = synced {
-                self.mark_fatal(FatalKind::CommitUncertain);
-                return Err(ParallelError::Io(error));
-            }
-            self.fire(CrashPoint::AfterPhase1Fsync);
-            durable.seq = seq;
-            durable.page_limit = candidate;
-            durable.txn_limit = txn_limit;
-            self.durable_page_limit.store(candidate, Ordering::Release);
-            self.durable_txn_limit.store(txn_limit, Ordering::Release);
-            page_limit = candidate;
         }
+        Ok(())
+    }
 
-        // ФАЗА 2: две копии записи под EpochGuard, затем fdatasync.
-        let guard = EpochGuard::enter(
-            self.zone_guard
-                .get(zone as usize)
-                .ok_or(ParallelError::InvalidArgument { field: "zone_seq" })?,
-        );
-        if chain_write.is_none() && old.is_some_and(|previous| previous.version >= self.gc.mp(zone))
-        {
-            drop(guard);
-            self.stats.reader_contended.fetch_add(1, Ordering::Relaxed);
-            return Err(ParallelError::ReaderContended);
-        }
-        self.fire(CrashPoint::BeforeRootWrite);
-        let written = ring
-            .write_cell(slot.page_a, slot.cell_offset(record.version), &record)
-            .and_then(|()| {
-                self.fire(CrashPoint::AfterRootCopyA);
-                ring.write_cell(slot.page_b, slot.cell_offset(record.version), &record)
-            })
-            .and_then(|()| {
-                self.fire(CrashPoint::AfterRootCopyB);
+    /// Фаза 2: две копии записи каждой зоны под её `EpochGuard`; один
+    /// `fdatasync` для `Sync`. `ReaderContended` уходит в `results` и в
+    /// `pending` не попадает (зона не публикуется).
+    fn phase2(
+        &self,
+        members: &[PreparedPublish],
+        mode: SyncModeV2,
+        results: &mut [Option<Result<PublishOutcome, ParallelError>>],
+        pending: &mut Vec<usize>,
+    ) -> Result<(), ParallelError> {
+        let ring = Ring::new(&self.file, &self.geometry);
+        pending.clear();
+        for (index, member) in members.iter().enumerate() {
+            let Some(guard_ref) = self.zone_guard.get(member.zone as usize) else {
+                return Err(ParallelError::InvalidArgument { field: "zone_seq" });
+            };
+            let guard = EpochGuard::enter(guard_ref);
+            if member.chain_write.is_none()
+                && member
+                    .old
+                    .is_some_and(|previous| previous.version >= self.gc.mp(member.zone))
+            {
                 drop(guard);
-                retry_eintr(|| fdatasync(&self.file)).map_err(std::io::Error::from)?;
-                Ok(())
-            });
-        if let Err(error) = written {
-            // Исход фазы 2 не определён: запись могла долететь. Дальнейшая
-            // запись запрещена до `fsck` (иначе рекламация могла бы отдать
-            // страницу опубликованной версии).
-            self.mark_fatal(FatalKind::CommitUncertain);
-            return Err(error);
+                self.stats.reader_contended.fetch_add(1, Ordering::Relaxed);
+                if let Some(slot) = results.get_mut(index) {
+                    *slot = Some(Err(ParallelError::ReaderContended));
+                }
+                continue;
+            }
+            self.fire(CrashPoint::BeforeRootWrite);
+            if let Err(error) = ring.write_cell(
+                member.slot.page_a,
+                member.slot.cell_offset(member.record.version),
+                &member.record,
+            ) {
+                drop(guard);
+                return Err(error);
+            }
+            self.fire(CrashPoint::AfterRootCopyA);
+            let written = ring.write_cell(
+                member.slot.page_b,
+                member.slot.cell_offset(member.record.version),
+                &member.record,
+            );
+            drop(guard);
+            written?;
+            self.fire(CrashPoint::AfterRootCopyB);
+            pending.push(index);
+        }
+        if mode == SyncModeV2::Sync {
+            self.fsync_data()?;
         }
         self.fire(CrashPoint::AfterPhase2Fsync);
+        Ok(())
+    }
 
-        // Публикация в памяти после durable-фазы: только теперь пул
-        // фиксируется (иначе повторная попытка удвоила бы `dropped(V)`).
-        if let Some(pool) = reclaim.pool {
-            self.commit_free_pool(zone, pool);
-        }
-        self.fire(CrashPoint::BeforeHeadPublish);
-        if let Some(block) = self.heads.get(zone as usize) {
-            block.store(&record);
-        }
-        if let Some(flags) = self.zone_state.get(zone as usize)
-            && record.flags.contains(RootFlags::NEEDS_FSCK)
-        {
-            flags.fetch_or(ZONE_NEEDS_FSCK, Ordering::AcqRel);
-        }
-        self.published_txn
-            .fetch_max(record.version, Ordering::Release);
-        self.stats.publications.fetch_add(1, Ordering::Relaxed);
-        let evicted_page = chain_write.map(|(page, _, _)| {
-            self.stats.chain_evictions.fetch_add(1, Ordering::Relaxed);
-            if let Some(depth) = self.chain_depth.get(zone as usize) {
-                let current = depth.load(Ordering::Acquire);
-                if current != CHAIN_UNKNOWN {
-                    depth.store(current.saturating_add(1), Ordering::Release);
-                }
+    /// Публикация голов участников, чьи записи durable (или хотя бы записаны
+    /// для `Flush`/`Memory`). Пулы фиксируются только здесь.
+    fn publish_group(
+        &self,
+        mut members: Vec<PreparedPublish>,
+        mode: SyncModeV2,
+        page_limit: u64,
+        pending: &[usize],
+        results: &mut [Option<Result<PublishOutcome, ParallelError>>],
+    ) {
+        let mut published_txn = 0_u64;
+        for &index in pending {
+            let Some(member) = members.get_mut(index) else {
+                continue;
+            };
+            if let Some(pool) = member.reclaim.pool.take() {
+                self.commit_free_pool(member.zone, pool);
             }
-            page
-        });
+            self.fire(CrashPoint::BeforeHeadPublish);
+            if let Some(block) = self.heads.get(member.zone as usize) {
+                block.store(&member.record);
+            }
+            if let Some(flags) = self.zone_state.get(member.zone as usize)
+                && member.record.flags.contains(RootFlags::NEEDS_FSCK)
+            {
+                flags.fetch_or(ZONE_NEEDS_FSCK, Ordering::AcqRel);
+            }
+            if mode == SyncModeV2::Sync
+                && let Some(slot) = self.durable_versions.get(member.zone as usize)
+            {
+                slot.store(member.record.version, Ordering::Release);
+            }
+            published_txn = published_txn.max(member.record.version);
+            self.stats.publications.fetch_add(1, Ordering::Relaxed);
+            let evicted_page = member.chain_write.map(|(page, _, _)| {
+                self.stats.chain_evictions.fetch_add(1, Ordering::Relaxed);
+                if let Some(depth) = self.chain_depth.get(member.zone as usize) {
+                    let current = depth.load(Ordering::Acquire);
+                    if current != CHAIN_UNKNOWN {
+                        depth.store(current.saturating_add(1), Ordering::Release);
+                    }
+                }
+                page
+            });
+            if let Some(slot) = results.get_mut(index) {
+                *slot = Some(Ok(PublishOutcome {
+                    zone: member.zone,
+                    version: member.record.version,
+                    page_limit,
+                    prev_record: member.record.prev_record,
+                    evicted_page,
+                }));
+            }
+        }
+        if published_txn != 0 {
+            self.published_txn
+                .fetch_max(published_txn, Ordering::Release);
+        }
+        if mode == SyncModeV2::Sync {
+            self.promote_sticky();
+        }
         self.fire(CrashPoint::AfterHeadPublish);
-        Ok(PublishOutcome {
-            zone,
-            version: record.version,
-            page_limit,
-            prev_record,
-            evicted_page,
-        })
     }
 
     /// Готовит bucket-образы, `free_head` и (при необходимости) chain-страницу.
@@ -1203,7 +1746,7 @@ impl ParallelStore {
         needs_chain: bool,
         max_allocated: &mut u64,
     ) -> Result<ReclaimPrep, ParallelError> {
-        let durable = self.head(zone).map_or(0, |head| head.version);
+        let durable = self.durable_version(zone);
         let rv = self.gc.reclaim_version(zone, durable);
         let data_first = self.geometry.page_data_first();
         let mut pool = {
@@ -1620,20 +2163,24 @@ impl ParallelStore {
                     merge_fatal(&mut fatal, Some(FatalKind::AllocWatermarkRegression));
                     issues.push("ALLOC_RECORD: понижение watermark между копиями".into());
                 }
-                if chosen.page_limit < scan.max_page_limit
-                    || chosen.page_limit < u64::from(self.geometry.page_data_first())
-                {
+                let strict = self.effective_mode() == SyncModeV2::Sync;
+                if chosen.page_limit < u64::from(self.geometry.page_data_first()) {
                     merge_fatal(&mut fatal, Some(FatalKind::AllocWatermarkRegression));
-                    issues.push("ALLOC_RECORD.page_limit ниже ring/пролога".into());
+                    issues.push("ALLOC_RECORD.page_limit ниже пролога".into());
                 }
-                if chosen.txn_limit < scan.max_version {
+                if strict && chosen.page_limit < scan.max_page_limit {
+                    merge_fatal(&mut fatal, Some(FatalKind::AllocWatermarkRegression));
+                    issues.push("ALLOC_RECORD.page_limit ниже ring".into());
+                }
+                if strict && chosen.txn_limit < scan.max_version {
                     merge_fatal(&mut fatal, Some(FatalKind::RootWatermarkRegression));
                     issues.push("ALLOC_RECORD.txn_limit ниже version".into());
                 }
                 // Диск впереди памяти — незавершённая группа (фаза 1); диск
-                // позади — регрессия watermark.
-                if chosen.page_limit < self.durable_page_limit()
-                    || chosen.txn_limit < self.durable_txn_limit()
+                // позади — регрессия watermark (только для `Sync`).
+                if strict
+                    && (chosen.page_limit < self.durable_page_limit()
+                        || chosen.txn_limit < self.durable_txn_limit())
                 {
                     merge_fatal(&mut fatal, Some(FatalKind::AllocWatermarkRegression));
                     issues.push("ALLOC_RECORD ниже in-memory DP/DT".into());
@@ -1664,11 +2211,13 @@ impl ParallelStore {
                 issues.push(format!("zone {zone}: free chain: {error}"));
             }
         }
-        if self.durable_page_limit() < scan.max_page_limit {
-            merge_fatal(&mut fatal, Some(FatalKind::AllocWatermarkRegression));
-        }
-        if self.durable_txn_limit() < scan.max_version {
-            merge_fatal(&mut fatal, Some(FatalKind::RootWatermarkRegression));
+        if self.effective_mode() == SyncModeV2::Sync {
+            if self.durable_page_limit() < scan.max_page_limit {
+                merge_fatal(&mut fatal, Some(FatalKind::AllocWatermarkRegression));
+            }
+            if self.durable_txn_limit() < scan.max_version {
+                merge_fatal(&mut fatal, Some(FatalKind::RootWatermarkRegression));
+            }
         }
         let leaked = self
             .allocator
@@ -1713,6 +2262,107 @@ impl ParallelStore {
             self.note_fatal(kind);
         }
         Ok(report)
+    }
+
+    /// Отчёт об утечках: `[data_first, DP)` вне дерева/chain/bucket/free,
+    /// оценка aborted-страниц `[DP, cursor)` и порог [`MAX_LEAK_RATIO`].
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt`/`Io` — структурная проверка не прошла.
+    pub fn leak_report(&self) -> Result<LeakReport, ParallelError> {
+        let graph = self.fsck_graph()?;
+        Ok(Self::leak_report_from(&graph, self))
+    }
+
+    fn leak_report_from(graph: &crate::parallel::verify::GraphReport, store: &Self) -> LeakReport {
+        let aborted = store
+            .allocator
+            .leaked_pages(store.durable_page_limit.load(Ordering::Acquire));
+        let ratio = if graph.durable_pages == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                graph.leaked_pages as f64 / graph.durable_pages as f64
+            }
+        };
+        LeakReport {
+            leaked_pages: graph.leaked_pages,
+            leaked_page_ids: graph.leaked_page_ids.clone(),
+            durable_pages: graph.durable_pages,
+            aborted_pages: aborted,
+            ratio,
+            max_ratio: MAX_LEAK_RATIO,
+            exceeds_max_ratio: ratio > MAX_LEAK_RATIO,
+            fatal: graph.fatal,
+            issues: graph.issues.clone(),
+        }
+    }
+
+    /// Возвращает утёкшие страницы в durable free-пул (offline-операция,
+    /// минимум §9.2/R4).
+    ///
+    /// Утечки `[data_first, DP)`, не достижимые ни из дерева, ни из chain, ни
+    /// из bucket'ов, записываются как bucket-группа каталога (`owner_zone = 0`)
+    /// `drop_txn = new_version` и переносятся в donation-пул. Пересечение
+    /// множеств (file-fatal) — отказ до `fsck`-анализа: repair не «чинит»
+    /// порчу.
+    ///
+    /// Вызывать только когда писателей нет (offline/`fsck --repair`).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt(PageOverlap)` — пересечение множеств; `ReadOnly`/`Io`/`MapFull`.
+    pub fn repair_leaks(&self) -> Result<RepairReport, ParallelError> {
+        let graph = crate::parallel::verify::verify(self)?;
+        if let Some(kind) = graph.fatal {
+            self.note_fatal(kind);
+            return Err(ParallelError::Corrupt {
+                kind: V2CorruptKind::PageOverlap,
+                page: None,
+            });
+        }
+        let leaked = graph.leaked_page_ids.clone();
+        if leaked.is_empty() {
+            return Ok(RepairReport {
+                repaired_pages: 0,
+                remaining_leaks: 0,
+                ok: true,
+                issues: graph.issues,
+            });
+        }
+        self.ensure_writable()?;
+        let head = self.catalog_head();
+        let version = self.allocator.next_txn_exact()?;
+        let entry = RootEntry {
+            owner_zone: 0,
+            version,
+            root_page: head.map_or(0, |current| current.root_page),
+            tree_level: head.map_or(0, |current| current.tree_level),
+            rrset_count: head.map_or(0, |current| current.rrset_count),
+            soa_serial: head.map_or(0, |current| current.soa_serial),
+            state: crate::parallel::root::RootState::Serving,
+            flags: RootFlags::CATALOG,
+            ..RootEntry::default()
+        };
+        // Страницы остаются durable-free в bucket-цепочке каталога: повторно
+        // дарить их нельзя (double-free: bucket уже ссылается на них).
+        let _outcome = self.publish_root_with_drops(entry, &leaked)?;
+        let after = crate::parallel::verify::verify(self)?;
+        let mut issues = after.issues.clone();
+        if after.leaked_pages != 0 {
+            issues.push(format!(
+                "после repair осталось {} утёкших страниц",
+                after.leaked_pages
+            ));
+        }
+        Ok(RepairReport {
+            repaired_pages: u64::try_from(leaked.len()).unwrap_or(u64::MAX),
+            remaining_leaks: after.leaked_pages,
+            ok: after.fatal.is_none() && after.leaked_pages == 0,
+            issues,
+        })
     }
 
     fn ensure_writable(&self) -> Result<(), ParallelError> {
@@ -1818,6 +2468,18 @@ impl ParallelStore {
         self.head(0)
     }
 
+    /// Сбрасывает in-memory состояние слота под переиспользование `zone_seq`
+    /// (tombstone → новая зона): глубина chain неизвестна, деградация старой
+    /// зоны к новому владельцу не относится.
+    pub(crate) fn reset_zone_slot(&self, zone: u32) {
+        if let Some(depth) = self.chain_depth.get(zone as usize) {
+            depth.store(CHAIN_UNKNOWN, Ordering::Release);
+        }
+        if let Some(flags) = self.zone_state.get(zone as usize) {
+            flags.store(0, Ordering::Release);
+        }
+    }
+
     /// Читает страницу данных в готовый буфер (zero-alloc read-path v2).
     ///
     /// # Errors
@@ -1835,6 +2497,29 @@ impl ParallelStore {
         let offset = self.geometry.page_offset(page)?;
         self.file.read_exact_at(buffer, offset)?;
         Ok(())
+    }
+
+    /// `fdatasync` с инъекцией ошибки (тестовый harness); любая ошибка —
+    /// `Io`, вызывающий сам решает про `CommitUncertain`.
+    fn fsync_data(&self) -> Result<(), ParallelError> {
+        let delay = self.sync_delay_ns.load(Ordering::Acquire);
+        if delay != 0 {
+            // `fdatasync` одного inode сериализуется в ядре — модель это
+            // учитывает, иначе замер не отражает устройство.
+            let _gate = lock_unpoison(&self.sync_delay_gate);
+            std::thread::sleep(std::time::Duration::from_nanos(delay));
+        }
+        if self
+            .io_fault_hook
+            .as_ref()
+            .is_some_and(|hook| hook.fail_sync())
+        {
+            return Err(ParallelError::Io(std::io::Error::other(
+                "injected fdatasync failure",
+            )));
+        }
+        retry_eintr(|| fdatasync(&self.file))
+            .map_err(|error| ParallelError::Io(std::io::Error::from(error)))
     }
 
     fn fire(&self, point: CrashPoint) {
@@ -2137,6 +2822,20 @@ fn allocate_u32(max_zones: u32, initial: u32) -> Result<Box<[AtomicU32]>, Parall
     Ok(values.into_boxed_slice())
 }
 
+fn allocate_u64(max_zones: u32, initial: u64) -> Result<Box<[AtomicU64]>, ParallelError> {
+    let count = usize::try_from(max_zones)
+        .map_err(|_| ParallelError::InvalidArgument { field: "max_zones" })?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| ParallelError::MapFull {
+            high_water: u64::from(max_zones),
+            page_count_max: max_zones,
+        })?;
+    values.resize_with(count, || AtomicU64::new(initial));
+    Ok(values.into_boxed_slice())
+}
+
 fn allocate_u8(max_zones: u32, initial: u8) -> Result<Box<[AtomicU8]>, ParallelError> {
     let count = usize::try_from(max_zones)
         .map_err(|_| ParallelError::InvalidArgument { field: "max_zones" })?;
@@ -2287,4 +2986,26 @@ pub fn open_read_only(path: &Path) -> Result<ParallelStore, ParallelError> {
             page_cache_entries: DEFAULT_PAGE_CACHE_V2_ENTRIES,
         },
     )
+}
+
+/// Offline `fsck --repair`: открывает файл под `LOCK_EX`, возвращает утёкшие
+/// страницы в durable free-пул и закрывает стор.
+///
+/// Пересечение множеств страниц (file-fatal) — отказ: такой файл чинится
+/// только вручную/через `fsck --verify`. Функция идемпотентна: повторный
+/// вызов на чистом файле возвращает `repaired_pages = 0`.
+///
+/// # Errors
+///
+/// `Busy` — файл занят другим writer'ом; `Corrupt`/`Io`/`ReadOnly`/`MapFull`.
+pub fn fsck_repair(path: &Path) -> Result<RepairReport, ParallelError> {
+    let store = ParallelStore::open(
+        path,
+        OpenConfigV2 {
+            read_only: false,
+            writer_lock: true,
+            page_cache_entries: DEFAULT_PAGE_CACHE_V2_ENTRIES,
+        },
+    )?;
+    store.repair_leaks()
 }

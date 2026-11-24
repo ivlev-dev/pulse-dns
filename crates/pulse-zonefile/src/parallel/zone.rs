@@ -100,6 +100,14 @@ pub struct CommitOutcome {
     pub changed: bool,
 }
 
+/// Подготовленный коммит зоны (dirty-страницы уже записаны, txn закреплён).
+struct StagedCommit {
+    txn: u64,
+    dirty_pages: u32,
+    drops: Vec<u32>,
+    entry: RootEntry,
+}
+
 /// Материализованный `RRset` (владеющая копия, включая overflow).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RrsetRecord {
@@ -212,6 +220,9 @@ impl<'a> ParallelZones<'a> {
             entries: HashMap::new(),
             origins: HashMap::new(),
         };
+        // `next_seq` восстанавливается и по головам (включая tombstone), иначе
+        // после удаления всех зон каталог пуст и свободные слоты терялись бы.
+        zones.next_seq = Self::scan_next_seq(store);
         let Some(head) = store.catalog_head() else {
             return Ok(zones);
         };
@@ -244,6 +255,16 @@ impl<'a> ParallelZones<'a> {
             }
         }
         Ok(zones)
+    }
+
+    fn scan_next_seq(store: &ParallelStore) -> u32 {
+        let mut next = 1_u32;
+        for seq in 1..store.geometry().max_zones() {
+            if store.head_entry(seq).is_some() {
+                next = next.max(seq.saturating_add(1));
+            }
+        }
+        next
     }
 
     /// Стор.
@@ -297,9 +318,10 @@ impl<'a> ParallelZones<'a> {
 
     /// Создаёт зону: `RootEntry` зоны (пустое дерево), затем запись каталога.
     ///
-    /// Порядок: сначала durable-голова зоны, затем каталог. Крах между ними
-    /// оставляет недостижимую зону (PW-L7), но не порчу; повторный
-    /// `create_zone` выдаст новый `zone_seq`.
+    /// Сначала переиспользуется свободный слот удалённой зоны (tombstone
+    /// durable, каталог уже очищен `gc_catalog`), иначе выдаётся новый
+    /// `zone_seq`. Крах между коммитом зоны и каталогом оставляет недостижимую
+    /// зону (PW-L7), но не порчу.
     ///
     /// # Errors
     ///
@@ -320,31 +342,97 @@ impl<'a> ParallelZones<'a> {
             });
         }
         let max_zones = self.store.geometry().max_zones();
-        let mut zone_seq = self.next_seq;
-        // Пропускаем «осиротевшие» головы от краха между коммитом зоны и
-        // каталогом (PW-L7): слот занят, но в каталоге его нет.
-        while zone_seq < max_zones && self.store.head_entry(zone_seq).is_some() {
-            zone_seq = zone_seq.saturating_add(1);
+        let mut zone_seq = self.reusable_slot();
+        if zone_seq.is_none() {
+            let mut candidate = self.next_seq;
+            // Пропускаем «осиротевшие» головы от краха между коммитом зоны и
+            // каталогом (PW-L7): слот занят, но в каталоге его нет.
+            while candidate < max_zones && self.store.head_entry(candidate).is_some() {
+                candidate = candidate.saturating_add(1);
+            }
+            zone_seq = Some(candidate);
         }
+        let zone_seq = zone_seq.ok_or(ParallelError::InvalidArgument { field: "max_zones" })?;
         if zone_seq >= max_zones {
             return Err(ParallelError::InvalidArgument { field: "max_zones" });
         }
-        self.next_seq = zone_seq.saturating_add(1);
+        self.next_seq = self.next_seq.max(zone_seq.saturating_add(1));
+        self.store.reset_zone_slot(zone_seq);
         let mut zone = ParallelZone::open_new(self.store, *origin, zone_seq, meta.soa_serial)?;
-        let outcome = zone.commit()?;
+        let outcome = zone.commit_with(self.store.effective_mode())?;
         let value = CatalogValue {
             zone_seq,
             soa_serial: meta.soa_serial,
             origin_len: u32::try_from(origin.as_rle().len()).unwrap_or(u32::MAX),
             created_txn: outcome.version,
         };
-        self.write_catalog_entry(origin, value, true)?;
+        self.write_catalog_edit(CatalogEdit::Upsert(origin, value))?;
         self.origins.insert(zone_seq, *origin);
         self.entries.insert(*origin, value);
         Ok(zone_seq)
     }
 
+    /// Durable tombstone-слот без записи в каталоге, который можно
+    /// переиспользовать (`zone_seq` не расходуется бесконечно).
+    fn reusable_slot(&self) -> Option<u32> {
+        for seq in 1..self.next_seq {
+            if self.origins.contains_key(&seq) {
+                continue;
+            }
+            let Some(head) = self.store.head_entry(seq) else {
+                continue;
+            };
+            if head.is_tombstone()
+                && head.deleted_txn != 0
+                && self.store.durable_version(seq) >= head.deleted_txn
+            {
+                return Some(seq);
+            }
+        }
+        None
+    }
+
+    /// Удаляет из каталога зоны, чей tombstone уже durable (§5.6, §6.5).
+    ///
+    /// Каталог-запись уходит после durable-удаления, поэтому крах на любой
+    /// стадии оставляет либо живую зону, либо tombstone, но не «висячую»
+    /// запись каталога на удалённую зону. Возвращает удалённые origin'ы; слот
+    /// `zone_seq` становится доступен [`ParallelZones::create_zone`] после
+    /// durable-коммита каталога.
+    ///
+    /// # Errors
+    ///
+    /// `Io`/`Corrupt`/`MapFull` — коммит каталога.
+    pub fn gc_catalog(&mut self) -> Result<Vec<NameRle>, ParallelError> {
+        let mut candidates = Vec::new();
+        for (origin, value) in &self.entries {
+            let Some(head) = self.store.head_entry(value.zone_seq) else {
+                continue;
+            };
+            if !head.is_tombstone() || head.deleted_txn == 0 {
+                continue;
+            }
+            if self.store.durable_version(value.zone_seq) < head.deleted_txn {
+                continue;
+            }
+            candidates.push((*origin, value.zone_seq));
+        }
+        candidates.sort_by_key(|(_, zone)| *zone);
+        let mut removed = Vec::new();
+        for (origin, zone) in candidates {
+            if self.write_catalog_edit(CatalogEdit::Remove(&origin))? {
+                self.entries.remove(&origin);
+                self.origins.remove(&zone);
+                removed.push(origin);
+            }
+        }
+        Ok(removed)
+    }
+
     /// Помечает зону tombstone (`delete_zone`), каталог не меняется.
+    ///
+    /// Каталог-запись удаляется отдельно через [`ParallelZones::gc_catalog`]
+    /// после durable tombstone.
     ///
     /// # Errors
     ///
@@ -407,25 +495,41 @@ impl<'a> ParallelZones<'a> {
         })
     }
 
-    fn write_catalog_entry(
-        &mut self,
-        origin: &NameRle,
-        value: CatalogValue,
-        inserted: bool,
-    ) -> Result<(), ParallelError> {
+    fn write_catalog_edit(&mut self, edit: CatalogEdit<'_>) -> Result<bool, ParallelError> {
         let _lease = self.store.lease_guard(0);
         let mut io = WriteIo::new(self.store, 0, self.version);
         io.clear_cache();
         let txn = io.next_txn()?;
         io.set_version(txn);
-        let key = Key::new(origin, T_ZONE_ENTRY, 0, 0)?;
-        let raw = value.encode();
-        let item = LeafItem::new(key, ItemValue::zone_entry(&raw)?);
         let old_root = self.tree.root();
         let old_level = self.tree.level();
-        if let Err(error) = self.tree.insert_or_replace(&mut io, txn, &item) {
-            self.tree = BTree::new(old_root, old_level)?;
-            return Err(writer_error(&io, error));
+        let changed = match edit {
+            CatalogEdit::Upsert(origin, value) => {
+                let key = Key::new(origin, T_ZONE_ENTRY, 0, 0)?;
+                let raw = value.encode();
+                let item = LeafItem::new(key, ItemValue::zone_entry(&raw)?);
+                match self.tree.insert_or_replace(&mut io, txn, &item) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        self.tree = BTree::new(old_root, old_level)?;
+                        return Err(writer_error(&io, error));
+                    }
+                }
+            }
+            CatalogEdit::Remove(origin) => {
+                let key = Key::new(origin, T_ZONE_ENTRY, 0, 0)?;
+                match self.tree.delete(&mut io, txn, &key) {
+                    Ok(value) => value.is_some(),
+                    Err(error) => {
+                        self.tree = BTree::new(old_root, old_level)?;
+                        return Err(writer_error(&io, error));
+                    }
+                }
+            }
+        };
+        if !changed {
+            io.clear();
+            return Ok(false);
         }
         let dirty = io.take_dirty();
         for (page, bytes) in dirty {
@@ -435,11 +539,10 @@ impl<'a> ParallelZones<'a> {
                 return Err(error);
             }
         }
-        let entries = self.entries.len();
-        let rrset_count = if inserted {
-            u32::try_from(entries.saturating_add(1)).unwrap_or(u32::MAX)
-        } else {
-            u32::try_from(entries).unwrap_or(u32::MAX)
+        let count = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
+        let rrset_count = match edit {
+            CatalogEdit::Upsert(..) => count.saturating_add(1),
+            CatalogEdit::Remove(..) => count.saturating_sub(1),
         };
         let drops = io.take_freed();
         let entry = RootEntry {
@@ -454,11 +557,15 @@ impl<'a> ParallelZones<'a> {
         };
         let mut attempt = 0_u32;
         loop {
-            match self.store.publish_root_with_drops(entry, &drops) {
+            match self.store.publish_root_with_drops_mode(
+                entry,
+                &drops,
+                self.store.effective_mode(),
+            ) {
                 Ok(_) => {
                     self.version = txn;
                     io.finish_commit();
-                    return Ok(());
+                    return Ok(true);
                 }
                 Err(ParallelError::ReaderContended) if attempt < PUBLISH_RETRIES => {
                     attempt = attempt.saturating_add(1);
@@ -471,6 +578,15 @@ impl<'a> ParallelZones<'a> {
             }
         }
     }
+}
+
+/// Правка каталога зон.
+#[derive(Debug, Clone, Copy)]
+enum CatalogEdit<'a> {
+    /// Вставить/заменить запись зоны.
+    Upsert(&'a NameRle, CatalogValue),
+    /// Удалить запись зоны.
+    Remove(&'a NameRle),
 }
 
 /// Writer одной зоны; lease удерживается на всё время жизни.
@@ -486,6 +602,8 @@ pub struct ParallelZone<'a> {
     _lease: MutexGuard<'a, ()>,
     base_version: u64,
     txn: Option<u64>,
+    /// Новой/переиспользованной зоне нужен первый durable `RootEntry`.
+    needs_root: bool,
     rrset_count: u32,
     soa_serial: u32,
 }
@@ -521,6 +639,7 @@ impl<'a> ParallelZone<'a> {
             _lease: lease,
             base_version: head.version,
             txn: None,
+            needs_root: false,
             rrset_count: head.rrset_count,
             soa_serial: head.soa_serial,
         })
@@ -533,11 +652,13 @@ impl<'a> ParallelZone<'a> {
         soa_serial: u32,
     ) -> Result<Self, ParallelError> {
         let lease = store.lease_guard(zone);
-        if store.head_entry(zone).is_some() {
-            return Err(ParallelError::InvalidArgument { field: "zone_seq" });
-        }
+        let base_version = match store.head_entry(zone) {
+            None => 0,
+            Some(head) if head.is_tombstone() => head.version,
+            Some(_) => return Err(ParallelError::InvalidArgument { field: "zone_seq" }),
+        };
         let tree = ZoneTree::empty(origin);
-        let io = WriteIo::new(store, zone, 0);
+        let io = WriteIo::new(store, zone, base_version);
         Ok(Self {
             store,
             origin,
@@ -545,8 +666,9 @@ impl<'a> ParallelZone<'a> {
             tree,
             io,
             _lease: lease,
-            base_version: 0,
+            base_version,
             txn: None,
+            needs_root: true,
             rrset_count: 0,
             soa_serial,
         })
@@ -771,38 +893,143 @@ impl<'a> ParallelZone<'a> {
     ///
     /// # Errors
     ///
-    /// `Unsupported` — не `Sync`; `Io`/`MapFull`/`ReaderContended`.
+    /// `DurabilityBelowFileMode` — липкий/файловый `Sync`; `Io`/`MapFull`/
+    /// `ReaderContended`.
     pub fn commit(&mut self) -> Result<CommitOutcome, ParallelError> {
         self.commit_with(SyncModeV2::Sync)
     }
 
-    /// Коммит с явным режимом durability (`Flush`/`Memory` — B2).
+    /// Коммит с явным режимом durability: `Sync`/`Flush`/`Memory` (§7.2).
+    ///
+    /// `Flush` синхронизирует данные (фаза 1) и не синхронизирует корни;
+    /// `Memory` не делает `fdatasync` вовсе. Проверка липкого `Sync` —
+    /// [`ParallelError::DurabilityBelowFileMode`].
     ///
     /// # Errors
     ///
-    /// `Unsupported` — не `Sync`; `Io`/`MapFull`/`ReaderContended`.
-    #[allow(clippy::too_many_lines)]
+    /// `Unsupported` — режим не поддержан файлом; `DurabilityBelowFileMode`;
+    /// `Io`/`MapFull`/`ReaderContended`.
     pub fn commit_with(&mut self, durability: SyncModeV2) -> Result<CommitOutcome, ParallelError> {
-        if durability != SyncModeV2::Sync {
-            return Err(ParallelError::Unsupported {
-                what: "durability mode (phase B1 implements Sync only)",
+        let Some(staged) = self.stage_commit(durability)? else {
+            return Ok(CommitOutcome {
+                zone: self.zone,
+                version: self.base_version,
+                root_page: self.tree.root(),
+                tree_level: self.tree.level(),
+                rrset_count: self.rrset_count,
+                dirty_pages: 0,
+                page_limit: u32::try_from(self.store.durable_page_limit()).unwrap_or(u32::MAX),
+                changed: false,
             });
+        };
+        let mut attempt = 0_u32;
+        loop {
+            match self
+                .store
+                .publish_root_with_drops_mode(staged.entry, &staged.drops, durability)
+            {
+                Ok(outcome) => return Ok(self.complete_commit(&staged, outcome)),
+                Err(ParallelError::ReaderContended) if attempt < PUBLISH_RETRIES => {
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(error) => {
+                    self.rollback();
+                    return Err(error);
+                }
+            }
         }
+    }
+
+    /// Коммит через координатор group commit (§7.1): запрос батчится с другими
+    /// зонами, ack приходит после публикации головы.
+    ///
+    /// # Errors
+    ///
+    /// [`ParallelError::GroupClosed`] — координатор остановлен;
+    /// `DurabilityBelowFileMode`; `Io`/`MapFull`/`ReaderContended`/`Unsupported`.
+    pub fn commit_via(
+        &mut self,
+        committer: &crate::parallel::group::GroupCommitter,
+    ) -> Result<CommitOutcome, ParallelError> {
+        let durability = SyncModeV2::Sync;
+        let Some(staged) = self.stage_commit(durability)? else {
+            return Ok(CommitOutcome {
+                zone: self.zone,
+                version: self.base_version,
+                root_page: self.tree.root(),
+                tree_level: self.tree.level(),
+                rrset_count: self.rrset_count,
+                dirty_pages: 0,
+                page_limit: u32::try_from(self.store.durable_page_limit()).unwrap_or(u32::MAX),
+                changed: false,
+            });
+        };
+        let weight = u64::from(staged.dirty_pages) * 4096;
+        let mut attempt = 0_u32;
+        loop {
+            match committer.commit(staged.entry, &staged.drops, weight) {
+                Ok(outcome) => return Ok(self.complete_commit(&staged, outcome)),
+                Err(ParallelError::ReaderContended) if attempt < PUBLISH_RETRIES => {
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(error) => {
+                    self.rollback();
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Коммит через координатор с явным режимом durability.
+    ///
+    /// # Errors
+    ///
+    /// См. [`ParallelZone::commit_via`] и
+    /// [`ParallelError::DurabilityBelowFileMode`].
+    pub fn commit_via_with(
+        &mut self,
+        committer: &crate::parallel::group::GroupCommitter,
+        durability: SyncModeV2,
+    ) -> Result<CommitOutcome, ParallelError> {
+        let Some(staged) = self.stage_commit(durability)? else {
+            return Ok(CommitOutcome {
+                zone: self.zone,
+                version: self.base_version,
+                root_page: self.tree.root(),
+                tree_level: self.tree.level(),
+                rrset_count: self.rrset_count,
+                dirty_pages: 0,
+                page_limit: u32::try_from(self.store.durable_page_limit()).unwrap_or(u32::MAX),
+                changed: false,
+            });
+        };
+        let weight = u64::from(staged.dirty_pages) * 4096;
+        let mut attempt = 0_u32;
+        loop {
+            match committer.commit_with(staged.entry, &staged.drops, weight, durability) {
+                Ok(outcome) => return Ok(self.complete_commit(&staged, outcome)),
+                Err(ParallelError::ReaderContended) if attempt < PUBLISH_RETRIES => {
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(error) => {
+                    self.rollback();
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Готовит коммит: проверяет режим, пишет dirty-страницы, собирает
+    /// `RootEntry` и `drops`. `None` — нечего публиковать (пустой коммит).
+    fn stage_commit(
+        &mut self,
+        durability: SyncModeV2,
+    ) -> Result<Option<StagedCommit>, ParallelError> {
+        self.store.check_durability(durability)?;
         let txn = match self.txn {
             Some(txn) => txn,
-            None if self.base_version == 0 => self.ensure_txn()?,
-            None => {
-                return Ok(CommitOutcome {
-                    zone: self.zone,
-                    version: self.base_version,
-                    root_page: self.tree.root(),
-                    tree_level: self.tree.level(),
-                    rrset_count: self.rrset_count,
-                    dirty_pages: 0,
-                    page_limit: u32::try_from(self.store.durable_page_limit()).unwrap_or(u32::MAX),
-                    changed: false,
-                });
-            }
+            None if self.base_version == 0 || self.needs_root => self.ensure_txn()?,
+            None => return Ok(None),
         };
         let dirty = self.io.take_dirty();
         let dirty_pages = u32::try_from(dirty.len()).unwrap_or(u32::MAX);
@@ -823,36 +1050,38 @@ impl<'a> ParallelZone<'a> {
             state: RootState::Serving,
             ..RootEntry::default()
         };
-        let mut attempt = 0_u32;
-        loop {
-            match self.store.publish_root_with_drops(entry, &drops) {
-                Ok(outcome) => {
-                    self.base_version = txn;
-                    self.txn = None;
-                    self.io.finish_commit();
-                    return Ok(CommitOutcome {
-                        zone: self.zone,
-                        version: txn,
-                        root_page: entry.root_page,
-                        tree_level: entry.tree_level,
-                        rrset_count: self.rrset_count,
-                        dirty_pages,
-                        page_limit: u32::try_from(outcome.page_limit).unwrap_or(u32::MAX),
-                        changed: true,
-                    });
-                }
-                Err(ParallelError::ReaderContended) if attempt < PUBLISH_RETRIES => {
-                    attempt = attempt.saturating_add(1);
-                }
-                Err(error) => {
-                    self.rollback();
-                    return Err(error);
-                }
-            }
+        Ok(Some(StagedCommit {
+            txn,
+            dirty_pages,
+            drops,
+            entry,
+        }))
+    }
+
+    fn complete_commit(
+        &mut self,
+        staged: &StagedCommit,
+        outcome: crate::parallel::store::PublishOutcome,
+    ) -> CommitOutcome {
+        self.base_version = staged.txn;
+        self.txn = None;
+        self.needs_root = false;
+        self.io.finish_commit();
+        CommitOutcome {
+            zone: self.zone,
+            version: staged.txn,
+            root_page: staged.entry.root_page,
+            tree_level: staged.entry.tree_level,
+            rrset_count: self.rrset_count,
+            dirty_pages: staged.dirty_pages,
+            page_limit: u32::try_from(outcome.page_limit).unwrap_or(u32::MAX),
+            changed: true,
         }
     }
 
     fn commit_tombstone(&mut self) -> Result<CommitOutcome, ParallelError> {
+        let durability = self.store.effective_mode();
+        self.store.check_durability(durability)?;
         let txn = self.ensure_txn()?;
         // Страницы удаляемой зоны становятся недостижимыми: собираем их в
         // bucket `drop_txn = V`, чтобы GC вернул место.
@@ -884,7 +1113,11 @@ impl<'a> ParallelZone<'a> {
         };
         let mut attempt = 0_u32;
         loop {
-            match self.store.publish_root_with_drops(entry, &drops) {
+            match self.store.publish_root_with_drops_mode(
+                entry,
+                &drops,
+                self.store.effective_mode(),
+            ) {
                 Ok(outcome) => {
                     self.base_version = txn;
                     self.txn = None;
@@ -946,7 +1179,10 @@ impl<'a> ParallelZone<'a> {
         };
         let mut attempt = 0_u32;
         loop {
-            match self.store.publish_root_with_drops(entry, &[]) {
+            match self
+                .store
+                .publish_root_with_drops_mode(entry, &[], self.store.effective_mode())
+            {
                 Ok(outcome) => {
                     self.base_version = version;
                     self.txn = None;

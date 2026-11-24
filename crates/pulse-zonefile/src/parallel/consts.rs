@@ -108,6 +108,26 @@ pub const NO_VERSION: u64 = u64::MAX;
 /// Тип `leader_term` в M1: один процесс, один координатор.
 pub const LEADER_TERM_M1: u64 = 1;
 
+// --- Group commit (B2b, §7.1) ---
+/// Максимум зон в одной группе (§7.1 п. 8).
+pub const MAX_BATCH_ZONES: u32 = 256;
+/// Максимум суммы «веса» запросов группы (≈ байты) — `1 МиБ`.
+pub const MAX_BATCH_BYTES: u64 = 1 << 20;
+/// Максимальная задержка набора группы — 1 мс.
+pub const MAX_BATCH_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+/// Порог bulk-коммита: запрос больше — отдельная группа из одного элемента.
+pub const BULK_COMMIT_BYTES: u64 = 256 << 10;
+/// Ёмкость очереди координатора (запросов).
+pub const QUEUE_ZONES: usize = 1024;
+/// Бюджет байтов очереди координатора — `64 МиБ`.
+pub const QUEUE_BYTES: u64 = 64 << 20;
+
+// --- Утечки/`fsck --repair` (§6.5, R4) ---
+/// Алерт-порог доли утечек: 1 % от `[data_first, DP)`.
+pub const MAX_LEAK_RATIO: f64 = 0.01;
+/// Порог в промилле для метрик/отчётов (`MAX_LEAK_RATIO * 1000`).
+pub const MAX_LEAK_RATIO_PERMILLE: u64 = 10;
+
 // --- Смещения `RootEntry` (§4.1) ---
 
 pub(crate) const ROOT_OFF_CRC: usize = 0;

@@ -74,6 +74,49 @@ impl SyncModeV2 {
             _ => None,
         }
     }
+
+    /// Класс durability: `Memory < Flush < Sync`.
+    #[must_use]
+    pub const fn durability_rank(self) -> u8 {
+        match self {
+            Self::Memory => 0,
+            Self::Flush => 1,
+            Self::Sync => 2,
+        }
+    }
+
+    /// Эффективный режим файла при `durable_txn_limit` (§7.2).
+    ///
+    /// После первого durable-барьера (`DT > 1`: `Sync`-группа или `sync()`)
+    /// файл липко ведёт себя как [`SyncModeV2::Sync`]: запись слабее запрещена,
+    /// иначе recovery доверял бы durable-водоразделу, за которым остались
+    /// несинхронизированные страницы.
+    #[must_use]
+    pub const fn effective_mode(self, durable_txn: u64) -> Self {
+        if durable_txn > 1 { Self::Sync } else { self }
+    }
+
+    /// Проверяет, что запрошенный режим не слабее эффективного.
+    ///
+    /// # Errors
+    ///
+    /// [`ParallelError::DurabilityBelowFileMode`], если `requested` слабее
+    /// [`SyncModeV2::effective_mode`].
+    pub fn check_commit(
+        self,
+        durable_txn: u64,
+        requested: Self,
+    ) -> Result<(), crate::parallel::error::ParallelError> {
+        if requested.durability_rank() < self.effective_mode(durable_txn).durability_rank() {
+            return Err(
+                crate::parallel::error::ParallelError::DurabilityBelowFileMode {
+                    requested,
+                    effective: self.effective_mode(durable_txn),
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Superblock v2 (страницы 0 и 1).

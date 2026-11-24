@@ -174,14 +174,19 @@ pub(crate) fn recover(file: &File, file_size: u64) -> Result<Recovered, Parallel
     let alloc_txn_limit = alloc.map(|record| record.txn_limit);
     let durable_page_limit = alloc_page_limit.unwrap_or(0);
     let durable_txn_limit = alloc_txn_limit.unwrap_or(0);
+    // `Flush`/`Memory`-файл без durable-барьера (`DT <= 1`) законно имеет
+    // корни новее `ALLOC_RECORD`: fsync данных был, meta — нет (§7.2). Строгие
+    // watermark-проверки действуют только для `Sync`/липкого режима.
+    let strict =
+        superblock.sync_mode == crate::parallel::layout::SyncModeV2::Sync || durable_txn_limit > 1;
 
-    if durable_page_limit < max_root_page_limit {
+    if strict && durable_page_limit < max_root_page_limit {
         merge_fatal(&mut fatal, Some(FatalKind::AllocWatermarkRegression));
     }
     if alloc.is_some() && durable_page_limit < u64::from(geometry.page_data_first()) {
         merge_fatal(&mut fatal, Some(FatalKind::AllocWatermarkRegression));
     }
-    if durable_txn_limit < max_root_version {
+    if strict && durable_txn_limit < max_root_version {
         merge_fatal(&mut fatal, Some(FatalKind::RootWatermarkRegression));
     }
 
@@ -191,12 +196,21 @@ pub(crate) fn recover(file: &File, file_size: u64) -> Result<Recovered, Parallel
     if dp > u64::from(geometry.page_count_max()) {
         merge_fatal(&mut fatal, Some(FatalKind::AllocWatermarkRegression));
     }
-    let dt = durable_txn_limit.max(max_root_version).max(1);
-    let next_txn = dt
+    let dt = if strict {
+        durable_txn_limit.max(max_root_version)
+    } else {
+        durable_txn_limit
+    }
+    .max(1);
+    let next_txn = durable_txn_limit
+        .max(max_root_version)
+        .max(1)
         .checked_add(1)
         .ok_or(ParallelError::InvalidArgument { field: "txn" })?;
     max_root_page_limit = max_root_page_limit.min(dp);
-    max_root_version = max_root_version.min(dt);
+    if strict {
+        max_root_version = max_root_version.min(dt);
+    }
 
     let report = RecoveryReport {
         superblock_source,

@@ -43,6 +43,10 @@ pub struct GraphReport {
     pub free_pages: u64,
     /// Страницы `[data_first, DP)`, не попавшие ни в один набор.
     pub leaked_pages: u64,
+    /// Номера утёкших страниц (для `fsck --repair`).
+    pub leaked_page_ids: Vec<u32>,
+    /// Ёмкость проверенной области `[data_first, DP)`.
+    pub durable_pages: u64,
     /// Диагностические сообщения.
     pub issues: Vec<String>,
     /// File-fatal причина (пересечение множеств).
@@ -144,8 +148,10 @@ pub(crate) fn verify(store: &ParallelStore) -> Result<GraphReport, ParallelError
             && !sets.free.contains(&page)
         {
             report.leaked_pages = report.leaked_pages.saturating_add(1);
+            report.leaked_page_ids.push(page);
         }
     }
+    report.durable_pages = u64::from(durable.saturating_sub(geometry.page_data_first()));
     report.reachable_pages = u64::try_from(sets.tree.len()).unwrap_or(u64::MAX);
     report.chain_pages = u64::try_from(sets.chain.len()).unwrap_or(u64::MAX);
     report.bucket_pages = u64::try_from(sets.buckets.len()).unwrap_or(u64::MAX);
@@ -274,4 +280,38 @@ fn walk_chain(
         page = chain.entry.prev_record;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GraphReport, Kind, Sets};
+
+    #[test]
+    fn duplicate_page_is_reported_as_overlap() {
+        let mut sets = Sets::default();
+        let mut report = GraphReport::default();
+        assert!(sets.overlap(42, Kind::Tree, &mut report));
+        assert!(!sets.overlap(42, Kind::Tree, &mut report));
+        assert_eq!(
+            report.fatal,
+            Some(crate::parallel::error::FatalKind::PageOverlap)
+        );
+        assert_eq!(report.issues.len(), 1);
+    }
+
+    #[test]
+    fn disjoint_pages_stay_ok() {
+        let mut sets = Sets::default();
+        let mut report = GraphReport::default();
+        for (page, kind) in [
+            (1, Kind::Tree),
+            (2, Kind::Chain),
+            (3, Kind::Bucket),
+            (4, Kind::Free),
+        ] {
+            assert!(sets.overlap(page, kind, &mut report));
+        }
+        assert!(report.fatal.is_none());
+        assert_eq!(report.issues.len(), 0);
+    }
 }

@@ -46,3 +46,7 @@ harness = false
 [[bench]]
 name = "v2_cache"
 harness = false
+
+[[bench]]
+name = "v2_group"
+harness = false

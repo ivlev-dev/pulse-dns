@@ -503,7 +503,7 @@ fn delete_and_tombstone() {
 }
 
 #[test]
-fn durability_other_modes_are_unsupported() {
+fn durability_flush_and_memory_require_file_mode() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("zones.v2");
     let store = ParallelStore::create(&path, config()).unwrap();
@@ -513,14 +513,27 @@ fn durability_other_modes_are_unsupported() {
         .create_zone(&apex, ZoneCreateMeta { soa_serial: 1 })
         .unwrap();
     let mut writer = zones.writer(&apex).unwrap();
+    let name = NameRle::from_ascii("one.z0.example").unwrap();
+    writer.upsert_rrset(&name, 1, 0, &rr(60, &[1])).unwrap();
+    // Файл создан в `Sync`: слабее липкого режима нельзя (§7.2).
     assert!(matches!(
         writer.commit_with(SyncModeV2::Flush),
-        Err(ParallelError::Unsupported { .. })
+        Err(ParallelError::DurabilityBelowFileMode { .. })
     ));
     assert!(matches!(
         writer.commit_with(SyncModeV2::Memory),
-        Err(ParallelError::Unsupported { .. })
+        Err(ParallelError::DurabilityBelowFileMode { .. })
     ));
+    // `Sync` разрешён и публикует данные.
+    let outcome = writer.commit().unwrap();
+    assert!(outcome.changed);
+    let view = {
+        let reader = store.reader().unwrap();
+        let view = zones.read(&reader, &apex).unwrap();
+        assert!(view.lookup(&name, 1, 0).unwrap().is_some());
+        view.version()
+    };
+    assert_eq!(view, outcome.version);
 }
 
 #[test]

@@ -10,8 +10,14 @@
 //! Фаза B2a: [`PageCacheV2`] (валидация страницы один раз на `(page_no, txn)`,
 //! zero-copy warm lookup) и рекламация — per-zone bucket'ы с `drop_txn`,
 //! `free_head` в `RootEntry`, `is_reclaimable`, chain-GC, освобождение
-//! overflow/tombstone и donation. Group commit, `Flush`/`Memory` и
-//! межпроцессная запись — фаза B2b. v1-модули и `pulsed` не затронуты.
+//! overflow/tombstone и donation.
+//!
+//! Фаза B2b: group commit ([`GroupCommitter`], [`ParallelStore::commit_group`]):
+//! батчинг зон, ровно два `fdatasync` на группу, backpressure и ack после
+//! публикации; `Flush`/`Memory` и липкий `Sync`; tombstone-GC каталога
+//! ([`ParallelZones::gc_catalog`]); sweep утечек ([`ParallelStore::leak_report`],
+//! [`ParallelStore::repair_leaks`], [`fsck_repair`]). Межпроцессная запись —
+//! вне M1. v1-модули и `pulsed` не затронуты.
 //!
 //! # Пример
 //!
@@ -43,6 +49,7 @@ pub mod consts;
 pub mod error;
 pub mod freepool;
 pub mod geometry;
+pub mod group;
 pub mod layout;
 pub mod pagecache;
 mod pageio;
@@ -58,6 +65,7 @@ pub use alloc::{AllocHandle, AllocTicket, Allocator};
 pub use error::{CopySource, FatalKind, ParallelError, V2CorruptKind};
 pub use freepool::is_reclaimable;
 pub use geometry::{Geometry, ZoneSlot};
+pub use group::{GroupCommitConfig, GroupCommitter, GroupStats};
 pub use layout::{
     AllocRecord, ChainPage, FilePin, FileReaderSlot, LayoutHead, SuperblockV2, SyncModeV2,
     WriterRegistry,
@@ -69,7 +77,8 @@ pub use recovery::{FsckLiteReport, OpenConfigV2, RecoveryReport};
 pub use ring::{CellView, CopyState, SlotView};
 pub use root::{RootEntry, RootFieldError, RootFlags, RootState};
 pub use store::{
-    CrashHook, CrashPoint, ParallelStore, PublishOutcome, StoreConfig, StoreStats, ZoneSnapshot,
+    CrashHook, CrashPoint, GroupCommitRequest, IoFaultHook, LeakReport, ParallelStore,
+    PublishOutcome, RepairReport, StoreConfig, StoreStats, ZoneSnapshot, fsck_repair,
     open_read_only,
 };
 pub use verify::GraphReport;
@@ -77,6 +86,9 @@ pub use zone::{
     CommitOutcome, ParallelZone, ParallelZones, RrsetRecord, RrsetRef, ZoneCreateMeta, ZoneInfo,
     ZoneReader,
 };
+
+/// Алиас режима durability v2: `Durability::Sync`/`Flush`/`Memory` (§7.2).
+pub type Durability = SyncModeV2;
 
 // v1-типы, с которыми работает B1-API зон (переиспользование, не копия).
 pub use crate::tree::{RrsetData, UpsertOutcome};
