@@ -1,0 +1,23 @@
+[package]
+name = "pulse-transfer"
+description = "TSIG, AXFR/IXFR and NOTIFY for pulse-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+aws-lc-rs = "1.19"
+pulse-dns = { path = "../pulse-dns" }
+subtle = "2.6"
+thiserror = "2"
+zeroize = { version = "1.9", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+hex = "0.4"
+proptest = "1"
+
+[lints]
+workspace = true
