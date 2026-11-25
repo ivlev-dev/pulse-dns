@@ -19,7 +19,7 @@
 
 ## Проверки (зелёные)
 
-- `cargo test --workspace --all-features` — **1332 теста**, 0 failures.
+- `cargo test --workspace --all-features` — **1444 теста**, 0 failures.
 - `cargo fmt --check`.
 - `cargo clippy --workspace --all-targets -D warnings`.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
@@ -31,19 +31,32 @@
 
 | Крейт | Статус |
 |---|---|
-| `pulse-dns` | wire-формат DNS, RR-типы, сжатие имён, EDNS0, RFC 3597, канонизация RFC 4034, лимиты, 0 `unsafe` |
-| `pulse-dnssec` | sign/validate алгоритмы 8/13/15, RRSIG при DO=1, NSEC и NSEC3 (SHA-1, salt/iterations, closest encloser, wildcard; NSEC3-подпись, NSEC3PARAM, Opt-Out), DS через API, trust anchors IANA и RFC 5011 (`TrustAnchorStore`, add/revoke hold-down, `0600`-состояние), автоматическая ротация KSK/ZSK (pre-publish/double-sign/active/retire) |
+| `pulse-dns` | wire-формат DNS, RR-типы, сжатие имён, EDNS0, RFC 3597, канонизация RFC 4034, лимиты, 0 `unsafe`; zero-copy разбор запроса и ответ (`respond_ref_into`) |
+| `pulse-dnssec` | sign/validate алгоритмы 8/13/15, RRSIG при DO=1, NSEC и NSEC3 (SHA-1, salt/iterations, closest encloser, wildcard; NSEC3-подпись, NSEC3PARAM, Opt-Out), DS через API, trust anchors IANA и RFC 5011 (`TrustAnchorStore`, add/revoke hold-down, `0600`-состояние), автоматическая ротация KSK/ZSK (pre-publish/double-sign/active/retire); NSEC/NSEC3 индексы |
 | `pulse-dnscrypt` | DNSCrypt v2: сертификаты, сервер, клиент, UDP и TCP (framing, метрики) |
 | `pulse-master` | парсер/сериализатор RFC 1035 master-файлов |
 | `pulse-transfer` | TSIG, AXFR/IXFR, NOTIFY |
-| `pulse-zonefile` | v2 `ParallelStore`: lock-free аллокатор страниц, ring-головы версий A/B, per-zone пулы/GC, in-process пины читателей, per-zone commit, group commit (2 fsync на группу), PageCache, recovery, полный `fsck --verify` и `--repair`, `compact_zone`, `sync`; **межпроцессная запись v2** (ADR 0007): sidecar-координатор `<file>.pulsecoord`, CAS-курсор в shared mmap, `fcntl` per-zone leases + fencing (pid/starttime/generation), общая reader table, `LOCK_SH`; 4 процесса × 4 зоны, kill -9, 10k коммитов в 2 процессах; ~20k zone-commit/s; v1 читается для `pulsed convert` |
-| `pulse-runtime` | io_uring UDP (ring на ядро, multishot recv + provided buffers, IP_PKTINFO, NODROP-проверка, backpressure, graceful shutdown, изоляция паник) + epoll-фолбэк |
-| `pulse-server` | авторитетный движок: NXDOMAIN/NODATA/ENT, wildcard/closest encloser, CNAME/DNAME, делегация/glue/DS, EDNS/BADVERS, TC, ANY по RFC 8482, детерминированный additional |
+| `pulse-zonefile` | v2 `ParallelStore`: lock-free аллокатор страниц, ring-головы версий A/B, per-zone пулы/GC, in-process пины читателей, per-zone commit, group commit (2 fsync на группу), PageCache, recovery, полный `fsck --verify` и `--repair`, `compact_zone`, `sync`; **межпроцессная запись v2** (ADR 0007): sidecar-координатор `<file>.pulsecoord`, CAS-курсор в shared mmap, `fcntl` per-zone leases + fencing (pid/starttime/generation), общая reader table, `LOCK_SH`; 4 процесса × 4 зоны, kill -9, 10k коммитов в 2 процессах; ~20k zone-commit/s; bulk-load 1M RRset за 2.5–2.8 с; order-key memcmp; каталог 1000 зон за 83 мс (исправлен self-deadlock); v1 читается для `pulsed convert` |
+| `pulse-runtime` | io_uring UDP (ring на ядро, multishot recv + provided buffers, `REGISTER_FILES`, `COOP/DEFER_TASKRUN`, опции SQPOLL/`SO_BUSY_POLL`, IP_PKTINFO, NODROP-проверка, backpressure, graceful shutdown, изоляция паник) + epoll-фолбэк |
+| `pulse-server` | авторитетный движок: NXDOMAIN/NODATA/ENT, wildcard/closest encloser, CNAME/DNAME, делегация/glue/DS, EDNS/BADVERS, TC, ANY по RFC 8482, детерминированный additional; zero-copy ответ (`respond_ref_into`), NSEC/NSEC3 индексы для быстрого NXDOMAIN |
 | `pulse-resolver` | library: forward/iterative, кеш + negative caching, blocklist/allowlist/overrides, DNSSEC AD/BOGUS→SERVFAIL, UDP/TCP + upstream DoT/DoH с failover/cooldown, пул keep-alive соединений (`pool_size`, default 4, in-flight лимит, reconnect backoff), смешанные upstream |
 | `pulseresolved` | binary резолвер: TOML-конфиг (JSON — совместимость), UDP/TCP, серверные DoT/DoH/1.1/DoH/2/DoH/3/DoQ/DNSCrypt v2 (UDP+TCP), ACL клиентов (default loopback, отдельный `tls_allow_from`), per-source rate limit, полный RRL (`noerror`/`nxdomain`/`referral`/`error`, per-source + per-name, slip, refused/drop/truncate; только UDP), пул DoT/DoH, смешанные upstream (UDP/TCP/DoT/DoH), кеш, blocklist, overrides, DNSSEC, SIGHUP (blocklist + TLS-пара), `/metrics` по транспортам, `/healthz`, control-plane REST API (`control_listen`, bearer-token, cache/purge, blocklist reload, upstreams, trust anchors, RRL patch, config, RFC 9457 problem+json, `X-Request-Id`, rate limit на токен, graceful shutdown) |
 | `pulse-tls` | DoT (RFC 7858), DoH/1.1 (RFC 8484), DoH/2 (`http2`), DoH/3 (`http3`, RFC 9114) и DoQ (`doq`) на rustls/quinn/h3: серверы и клиенты (webpki-roots/CA, ALPN, keep-alive) |
 | `pulse-api` | REST доведён: health/ready/metrics/OpenAPI, zones CRUD, RRset CRUD/PATCH, settings, serial, transfers/jobs, import, audit, confirm_origin, keys rollover/status, async `Prefer: respond-async`, bearer-auth + scopes + per-zone allowlist, ETag/If-Match, RFC 9457 problem+json, Idempotency-Key, пагинация, лимиты; write-ahead journal (outbox) мутаций: CRC/seq, fsync, crash-recovery, compaction, `journal_*` метрики |
 | `pulsed` | binary: TOML-конфиг (JSON — совместимость) с CLI-overrides, UDP+TCP+DoT+DoH/1.1+DoH/2+DoH/3+DoQ+DNSCrypt v2 (UDP/TCP)+REST, зоны только в `pulse-zonefile` v2 (`--data`), DNS отвечает из mmap, импорт `.zone`, `convert` v1→v2, per-zone/group commit, AXFR/IXFR-out, NOTIFY, secondary-зоны, DNSSEC-подпись NSEC/NSEC3, автоматическая ротация ключей, journal REST-мутаций с recovery на старте (`journal = true` по умолчанию), graceful shutdown, Dockerfile |
+
+## Оптимизация горячего пути (выполнено)
+
+- **Zero-copy ответ**: `respond_ref_into` покрывает A/AAAA/MX/TXT/SRV/CNAME/NS/SVCB/HTTPS,
+  NXDOMAIN/NODATA, wildcard (unsigned), EDNS без DO; `udp-e2e` allocs/query с 52 → 0–0.01.
+  Signed/DO=1, referral, ANY, wildcard-CNAME — полный (медленный) путь.
+- **NSEC/NSEC3 индексы**: NXDOMAIN p99 на 100k signed с 367 мс → 0.71 мс; 1M in-memory p99 18 µs (цель <2 мс).
+- **Bulk-load**: 1M RRset за 2.5–2.8 с (было 26 мин), 91 МБ RSS, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с.
+- **Память**: v2 чтение 1M RRset RssAnon 6.3 МБ (было ~9.6), soak 600 с без роста; сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов).
+- **Чтение**: zone snapshot 87–92 нс, RRset warm wide ~1.36–1.45 µs (−20%), order-key memcmp; warm lookup 0 аллокаций.
+- **io_uring**: RSS 4.7/10.2/17.5 МБ на 1/4/8 workers (было 12.7/40.6/104.9); p99 8 workers 650→440 µs; SQPOLL на этом ядре медленнее (выкл), registered files вкл.
+- **Каталог 1000 зон**: исправлено зависание (выделенный lease-шард каталога); 1000 зон за 83 мс, 4096 за 651 мс.
+- **Тесты**: утечка дочерних процессов закрыта RAII-guard; 3× без утечек.
 
 ## Проверено руками
 
@@ -112,16 +125,23 @@
   очищает lease/reader, чужие зоны целы; kill -9 в середине коммита → `DP`
   не убывает, зона на `V−1`/`V`; 10 000 коммитов в 2 процессах без
   пересечений страниц; single-process без регрессий.
-- Производительность (loopback, хост нагружен, числа консервативные):
-  UDP echo 220 117 qps (4 worker / 4 клиента, окно 16); epoll 230 352 qps;
-  окно 1 — 89 036 qps, p50 35 µs, p99 182 µs; zone lookup 156–268 нс;
-  RRset lookup ~2–4.9 µs при 1M; insert ~10 000/s; 0 аллокаций на warm lookup;
-  alloc reserve ~50M/s; per-zone commit 49k zone-commit/s (4 потока, B1, tmpfs);
-  group commit: 2 fsync/группу, ускорение 2.4× (btrfs), 3.36× (эмуляция fsync 2 мс);
-  p50 6.35 ms (group) vs 17.5 ms (per-zone) на btrfs; end-to-end baseline 88 024 q/s,
-  при 8 писателях в 8 зон — 72 088 q/s; PageCache 418 нс warm single-page,
-  полный lookup ~1.06 µs; зона не материализуется в RAM (RssAnon не растёт);
-  DoT ~10.4k qps; DoH h2 ~8.2k DNS/s; DoH3 ~13.6–14.9k; DoQ ~5.25k.
+- Производительность (loopback, окно 1, 4 клиента; хост нагружен, числа консервативные):
+  A p50 68 µs, p99 141 µs; mix p50 68 µs, p99 604 µs, ~44k qps на 4 клиентах;
+  10k open-loop mix p99 777 µs (было 2361); NXDOMAIN 10k qps p50 757 µs, p99 1.56 мс,
+  timeouts 0 (было 260 мс/16912); NX window1 p50 235 µs.
+  NSEC/NSEC3: NXDOMAIN p99 на 100k signed 367 мс → 0.71 мс; 1M in-memory p99 18 µs.
+  Zero-copy: allocs/query 52 → 0–0.01 (udp-e2e); signed/DO=1, referral, ANY, wildcard-CNAME — полный путь.
+  Память: v2 чтение 1M RRset RssAnon 6.3 МБ (было ~9.6); soak 600 с без роста;
+  сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов).
+  Чтение: zone snapshot 87–92 нс; RRset warm wide ~1.36–1.45 µs (−20%); order-key memcmp; warm lookup 0 аллокаций.
+  io_uring: RSS 4.7/10.2/17.5 МБ на 1/4/8 workers (было 12.7/40.6/104.9); p99 8 workers 650→440 µs;
+  SQPOLL медленнее (выкл), registered files вкл.
+  Bulk-load: 1M RRset 2.5–2.8 с (было 26 мин), 91 МБ RSS, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с.
+  Каталог: 1000 зон за 83 мс, 4096 за 651 мс (исправлен self-deadlock на 256-й зоне).
+  Старые замеры (loopback, хост нагружен): UDP echo 220 117 qps (4w/4c, окно 16); epoll 230 352 qps;
+  окно 1 — 89 036 qps, p50 35 µs, p99 182 µs; zone lookup 156–268 нс; insert ~10 000/s;
+  alloc reserve ~50M/s; per-zone commit 49k zone-commit/s; group commit 2 fsync/группу (2.4×/3.36×);
+  PageCache 418 нс warm single-page; полный lookup ~1.06 µs; DoT ~10.4k; DoH h2 ~8.2k; DoH3 ~13.6–14.9k; DoQ ~5.25k.
 - Fuzz/CI: `fuzz/` (cargo-fuzz, nightly) — 5 таргетов (`dns_wire`,
   `master_zone`, `zonefile_v2_open`, `transfer_tsig`, `dnscrypt_packet`),
   seed-корпус; CI job `fuzz-smoke` на push в main; Miri на
@@ -142,7 +162,11 @@
   автоматически.
 - REST — MVP-подмножество спецификации (хотя доведён по jobs/transfers/audit);
   API доступен только на loopback (без TLS).
-- RRset lookup ~2–4.9 µs при 1M против цели 500 нс (не достигнута).
+- RRset warm wide ~1.36–1.45 µs при 1M (−20%); цель 500 нс не достигнута.
+- Signed/DO=1, referral, ANY, wildcard-CNAME — полный (медленный) путь ответа (zero-copy не покрывает).
+- Bulk-load требует отсортированный вход; `Memory` incremental не реклеймит (bulk рекомендуется).
+- Замеры на loopback + SMT: клиент и сервер делят 8 vCPU, абсолютные qps занижены.
+- perf record заблокирован (paranoid=2), flamegraph не снят.
 - Loom отсутствует (fuzz и Miri есть); Miri — continue-on-error.
 - File-fatal порча требует ручного разбора (repair её не «чинит»).
 - io_uring работает на уровне L3 только при поддержке `IORING_FEAT_NODROP`,
@@ -175,7 +199,11 @@ dig @127.0.0.1 -p 5353 example.com. A +norecurse
 
 ## Риски и известные дефекты
 
-- RRset lookup ~2–4.9 µs при 1M против цели 500 нс.
+- RRset warm wide ~1.36–1.45 µs при 1M (−20%); цель 500 нс не достигнута.
+- Signed/DO=1, referral, ANY, wildcard-CNAME — полный (медленный) путь.
+- Bulk требует отсортированный вход; `Memory` incremental не реклеймит (bulk рекомендуется).
+- Замеры на loopback + SMT: клиент и сервер делят 8 vCPU, абсолютные qps занижены.
+- perf record заблокирован (paranoid=2), flamegraph не снят.
 - API доступен только на loopback, TLS отсутствует.
 - Storage: параллельная запись по зонам внутри одного процесса (v2) и
   межпроцессная (v2, ADR 0007); каталог — один writer, durable-пулы bump-only
