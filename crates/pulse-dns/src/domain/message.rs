@@ -168,6 +168,13 @@ impl Flags {
     }
 
     /// Устанавливает младшие 4 бита RCODE.
+    #[must_use]
+    pub fn with_rcode_bits(mut self, value: u8) -> Self {
+        self.set_rcode_low(value);
+        self
+    }
+
+    /// Устанавливает младшие 4 бита RCODE.
     pub(crate) fn set_rcode_low(&mut self, value: u8) {
         self.0 = (self.0 & !0x000F) | u16::from(value & 0x0F);
     }
@@ -589,6 +596,53 @@ impl Message {
     /// [`EncodeError`] при превышении лимитов или ошибке записи.
     pub fn encode(&self, options: &EncodeOptions) -> Result<Vec<u8>, EncodeError> {
         crate::wire::encode::encode_message(self, *options)
+    }
+
+    /// Кодирует сообщение прямо в переданный срез (компрессия включена).
+    ///
+    /// Не аллоцирует память: таблица компрессии создаётся на стеке.
+    /// Возвращает длину записанного сообщения.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::BufferTooSmall`], если `out` меньше сообщения;
+    /// [`EncodeError::MessageTooLong`], если сообщение длиннее 65535 октетов;
+    /// прочие [`EncodeError`] при некорректных данных.
+    pub fn encode_into(&self, out: &mut [u8]) -> Result<usize, EncodeError> {
+        self.encode_into_with(out, &EncodeOptions::compressed())
+    }
+
+    /// То же, что [`Message::encode_into`], с явными опциями кодирования.
+    ///
+    /// # Errors
+    ///
+    /// См. [`Message::encode_into`].
+    pub fn encode_into_with(
+        &self,
+        out: &mut [u8],
+        options: &EncodeOptions,
+    ) -> Result<usize, EncodeError> {
+        let mut scratch = crate::wire::EncodeScratch::new();
+        crate::wire::encode::encode_message_into(self, *options, out, &mut scratch)
+    }
+
+    /// Точная длина wire-формы без записи байтов (компрессия включена).
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError`] при превышении лимитов или некорректных данных.
+    pub fn encoded_len(&self) -> Result<usize, EncodeError> {
+        self.encoded_len_with(&EncodeOptions::compressed())
+    }
+
+    /// То же, что [`Message::encoded_len`], с явными опциями кодирования.
+    ///
+    /// # Errors
+    ///
+    /// См. [`Message::encoded_len`].
+    pub fn encoded_len_with(&self, options: &EncodeOptions) -> Result<usize, EncodeError> {
+        let mut scratch = crate::wire::EncodeScratch::new();
+        crate::wire::encode::encoded_message_len(self, *options, &mut scratch)
     }
 
     /// Кодирует сообщение и записывает его в `out`.

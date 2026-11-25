@@ -6,7 +6,7 @@
 //! детерминированы.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype};
 use thiserror::Error;
@@ -70,8 +70,10 @@ pub struct InMemoryZone {
     cuts: HashSet<Name>,
     soa: Option<Rrset>,
     ns: Option<Rrset>,
-    /// NSEC-наборы, отсортированные по каноническому порядку владельцев.
-    nsec: Vec<(Name, Rrset)>,
+    /// NSEC-наборы по каноническому порядку владельцев.
+    nsec: BTreeMap<CanonicalName, Rrset>,
+    /// NSEC3-наборы по hashed-владельцу (декодированный hash).
+    nsec3: BTreeMap<Vec<u8>, Rrset>,
 }
 
 impl InMemoryZone {
@@ -90,7 +92,8 @@ impl InMemoryZone {
             cuts: HashSet::new(),
             soa: None,
             ns: None,
-            nsec: Vec::new(),
+            nsec: BTreeMap::new(),
+            nsec3: BTreeMap::new(),
         }
     }
 
@@ -163,21 +166,21 @@ impl InMemoryZone {
             }
         }
         let is_nsec = rrset.rr_type() == Rtype::NSEC;
-        let nsec_entry = is_nsec.then(|| (rrset.owner().clone(), rrset.clone()));
+        let nsec_owner = is_nsec.then(|| (CanonicalName(rrset.owner().clone()), rrset.clone()));
+        let nsec3_entry = if rrset.rr_type() == Rtype::NSEC3 {
+            nsec3_hash_of(rrset.owner()).map(|hash| (hash, rrset.clone()))
+        } else {
+            None
+        };
         self.rrsets
             .insert((rrset.owner().clone(), rrset.rr_type()), rrset);
-        if let Some((owner, nsec)) = nsec_entry {
-            self.insert_nsec(owner, nsec);
+        if let Some((owner, nsec)) = nsec_owner {
+            self.nsec.insert(owner, nsec);
+        }
+        if let Some((hash, nsec3)) = nsec3_entry {
+            self.nsec3.insert(hash, nsec3);
         }
         Ok(())
-    }
-
-    fn insert_nsec(&mut self, owner: Name, rrset: Rrset) {
-        self.nsec.retain(|(existing, _)| existing != &owner);
-        let position = self
-            .nsec
-            .partition_point(|(existing, _)| existing.cmp_canonical(&owner) == Ordering::Less);
-        self.nsec.insert(position, (owner, rrset));
     }
 
     fn register_node(&mut self, owner: &Name) {
@@ -326,26 +329,19 @@ impl ZoneView for InMemoryZone {
     }
 
     fn nsec_cover(&self, name: &Name) -> Option<Rrset> {
-        if self.nsec.is_empty() {
-            return None;
-        }
-        let position = self
+        let (owner, rrset) = self
             .nsec
-            .partition_point(|(owner, _)| owner.cmp_canonical(name) == Ordering::Less);
-        let candidate = if position == 0 {
-            self.nsec.last()
-        } else {
-            self.nsec.get(position - 1)
-        }?;
-        let (owner, rrset) = candidate;
-        if owner == name {
+            .range(..=CanonicalName(name.clone()))
+            .next_back()
+            .or_else(|| self.nsec.iter().next_back())?;
+        if &owner.0 == name {
             return None;
         }
         let next = rrset.rdatas().iter().find_map(|rdata| match rdata {
             Rdata::Nsec(nsec) => Some(nsec.next_domain()),
             _ => None,
         })?;
-        nsec_covers(owner, next, name).then(|| rrset.clone())
+        nsec_covers(&owner.0, next, name).then(|| rrset.clone())
     }
 
     fn denial(&self) -> DenialKind {
@@ -371,28 +367,50 @@ impl ZoneView for InMemoryZone {
     }
 
     fn nsec3_cover(&self, hash: &[u8]) -> Option<Rrset> {
-        for ((owner, rr_type), rrset) in &self.rrsets {
-            if *rr_type != Rtype::NSEC3 {
-                continue;
-            }
-            let Some(label) = owner.first_label() else {
-                continue;
-            };
-            let Ok(owner_hash) = pulse_dnssec::denial::base32hex::decode(label) else {
-                continue;
-            };
-            let Some(next) = rrset.rdatas().iter().find_map(|rdata| match rdata {
-                Rdata::Nsec3(data) => Some(data.next_hashed_owner()),
-                _ => None,
-            }) else {
-                continue;
-            };
-            if nsec3_covers(&owner_hash, next, hash) {
-                return Some(rrset.clone());
-            }
+        let (owner_hash, rrset) = self
+            .nsec3
+            .range(..=hash.to_vec())
+            .next_back()
+            .or_else(|| self.nsec3.iter().next_back())?;
+        if owner_hash.as_slice() == hash {
+            return None;
         }
-        None
+        let next = rrset.rdatas().iter().find_map(|rdata| match rdata {
+            Rdata::Nsec3(data) => Some(data.next_hashed_owner()),
+            _ => None,
+        })?;
+        nsec3_covers(owner_hash, next, hash).then(|| rrset.clone())
     }
+}
+
+/// Обёртка имени с `Ord` по каноническому порядку RFC 4034 §6.1.
+#[derive(Debug, Clone)]
+struct CanonicalName(Name);
+
+impl PartialEq for CanonicalName {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.cmp_canonical(&other.0) == Ordering::Equal
+    }
+}
+
+impl Eq for CanonicalName {}
+
+impl PartialOrd for CanonicalName {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CanonicalName {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.cmp_canonical(&other.0)
+    }
+}
+
+/// Декодирует hash из первой метки hashed-владельца NSEC3.
+fn nsec3_hash_of(owner: &Name) -> Option<Vec<u8>> {
+    let label = owner.first_label()?;
+    pulse_dnssec::denial::base32hex::decode(label).ok()
 }
 
 /// RFC 5155 §7.2: покрывает ли hash-интервал `(owner, next)` значение `hash`.

@@ -23,3 +23,11 @@ testkit = []
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "respond"
+harness = false
+
+[[bench]]
+name = "negative"
+harness = false

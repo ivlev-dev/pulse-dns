@@ -110,7 +110,7 @@ pub mod domain;
 pub mod testkit;
 
 pub use application::{
-    EngineConfig, NEGATIVE_TTL_CAP, QueryEngine, QueryError, QueryStats, StatsSnapshot, Transport,
-    ZoneView,
+    EncodedResponse, EngineConfig, NEGATIVE_TTL_CAP, QueryEngine, QueryError, QueryStats, Scratch,
+    StatsSnapshot, Transport, ZoneView,
 };
 pub use domain::{DenialKind, LookupOutcome, ZoneState};

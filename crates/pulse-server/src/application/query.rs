@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pulse_dns::{
-    Edns, EncodeError, EncodeOptions, Flags, MAX_MESSAGE_LEN, MAX_NAME_WIRE_LEN, Message, Name,
-    Opcode, Rclass, Rcode, Rdata, RdataError, Record, RecordError, Rrset, RrsetError, Rtype, Ttl,
-    TtlError,
+    Checkpoint, Edns, EncodeError, EncodeOptions, EncodeScratch, Encoder, Flags, HeaderCounts,
+    MAX_MESSAGE_LEN, MAX_NAME_WIRE_LEN, Message, Name, Opcode, Rclass, Rcode, Rdata, RdataError,
+    Record, RecordError, Rrset, RrsetError, Rtype, Ttl, TtlError, edns_wire_len,
 };
 use pulse_dnssec::{DenialLimits, Nsec3Params};
 use thiserror::Error;
@@ -55,6 +55,56 @@ pub enum Transport {
     Udp,
     /// TCP: ответ ограничен 65535 октетами, `TC` не выставляется.
     Tcp,
+}
+
+/// Переиспользуемое состояние построения ответа на поток.
+///
+/// Держите один экземпляр на worker-поток и передавайте его в
+/// [`QueryEngine::respond_into`]: таблица компрессии и вспомогательные
+/// коллекции (`visited`, `targets`, `seen`, `signatures`) не аллоцируются
+/// заново на каждый запрос.
+#[derive(Default)]
+pub struct Scratch {
+    encode: EncodeScratch,
+    visited: Vec<Name>,
+    targets: Vec<Name>,
+    seen: HashSet<(Name, Rtype)>,
+    signatures: HashSet<(Name, Rdata)>,
+}
+
+impl Scratch {
+    /// Создаёт пустое состояние.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Сбрасывает состояние перед новым ответом.
+    pub fn clear(&mut self) {
+        self.encode.clear();
+        self.visited.clear();
+        self.targets.clear();
+        self.seen.clear();
+        self.signatures.clear();
+    }
+}
+
+impl core::fmt::Debug for Scratch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Scratch")
+            .field("visited", &self.visited.len())
+            .field("targets", &self.targets.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Результат потокового кодирования ответа.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodedResponse {
+    /// Длина записанного сообщения в октетах.
+    pub len: usize,
+    /// Был ли ответ усечён по лимиту транспорта (`TC = 1`).
+    pub truncated: bool,
 }
 
 /// Ошибка построения ответа.
@@ -118,7 +168,9 @@ pub enum QueryError {
 /// каждый вызов [`QueryEngine::respond`] независим.
 pub struct QueryEngine {
     zones: Vec<Arc<dyn ZoneView>>,
-    zone_index: HashMap<Name, usize>,
+    /// Индекс origin'ов по несжатой wire-форме имени: поиск зоны идёт по
+    /// суффиксам QNAME без клонирования `Name`.
+    zone_index: HashMap<Vec<u8>, usize>,
     stats: Arc<QueryStats>,
     config: EngineConfig,
 }
@@ -156,7 +208,7 @@ impl QueryEngine {
     fn build(zones: Vec<Arc<dyn ZoneView>>, stats: Arc<QueryStats>, config: EngineConfig) -> Self {
         let mut zone_index = HashMap::with_capacity(zones.len());
         for (position, zone) in zones.iter().enumerate() {
-            zone_index.insert(zone.origin().clone(), position);
+            zone_index.insert(zone.origin().as_wire().to_vec(), position);
         }
         Self {
             zones,
@@ -282,28 +334,247 @@ impl QueryEngine {
                 Ok(message)
             }
             Transport::Tcp => {
-                let encoded = message.encode(&EncodeOptions::compressed())?;
-                if encoded.len() > MAX_MESSAGE_LEN {
-                    return Err(QueryError::Encode(EncodeError::MessageTooLong {
-                        len: encoded.len(),
-                    }));
-                }
+                // Точная длина вместо полного кодирования в `Vec`: тот же
+                // контракт (`MessageTooLong` при >65535), но без аллокации.
+                message.encoded_len()?;
                 Ok(message)
             }
         }
     }
 
-    fn find_zone(&self, qname: &Name) -> Option<&dyn ZoneView> {
-        let mut current = Some(qname.clone());
-        while let Some(candidate) = current {
-            if let Some(&position) = self.zone_index.get(&candidate)
-                && let Some(zone) = self.zones.get(position)
-            {
-                return Some(zone.as_ref());
-            }
-            current = candidate.parent();
+    /// Полностью собирает и кодирует ответ прямо в `out`, без промежуточных
+    /// [`Message`] и `Vec`.
+    ///
+    /// Внутренняя ошибка превращается в `SERVFAIL`, как и в
+    /// [`QueryEngine::respond`].
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError`], если не удалось записать даже `SERVFAIL` в `out`.
+    pub fn respond_into(
+        &self,
+        request: &Message,
+        transport: Transport,
+        out: &mut [u8],
+        scratch: &mut Scratch,
+    ) -> Result<usize, QueryError> {
+        if let Ok(response) = self.try_respond_into(request, transport, out, scratch) {
+            return Ok(response.len);
         }
-        None
+        self.stats.record_servfail();
+        Self::error_into(request, Rcode::SERVFAIL, out, &mut scratch.encode).map(|r| r.len)
+    }
+
+    /// Потоковая версия [`QueryEngine::try_respond`].
+    ///
+    /// Заголовок резервируется первым, записи пишутся в `out` по мере обхода
+    /// секций; при усечении (UDP) непоместившаяся запись откатывается вместе
+    /// со своими суффиксами компрессии. Для UDP `out` может быть равен
+    /// согласованному payload, для TCP — до [`MAX_MESSAGE_LEN`].
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError`], если данные зоны некорректны или ответ не кодируется.
+    #[allow(clippy::too_many_lines)]
+    pub fn try_respond_into(
+        &self,
+        request: &Message,
+        transport: Transport,
+        out: &mut [u8],
+        scratch: &mut Scratch,
+    ) -> Result<EncodedResponse, QueryError> {
+        self.stats.record_query();
+
+        if request.flags().qr() {
+            self.stats.record_formerr();
+            return Self::error_into(request, Rcode::FORMERR, out, &mut scratch.encode);
+        }
+        if request.opcode() != Opcode::QUERY {
+            self.stats.record_notimp();
+            return Self::error_into(request, Rcode::NOTIMP, out, &mut scratch.encode);
+        }
+        let Some(question) = request.questions().first() else {
+            self.stats.record_formerr();
+            return Self::error_into(request, Rcode::FORMERR, out, &mut scratch.encode);
+        };
+        if request.questions().len() != 1 {
+            self.stats.record_formerr();
+            return Self::error_into(request, Rcode::FORMERR, out, &mut scratch.encode);
+        }
+        if request.edns().is_some_and(|edns| edns.version() != 0) {
+            self.stats.record_badvers();
+            return Self::error_into(request, Rcode::BADVERS, out, &mut scratch.encode);
+        }
+        if is_transfer_meta_qtype(question.qtype()) {
+            self.stats.record_notimp();
+            return Self::error_into(request, Rcode::NOTIMP, out, &mut scratch.encode);
+        }
+
+        let qname = question.qname();
+        let qtype = question.qtype();
+        let Some(zone) = self.find_zone(qname) else {
+            self.stats.record_refused();
+            return Self::error_into(request, Rcode::REFUSED, out, &mut scratch.encode);
+        };
+        if zone.state() == ZoneState::Expired {
+            self.stats.record_servfail();
+            return Self::error_into(request, Rcode::SERVFAIL, out, &mut scratch.encode);
+        }
+        if zone.state() != ZoneState::Serving {
+            self.stats.record_refused();
+            return Self::error_into(request, Rcode::REFUSED, out, &mut scratch.encode);
+        }
+        let qclass = question.qclass();
+        if qclass != zone.class() && qclass != Rclass::ANY {
+            self.stats.record_refused();
+            return Self::error_into(request, Rcode::REFUSED, out, &mut scratch.encode);
+        }
+
+        let do_bit = request.edns().is_some_and(Edns::dnssec_ok);
+        let resolution = self.resolve_with(zone, qname, qtype, do_bit, &mut scratch.visited)?;
+        match resolution.status {
+            Status::NxDomain => self.stats.record_nxdomain(),
+            Status::NoData => self.stats.record_nodata(),
+            Status::Answer | Status::Referral | Status::YxDomain => {}
+        }
+
+        let rcode = status_rcode(resolution.status);
+        let flags = Flags::new()
+            .with_qr(true)
+            .with_opcode(request.opcode())
+            .with_rd(request.flags().rd())
+            .with_cd(request.flags().cd())
+            .with_aa(resolution.aa)
+            .with_ra(false)
+            .with_ad(false)
+            .with_tc(false)
+            .with_rcode_bits(rcode.header_bits());
+        let response_edns = request.edns().map(response_edns);
+        let opt_len = match &response_edns {
+            Some(edns) => edns_wire_len(edns)?,
+            None => 0,
+        };
+        let limit = match transport {
+            Transport::Udp => usize::from(
+                request
+                    .edns()
+                    .map_or(UDP_PAYLOAD_WITHOUT_EDNS, negotiated_payload),
+            ),
+            Transport::Tcp => MAX_MESSAGE_LEN,
+        };
+        let capacity = out.len().min(limit);
+        let question_count = u16::try_from(request.questions().len()).unwrap_or(u16::MAX);
+        let Some(buffer) = out.get_mut(..capacity) else {
+            return Err(QueryError::Encode(EncodeError::Internal {
+                reason: "response buffer range",
+            }));
+        };
+        let mut encoder = Encoder::new(buffer, EncodeOptions::compressed(), &mut scratch.encode);
+        encoder.begin_message(request.id())?;
+        for question in request.questions() {
+            encoder.write_question(question)?;
+        }
+        if encoder.len().saturating_add(opt_len) > capacity {
+            return Err(QueryError::BaseTooLarge {
+                limit: u16::try_from(capacity).unwrap_or(u16::MAX),
+            });
+        }
+        let budget = match transport {
+            Transport::Udp => capacity.saturating_sub(opt_len),
+            Transport::Tcp => capacity,
+        };
+
+        let mut sink = WireSink::new(encoder, transport, budget);
+        walk_response(
+            zone,
+            &resolution,
+            do_bit,
+            &mut sink,
+            &mut scratch.targets,
+            &mut scratch.seen,
+            &mut scratch.signatures,
+        )?;
+        let truncated = sink.truncated;
+        let answer_count = sink.answer_count;
+        let authority_count = sink.authority_count;
+        let additional_count = sink.additional_count;
+        let mut encoder = sink.into_encoder();
+        if let Some(edns) = &response_edns {
+            encoder.write_edns(edns)?;
+        }
+        let additional = additional_count.saturating_add(u16::from(response_edns.is_some()));
+        let len = encoder.finish(
+            flags.with_tc(truncated),
+            HeaderCounts {
+                question: question_count,
+                answer: answer_count,
+                authority: authority_count,
+                additional,
+            },
+        )?;
+        if truncated {
+            self.stats.record_truncated();
+        }
+        Ok(EncodedResponse { len, truncated })
+    }
+
+    fn error_into(
+        request: &Message,
+        rcode: Rcode,
+        out: &mut [u8],
+        scratch: &mut EncodeScratch,
+    ) -> Result<EncodedResponse, QueryError> {
+        let flags = Flags::new()
+            .with_qr(true)
+            .with_opcode(request.opcode())
+            .with_rd(request.flags().rd())
+            .with_cd(request.flags().cd())
+            .with_ra(false)
+            .with_aa(false)
+            .with_tc(false)
+            .with_rcode_bits(rcode.header_bits());
+        let edns = request
+            .edns()
+            .map(|edns| response_edns(edns).with_extended_rcode(rcode.extended_bits()));
+        let question_count = u16::from(!request.questions().is_empty());
+        let additional = u16::from(edns.is_some());
+        let mut encoder = Encoder::new(out, EncodeOptions::compressed(), scratch);
+        encoder.begin_message(request.id())?;
+        if let Some(question) = request.questions().first() {
+            encoder.write_question(question)?;
+        }
+        if let Some(edns) = &edns {
+            encoder.write_edns(edns)?;
+        }
+        let len = encoder.finish(
+            flags,
+            HeaderCounts {
+                question: question_count,
+                answer: 0,
+                authority: 0,
+                additional,
+            },
+        )?;
+        Ok(EncodedResponse {
+            len,
+            truncated: false,
+        })
+    }
+
+    fn find_zone(&self, qname: &Name) -> Option<&dyn ZoneView> {
+        let wire = qname.as_wire();
+        let mut position = 0_usize;
+        loop {
+            let suffix = wire.get(position..)?;
+            if let Some(&index) = self.zone_index.get(suffix) {
+                return self.zones.get(index).map(AsRef::as_ref);
+            }
+            let length = *suffix.first()?;
+            if length == 0 {
+                return None;
+            }
+            position = position.checked_add(1 + usize::from(length))?;
+        }
     }
 
     fn resolve(
@@ -313,6 +584,19 @@ impl QueryEngine {
         qtype: Rtype,
         do_bit: bool,
     ) -> Result<Resolution, QueryError> {
+        let mut visited = Vec::new();
+        self.resolve_with(zone, qname, qtype, do_bit, &mut visited)
+    }
+
+    fn resolve_with(
+        &self,
+        zone: &dyn ZoneView,
+        qname: &Name,
+        qtype: Rtype,
+        do_bit: bool,
+        visited: &mut Vec<Name>,
+    ) -> Result<Resolution, QueryError> {
+        visited.clear();
         if let Some(mut referral) = referral_for(zone, qname, qtype, do_bit)? {
             if matches!(referral.status, Status::NoData | Status::NxDomain) {
                 append_negative_soa(zone, &mut referral)?;
@@ -323,8 +607,7 @@ impl QueryEngine {
             return Ok(referral);
         }
         let mut resolution = Resolution::empty();
-        let mut visited = Vec::new();
-        self.resolve_name(zone, qname, qtype, 0, &mut visited, &mut resolution)?;
+        self.resolve_name(zone, qname, qtype, 0, visited, &mut resolution)?;
         if matches!(resolution.status, Status::NoData | Status::NxDomain) {
             append_negative_soa(zone, &mut resolution)?;
         }
@@ -557,94 +840,19 @@ impl QueryEngine {
         resolution: &Resolution,
         do_bit: bool,
     ) -> Result<(), QueryError> {
-        let signed = do_bit && zone.signed();
-        let mut signatures: HashSet<(Name, Rdata)> = HashSet::new();
-
-        for rrset in &resolution.answers {
-            let source = resolution
-                .signature_sources
-                .get(&(rrset.owner().clone(), rrset.rr_type()))
-                .unwrap_or(rrset.owner());
-            append_rrset(
-                message,
-                zone,
-                rrset,
-                Section::Answer,
-                signed,
-                Some(source),
-                &mut signatures,
-            )?;
-        }
-        for rrset in &resolution.authority {
-            append_rrset(
-                message,
-                zone,
-                rrset,
-                Section::Authority,
-                signed,
-                None,
-                &mut signatures,
-            )?;
-        }
-
-        let mut seen: HashSet<(Name, Rtype)> = resolution
-            .answers
-            .iter()
-            .chain(resolution.authority.iter())
-            .map(|rrset| (rrset.owner().clone(), rrset.rr_type()))
-            .collect();
-
-        let mut targets: Vec<Name> = Vec::new();
-        for rrset in &resolution.answers {
-            collect_targets(rrset, &mut targets);
-        }
-        targets.retain(|target| {
-            target.is_subdomain_of(zone.origin()) && find_delegation(zone, target).is_none()
-        });
-
-        // Referral: glue допустим только для имён внутри этого же cut
-        // (bailiwick). Цель ниже другого cut — не наши данные.
-        let mut referral_targets: Vec<Name> = Vec::new();
-        for rrset in &resolution.authority {
-            if rrset.rr_type() != Rtype::NS {
-                continue;
-            }
-            let cut = rrset.owner();
-            let mut candidates = Vec::new();
-            collect_targets(rrset, &mut candidates);
-            for target in candidates {
-                if !target.is_subdomain_of(zone.origin()) {
-                    continue;
-                }
-                match find_delegation(zone, &target) {
-                    None => referral_targets.push(target),
-                    Some(delegation) if delegation == *cut => referral_targets.push(target),
-                    Some(_) => {}
-                }
-            }
-        }
-        targets.extend(referral_targets);
-        targets.sort_by(Name::cmp_canonical);
-        targets.dedup();
-
-        for target in targets {
-            for glue in zone.glue(&target) {
-                let key = (glue.owner().clone(), glue.rr_type());
-                if !seen.insert(key) {
-                    continue;
-                }
-                append_rrset(
-                    message,
-                    zone,
-                    &glue,
-                    Section::Additional,
-                    signed,
-                    None,
-                    &mut signatures,
-                )?;
-            }
-        }
-        Ok(())
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+        let mut signatures = HashSet::new();
+        let mut sink = MessageSink { message };
+        walk_response(
+            zone,
+            resolution,
+            do_bit,
+            &mut sink,
+            &mut targets,
+            &mut seen,
+            &mut signatures,
+        )
     }
 
     fn error_response(request: &Message, rcode: Rcode) -> Message {
@@ -700,25 +908,279 @@ impl Section {
     }
 }
 
+/// Продолжать ли обход после текущей записи.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Stop,
+}
+
+/// Приёмник записей ответа: либо в [`Message`], либо сразу в wire-буфер.
+trait RecordSink {
+    fn push(
+        &mut self,
+        section: Section,
+        owner: &Name,
+        rr_type: Rtype,
+        class: Rclass,
+        ttl: Ttl,
+        rdata: &Rdata,
+    ) -> Result<Flow, QueryError>;
+}
+
+/// Приёмник для прежнего API [`QueryEngine::respond`] (собирает [`Message`]).
+struct MessageSink<'a> {
+    message: &'a mut Message,
+}
+
+impl RecordSink for MessageSink<'_> {
+    fn push(
+        &mut self,
+        section: Section,
+        owner: &Name,
+        rr_type: Rtype,
+        class: Rclass,
+        ttl: Ttl,
+        rdata: &Rdata,
+    ) -> Result<Flow, QueryError> {
+        let record = Record::new(owner.clone(), rr_type, class, ttl, rdata.clone())?;
+        section.add(self.message, record);
+        Ok(Flow::Continue)
+    }
+}
+
+/// Приёмник для [`QueryEngine::respond_into`]: пишет прямо в буфер и
+/// откатывает записи, не поместившиеся в лимит UDP.
+struct WireSink<'a> {
+    encoder: Encoder<'a>,
+    transport: Transport,
+    budget: usize,
+    truncated: bool,
+    group_start: Checkpoint,
+    group_key: Option<(Name, Rtype)>,
+    answer_count: u16,
+    authority_count: u16,
+    additional_count: u16,
+}
+
+impl<'a> WireSink<'a> {
+    fn new(encoder: Encoder<'a>, transport: Transport, budget: usize) -> Self {
+        let group_start = encoder.checkpoint();
+        Self {
+            encoder,
+            transport,
+            budget,
+            truncated: false,
+            group_start,
+            group_key: None,
+            answer_count: 0,
+            authority_count: 0,
+            additional_count: 0,
+        }
+    }
+
+    fn into_encoder(self) -> Encoder<'a> {
+        self.encoder
+    }
+}
+
+impl RecordSink for WireSink<'_> {
+    fn push(
+        &mut self,
+        section: Section,
+        owner: &Name,
+        rr_type: Rtype,
+        class: Rclass,
+        ttl: Ttl,
+        rdata: &Rdata,
+    ) -> Result<Flow, QueryError> {
+        let checkpoint = self.encoder.checkpoint();
+        if section == Section::Additional {
+            // Усечение additional — по группам `(owner, type)`.
+            let same_group = self
+                .group_key
+                .as_ref()
+                .is_some_and(|(name, ty)| name == owner && *ty == rr_type);
+            if !same_group {
+                self.group_key = Some((owner.clone(), rr_type));
+                self.group_start = checkpoint;
+            }
+        }
+        let rollback_to = if section == Section::Additional {
+            self.group_start
+        } else {
+            checkpoint
+        };
+        match self.encoder.write_rr(owner, rr_type, class, ttl, rdata) {
+            Ok(()) => {}
+            Err(EncodeError::BufferTooSmall { .. }) if self.transport == Transport::Udp => {
+                self.encoder.rollback(rollback_to);
+                if section != Section::Additional {
+                    self.truncated = true;
+                }
+                return Ok(Flow::Stop);
+            }
+            Err(error) => return Err(QueryError::Encode(error)),
+        }
+        if self.transport == Transport::Udp && self.encoder.len() > self.budget {
+            self.encoder.rollback(rollback_to);
+            if section != Section::Additional {
+                self.truncated = true;
+            }
+            return Ok(Flow::Stop);
+        }
+        match section {
+            Section::Answer => self.answer_count = self.answer_count.saturating_add(1),
+            Section::Authority => {
+                self.authority_count = self.authority_count.saturating_add(1);
+            }
+            Section::Additional => {
+                self.additional_count = self.additional_count.saturating_add(1);
+            }
+        }
+        Ok(Flow::Continue)
+    }
+}
+
+/// Обходит секции ответа в wire-порядке: answer, authority, additional/glue.
+///
+/// Логика композиции (RRSIG, dedup, сортировка glue) общая для [`Message`] и
+/// потокового энкодера; различается только приёмник записей.
+fn walk_response(
+    zone: &dyn ZoneView,
+    resolution: &Resolution,
+    do_bit: bool,
+    sink: &mut dyn RecordSink,
+    targets: &mut Vec<Name>,
+    seen: &mut HashSet<(Name, Rtype)>,
+    signatures: &mut HashSet<(Name, Rdata)>,
+) -> Result<(), QueryError> {
+    let signed = do_bit && zone.signed();
+    signatures.clear();
+    targets.clear();
+    seen.clear();
+
+    for rrset in &resolution.answers {
+        let source = resolution
+            .signature_sources
+            .get(&(rrset.owner().clone(), rrset.rr_type()))
+            .unwrap_or(rrset.owner());
+        if append_rrset(
+            sink,
+            zone,
+            rrset,
+            Section::Answer,
+            signed,
+            Some(source),
+            signatures,
+        )? == Flow::Stop
+        {
+            return Ok(());
+        }
+    }
+    for rrset in &resolution.authority {
+        if append_rrset(
+            sink,
+            zone,
+            rrset,
+            Section::Authority,
+            signed,
+            None,
+            signatures,
+        )? == Flow::Stop
+        {
+            return Ok(());
+        }
+    }
+
+    for rrset in &resolution.answers {
+        collect_targets(rrset, targets);
+    }
+    targets.retain(|target| {
+        target.is_subdomain_of(zone.origin()) && find_delegation(zone, target).is_none()
+    });
+
+    // Referral: glue допустим только для имён внутри этого же cut
+    // (bailiwick). Цель ниже другого cut — не наши данные.
+    let mut referral_targets: Vec<Name> = Vec::new();
+    for rrset in &resolution.authority {
+        if rrset.rr_type() != Rtype::NS {
+            continue;
+        }
+        let cut = rrset.owner();
+        let mut candidates = Vec::new();
+        collect_targets(rrset, &mut candidates);
+        for target in candidates {
+            if !target.is_subdomain_of(zone.origin()) {
+                continue;
+            }
+            match find_delegation(zone, &target) {
+                None => referral_targets.push(target),
+                Some(delegation) if delegation == *cut => referral_targets.push(target),
+                Some(_) => {}
+            }
+        }
+    }
+    targets.extend(referral_targets);
+    targets.sort_by(Name::cmp_canonical);
+    targets.dedup();
+
+    for rrset in resolution.answers.iter().chain(resolution.authority.iter()) {
+        seen.insert((rrset.owner().clone(), rrset.rr_type()));
+    }
+
+    for target in targets.iter() {
+        for glue in zone.glue(target) {
+            let key = (glue.owner().clone(), glue.rr_type());
+            if !seen.insert(key) {
+                continue;
+            }
+            if append_rrset(
+                sink,
+                zone,
+                &glue,
+                Section::Additional,
+                signed,
+                None,
+                signatures,
+            )? == Flow::Stop
+            {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Добавляет RRset и (при `DO = 1`) его `RRSIG`.
 ///
 /// `signature_owner` задаёт имя, под которым подписи хранятся в зоне; для
 /// wildcard-развёрнутого ответа это `*.closest-encloser`, а записи
 /// переименовываются в QNAME (RFC 4035 §5.3.2).
 fn append_rrset(
-    message: &mut Message,
+    sink: &mut dyn RecordSink,
     zone: &dyn ZoneView,
     rrset: &Rrset,
     section: Section,
     signed: bool,
     signature_owner: Option<&Name>,
     signatures: &mut HashSet<(Name, Rdata)>,
-) -> Result<(), QueryError> {
-    for record in rrset_records(rrset)? {
-        section.add(message, record);
+) -> Result<Flow, QueryError> {
+    for rdata in rrset.rdatas() {
+        if sink.push(
+            section,
+            rrset.owner(),
+            rrset.rr_type(),
+            rrset.class(),
+            rrset.ttl(),
+            rdata,
+        )? == Flow::Stop
+        {
+            return Ok(Flow::Stop);
+        }
     }
     if !signed || rrset.rr_type() == Rtype::RRSIG {
-        return Ok(());
+        return Ok(Flow::Continue);
     }
     let source = signature_owner.unwrap_or_else(|| rrset.owner());
     for signatures_rrset in zone.lookup_all_rrsig(source, rrset.rr_type()) {
@@ -727,14 +1189,23 @@ fn append_rrset(
         } else {
             reowner(&signatures_rrset, rrset.owner())?
         };
-        for record in rrset_records(&signatures_rrset)? {
-            let key = (record.owner().clone(), record.rdata().clone());
-            if signatures.insert(key) {
-                section.add(message, record);
+        for rdata in signatures_rrset.rdatas() {
+            let key = (signatures_rrset.owner().clone(), rdata.clone());
+            if signatures.insert(key)
+                && sink.push(
+                    section,
+                    signatures_rrset.owner(),
+                    signatures_rrset.rr_type(),
+                    signatures_rrset.class(),
+                    signatures_rrset.ttl(),
+                    rdata,
+                )? == Flow::Stop
+            {
+                return Ok(Flow::Stop);
             }
         }
     }
-    Ok(())
+    Ok(Flow::Continue)
 }
 
 /// Добавляет denial-доказательство к негативному или wildcard-ответу.
@@ -1239,20 +1710,6 @@ fn append_negative_soa(zone: &dyn ZoneView, resolution: &mut Resolution) -> Resu
     Ok(())
 }
 
-fn rrset_records(rrset: &Rrset) -> Result<Vec<Record>, QueryError> {
-    let mut records = Vec::with_capacity(rrset.len());
-    for rdata in rrset.rdatas() {
-        records.push(Record::new(
-            rrset.owner().clone(),
-            rrset.rr_type(),
-            rrset.class(),
-            rrset.ttl(),
-            rdata.clone(),
-        )?);
-    }
-    Ok(records)
-}
-
 fn collect_targets(rrset: &Rrset, targets: &mut Vec<Name>) {
     match rrset.rr_type() {
         Rtype::NS => {
@@ -1376,8 +1833,10 @@ fn additional_groups(records: &[Record]) -> Vec<Vec<Record>> {
 }
 
 fn fits(message: &Message, limit: u16) -> Result<bool, QueryError> {
-    match message.encode(&EncodeOptions::compressed()) {
-        Ok(encoded) => Ok(encoded.len() <= usize::from(limit)),
+    // Точная длина без записи байтов: усечение больше не аллоцирует `Vec`
+    // на каждую пробную запись.
+    match message.encoded_len() {
+        Ok(len) => Ok(len <= usize::from(limit)),
         Err(EncodeError::MessageTooLong { .. }) => Ok(false),
         Err(error) => Err(QueryError::Encode(error)),
     }

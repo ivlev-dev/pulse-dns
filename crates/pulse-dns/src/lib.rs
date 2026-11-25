@@ -58,6 +58,7 @@ pub use domain::{
     SvcbData, TTL_MAX, TlsaData, Ttl, TtlError, TxtData, TypeBitmap, name_cmp,
 };
 pub use wire::{
-    DecodeError, DecodeLimits, EDNS_DEFAULT_PAYLOAD, EDNS_MAX_PAYLOAD, EncodeError, EncodeOptions,
-    MAX_COMPRESSION_POINTERS, MAX_MESSAGE_LEN, MAX_RECORDS, MAX_UDP_PAYLOAD,
+    Checkpoint, DecodeError, DecodeLimits, EDNS_DEFAULT_PAYLOAD, EDNS_MAX_PAYLOAD, EncodeError,
+    EncodeOptions, EncodeScratch, Encoder, HeaderCounts, MAX_COMPRESSION_POINTERS, MAX_MESSAGE_LEN,
+    MAX_RECORDS, MAX_UDP_PAYLOAD, edns_wire_len,
 };

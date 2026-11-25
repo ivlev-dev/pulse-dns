@@ -20,6 +20,8 @@ pub(crate) mod decode;
 pub(crate) mod encode;
 pub(crate) mod rdata;
 
+pub use encode::{Checkpoint, EncodeScratch, Encoder, HeaderCounts, edns_wire_len};
+
 /// Максимальная длина DNS-сообщения (TCP, RFC 1035 §4.2.2).
 pub const MAX_MESSAGE_LEN: usize = 65_535;
 /// Максимальное число указателей сжатия в одной цепочке (SEC-DNS-002).
@@ -237,6 +239,14 @@ pub enum EncodeError {
         declared: Rtype,
         /// Тип RDATA.
         actual: Rtype,
+    },
+    /// Целевой срез меньше, чем нужно для сообщения.
+    #[error("buffer of {capacity} octets is too small (needs at least {needed})")]
+    BufferTooSmall {
+        /// Размер переданного буфера.
+        capacity: usize,
+        /// Минимальная требуемая длина (нижняя оценка на момент отказа).
+        needed: usize,
     },
     /// Ошибка записи в целевой поток.
     #[error("i/o error while writing message: {0}")]

@@ -92,6 +92,10 @@ struct Signed {
 }
 
 fn sign_nsec3(salt: &[u8], iterations: u16) -> Signed {
+    sign_nsec3_config(salt, iterations, false)
+}
+
+fn sign_nsec3_config(salt: &[u8], iterations: u16, opt_out: bool) -> Signed {
     let origin = name("example.com");
     let signer = ZoneSigner::new(
         vec![
@@ -105,9 +109,10 @@ fn sign_nsec3(salt: &[u8], iterations: u16) -> Signed {
         300,
     )
     .expect("signer");
-    let policy = DenialPolicy::Nsec3(
-        Nsec3Config::new(salt.to_vec(), iterations).expect("valid NSEC3 config"),
-    );
+    let config = Nsec3Config::new(salt.to_vec(), iterations)
+        .expect("valid NSEC3 config")
+        .with_opt_out(opt_out);
+    let policy = DenialPolicy::Nsec3(config);
     let signed_zone = signer
         .sign_zone_with(&origin, &zone_data(), 1_700_000_000, &policy)
         .expect("sign NSEC3 zone");
@@ -340,6 +345,44 @@ fn nsec3_positive_and_negative_answers_validate() {
             .chain(response.authority())
             .all(|record| record.rr_type() != Rtype::RRSIG && record.rr_type() != Rtype::NSEC3)
     );
+}
+
+#[test]
+fn nsec3_opt_out_proves_insecure_delegation() {
+    let signed = sign_nsec3_config(&[0x33, 0x44], 0, true);
+    let engine = QueryEngine::new(vec![Arc::new(signed.zone.clone())]);
+    let origin = name("example.com");
+    let cut = name("sub.example.com");
+
+    // DS-NODATA в insecure cut: точного NSEC3 нет, доказываем CE + cover
+    // с opt-out.
+    let response = query(&engine, "sub.example.com.", Rtype::DS, true);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    let proofs = nsec3_proofs(response.authority());
+    assert!(
+        proofs.iter().any(Nsec3Proof::opt_out),
+        "opt-out flag must be set on the covering NSEC3"
+    );
+    let outcome = nsec3_ds_nodata(&cut, &origin, &proofs, DenialLimits::new())
+        .expect("NSEC3 opt-out DS-NODATA proof");
+    assert_eq!(outcome.outcome, DenialOutcome::NoData);
+    assert!(!outcome.is_secure(), "opt-out delegation is insecure");
+
+    // Referral ниже cut доказывает то же самое.
+    let response = query(&engine, "host.sub.example.com.", Rtype::A, true);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    assert!(
+        response
+            .authority()
+            .iter()
+            .any(|record| record.rr_type() == Rtype::NS),
+        "referral expected"
+    );
+    let proofs = nsec3_proofs(response.authority());
+    let outcome = nsec3_ds_nodata(&cut, &origin, &proofs, DenialLimits::new())
+        .expect("NSEC3 opt-out referral proof");
+    assert_eq!(outcome.outcome, DenialOutcome::NoData);
+    assert!(!outcome.is_secure(), "opt-out referral is insecure");
 }
 
 #[test]

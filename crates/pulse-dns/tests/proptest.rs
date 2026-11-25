@@ -357,6 +357,38 @@ proptest! {
     }
 
     #[test]
+    fn encode_into_matches_encode(message in message()) {
+        let expected = message.encode(&EncodeOptions::default()).unwrap();
+        let mut out = vec![0_u8; expected.len()];
+        let len = message.encode_into(&mut out).unwrap();
+        prop_assert_eq!(len, expected.len());
+        prop_assert_eq!(out, expected);
+        prop_assert_eq!(message.encoded_len().unwrap(), len);
+    }
+
+    #[test]
+    fn encode_into_matches_encode_with_complex_rdata(
+        rdata in complex_rdata(),
+        ttl in 0_u32..=TTL_MAX,
+    ) {
+        let record = Record::new(
+            Name::parse("example.com").unwrap(),
+            rdata.rr_type(),
+            Rclass::IN,
+            Ttl::new(ttl).unwrap(),
+            rdata,
+        )
+        .unwrap();
+        let mut message = Message::query(1, Question::new(Name::root(), Rtype::A, Rclass::IN));
+        message.add_answer(record);
+        let expected = message.encode(&EncodeOptions::default()).unwrap();
+        let mut out = vec![0_u8; expected.len()];
+        let len = message.encode_into(&mut out).unwrap();
+        prop_assert_eq!(len, expected.len());
+        prop_assert_eq!(out, expected);
+    }
+
+    #[test]
     fn complex_rdata_roundtrip(
         rdata in complex_rdata(),
         ttl in 0_u32..=TTL_MAX,
