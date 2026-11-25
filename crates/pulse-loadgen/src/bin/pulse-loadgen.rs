@@ -106,6 +106,20 @@ struct Args {
     /// JSON-файл результата.
     #[arg(long)]
     json_out: Option<PathBuf>,
+    /// CPU клиентских потоков (например `1,3,5,7`). Проверяется против
+    /// `sched_getaffinity`; потоки пиннятся round-robin.
+    #[arg(long)]
+    client_cpus: Option<String>,
+    /// CPU серверного процесса (информационно: `pulse-loadgen` не запускает
+    /// сервер; для пиннинга сервера используйте `pulse-bench --server-cpus`).
+    #[arg(long)]
+    server_cpus: Option<String>,
+    /// CPU REST-писателей; по умолчанию — вторая половина `--client-cpus`.
+    #[arg(long)]
+    rest_cpus: Option<String>,
+    /// Добавлять EDNS0 DO в запросы (ответы DNSSEC-подписанной зоны).
+    #[arg(long)]
+    dnssec_do: bool,
     /// Не печатать human-таблицу.
     #[arg(long)]
     quiet: bool,
@@ -131,8 +145,67 @@ impl From<ModeArg> for Mode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<(), String> {
     let args = Args::parse();
+    if args.server_cpus.is_some() {
+        eprintln!(
+            "pulse-loadgen: --server-cpus не применяется этим бинарником \
+             (сервер не запускается); используйте pulse-bench --server-cpus"
+        );
+    }
+    let allowed = pulse_loadgen::affinity::allowed_cpus()?;
+    let client_cpus = args
+        .client_cpus
+        .as_deref()
+        .map(pulse_loadgen::affinity::CpuSet::parse)
+        .transpose()?;
+    if let Some(cpus) = &client_cpus {
+        for cpu in cpus.cpus() {
+            if !allowed.contains(*cpu) {
+                return Err(format!(
+                    "--client-cpus: CPU {cpu} вне allowed {}",
+                    allowed.as_list()
+                ));
+            }
+        }
+    }
+    if let Some(rest) = &args.rest_cpus {
+        for cpu in pulse_loadgen::affinity::CpuSet::parse(rest)?.cpus() {
+            if !allowed.contains(*cpu) {
+                return Err(format!(
+                    "--rest-cpus: CPU {cpu} вне allowed {}",
+                    allowed.as_list()
+                ));
+            }
+        }
+    }
+    let (dns_cpus, rest_cpus) = match (&client_cpus, &args.rest_cpus) {
+        (Some(set), Some(rest)) => (
+            Some(set.cpus().to_vec()),
+            Some(
+                pulse_loadgen::affinity::CpuSet::parse(rest)?
+                    .cpus()
+                    .to_vec(),
+            ),
+        ),
+        (Some(set), None) => {
+            let (dns, rest) = set.split_at_half();
+            (
+                Some(dns.cpus().to_vec()),
+                (!rest.is_empty()).then(|| rest.cpus().to_vec()),
+            )
+        }
+        (None, Some(rest)) => (
+            None,
+            Some(
+                pulse_loadgen::affinity::CpuSet::parse(rest)?
+                    .cpus()
+                    .to_vec(),
+            ),
+        ),
+        (None, None) => (None, None),
+    };
     let mix = Mix::parse(&args.mix)?;
     let mode: Mode = args.mode.into();
     let qps = args.qps.filter(|qps| *qps > 0.0);
@@ -144,6 +217,7 @@ fn main() -> Result<(), String> {
         rate: args.rest_rate,
         timeout: Duration::from_secs(5),
         tag: String::new(),
+        cpus: rest_cpus,
     });
     let config = ClientConfig {
         target: args.server,
@@ -165,6 +239,8 @@ fn main() -> Result<(), String> {
         validate_every: args.validate_every,
         rest,
         max_inflight: args.max_inflight,
+        cpus: dns_cpus,
+        edns_do: args.dnssec_do,
     };
     let result = match mode {
         Mode::Udp => pulse_loadgen::udp::run(&config)?,

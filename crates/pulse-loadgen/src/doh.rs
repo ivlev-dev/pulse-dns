@@ -86,6 +86,7 @@ pub fn run(config: &ClientConfig) -> Result<RunResult, String> {
         config.mix,
         config.working_set,
         config.seed,
+        config.edns_do,
     )?);
     let tls = match &config.ca {
         Some(path) => ClientTlsConfig::with_ca_file(path, b"h2")
@@ -96,9 +97,7 @@ pub fn run(config: &ClientConfig) -> Result<RunResult, String> {
     let host = crate::sysinfo::host_info();
     let warmup = phase(config, &queries, &tls, config.warmup);
     let before = crate::sysinfo::snapshot();
-    let started = Instant::now();
     let mut stats = phase(config, &queries, &tls, config.duration);
-    let elapsed = started.elapsed();
     let after = crate::sysinfo::snapshot();
     let merged_histogram = stats.histogram.take().unwrap_or_else(histogram);
     let latency = crate::report::latency_from_hist(&merged_histogram, 1.0);
@@ -117,7 +116,7 @@ pub fn run(config: &ClientConfig) -> Result<RunResult, String> {
             },
         );
     }
-    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    let seconds = config.duration.as_secs_f64().max(f64::EPSILON);
     #[allow(clippy::cast_precision_loss)]
     let client_qps = stats.received as f64 / seconds;
     Ok(RunResult {
@@ -162,6 +161,11 @@ fn phase(
             let queries = Arc::clone(queries);
             let tls = tls.clone();
             handles.push(scope.spawn(move || {
+                if let Some(cpus) = config.cpus.as_deref()
+                    && let Err(error) = crate::affinity::pin_thread(cpus, thread)
+                {
+                    eprintln!("pulse-loadgen: doh thread {thread} affinity: {error}");
+                }
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()

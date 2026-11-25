@@ -20,7 +20,9 @@ dhat = { version = "0.3", optional = true }
 h2 = "0.4"
 hdrhistogram = "7.6"
 http = "1"
+libc = "0.2"
 pulse-dns = { path = "../pulse-dns" }
+pulse-dnssec = { path = "../pulse-dnssec" }
 pulse-tls = { path = "../pulse-tls" }
 pulse-zonefile = { path = "../pulse-zonefile" }
 pulsed = { path = "../pulsed" }

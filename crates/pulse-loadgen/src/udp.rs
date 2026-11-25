@@ -97,6 +97,7 @@ pub fn run(config: &ClientConfig) -> Result<RunResult, String> {
         config.mix,
         config.working_set,
         config.seed,
+        config.edns_do,
     )?);
     let host = crate::sysinfo::host_info();
     // Прогрев: page cache, TCP/TLS-handshake, аллокатор сервера.
@@ -104,9 +105,7 @@ pub fn run(config: &ClientConfig) -> Result<RunResult, String> {
 
     let rest = config.rest.as_ref().map(crate::rest::RestHandle::start);
     let before = crate::sysinfo::snapshot();
-    let started = Instant::now();
     let mut stats = phase(config, &queries, config.duration);
-    let elapsed = started.elapsed();
     let rest_result = rest.map(crate::rest::RestHandle::finish);
     let after = crate::sysinfo::snapshot();
 
@@ -127,7 +126,9 @@ pub fn run(config: &ClientConfig) -> Result<RunResult, String> {
             },
         );
     }
-    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    // Знаменатель — окно измерения, без хвостового drain (он может ждать
+    // потерянные ответы до timeout и занижать qps).
+    let seconds = config.duration.as_secs_f64().max(f64::EPSILON);
     #[allow(clippy::cast_precision_loss)]
     let client_qps = stats.received as f64 / seconds;
     Ok(RunResult {
@@ -166,6 +167,11 @@ fn phase(config: &ClientConfig, queries: &Arc<QuerySet>, duration: Duration) -> 
         for thread in 0..threads {
             let queries = Arc::clone(queries);
             handles.push(scope.spawn(move || {
+                if let Some(cpus) = config.cpus.as_deref()
+                    && let Err(error) = crate::affinity::pin_thread(cpus, thread)
+                {
+                    eprintln!("pulse-loadgen: udp thread {thread} affinity: {error}");
+                }
                 match run_thread(config, thread, &queries, deadline) {
                     Ok(stats) => stats,
                     Err(error) => {

@@ -203,6 +203,9 @@ pub struct HostInfo {
     pub loadavg: [f64; 3],
     /// SMT siblings (например `0-1`).
     pub smt: String,
+    /// SMT-группы: `core0: 0-1, core1: 2-3, ...`.
+    #[serde(default)]
+    pub siblings: Vec<String>,
     /// Имя хоста.
     pub hostname: String,
 }
@@ -234,6 +237,10 @@ pub fn host_info() -> HostInfo {
     let smt = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list")
         .map(|text| text.trim().to_owned())
         .unwrap_or_default();
+    let siblings = crate::affinity::topology()
+        .iter()
+        .map(|group| group.cpus.as_list())
+        .collect();
     let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|text| text.trim().to_owned())
         .unwrap_or_default();
@@ -243,6 +250,7 @@ pub fn host_info() -> HostInfo {
         kernel,
         loadavg,
         smt,
+        siblings,
         hostname,
     }
 }
@@ -250,13 +258,31 @@ pub fn host_info() -> HostInfo {
 /// CPU-тики процесса (`utime + stime`) из `/proc/<pid>/stat`.
 #[must_use]
 pub fn process_cpu_ticks(pid: u32) -> Option<u64> {
+    let (user, system) = process_cpu_ticks_split(pid)?;
+    Some(user.saturating_add(system))
+}
+
+/// `utime`/`stime` процесса в тиках из `/proc/<pid>/stat`.
+#[must_use]
+pub fn process_cpu_ticks_split(pid: u32) -> Option<(u64, u64)> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let close = text.rfind(')')?;
     let fields: Vec<&str> = text.get(close + 1..)?.split_whitespace().collect();
     // После comm и state: utime — 12-е поле из остатка (state=0).
     let utime: u64 = fields.get(11)?.parse().ok()?;
     let stime: u64 = fields.get(12)?.parse().ok()?;
-    Some(utime.saturating_add(stime))
+    Some((utime, stime))
+}
+
+/// `VmRSS` процесса, КиБ.
+#[must_use]
+pub fn process_rss_kb(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
 }
 
 /// `CLK_TCK` (на Linux почти всегда 100; читается из `getconf`).

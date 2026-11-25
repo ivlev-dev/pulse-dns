@@ -94,18 +94,17 @@ pub fn run_tcp(config: &ClientConfig) -> Result<RunResult, String> {
         config.mix,
         config.working_set,
         config.seed,
+        config.edns_do,
     )?);
     let host = crate::sysinfo::host_info();
     let warmup = phase_tcp(config, &queries, config.warmup);
     let rest = config.rest.as_ref().map(crate::rest::RestHandle::start);
     let before = crate::sysinfo::snapshot();
-    let started = Instant::now();
     let mut stats = phase_tcp(config, &queries, config.duration);
-    let elapsed = started.elapsed();
     let rest = rest.map(crate::rest::RestHandle::finish);
     let after = crate::sysinfo::snapshot();
     Ok(build_result(
-        config, &mut stats, elapsed, &before, &after, host, rest, &warmup,
+        config, &mut stats, &before, &after, host, rest, &warmup,
     ))
 }
 
@@ -121,18 +120,17 @@ pub fn run_dot(config: &ClientConfig) -> Result<RunResult, String> {
         config.mix,
         config.working_set,
         config.seed,
+        config.edns_do,
     )?);
     let host = crate::sysinfo::host_info();
     let warmup = phase_dot(config, &queries, config.warmup)?;
     let rest = config.rest.as_ref().map(crate::rest::RestHandle::start);
     let before = crate::sysinfo::snapshot();
-    let started = Instant::now();
     let mut stats = phase_dot(config, &queries, config.duration)?;
-    let elapsed = started.elapsed();
     let rest = rest.map(crate::rest::RestHandle::finish);
     let after = crate::sysinfo::snapshot();
     Ok(build_result(
-        config, &mut stats, elapsed, &before, &after, host, rest, &warmup,
+        config, &mut stats, &before, &after, host, rest, &warmup,
     ))
 }
 
@@ -140,7 +138,6 @@ pub fn run_dot(config: &ClientConfig) -> Result<RunResult, String> {
 fn build_result(
     config: &ClientConfig,
     stats: &mut Stats,
-    elapsed: Duration,
     before: &(
         crate::sysinfo::UdpCounters,
         Option<std::collections::BTreeMap<String, u64>>,
@@ -170,7 +167,7 @@ fn build_result(
             },
         );
     }
-    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    let seconds = config.duration.as_secs_f64().max(f64::EPSILON);
     #[allow(clippy::cast_precision_loss)]
     let client_qps = stats.received as f64 / seconds;
     RunResult {
@@ -208,7 +205,14 @@ fn phase_tcp(config: &ClientConfig, queries: &Arc<QuerySet>, duration: Duration)
         let mut handles = Vec::with_capacity(threads);
         for thread in 0..threads {
             let queries = Arc::clone(queries);
-            handles.push(scope.spawn(move || tcp_thread(config, thread, &queries, deadline)));
+            handles.push(scope.spawn(move || {
+                if let Some(cpus) = config.cpus.as_deref()
+                    && let Err(error) = crate::affinity::pin_thread(cpus, thread)
+                {
+                    eprintln!("pulse-loadgen: tcp thread {thread} affinity: {error}");
+                }
+                tcp_thread(config, thread, &queries, deadline)
+            }));
         }
         for handle in handles {
             if let Ok(stats) = handle.join() {
@@ -374,6 +378,11 @@ fn phase_dot(
             let server_name = config.server_name.clone();
             let target = config.target;
             handles.push(scope.spawn(move || {
+                if let Some(cpus) = config.cpus.as_deref()
+                    && let Err(error) = crate::affinity::pin_thread(cpus, thread)
+                {
+                    eprintln!("pulse-loadgen: dot thread {thread} affinity: {error}");
+                }
                 let client = DotClient::from_addr_with_tls(target, &server_name, tls);
                 match client {
                     Ok(client) => dot_thread(config, thread, &queries, deadline, &client),

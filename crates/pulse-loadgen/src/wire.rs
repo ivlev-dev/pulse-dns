@@ -5,7 +5,7 @@
 //! header-only (ID/QR/RCODE) — без аллокаций; каждая N-я выборка проверяется
 //! полным `decode` и сверкой вопроса.
 
-use pulse_dns::{DecodeLimits, EncodeOptions, Message, Name, Question, Rclass, Rtype};
+use pulse_dns::{DecodeLimits, Edns, EncodeOptions, Message, Name, Question, Rclass, Rtype};
 
 use crate::mix::{Class, Mix, Rng};
 
@@ -45,6 +45,7 @@ impl QuerySet {
         mix: Mix,
         working_set: usize,
         seed: u64,
+        dnssec_do: bool,
     ) -> Result<Self, String> {
         let zones = zones.max(1);
         let rrsets = rrsets_per_zone.max(4);
@@ -56,7 +57,7 @@ impl QuerySet {
             let zone = rng.below(u64::from(zones));
             let packet = if class == Class::Nx {
                 let name = format!("nx{}.z{zone}.bench.test.", rng.below(u64::from(rrsets)));
-                build_packet(class, &name, Rtype::A)?
+                build_packet(class, &name, Rtype::A, dnssec_do)?
             } else {
                 let (qtype, type_index) = match class {
                     Class::A => (Rtype::A, 0_u64),
@@ -69,7 +70,7 @@ impl QuerySet {
                 let record = rng.below(per_type.max(1)) * 4 + type_index;
                 let record = record.min(u64::from(rrsets) - 1);
                 let name = format!("r{record:07}.z{zone}.bench.test.");
-                build_packet(class, &name, qtype)?
+                build_packet(class, &name, qtype, dnssec_do)?
             };
             by_class[class.index()].push(packet);
         }
@@ -89,9 +90,13 @@ impl QuerySet {
     }
 }
 
-fn build_packet(class: Class, name: &str, qtype: Rtype) -> Result<Packet, String> {
+fn build_packet(class: Class, name: &str, qtype: Rtype, dnssec_do: bool) -> Result<Packet, String> {
     let name = Name::parse(name).map_err(|error| format!("query name {name:?}: {error}"))?;
-    let message = Message::query(0, Question::new(name.clone(), qtype, Rclass::IN))
+    let mut message = Message::query(0, Question::new(name.clone(), qtype, Rclass::IN));
+    if dnssec_do {
+        message.set_edns(Some(Edns::new(1232).with_dnssec_ok(true)));
+    }
+    let message = message
         .encode(&EncodeOptions::compressed())
         .map_err(|error| format!("encode query: {error}"))?;
     Ok(Packet {
@@ -195,8 +200,8 @@ mod tests {
 
     #[test]
     fn query_set_is_deterministic() {
-        let left = QuerySet::build(2, 40, Mix::default(), 200, 7).expect("set");
-        let right = QuerySet::build(2, 40, Mix::default(), 200, 7).expect("set");
+        let left = QuerySet::build(2, 40, Mix::default(), 200, 7, false).expect("set");
+        let right = QuerySet::build(2, 40, Mix::default(), 200, 7, false).expect("set");
         assert_eq!(left.len(), 200);
         for (left, right) in left.by_class.iter().zip(right.by_class.iter()) {
             assert_eq!(left.len(), right.len());

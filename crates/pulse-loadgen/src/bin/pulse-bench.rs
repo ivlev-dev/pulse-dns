@@ -47,12 +47,36 @@ struct Args {
     /// Каталог артефактов.
     #[arg(long, default_value = "target/bench")]
     out_dir: PathBuf,
-    /// Markdown-отчёт.
-    #[arg(long, default_value = "docs/bench/baseline.md")]
-    report: PathBuf,
-    /// JSON-отчёт.
-    #[arg(long, default_value = "docs/bench/baseline.json")]
-    json: PathBuf,
+    /// Markdown-отчёт (по умолчанию `docs/bench/baseline.md`
+    /// или `docs/bench/isolated.md` для `--isolated`).
+    #[arg(long)]
+    report: Option<PathBuf>,
+    /// JSON-отчёт (по умолчанию `docs/bench/baseline.json`
+    /// или `docs/bench/isolated.json` для `--isolated`).
+    #[arg(long)]
+    json: Option<PathBuf>,
+    /// Изолированный стенд: сервер и клиент на разных CPU, сценарии `iso-*`
+    /// и контрольные `shared-*` на общем наборе.
+    #[arg(long)]
+    isolated: bool,
+    /// CPU серверного процесса (например `0-3`); применяется через `taskset`.
+    #[arg(long)]
+    server_cpus: Option<String>,
+    /// CPU клиентских потоков (например `4-7`); `sched_setaffinity`.
+    #[arg(long)]
+    client_cpus: Option<String>,
+    /// CPU REST-писателей; по умолчанию — вторая половина клиентского набора.
+    #[arg(long)]
+    rest_cpus: Option<String>,
+    /// Авто-раскладка по SMT-группам (целые физические ядра на сторону).
+    #[arg(long)]
+    auto_layout: bool,
+    /// Не запускать контрольные `shared-*` сценарии в isolated-режиме.
+    #[arg(long)]
+    no_shared_controls: bool,
+    /// `perf stat`/`perf record` для каждого isolated-сценария.
+    #[arg(long)]
+    perf_scenarios: bool,
     /// Короткий smoke-прогон (1 rep, 2 c, без 1M/soak/perf).
     #[arg(long)]
     quick: bool,
@@ -159,6 +183,7 @@ impl Transport {
     }
 }
 
+#[derive(Clone)]
 struct ScenarioDef {
     name: &'static str,
     description: &'static str,
@@ -174,6 +199,18 @@ struct ScenarioDef {
     duration: Option<f64>,
     reps: Option<usize>,
     notes: Vec<&'static str>,
+}
+
+impl ScenarioDef {
+    /// Сценарий с пиннингом CPU (isolated-стенд).
+    fn affinity(&self) -> bool {
+        self.name.starts_with("iso-")
+    }
+
+    /// Запросы с EDNS0 DO (DNSSEC-сценарий).
+    fn edns_do(&self) -> bool {
+        self.name.contains("signed")
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -338,28 +375,317 @@ fn scenarios(quick: bool) -> Vec<ScenarioDef> {
     list
 }
 
+/// Сценарии изолированного стенда: сервер на `--server-cpus`, клиент на
+/// `--client-cpus`; плюс контрольные `shared-*` копии без пиннинга.
+#[allow(clippy::too_many_lines)]
+fn isolated_scenarios() -> Vec<ScenarioDef> {
+    let a_only = Mix::parse("a=100,aaaa=0,mx=0,txt=0,nx=0").expect("mix a=100");
+    let nx_only = Mix::parse("a=0,aaaa=0,mx=0,txt=0,nx=100").expect("mix nx=100");
+    vec![
+        ScenarioDef {
+            name: "iso-udp-a",
+            description: "UDP, A-only, closed-loop окно 64: лучший путь (positive hit).",
+            store: STORE_100K,
+            transport: Transport::Udp,
+            workers: 4,
+            threads: 8,
+            qps: None,
+            window: 64,
+            mix: a_only,
+            rest: false,
+            working_set: 16_384,
+            duration: Some(5.0),
+            reps: Some(3),
+            notes: vec!["Сервер/клиент на разных физических ядрах (см. раздел «CPU-раскладка»)."],
+        },
+        ScenarioDef {
+            name: "iso-udp-mix",
+            description: "UDP, mix A/AAAA/MX/TXT/NXDOMAIN, closed-loop окно 64.",
+            store: STORE_100K,
+            transport: Transport::Udp,
+            workers: 4,
+            threads: 8,
+            qps: None,
+            window: 64,
+            mix: Mix::default(),
+            rest: false,
+            working_set: 16_384,
+            duration: Some(5.0),
+            reps: Some(3),
+            notes: vec![],
+        },
+        ScenarioDef {
+            name: "iso-udp-nx",
+            description: "UDP, 100% NXDOMAIN, closed-loop окно 64: худший путь перебора суффиксов.",
+            store: STORE_100K,
+            transport: Transport::Udp,
+            workers: 4,
+            threads: 8,
+            qps: None,
+            window: 64,
+            mix: nx_only,
+            rest: false,
+            working_set: 16_384,
+            duration: Some(5.0),
+            reps: Some(3),
+            notes: vec![],
+        },
+        ScenarioDef {
+            name: "iso-udp-signed",
+            description: "UDP, DNSSEC-подписанная зона (EDNS DO=1), mix, closed-loop окно 64.",
+            store: STORE_1K,
+            transport: Transport::Udp,
+            workers: 4,
+            threads: 8,
+            qps: None,
+            window: 64,
+            mix: Mix::default(),
+            rest: false,
+            working_set: 1_000,
+            duration: Some(5.0),
+            reps: Some(3),
+            notes: vec![
+                "Зона `z0.bench.test.` подписывается `pulsed` при загрузке (CSK Ed25519); \
+                 клиент шлёт EDNS0 с DO=1.",
+            ],
+        },
+        ScenarioDef {
+            name: "iso-tcp",
+            description: "TCP, 8 соединений, closed-loop окно 16 (length-prefix).",
+            store: STORE_100K,
+            transport: Transport::Tcp,
+            workers: 4,
+            threads: 8,
+            qps: None,
+            window: 16,
+            mix: Mix::default(),
+            rest: false,
+            working_set: 16_384,
+            duration: Some(5.0),
+            reps: Some(3),
+            notes: vec![],
+        },
+        ScenarioDef {
+            name: "iso-doh-h2",
+            description: "DoH/HTTP/2, 8 соединений × 16 stream'ов, closed-loop.",
+            store: STORE_100K,
+            transport: Transport::DohH2,
+            workers: 4,
+            threads: 8,
+            qps: None,
+            window: 16,
+            mix: Mix::default(),
+            rest: false,
+            working_set: 16_384,
+            duration: Some(5.0),
+            reps: Some(3),
+            notes: vec![],
+        },
+        ScenarioDef {
+            name: "iso-udp-rest",
+            description: "UDP 10k qps + REST PUT в 8 зон; клиентские роли DNS/REST разведены по CPU.",
+            store: STORE_8,
+            transport: Transport::Udp,
+            workers: 4,
+            threads: 4,
+            qps: Some(10_000.0),
+            window: 1,
+            mix: Mix::default(),
+            rest: true,
+            working_set: 4_096,
+            duration: Some(5.0),
+            reps: Some(3),
+            notes: vec![
+                "DNS-клиент — первая половина `--client-cpus`, REST-писатели — вторая \
+                 (или `--rest-cpus`). API `pulsed` живёт в том же процессе, что DNS.",
+            ],
+        },
+    ]
+}
+
+/// Копия сценария без пиннинга (контроль «loopback-общий»).
+fn shared_twin(scenario: &ScenarioDef) -> ScenarioDef {
+    ScenarioDef {
+        name: Box::leak(
+            format!("shared-{}", scenario.name.trim_start_matches("iso-")).into_boxed_str(),
+        ),
+        description: Box::leak(
+            format!(
+                "{} (контроль: сервер и клиент на общем наборе CPU).",
+                scenario.description
+            )
+            .into_boxed_str(),
+        ),
+        notes: vec!["Без affinity: все потоки могут мигрировать по всем CPU."],
+        ..scenario.clone()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct Layout {
+    server: Option<Vec<usize>>,
+    client: Option<Vec<usize>>,
+    rest: Option<Vec<usize>>,
+    note: String,
+    warnings: Vec<String>,
+}
+
+impl Layout {
+    fn enabled(&self) -> bool {
+        self.server.is_some() && self.client.is_some()
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn resolve_layout(args: &Args) -> Result<Layout, String> {
+    let allowed = pulse_loadgen::affinity::allowed_cpus()?;
+    let mut server = args
+        .server_cpus
+        .as_deref()
+        .map(pulse_loadgen::affinity::CpuSet::parse)
+        .transpose()?;
+    let mut client = args
+        .client_cpus
+        .as_deref()
+        .map(pulse_loadgen::affinity::CpuSet::parse)
+        .transpose()?;
+    let mut notes = Vec::new();
+    let groups = pulse_loadgen::affinity::topology();
+    let auto = args.auto_layout || (args.isolated && (server.is_none() || client.is_none()));
+    if auto {
+        let suggestion = pulse_loadgen::affinity::suggest_layout(&groups)?;
+        notes.push(suggestion.note.clone());
+        if server.is_none() {
+            server = Some(suggestion.server);
+        }
+        if client.is_none() {
+            client = Some(suggestion.client);
+        }
+    }
+    if server.is_some() != client.is_some() {
+        return Err(
+            "укажите оба набора (--server-cpus и --client-cpus) либо ни одного; \
+             частичный пиннинг искажает сравнение"
+                .to_owned(),
+        );
+    }
+    let mut warnings = Vec::new();
+    let (server, client) = match (server, client) {
+        (Some(server), Some(client)) => {
+            pulse_loadgen::affinity::validate_partition(&server, &client, &allowed)?;
+            // Проверяем право на sched_setaffinity заранее: если контейнер
+            // запрещает, клиент продолжит без пиннинга с явным предупреждением.
+            if let Some(cpu) = client.cpus().first()
+                && let Err(error) = pulse_loadgen::affinity::set_current_thread_affinity(&[*cpu])
+            {
+                warnings.push(format!(
+                    "sched_setaffinity недоступен ({error}); клиентские потоки будут без                      пиннинга, сервер всё равно пиннится через taskset"
+                ));
+                let _ = pulse_loadgen::affinity::set_current_thread_affinity(allowed.cpus());
+            } else {
+                let _ = pulse_loadgen::affinity::set_current_thread_affinity(allowed.cpus());
+            }
+            let shared = pulse_loadgen::affinity::shared_groups(&server, &client, &groups);
+            if !shared.is_empty() {
+                warnings.push(format!(
+                    "сервер и клиент делят SMT-сиблингов: {:?}. Это не изолированный стенд — \
+                     qps/p99 содержат SMT-конкуренцию; для чистого замера возьмите целые \
+                     физические ядра на сторону (например 0-3 / 4-7 на 4 ядрах).",
+                    shared
+                        .iter()
+                        .map(pulse_loadgen::affinity::CpuSet::as_list)
+                        .collect::<Vec<_>>()
+                ));
+            }
+            notes.push(format!(
+                "allowed: {}, server: {}, client: {}; topology: {}",
+                allowed.as_list(),
+                server.as_list(),
+                client.as_list(),
+                pulse_loadgen::affinity::topology_report(&groups)
+            ));
+            (Some(server), Some(client))
+        }
+        _ => (None, None),
+    };
+    let rest = match &args.rest_cpus {
+        Some(text) => Some(pulse_loadgen::affinity::CpuSet::parse(text)?),
+        None => client
+            .as_ref()
+            .map(pulse_loadgen::affinity::CpuSet::split_at_half)
+            .and_then(|(_, rest)| (!rest.is_empty()).then_some(rest)),
+    };
+    if let (Some(server), Some(client), Some(rest)) = (&server, &client, &rest) {
+        let rest_set = rest.clone();
+        if server.intersects(&rest_set) {
+            return Err(format!(
+                "--rest-cpus {} пересекается с серверными CPU {}",
+                rest.as_list(),
+                server.as_list()
+            ));
+        }
+        if !rest_set.cpus().iter().all(|cpu| client.contains(*cpu)) {
+            warnings.push(format!(
+                "--rest-cpus {} выходит за клиентский набор {}; REST-роль может конкурировать \
+                 с сервером",
+                rest.as_list(),
+                client.as_list()
+            ));
+        }
+        let (dns, _) = client.split_at_half();
+        if args.rest_cpus.is_some() && rest_set.intersects(&dns) {
+            warnings.push(format!(
+                "--rest-cpus {} пересекается с DNS-клиентскими CPU {}; роли не разведены",
+                rest.as_list(),
+                dns.as_list()
+            ));
+        }
+    }
+    Ok(Layout {
+        server: server.map(|set| set.cpus().to_vec()),
+        client: client.map(|set| set.cpus().to_vec()),
+        rest: rest.map(|set| set.cpus().to_vec()),
+        note: notes.join("; "),
+        warnings,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<(), String> {
     let mut args = Args::parse();
+    let suffix = if args.isolated {
+        "isolated"
+    } else {
+        "baseline"
+    };
+    if args.report.is_none() {
+        args.report = Some(PathBuf::from(format!("docs/bench/{suffix}.md")));
+    }
+    if args.json.is_none() {
+        args.json = Some(PathBuf::from(format!("docs/bench/{suffix}.json")));
+    }
+    let report_path = args.report.clone().ok_or("report path is not resolved")?;
+    let json_path = args.json.clone().ok_or("json path is not resolved")?;
     if args.render_only {
-        let text = std::fs::read_to_string(&args.json).map_err(|error| error.to_string())?;
+        let text = std::fs::read_to_string(&json_path).map_err(|error| error.to_string())?;
         let mut report: BaselineReport = serde_json::from_str(&text)
-            .map_err(|error| format!("{}: {error}", args.json.display()))?;
+            .map_err(|error| format!("{}: {error}", json_path.display()))?;
         for memory in &mut report.memory {
             memory.summary = mem::summarize(
                 &memory.samples,
                 Duration::from_millis(memory.summary.duration_ms),
             );
         }
-        if let Ok(rows) = read_alloc(&args.out_dir)
+        if !args.isolated
+            && let Ok(rows) = read_alloc(&args.out_dir)
             && !rows.is_empty()
         {
             report.alloc = rows;
         }
         report.recommendations = recommendations(&report);
-        report::write_json(&report, &args.json)?;
-        report::write_markdown(&report, &args.report)?;
-        println!("re-rendered {}", args.report.display());
+        report::write_json(&report, &json_path)?;
+        report::write_markdown(&report, &report_path)?;
+        println!("re-rendered {}", report_path.display());
         return Ok(());
     }
     if args.reps == 0 {
@@ -372,6 +698,12 @@ fn main() -> Result<(), String> {
         args.skip_profile = true;
         args.skip_commit = true;
     }
+    if args.isolated {
+        args.skip_memory = true;
+        args.skip_soak = true;
+        args.skip_commit = true;
+        args.perf_scenarios = true;
+    }
     let pulsed = args.pulsed.clone();
     if !pulsed.exists() {
         return Err(format!(
@@ -379,8 +711,50 @@ fn main() -> Result<(), String> {
             pulsed.display()
         ));
     }
+    let layout = resolve_layout(&args)?;
+    for warning in &layout.warnings {
+        eprintln!("WARN affinity: {warning}");
+    }
+    if layout.enabled() {
+        eprintln!(
+            "affinity: server {}, client {}, rest {}",
+            layout
+                .server
+                .as_deref()
+                .map_or_else(String::new, pulse_loadgen::affinity::format_cpus),
+            layout
+                .client
+                .as_deref()
+                .map_or_else(String::new, pulse_loadgen::affinity::format_cpus),
+            layout
+                .rest
+                .as_deref()
+                .map_or_else(String::new, pulse_loadgen::affinity::format_cpus),
+        );
+    }
     std::fs::create_dir_all(&args.out_dir).map_err(|error| error.to_string())?;
-    let scenario_list = scenarios(args.quick);
+    let scenario_list = if args.isolated {
+        let mut bases = isolated_scenarios();
+        if args.quick {
+            bases.retain(|scenario| matches!(scenario.name, "iso-udp-mix" | "iso-udp-rest"));
+            for scenario in &mut bases {
+                scenario.duration = Some(2.0);
+                scenario.reps = Some(1);
+            }
+        }
+        // Пары iso/shared идут подряд: дрейф нагрузки хоста меньше искажает
+        // сравнение методик.
+        let mut list = Vec::with_capacity(bases.len() * 2);
+        for base in bases {
+            if !args.no_shared_controls && !args.quick {
+                list.push(shared_twin(&base));
+            }
+            list.push(base);
+        }
+        list
+    } else {
+        scenarios(args.quick)
+    };
     let mut store_specs: Vec<StoreSpec> = Vec::new();
     let mut add = |spec: StoreSpec| {
         if !store_specs.iter().any(|known| known.name == spec.name) {
@@ -412,12 +786,22 @@ fn main() -> Result<(), String> {
         args.skip_profile = true;
         args.skip_commit = true;
     }
-    let mut report = if args.merge && args.json.exists() {
-        let text = std::fs::read_to_string(&args.json).map_err(|error| error.to_string())?;
+    let mut report = if args.merge && json_path.exists() {
+        let text = std::fs::read_to_string(&json_path).map_err(|error| error.to_string())?;
         serde_json::from_str(&text)
-            .map_err(|error| format!("merge {}: {error}", args.json.display()))?
+            .map_err(|error| format!("merge {}: {error}", json_path.display()))?
     } else {
         BaselineReport {
+            title: args
+                .isolated
+                .then(|| "Isolated: pulsed, сервер и клиент на разных физических ядрах".to_owned()),
+            scope_note: args.isolated.then(|| {
+                "Методика: `iso-*` — сервер пиннится через `taskset`, клиентские потоки — \
+                 `sched_setaffinity`; `shared-*` — тот же сценарий без пиннинга (контроль \
+                 loopback-общий). 3 прогона, медиана; HDR p50/p99/p999. Сервер и клиент \
+                 на одной машине (loopback), поэтому абсолютные qps — нижняя оценка."
+                    .to_owned()
+            }),
             pulsed_version: version(&pulsed),
             git_rev: git_rev(),
             host: sysinfo::host_info(),
@@ -425,7 +809,15 @@ fn main() -> Result<(), String> {
         }
     };
     report.generated_unix = report::now_unix();
-    if !args.merge {
+    if args.isolated {
+        report.extra.retain(|section| {
+            !matches!(
+                section.title.as_str(),
+                "CPU-раскладка и права" | "Методика и CPU-раскладка" | "Isolated vs loopback-общий"
+            )
+        });
+    }
+    if !args.merge && !args.isolated {
         use std::os::unix::fs::MetadataExt;
         let mut body = String::from(
             "| Store | Зон | RRset | Logical MiB | Диск MiB | Генерация, с |\n|---|---|---|---|---|---|\n",
@@ -471,6 +863,83 @@ fn main() -> Result<(), String> {
         });
     }
 
+    let signed_key = ensure_sign_key(&args.out_dir)?;
+    if args.isolated {
+        let groups = pulse_loadgen::affinity::topology();
+        let mut body = String::new();
+        let _ = writeln!(
+            body,
+            "| Роль | CPU |\n|---|---|\n| Сервер (`taskset`) | `{}` |\n| Клиент DNS (`sched_setaffinity`) | `{}` |\n| REST-писатели | `{}` |",
+            layout.server.as_deref().map_or_else(
+                || "(без пиннинга)".to_owned(),
+                pulse_loadgen::affinity::format_cpus
+            ),
+            layout.client.as_deref().map_or_else(
+                || "(без пиннинга)".to_owned(),
+                pulse_loadgen::affinity::format_cpus
+            ),
+            layout.rest.as_deref().map_or_else(
+                || "(вторая половина клиента)".to_owned(),
+                pulse_loadgen::affinity::format_cpus
+            ),
+        );
+        let _ = writeln!(
+            body,
+            "\nSMT-группы (одно физическое ядро): `{}`.\n",
+            pulse_loadgen::affinity::topology_report(&groups)
+        );
+        if !layout.note.is_empty() {
+            let _ = writeln!(body, "{}\n", layout.note);
+        }
+        for warning in &layout.warnings {
+            let _ = writeln!(body, "> **Внимание:** {warning}\n");
+        }
+        let _ = writeln!(
+            body,
+            "**Методика.** Сервер запускается как `taskset -c <server> pulsed`; каждый \
+             клиентский поток в первой инструкции вызывает `sched_setaffinity(0, <один CPU>)` \
+             (round-robin по `--client-cpus`). Наборы проверяются на непустоту, вхождение в \
+             `Cpus_allowed_list` и непересечение; фактический affinity сервера сверяется по \
+             `/proc/<pid>/status` после `exec`. В `iso-udp-rest` DNS-клиент занимает первую \
+             половину клиентских CPU, REST-писатели — вторую. 3 прогона, в таблицу идёт \
+             медиана по клиентскому qps; латентность — HDR (3 значащие цифры), клиентская, \
+             `CLOCK_MONOTONIC` вокруг send/recv. `shared-*` — тот же сценарий без affinity, \
+             запускается сразу после `iso-*`, чтобы дрейф нагрузки хоста меньше влиял на \
+             сравнение."
+        );
+        let _ = writeln!(
+            body,
+            "\n`perf_event_paranoid={}`: `perf stat` (cycles/instructions/cache/TLB) доступен; \
+             `perf record -e cycles:u` без call-graph тоже доступен, но `--call-graph dwarf` и \
+             `-g` при paranoid=2 **запрещены** (`Failure to open event`). Harness пробует dwarf \
+             и откатывается на плоский `cycles:u`; flamegraph тогда без стеков, hotspots — по \
+             символам. Для dwarf-стеков нужен `CAP_PERFMON` или paranoid≤1.",
+            perf_paranoid()
+        );
+        let _ = writeln!(
+            body,
+            "\n**SMT-сиблинги** (из `/sys/devices/system/cpu/cpu*/topology/thread_siblings_list`): \
+             все `cpuN` внутри одной группы — одно физическое ядро. Рекомендуемая раскладка — \
+             целые ядра: `server=0-3`, `client=4-7` (используется здесь). Если серверу хватает \
+             двух логических CPU, более строгий вариант — `server=0,2`, `client=4,6`, а \
+             сиблинги `1,3,5,7` оставить idle. Раскладка `0,2,4,6` / `1,3,5,7` **не является \
+             изоляцией**: каждая пара CPU — сиблинги одного ядра, и сервер конкурирует с \
+             клиентом за SMT-порты."
+        );
+        let _ = writeln!(
+            body,
+            "\n**Ограничения.** Один хост, loopback; 4 физических ядра / 8 SMT-потоков \
+             (Ryzen 5 3500U), SMT и turbo не отключались, governor не менялся. На хосте \
+             параллельно работали другие процессы (см. `loadavg` ниже), поэтому абсолютные \
+             qps/p99 — нижняя оценка, а сравнение `iso`/`shared` валидно только в пределах \
+             этого прогона. UDP-сценарии `iso-udp-*` — closed-loop окно 64: p50/p99 включают \
+             очередь в клиентском сокете, это метрика насыщения, а не service time."
+        );
+        report.extra.push(ExtraSection {
+            title: "Методика и CPU-раскладка".to_owned(),
+            body,
+        });
+    }
     let list = scenario_list;
     for scenario in &list {
         if let Some(only) = &args.only
@@ -488,7 +957,16 @@ fn main() -> Result<(), String> {
             "== {}: {} rep(s) x {duration}s, workers={} threads={}",
             scenario.name, reps, scenario.workers, scenario.threads
         );
-        let scenario_report = run_scenario(&args, scenario, store, &cert, reps, duration)?;
+        let scenario_report = run_scenario(
+            &args,
+            scenario,
+            store,
+            &cert,
+            reps,
+            duration,
+            &layout,
+            &signed_key,
+        )?;
         if let Some(existing) = report
             .scenarios
             .iter_mut()
@@ -513,6 +991,13 @@ fn main() -> Result<(), String> {
     }
     report.scenarios = deduped;
 
+    if args.isolated {
+        report.extra.push(ExtraSection {
+            title: "Isolated vs loopback-общий".to_owned(),
+            body: comparison_table(&report),
+        });
+    }
+
     if !args.skip_memory {
         for spec in [
             STORE_1K, STORE_8, STORE_100K, STORE_100, STORE_1000, STORE_1M,
@@ -531,15 +1016,39 @@ fn main() -> Result<(), String> {
     }
 
     if !args.skip_profile {
-        eprintln!("== profile: perf stat/record на udp-w8");
-        match run_profile(&args, &stores, &cert) {
-            Ok(perf) => report.perf.push(perf),
-            Err(error) => {
-                report.perf.push(PerfReport {
-                    label: "udp-w8".to_owned(),
-                    note: format!("perf недоступен: {error}"),
-                    ..PerfReport::default()
-                });
+        let targets: Vec<&str> = if args.isolated || args.perf_scenarios {
+            list.iter()
+                .filter(|scenario| scenario.affinity())
+                .map(|scenario| scenario.name)
+                .collect()
+        } else {
+            vec!["udp-w8"]
+        };
+        for name in targets {
+            if let Some(only) = &args.only
+                && !name.contains(only.as_str())
+            {
+                continue;
+            }
+            let Some(scenario) = list.iter().find(|scenario| scenario.name == name) else {
+                continue;
+            };
+            let Some(store) = stores
+                .iter()
+                .find(|store| store.spec.name == scenario.store.name)
+            else {
+                continue;
+            };
+            eprintln!("== profile {name}: perf stat/record, cycles:u");
+            match run_profile(&args, scenario, store, &cert, &layout, &signed_key) {
+                Ok(perf) => report.perf.push(perf),
+                Err(error) => {
+                    report.perf.push(PerfReport {
+                        label: name.to_owned(),
+                        note: format!("perf недоступен: {error}"),
+                        ..PerfReport::default()
+                    });
+                }
             }
         }
     }
@@ -562,18 +1071,22 @@ fn main() -> Result<(), String> {
         });
     }
 
-    report.alloc = read_alloc(&args.out_dir)?;
+    report.alloc = if args.isolated {
+        Vec::new()
+    } else {
+        read_alloc(&args.out_dir)?
+    };
     report.recommendations = recommendations(&report);
     report.commands = commands(&args);
-    report::write_json(&report, &args.json)?;
-    report::write_markdown(&report, &args.report)?;
+    report::write_json(&report, &json_path)?;
+    report::write_markdown(&report, &report_path)?;
     println!(
         "baseline: {} scenario(s), {} memory row(s), {} alloc row(s) -> {} / {}",
         report.scenarios.len(),
         report.memory.len(),
         report.alloc.len(),
-        args.report.display(),
-        args.json.display()
+        report_path.display(),
+        json_path.display()
     );
     Ok(())
 }
@@ -627,6 +1140,33 @@ fn ensure_store(args: &Args, spec: StoreSpec) -> Result<StoreFiles, String> {
             file_bytes,
         })
     }
+}
+
+/// Готовит Ed25519 CSK для подписи `z0.bench.test.` (сценарий `iso-udp-signed`).
+fn ensure_sign_key(out_dir: &Path) -> Result<PathBuf, String> {
+    let dir = out_dir.join("dnssec");
+    let marker = dir.join("z0.key.private");
+    if let Ok(text) = std::fs::read_to_string(&marker) {
+        let path = PathBuf::from(text.trim());
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    let owner = Name::parse("z0.bench.test.").map_err(|error| error.to_string())?;
+    let key = pulse_dnssec::PrivateKey::generate(pulse_dnssec::Algorithm::ED25519)
+        .map_err(|error| format!("dnssec key: {error}"))?;
+    let paths = pulse_dnssec::write_key_pair(&dir, &owner, &key, 257, &pulse_dnssec::NoopAudit)
+        .map_err(|error| format!("dnssec key file: {error}"))?;
+    std::fs::write(&marker, paths.private.display().to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(paths.private)
 }
 
 fn ensure_cert(out_dir: &Path) -> Result<PathBuf, String> {
@@ -683,6 +1223,9 @@ struct RunningServer {
     doh_h2: u16,
     api: u16,
     log: PathBuf,
+    started: Instant,
+    start_ticks: Option<(u64, u64)>,
+    cpus: String,
 }
 
 impl RunningServer {
@@ -701,6 +1244,11 @@ impl RunningServer {
     }
 
     fn stop(mut self, duration: f64) -> ServerStats {
+        let rss_kb = sysinfo::process_rss_kb(self.pid).unwrap_or(0);
+        let end_ticks = sysinfo::process_cpu_ticks_split(self.pid);
+        let wall = self.started.elapsed().as_secs_f64();
+        let cpus = pulse_loadgen::affinity::pid_cpus(self.pid)
+            .map_or_else(String::new, |set| set.as_list());
         let _ = Command::new("kill")
             .arg("-TERM")
             .arg(self.pid.to_string())
@@ -723,7 +1271,35 @@ impl RunningServer {
             }
         }
         let text = std::fs::read_to_string(&self.log).unwrap_or_default();
-        parse_server_stats(&text, duration)
+        let mut stats = parse_server_stats(&text, duration);
+        stats.rss_kb = rss_kb;
+        stats.cpus = if cpus.is_empty() {
+            self.cpus.clone()
+        } else {
+            cpus
+        };
+        let hz = sysinfo::clock_ticks_per_sec().max(1) as f64;
+        if let (Some((user0, sys0)), Some((user1, sys1))) = (self.start_ticks, end_ticks)
+            && wall > 0.0
+        {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                stats.cpu_user_pct = user1.saturating_sub(user0) as f64 / hz / wall * 100.0;
+                stats.cpu_sys_pct = sys1.saturating_sub(sys0) as f64 / hz / wall * 100.0;
+            }
+        }
+        stats
+    }
+}
+
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = Command::new("kill")
+                .args(["-KILL", &self.pid.to_string()])
+                .status();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -734,6 +1310,8 @@ struct ServerOptions {
     doh_h2: bool,
     api: bool,
     label: String,
+    cpus: Option<Vec<usize>>,
+    sign_key: Option<PathBuf>,
 }
 
 struct ServerPorts {
@@ -820,6 +1398,14 @@ fn spawn_server(
             ports.api
         );
     }
+    if let Some(key) = &options.sign_key {
+        let _ = write!(
+            config,
+            "[dnssec.\"z0.bench.test.\"]\nvalidity_days = 30\n\
+             [[dnssec.\"z0.bench.test.\".keys]]\nrole = \"csk\"\npath = \"{}\"\n",
+            key.display()
+        );
+    }
     std::fs::write(&config_path, config).map_err(|error| error.to_string())?;
     let log_path = args
         .out_dir
@@ -830,16 +1416,19 @@ fn spawn_server(
     }
     let log = File::create(&log_path).map_err(|error| error.to_string())?;
     let stderr = log.try_clone().map_err(|error| error.to_string())?;
-    let mut command = if prefix.is_empty() {
-        Command::new(&args.pulsed)
-    } else {
-        let mut command = Command::new(prefix[0]);
-        command.env("LC_ALL", "C");
-        command.args(&prefix[1..]);
-        command.arg(&args.pulsed);
-        command
-    };
-    let child = command
+    let mut full: Vec<String> = prefix.iter().map(|value| (*value).to_owned()).collect();
+    if let Some(cpus) = &options.cpus {
+        full.push("taskset".to_owned());
+        full.push("-c".to_owned());
+        full.push(pulse_loadgen::affinity::format_cpus(cpus));
+    }
+    full.push(args.pulsed.display().to_string());
+    let mut command = Command::new(&full[0]);
+    command.env("LC_ALL", "C");
+    if full.len() > 1 {
+        command.args(&full[1..]);
+    }
+    let mut child = command
         .arg("--config")
         .arg(&config_path)
         .stdout(Stdio::from(log))
@@ -847,7 +1436,8 @@ fn spawn_server(
         .spawn()
         .map_err(|error| format!("spawn server: {error}"))?;
     let wrapper_pid = child.id();
-    // Под perf parent'ом реальный pid сервера — дочерний.
+    // Под perf parent'ом реальный pid сервера — дочерний. `taskset` делает
+    // exec, поэтому без perf pid совпадает с wrapper'ом.
     let pid = if prefix.is_empty() {
         wrapper_pid
     } else {
@@ -855,6 +1445,21 @@ fn spawn_server(
         loop {
             if let Some(pid) = child_pid(wrapper_pid) {
                 break pid;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                let tail: String = std::fs::read_to_string(&log_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .rev()
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(format!(
+                    "wrapper {wrapper_pid} exited ({status}) before pulsed; log tail:\n{tail}"
+                ));
             }
             if started.elapsed() > Duration::from_secs(5) {
                 return Err(format!(
@@ -865,7 +1470,7 @@ fn spawn_server(
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    let server = RunningServer {
+    let mut server = RunningServer {
         child,
         pid,
         udp: ports.udp,
@@ -874,8 +1479,40 @@ fn spawn_server(
         doh_h2: ports.doh_h2,
         api: ports.api,
         log: log_path,
+        started: Instant::now(),
+        start_ticks: None,
+        cpus: options
+            .cpus
+            .as_deref()
+            .map_or_else(String::new, pulse_loadgen::affinity::format_cpus),
     };
+    if let Some(cpus) = &options.cpus {
+        let expected = pulse_loadgen::affinity::format_cpus(cpus);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match pulse_loadgen::affinity::pid_cpus(pid) {
+                Some(actual) if actual.as_list() == expected => break,
+                _ if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Some(actual) => {
+                    return Err(format!(
+                        "taskset не применился: сервер pid {pid} имеет affinity {}, ожидался \
+                         {expected}",
+                        actual.as_list()
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "не удалось прочитать affinity сервера pid {pid} (ожидался {expected})"
+                    ));
+                }
+            }
+        }
+    }
     wait_ready(&server, options.workers)?;
+    server.started = Instant::now();
+    server.start_ticks = sysinfo::process_cpu_ticks_split(pid);
     Ok(server)
 }
 
@@ -936,6 +1573,7 @@ fn free_tcp_port() -> Result<u16, String> {
         .map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_scenario(
     args: &Args,
     scenario: &ScenarioDef,
@@ -943,9 +1581,12 @@ fn run_scenario(
     cert: &Path,
     reps: usize,
     duration: f64,
+    layout: &Layout,
+    signed_key: &Path,
 ) -> Result<Scenario, String> {
     let mut runs = Vec::new();
     let mut servers = Vec::new();
+    let mut client_cpu = Vec::new();
     for rep in 0..reps {
         let label = format!("{}-{rep}", scenario.name);
         let options = ServerOptions {
@@ -955,61 +1596,40 @@ fn run_scenario(
             doh_h2: scenario.transport == Transport::DohH2,
             api: scenario.rest,
             label: label.clone(),
+            cpus: scenario.affinity().then(|| layout.server.clone()).flatten(),
+            sign_key: scenario.edns_do().then(|| signed_key.to_path_buf()),
         };
         let server = start_server(args, &options, cert)?;
-        let rest = scenario.rest.then(|| pulse_loadgen::rest::RestConfig {
-            api: server.address(Transport::Udp, true),
-            token: "pd_bench_token".to_owned(),
-            zones: 8,
-            threads: 8,
-            rate: 80.0,
-            timeout: Duration::from_secs(5),
-            tag: format!("r{rep}-{}", std::process::id()),
-        });
-        let config = ClientConfig {
-            target: server.address(scenario.transport, false),
-            mode: scenario.transport.mode(),
-            threads: scenario.threads,
-            qps: scenario.qps,
-            window: scenario.window,
-            duration: Duration::from_secs_f64(duration),
-            warmup: Duration::from_secs_f64(if duration >= 5.0 { 3.0 } else { 0.5 }),
-            timeout: Duration::from_secs(2),
-            mix: scenario.mix,
-            zones: store.spec.zones,
-            rrsets_per_zone: store.spec.rrsets_per_zone,
-            seed: 0x5eed_1234_abcd_0001 ^ u64::try_from(rep).unwrap_or(0),
-            working_set: scenario.working_set.min(
-                usize::try_from(
-                    u64::from(store.spec.zones) * u64::from(store.spec.rrsets_per_zone),
-                )
-                .unwrap_or(scenario.working_set)
-                .max(5),
-            ),
-            ca: (scenario.transport == Transport::Dot || scenario.transport == Transport::DohH2)
-                .then(|| cert.to_path_buf()),
-            server_name: "localhost".to_owned(),
-            doh_path: "/dns-query".to_owned(),
-            validate_every: 64,
-            rest,
-            max_inflight: 8192,
-        };
+        let rest = rest_config(scenario, &server, rep, layout);
+        let mut config = client_config(scenario, store, &server, cert, rep, layout, duration);
+        config.rest = rest;
+        let before = sysinfo::process_cpu_ticks_split(std::process::id());
+        let elapsed = Instant::now();
         let run = run_client(&config)?;
-        let mut server_stats = server.stop(duration);
+        let wall = elapsed.elapsed().as_secs_f64();
+        let after = sysinfo::process_cpu_ticks_split(std::process::id());
+        let usage = cpu_usage(before, after, wall);
+        let mut server_stats = server.stop(wall.max(duration));
         let measured_responses = server_stats.responses.saturating_sub(run.warmup_received);
         #[allow(clippy::cast_precision_loss)]
         {
             server_stats.qps = measured_responses as f64 / duration.max(0.001);
         }
         eprintln!(
-            "   rep {rep}: client {:.0} qps, p99 {:.1}us, server {:.0} qps, rcvbuf Δ {}",
+            "   rep {rep}: client {:.0} qps, p99 {:.1}us, server {:.0} qps, rcvbuf Δ {}, \
+             cpu cl {:.0}/{:.0}% srv {:.0}/{:.0}%",
             run.client_qps,
             run.latency.p99 as f64 / 1000.0,
             server_stats.qps,
-            run.kernel.rcvbuf_errors()
+            run.kernel.rcvbuf_errors(),
+            usage.user_pct,
+            usage.sys_pct,
+            server_stats.cpu_user_pct,
+            server_stats.cpu_sys_pct,
         );
         runs.push(run);
         servers.push(server_stats);
+        client_cpu.push(usage);
     }
     let median = report::median_run_index(&runs);
     Ok(Scenario {
@@ -1023,7 +1643,92 @@ fn run_scenario(
             .iter()
             .map(|note| (*note).to_owned())
             .collect(),
+        client_cpu,
     })
+}
+
+fn client_config(
+    scenario: &ScenarioDef,
+    store: &StoreFiles,
+    server: &RunningServer,
+    cert: &Path,
+    rep: usize,
+    layout: &Layout,
+    duration: f64,
+) -> ClientConfig {
+    ClientConfig {
+        target: server.address(scenario.transport, false),
+        mode: scenario.transport.mode(),
+        threads: scenario.threads,
+        qps: scenario.qps,
+        window: scenario.window,
+        duration: Duration::from_secs_f64(duration),
+        warmup: Duration::from_secs_f64(if duration >= 5.0 { 3.0 } else { 0.5 }),
+        timeout: Duration::from_secs(2),
+        mix: scenario.mix,
+        zones: store.spec.zones,
+        rrsets_per_zone: store.spec.rrsets_per_zone,
+        seed: 0x5eed_1234_abcd_0001 ^ u64::try_from(rep).unwrap_or(0),
+        working_set: scenario.working_set.min(
+            usize::try_from(u64::from(store.spec.zones) * u64::from(store.spec.rrsets_per_zone))
+                .unwrap_or(scenario.working_set)
+                .max(5),
+        ),
+        ca: (scenario.transport == Transport::Dot || scenario.transport == Transport::DohH2)
+            .then(|| cert.to_path_buf()),
+        server_name: "localhost".to_owned(),
+        doh_path: "/dns-query".to_owned(),
+        validate_every: 64,
+        rest: None,
+        max_inflight: 8192,
+        cpus: scenario.affinity().then(|| layout.client.clone()).flatten(),
+        edns_do: scenario.edns_do(),
+    }
+}
+
+fn rest_config(
+    scenario: &ScenarioDef,
+    server: &RunningServer,
+    rep: usize,
+    layout: &Layout,
+) -> Option<pulse_loadgen::rest::RestConfig> {
+    scenario.rest.then(|| pulse_loadgen::rest::RestConfig {
+        api: server.address(Transport::Udp, true),
+        token: "pd_bench_token".to_owned(),
+        zones: 8,
+        threads: 4,
+        rate: 80.0,
+        timeout: Duration::from_secs(5),
+        tag: format!("{}-r{rep}-{}", scenario.name, std::process::id()),
+        cpus: scenario.affinity().then(|| layout.rest.clone()).flatten(),
+    })
+}
+
+fn cpu_usage(
+    before: Option<(u64, u64)>,
+    after: Option<(u64, u64)>,
+    wall_secs: f64,
+) -> report::CpuUsage {
+    let (Some(before), Some(after)) = (before, after) else {
+        return report::CpuUsage {
+            wall_secs,
+            ..report::CpuUsage::default()
+        };
+    };
+    let hz = sysinfo::clock_ticks_per_sec().max(1) as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let percent = |delta: u64| -> f64 {
+        if wall_secs <= 0.0 {
+            0.0
+        } else {
+            delta as f64 / hz / wall_secs * 100.0
+        }
+    };
+    report::CpuUsage {
+        user_pct: percent(after.0.saturating_sub(before.0)),
+        sys_pct: percent(after.1.saturating_sub(before.1)),
+        wall_secs,
+    }
 }
 
 fn run_client(config: &ClientConfig) -> Result<pulse_loadgen::RunResult, String> {
@@ -1045,6 +1750,8 @@ fn run_memory(args: &Args, store: &StoreFiles, cert: &Path) -> Result<mem::Memor
             doh_h2: false,
             api: false,
             label: format!("memory-{}", store.spec.name),
+            cpus: None,
+            sign_key: None,
         },
         cert,
     )?;
@@ -1072,6 +1779,8 @@ fn run_memory(args: &Args, store: &StoreFiles, cert: &Path) -> Result<mem::Memor
         validate_every: 0,
         rest: None,
         max_inflight: 8192,
+        cpus: None,
+        edns_do: false,
     };
     // Прогрев: страницы page cache и аллокаторы прогреты до сэмплирования.
     let _ = pulse_loadgen::udp::run(&base)?;
@@ -1096,6 +1805,8 @@ fn run_soak(args: &Args, store: &StoreFiles, cert: &Path) -> Result<mem::MemoryR
             doh_h2: false,
             api: false,
             label: "soak".to_owned(),
+            cpus: None,
+            sign_key: None,
         },
         cert,
     )?;
@@ -1119,6 +1830,8 @@ fn run_soak(args: &Args, store: &StoreFiles, cert: &Path) -> Result<mem::MemoryR
         validate_every: 0,
         rest: None,
         max_inflight: 8192,
+        cpus: None,
+        edns_do: false,
     };
     let _ = pulse_loadgen::udp::run(&base)?;
     let sampler = mem::Sampler::start(server.pid, store.path.clone(), Duration::from_millis(2000));
@@ -1140,90 +1853,120 @@ fn run_soak(args: &Args, store: &StoreFiles, cert: &Path) -> Result<mem::MemoryR
     Ok(memory)
 }
 
-#[allow(clippy::too_many_lines)]
-fn run_profile(args: &Args, stores: &[StoreFiles], cert: &Path) -> Result<PerfReport, String> {
-    let store = stores
-        .iter()
-        .find(|store| store.spec.name == "z100k")
-        .ok_or("z100k store missing")?;
-    let options = ServerOptions {
-        workers: 8,
-        store: store.path.clone(),
-        dot: false,
-        doh_h2: false,
-        api: false,
-        label: "perf-stat".to_owned(),
-    };
-    let stat_path = args.out_dir.join("perf-stat.txt");
-    let record_path = args.out_dir.join("perf.data");
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_profile(
+    args: &Args,
+    scenario: &ScenarioDef,
+    store: &StoreFiles,
+    cert: &Path,
+    layout: &Layout,
+    signed_key: &Path,
+) -> Result<PerfReport, String> {
+    let duration = scenario.duration.unwrap_or(5.0).clamp(2.0, 5.0);
+    let cpus = scenario.affinity().then(|| layout.server.clone()).flatten();
+    let stat_path = args
+        .out_dir
+        .join(format!("perf-stat-{}.txt", scenario.name));
+    let record_path = args.out_dir.join(format!("perf-{}.data", scenario.name));
     let _ = std::fs::remove_file(&stat_path);
     let _ = std::fs::remove_file(&record_path);
+    let options = ServerOptions {
+        workers: scenario.workers,
+        store: store.path.clone(),
+        dot: scenario.transport == Transport::Dot,
+        doh_h2: scenario.transport == Transport::DohH2,
+        api: scenario.rest,
+        label: format!("perf-stat-{}", scenario.name),
+        cpus: cpus.clone(),
+        sign_key: scenario.edns_do().then(|| signed_key.to_path_buf()),
+    };
     let stat_prefix = vec![
         "perf",
         "stat",
         "-o",
         stat_path.to_str().ok_or("perf-stat path")?,
         "-e",
-        "cycles,instructions,cache-references,cache-misses,branches,branch-misses,page-faults,context-switches,cpu-migrations",
+        "cycles,instructions,cache-references,cache-misses,L1-dcache-loads,\
+         L1-dcache-load-misses,dTLB-loads,dTLB-load-misses,iTLB-load-misses,\
+         branches,branch-misses,page-faults,context-switches,cpu-migrations",
         "--",
     ];
     let stat_server = start_profiled(args, &options, cert, &stat_prefix)?;
-    let load_config = profile_load_config(store, stat_server.address(Transport::Udp, false));
-    let stat_run = pulse_loadgen::udp::run(&load_config)?;
+    let mut load_config = client_config(scenario, store, &stat_server, cert, 0, layout, duration);
+    load_config.warmup = Duration::from_secs(1);
+    let stat_run = run_client(&load_config)?;
     stat_server.stop(load_config.duration.as_secs_f64());
     let stat_text = std::fs::read_to_string(&stat_path).unwrap_or_default();
     let mut counters = parse_perf_stat(&stat_text);
-    if let (Some(instructions), Some(cycles)) = (
-        counters.get("instructions").copied(),
-        counters.get("cycles").copied(),
-    ) && cycles > 0.0
-    {
-        counters.insert("ipc".to_owned(), instructions / cycles);
-    }
-    if let (Some(misses), Some(references)) = (
-        counters.get("cache-misses").copied(),
-        counters.get("cache-references").copied(),
-    ) && references > 0.0
-    {
-        counters.insert("cache-miss-pct".to_owned(), misses * 100.0 / references);
-    }
+    derive_ratios(&mut counters);
 
     let mut note = format!(
-        "perf stat — parent perf, сервер — child (ptrace_scope=1). Клиент: {:.0} qps, p99 {:.1} µs.",
+        "perf stat: perf — parent, сервер — child (ptrace_scope={}). Клиент: {:.0} qps, p99 {:.1} µs. user-space cycles: paranoid={}.",
+        ptrace_scope(),
         stat_run.client_qps,
-        stat_run.latency.p99 as f64 / 1000.0
+        stat_run.latency.p99 as f64 / 1000.0,
+        perf_paranoid()
     );
     let mut hotspots = Vec::new();
     let mut flamegraph = None;
-    let record_result = (|| -> Result<(Vec<Hotspot>, Option<String>, String), String> {
-        let options = ServerOptions {
-            workers: 8,
+    let mut record_errors: Vec<String> = Vec::new();
+    let mut recorded = false;
+    for (mode, dwarf) in [("dwarf", true), ("plain", false)] {
+        if recorded {
+            break;
+        }
+        let _ = std::fs::remove_file(&record_path);
+        let record_options = ServerOptions {
+            workers: scenario.workers,
             store: store.path.clone(),
-            dot: false,
-            doh_h2: false,
-            api: false,
-            label: "perf-record".to_owned(),
+            dot: scenario.transport == Transport::Dot,
+            doh_h2: scenario.transport == Transport::DohH2,
+            api: scenario.rest,
+            label: format!("perf-record-{}-{mode}", scenario.name),
+            cpus: cpus.clone(),
+            sign_key: scenario.edns_do().then(|| signed_key.to_path_buf()),
         };
-        let record_prefix = vec![
-            "perf",
-            "record",
-            "-e",
-            "cycles:u",
-            "-o",
-            record_path.to_str().ok_or("perf.data path")?,
-            "-F",
-            "199",
-            "-g",
-            "--call-graph",
-            "dwarf",
-            "--",
+        let mut record_prefix = vec![
+            "perf".to_owned(),
+            "record".to_owned(),
+            "-e".to_owned(),
+            "cycles:u".to_owned(),
+            "-o".to_owned(),
+            record_path.display().to_string(),
+            "-F".to_owned(),
+            "199".to_owned(),
         ];
-        let record_server = start_profiled(args, &options, cert, &record_prefix)?;
-        let mut load_config =
-            profile_load_config(store, record_server.address(Transport::Udp, false));
-        load_config.duration = Duration::from_secs(8);
-        let record_run = pulse_loadgen::udp::run(&load_config)?;
-        record_server.stop(load_config.duration.as_secs_f64());
+        if dwarf {
+            record_prefix.push("--call-graph".to_owned());
+            record_prefix.push("dwarf".to_owned());
+        }
+        record_prefix.push("--".to_owned());
+        let prefix_refs: Vec<&str> = record_prefix.iter().map(String::as_str).collect();
+        let record_server = match start_profiled(args, &record_options, cert, &prefix_refs) {
+            Ok(server) => server,
+            Err(error) => {
+                record_errors.push(format!("{mode}: {error}"));
+                continue;
+            }
+        };
+        let mut load = client_config(
+            scenario,
+            store,
+            &record_server,
+            cert,
+            0,
+            layout,
+            duration.min(4.0),
+        );
+        load.warmup = Duration::from_secs(1);
+        let record_run = match run_client(&load) {
+            Ok(run) => run,
+            Err(error) => {
+                record_errors.push(format!("{mode}: load: {error}"));
+                continue;
+            }
+        };
+        record_server.stop(load.duration.as_secs_f64());
         let report_text = Command::new("perf")
             .env("LC_ALL", "C")
             .args([
@@ -1241,34 +1984,37 @@ fn run_profile(args: &Args, stores: &[StoreFiles], cert: &Path) -> Result<PerfRe
             .ok()
             .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
             .unwrap_or_default();
-        let hotspots = parse_hotspots(&report_text);
-        let flamegraph = make_flamegraph(&record_path, &args.out_dir);
-        Ok((
-            hotspots,
-            flamegraph,
-            format!(
-                " perf record: {:.0} qps, p99 {:.1} µs.",
-                record_run.client_qps,
-                record_run.latency.p99 as f64 / 1000.0
-            ),
-        ))
-    })();
-    match record_result {
-        Ok((record_hotspots, record_flamegraph, text)) => {
-            hotspots = record_hotspots;
-            flamegraph = record_flamegraph;
-            note.push_str(&text);
-        }
-        Err(error) => {
-            let _ = write!(
-                note,
-                " perf record недоступен ({error}); hotspots/flamegraph не построены. \
-                 Причина обычно `kernel.perf_event_paranoid=2`; для сэмплирования нужен 1 или CAP_PERFMON."
-            );
-        }
+        hotspots = parse_hotspots(&report_text);
+        flamegraph = make_flamegraph(&record_path, &args.out_dir, scenario.name);
+        let graph = if dwarf {
+            "dwarf call-graph"
+        } else {
+            "без call-graph (paranoid=2 запрещает dwarf/fp)"
+        };
+        let _ = write!(
+            note,
+            " perf record ({graph}): {:.0} qps, p99 {:.1} µs.",
+            record_run.client_qps,
+            record_run.latency.p99 as f64 / 1000.0
+        );
+        recorded = true;
     }
+    if !recorded {
+        let _ = write!(
+            note,
+            " perf record недоступен ({}); hotspots/flamegraph не построены. \
+             При paranoid=2 kernel-space и call-graph sampling запрещены; нужен CAP_PERFMON \
+             или paranoid≤1. `perf stat` при этом доступен.",
+            record_errors.join("; ")
+        );
+    }
+
     Ok(PerfReport {
-        label: "udp-w8 (10k qps, z100k)".to_owned(),
+        label: format!(
+            "{} ({duration:.0}s, {})",
+            scenario.name,
+            scenario.transport.mode().as_str()
+        ),
         counters,
         hotspots,
         flamegraph,
@@ -1276,28 +2022,38 @@ fn run_profile(args: &Args, stores: &[StoreFiles], cert: &Path) -> Result<PerfRe
     })
 }
 
-fn profile_load_config(store: &StoreFiles, target: SocketAddr) -> ClientConfig {
-    ClientConfig {
-        target,
-        mode: Mode::Udp,
-        threads: 8,
-        qps: Some(10_000.0),
-        window: 1,
-        duration: Duration::from_secs(10),
-        warmup: Duration::from_secs(2),
-        timeout: Duration::from_secs(2),
-        mix: Mix::default(),
-        zones: store.spec.zones,
-        rrsets_per_zone: store.spec.rrsets_per_zone,
-        seed: 0xfeed_beef,
-        working_set: 16_384,
-        ca: None,
-        server_name: "localhost".to_owned(),
-        doh_path: "/dns-query".to_owned(),
-        validate_every: 0,
-        rest: None,
-        max_inflight: 8192,
+fn derive_ratios(counters: &mut std::collections::BTreeMap<String, f64>) {
+    if let (Some(instructions), Some(cycles)) = (
+        counters.get("instructions").copied(),
+        counters.get("cycles").copied(),
+    ) && cycles > 0.0
+    {
+        counters.insert("ipc".to_owned(), instructions / cycles);
     }
+    if let (Some(misses), Some(references)) = (
+        counters.get("cache-misses").copied(),
+        counters.get("cache-references").copied(),
+    ) && references > 0.0
+    {
+        counters.insert("cache-miss-pct".to_owned(), misses * 100.0 / references);
+    }
+    if let (Some(misses), Some(loads)) = (
+        counters.get("dTLB-load-misses").copied(),
+        counters.get("dTLB-loads").copied(),
+    ) && loads > 0.0
+    {
+        counters.insert("dtlb-miss-pct".to_owned(), misses * 100.0 / loads);
+    }
+}
+
+fn perf_paranoid() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
+        .map_or_else(|_| "?".to_owned(), |value| value.trim().to_owned())
+}
+
+fn ptrace_scope() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .map_or_else(|_| "?".to_owned(), |value| value.trim().to_owned())
 }
 
 fn parse_perf_stat(text: &str) -> std::collections::BTreeMap<String, f64> {
@@ -1342,6 +2098,10 @@ fn parse_hotspots(text: &str) -> Vec<Hotspot> {
                 || rest.split_whitespace().last().unwrap_or_default(),
                 |(_, tail)| tail.trim(),
             )
+            .split("  ")
+            .next()
+            .unwrap_or_default()
+            .trim()
             .to_owned();
         if !symbol.is_empty() && symbol != "symbol" {
             hotspots.push(Hotspot { symbol, percent });
@@ -1353,35 +2113,51 @@ fn parse_hotspots(text: &str) -> Vec<Hotspot> {
     hotspots
 }
 
-fn make_flamegraph(perf_data: &Path, out_dir: &Path) -> Option<String> {
-    let collapse = which("inferno-collapse-perf")?;
-    let flamegraph = which("inferno-flamegraph")?;
+fn make_flamegraph(perf_data: &Path, out_dir: &Path, label: &str) -> Option<String> {
     let script = Command::new("perf")
         .env("LC_ALL", "C")
         .args(["script", "-i", &perf_data.display().to_string()])
         .output()
         .ok()?;
-    if !script.status.success() {
+    if !script.status.success() || script.stdout.is_empty() {
         return None;
     }
-    let script_path = out_dir.join("perf-script.txt");
+    let script_path = out_dir.join(format!("perf-script-{label}.txt"));
     std::fs::write(&script_path, &script.stdout).ok()?;
-    let collapsed_path = out_dir.join("perf.folded");
-    let collapsed = Command::new(collapse)
-        .stdin(Stdio::from(File::open(&script_path).ok()?))
-        .stdout(Stdio::from(File::create(&collapsed_path).ok()?))
-        .output()
-        .ok()?;
-    if !collapsed.status.success() {
+    let script_text = String::from_utf8_lossy(&script.stdout);
+    let folded = pulse_loadgen::flame::collapse(&script_text);
+    if folded.is_empty() {
         return None;
     }
-    let svg_path = out_dir.join("flamegraph.svg");
-    let svg = Command::new(flamegraph)
-        .arg(&collapsed_path)
-        .stdout(Stdio::from(File::create(&svg_path).ok()?))
-        .output()
-        .ok()?;
-    svg.status.success().then(|| svg_path.display().to_string())
+    let folded_path = out_dir.join(format!("perf-{label}.folded"));
+    std::fs::write(&folded_path, &folded).ok()?;
+    let svg_path = out_dir.join(format!("flamegraph-{label}.svg"));
+    if let (Some(collapse), Some(flamegraph)) =
+        (which("inferno-collapse-perf"), which("inferno-flamegraph"))
+    {
+        let collapsed_path = out_dir.join(format!("perf-{label}.inferno.folded"));
+        let collapsed = Command::new(collapse)
+            .stdin(Stdio::from(File::open(&script_path).ok()?))
+            .stdout(Stdio::from(File::create(&collapsed_path).ok()?))
+            .output()
+            .ok()?;
+        if collapsed.status.success() {
+            let svg = Command::new(flamegraph)
+                .arg(&collapsed_path)
+                .stdout(Stdio::from(File::create(&svg_path).ok()?))
+                .output()
+                .ok()?;
+            if svg.status.success() {
+                return Some(svg_path.display().to_string());
+            }
+        }
+    }
+    let svg = pulse_loadgen::flame::render_svg(&folded, label);
+    if svg.is_empty() {
+        return None;
+    }
+    std::fs::write(&svg_path, svg).ok()?;
+    Some(svg_path.display().to_string())
 }
 
 fn which(binary: &str) -> Option<String> {
@@ -1500,8 +2276,200 @@ fn field(message: &str, key: &str) -> Option<u64> {
     None
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn comparison_table(report: &BaselineReport) -> String {
+    let mut body = String::from(
+        "| Сценарий | iso qps | shared qps | Δ qps | iso p50 µs | shared p50 µs | \
+         iso p99 µs | shared p99 µs | iso p999 µs | iso srv user/sys % | shared srv user/sys % | \
+         iso RSS MiB | shared RSS MiB |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+    );
+    let mut rows = 0;
+    for scenario in report
+        .scenarios
+        .iter()
+        .filter(|scenario| scenario.name.starts_with("iso-"))
+    {
+        let Some(iso_run) = scenario.runs.get(scenario.median) else {
+            continue;
+        };
+        let iso_cpu = scenario
+            .server
+            .get(scenario.median)
+            .cloned()
+            .unwrap_or_default();
+        let shared_name = format!("shared-{}", scenario.name.trim_start_matches("iso-"));
+        let Some(shared) = report
+            .scenarios
+            .iter()
+            .find(|candidate| candidate.name == shared_name)
+        else {
+            let _ = writeln!(
+                body,
+                "| {} | {:.0} | — | — | {:.2} | — | {:.2} | — | {:.2} | {:.0}/{:.0} | — | {:.1} | — |",
+                scenario.name,
+                iso_run.client_qps,
+                iso_run.latency.p50 as f64 / 1000.0,
+                iso_run.latency.p99 as f64 / 1000.0,
+                iso_run.latency.p999 as f64 / 1000.0,
+                iso_cpu.cpu_user_pct,
+                iso_cpu.cpu_sys_pct,
+                iso_cpu.rss_kb as f64 / 1024.0,
+            );
+            continue;
+        };
+        let Some(shared_run) = shared.runs.get(shared.median) else {
+            continue;
+        };
+        let shared_cpu = shared
+            .server
+            .get(shared.median)
+            .cloned()
+            .unwrap_or_default();
+        let delta =
+            (iso_run.client_qps - shared_run.client_qps) / shared_run.client_qps.max(1.0) * 100.0;
+        let _ = writeln!(
+            body,
+            "| {} | {:.0} | {:.0} | {:+.1}% | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | \
+             {:.0}/{:.0} | {:.0}/{:.0} | {:.1} | {:.1} |",
+            scenario.name,
+            iso_run.client_qps,
+            shared_run.client_qps,
+            delta,
+            iso_run.latency.p50 as f64 / 1000.0,
+            shared_run.latency.p50 as f64 / 1000.0,
+            iso_run.latency.p99 as f64 / 1000.0,
+            shared_run.latency.p99 as f64 / 1000.0,
+            iso_run.latency.p999 as f64 / 1000.0,
+            iso_cpu.cpu_user_pct,
+            iso_cpu.cpu_sys_pct,
+            shared_cpu.cpu_user_pct,
+            shared_cpu.cpu_sys_pct,
+            iso_cpu.rss_kb as f64 / 1024.0,
+            shared_cpu.rss_kb as f64 / 1024.0,
+        );
+        rows += 1;
+    }
+    if rows == 0 {
+        body.push_str(
+            "\nКонтрольные `shared-*` не запускались (`--no-shared-controls`). \
+             Запустите без флага для сравнения с loopback-общим.\n",
+        );
+    } else {
+        body.push_str(
+            "\n`shared-*` — тот же сценарий без affinity (все потоки мигрируют по 8 vCPU). \
+             Δ qps = (iso − shared) / shared; положительное значение — вклад изоляции. \
+             Оба варианта — loopback, поэтому это сравнение методики, а не абсолютный потолок. \
+             `shared-*` может выигрывать по qps: без пиннинга каждый процесс получает доступ \
+             ко всем 8 vCPU, тогда как `iso-*` ограничивает сторону 4 CPU. Изоляция убирает \
+             SMT-конкуренцию, но не увеличивает суммарное число CPU.\n",
+        );
+    }
+    body
+}
+
+fn isolated_recommendations(report: &BaselineReport) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut best = None;
+    for scenario in report
+        .scenarios
+        .iter()
+        .filter(|scenario| scenario.name.starts_with("iso-"))
+    {
+        let Some(run) = scenario.runs.get(scenario.median) else {
+            continue;
+        };
+        let shared = report.scenarios.iter().find(|candidate| {
+            candidate.name == format!("shared-{}", scenario.name.trim_start_matches("iso-"))
+        });
+        let shared_qps = shared
+            .and_then(|shared| shared.runs.get(shared.median))
+            .map_or(0.0, |run| run.client_qps);
+        if shared_qps > 0.0 {
+            let delta = (run.client_qps - shared_qps) / shared_qps * 100.0;
+            items.push(format!(
+                "{}: {:.0} qps (shared {shared_qps:.0}, {:+.1}%), p50 {:.1} µs, p99 {:.1} µs, \
+                 p999 {:.1} µs.",
+                scenario.name,
+                run.client_qps,
+                delta,
+                run.latency.p50 as f64 / 1000.0,
+                run.latency.p99 as f64 / 1000.0,
+                run.latency.p999 as f64 / 1000.0,
+            ));
+        } else {
+            items.push(format!(
+                "{}: {:.0} qps, p50 {:.1} µs, p99 {:.1} µs, p999 {:.1} µs.",
+                scenario.name,
+                run.client_qps,
+                run.latency.p50 as f64 / 1000.0,
+                run.latency.p99 as f64 / 1000.0,
+                run.latency.p999 as f64 / 1000.0,
+            ));
+        }
+        if run.kernel.rcvbuf_errors() > 0 {
+            items.push(format!(
+                "{}: `UdpRcvbufErrors` Δ {} — сервер/ядро теряли датаграммы; qps занижен, \
+                 поднимите `SO_RCVBUF`/уменьшите окно или число клиентских потоков.",
+                scenario.name,
+                run.kernel.rcvbuf_errors()
+            ));
+        }
+        if best.as_ref().is_none_or(|(_, qps)| run.client_qps > *qps) {
+            best = Some((scenario.name.clone(), run.client_qps));
+        }
+    }
+    if let Some((name, qps)) = best {
+        items.push(format!(
+            "Максимальный клиентский qps в прогоне — `{name}`: {qps:.0}. Это не потолок \
+             платформы: стенд loopback на 4 серверных CPU и шумном хосте; для приёмки \
+             100k qps нужен отдельный клиентский хост."
+        ));
+    }
+    if let Some(nx) = report
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.name == "iso-udp-nx")
+        && let Some(hit) = report
+            .scenarios
+            .iter()
+            .find(|scenario| scenario.name == "iso-udp-mix")
+        && let (Some(nx_run), Some(hit_run)) = (nx.runs.get(nx.median), hit.runs.get(hit.median))
+    {
+        items.push(format!(
+            "NXDOMAIN против mix: p99 {:.1} µs против {:.1} µs ({:.1}×). Негативный путь — \
+             главный вклад в хвост; оптимизация перебора суффиксов даёт больше, чем qps.",
+            nx_run.latency.p99 as f64 / 1000.0,
+            hit_run.latency.p99 as f64 / 1000.0,
+            nx_run.latency.p99 as f64 / hit_run.latency.p99.max(1) as f64
+        ));
+    }
+    if report.perf.iter().all(|perf| perf.hotspots.is_empty()) {
+        items.push(
+            "Функциональные hotspots не сняты: `perf record -e cycles:u` не дал сэмплов \
+             (paranoid≥3 или perf.data пуст). `perf stat`-счётчики при этом доступны; для \
+             flamegraph нужен `CAP_PERFMON` либо `kernel.perf_event_paranoid≤1`."
+                .to_owned(),
+        );
+    }
+    items.push(
+        "Изоляция проверяется по `Cpus_allowed_list` сервера и SMT-группам: сервер и клиент \
+         не должны делить физическое ядро. Раскладка 0,2,4,6/1,3,5,7 формально не пересекается, \
+         но оставляет каждого с сиблингом на чужой стороне — это не isolated."
+            .to_owned(),
+    );
+    items
+}
+
 #[allow(clippy::too_many_lines)]
 fn recommendations(report: &BaselineReport) -> Vec<String> {
+    if report
+        .title
+        .as_deref()
+        .is_some_and(|title| title.contains("Isolated"))
+    {
+        return isolated_recommendations(report);
+    }
     let mut items = Vec::new();
     if let Some(udp) = report
         .scenarios
@@ -1621,9 +2589,9 @@ fn recommendations(report: &BaselineReport) -> Vec<String> {
         .is_some_and(|perf| perf.hotspots.is_empty())
     {
         items.push(
-            "CPU-hotspots по функциям не сняты: `perf record` заблокирован \
-             `kernel.perf_event_paranoid=2` (сэмплирование), хотя `perf stat` считает \
-             cycles/instructions. Для flamegraph нужен paranoid 1 или CAP_PERFMON."
+            "Функциональные hotspots не сняты: `perf record -g/--call-graph dwarf` заблокирован \
+             `kernel.perf_event_paranoid=2`, хотя `perf stat` и плоский `perf record -e cycles:u` \
+             работают. Для flamegraph со стеками нужен paranoid≤1 или CAP_PERFMON."
                 .to_owned(),
         );
     }
@@ -1657,16 +2625,43 @@ fn recommendations(report: &BaselineReport) -> Vec<String> {
 }
 
 fn commands(args: &Args) -> Vec<String> {
-    vec![
+    let report = args.report.as_deref().map_or_else(
+        || "docs/bench/baseline.md".to_owned(),
+        |path| path.display().to_string(),
+    );
+    let json = args.json.as_deref().map_or_else(
+        || "docs/bench/baseline.json".to_owned(),
+        |path| path.display().to_string(),
+    );
+    let mut commands = vec![
         "cargo build --release -p pulsed -p pulse-loadgen".to_owned(),
         format!(
-            "{} --out-dir {} --report {} --json {}",
-            "target/release/pulse-bench",
-            args.out_dir.display(),
-            args.report.display(),
-            args.json.display()
+            "target/release/pulse-bench --out-dir {} --report {report} --json {json}",
+            args.out_dir.display()
         ),
-        "cargo run -p pulse-loadgen --release --features alloc --bin pulse-alloc -- \\\n  --data target/bench/z1m.v2 --rrsets 1000000 --ops 20000 --json-out target/bench/alloc.json".to_owned(),
-        "cargo bench -p pulsed --bench zone_writes".to_owned(),
-    ]
+    ];
+    if args.isolated {
+        commands.push(format!(
+            "target/release/pulse-bench --isolated --reuse --auto-layout \\
+             --server-cpus {} --client-cpus {} --rest-cpus {} \\
+             --out-dir {} --report {report} --json {json}",
+            args.server_cpus.as_deref().unwrap_or("0-3"),
+            args.client_cpus.as_deref().unwrap_or("4-7"),
+            args.rest_cpus.as_deref().unwrap_or("6-7"),
+            args.out_dir.display()
+        ));
+        commands.push(
+            "taskset -c 4-7 target/release/pulse-loadgen --server 127.0.0.1:5353 \\
+             --mode udp --threads 8 --window 64 --client-cpus 4-7 --json-out run.json"
+                .to_owned(),
+        );
+    }
+    commands.push(
+        "cargo run -p pulse-loadgen --release --features alloc --bin pulse-alloc -- \\
+         --data target/bench/z1m.v2 --rrsets 1000000 --ops 20000 \\
+         --json-out target/bench/alloc.json"
+            .to_owned(),
+    );
+    commands.push("cargo bench -p pulsed --bench zone_writes".to_owned());
+    commands
 }

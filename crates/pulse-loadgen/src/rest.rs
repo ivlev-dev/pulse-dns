@@ -31,6 +31,8 @@ pub struct RestConfig {
     /// Уникальный тег прогона: владельцы `w{thread}-{n}-{tag}` не конфликтуют
     /// между повторами (PUT в существующий owner без `If-Match` отвергается).
     pub tag: String,
+    /// CPU для writer'ов (round-robin). `None` — без пиннинга.
+    pub cpus: Option<Vec<usize>>,
 }
 
 impl Default for RestConfig {
@@ -43,6 +45,7 @@ impl Default for RestConfig {
             rate: 80.0,
             timeout: Duration::from_secs(5),
             tag: String::new(),
+            cpus: None,
         }
     }
 }
@@ -142,6 +145,11 @@ impl RestHandle {
 }
 
 fn writer(thread: usize, config: &RestConfig, stop: &AtomicBool) -> WriterResult {
+    if let Some(cpus) = config.cpus.as_deref()
+        && let Err(error) = crate::affinity::pin_thread(cpus, thread)
+    {
+        eprintln!("pulse-loadgen: rest writer {thread} affinity: {error}");
+    }
     let mut result = WriterResult {
         requests: 0,
         acked: 0,

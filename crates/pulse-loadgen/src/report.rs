@@ -48,6 +48,29 @@ pub struct ServerStats {
     pub servfail: u64,
     /// Серверный qps (responses / длительность прогона).
     pub qps: f64,
+    /// Доля user CPU процесса сервера за прогон, % (100% = одно ядро).
+    #[serde(default)]
+    pub cpu_user_pct: f64,
+    /// Доля sys CPU процесса сервера за прогон, %.
+    #[serde(default)]
+    pub cpu_sys_pct: f64,
+    /// `VmRSS` сервера после прогона, КиБ.
+    #[serde(default)]
+    pub rss_kb: u64,
+    /// Реальный `Cpus_allowed_list` сервера (проверка affinity).
+    #[serde(default)]
+    pub cpus: String,
+}
+
+/// CPU-время процесса в процентах от одного ядра.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct CpuUsage {
+    /// user-время, %.
+    pub user_pct: f64,
+    /// sys-время, %.
+    pub sys_pct: f64,
+    /// Стена, с.
+    pub wall_secs: f64,
 }
 
 /// Один сценарий: 3 прогона + медиана.
@@ -65,6 +88,9 @@ pub struct Scenario {
     pub median: usize,
     /// Пометки о шуме/ограничениях.
     pub notes: Vec<String>,
+    /// CPU-время клиентского процесса по прогонам.
+    #[serde(default)]
+    pub client_cpu: Vec<CpuUsage>,
 }
 
 /// `perf stat`-счётчики и hotspots.
@@ -120,6 +146,12 @@ pub struct ExtraSection {
 /// Полный baseline.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BaselineReport {
+    /// Заголовок отчёта (по умолчанию — baseline на loopback).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Вводная заметка о методике/ограничениях.
+    #[serde(default)]
+    pub scope_note: Option<String>,
     /// Unix-время генерации.
     pub generated_unix: u64,
     /// Версия `pulsed`.
@@ -231,15 +263,23 @@ pub fn write_markdown(report: &BaselineReport, path: &Path) -> Result<(), String
 pub fn render_markdown(report: &BaselineReport) -> String {
     let mut out = String::new();
     let host = &report.host;
-    let _ = writeln!(out, "# Baseline: pulsed на loopback");
+    let title = report
+        .title
+        .as_deref()
+        .unwrap_or("Baseline: pulsed на loopback");
+    let _ = writeln!(out, "# {title}");
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Автогенерировано `pulse-bench`; JSON рядом: см. `docs/bench/baseline.json`.\n\
+        "Автогенерировано `pulse-bench`; JSON-версия — файл из `--json`.\n\
          Все числа — **медиана трёх прогонов**, если не сказано иное. Прогрев входит в \
          каждый прогон, но не в измерение."
     );
     let _ = writeln!(out);
+    if let Some(scope) = &report.scope_note {
+        let _ = writeln!(out, "{scope}");
+        let _ = writeln!(out);
+    }
     let _ = writeln!(out, "## Окружение");
     let _ = writeln!(out);
     let _ = writeln!(out, "| Параметр | Значение |");
@@ -248,6 +288,11 @@ pub fn render_markdown(report: &BaselineReport) -> String {
     let _ = writeln!(out, "| CPU | {} |", host.model);
     let _ = writeln!(out, "| vCPU | {} |", host.cpus);
     let _ = writeln!(out, "| SMT siblings | `{}` |", host.smt);
+    let _ = writeln!(
+        out,
+        "| Физические ядра (SMT-группы) | `{}` |",
+        host.siblings.join("`, `")
+    );
     let _ = writeln!(out, "| Kernel | `{}` |", host.kernel);
     let _ = writeln!(out, "| `pulsed` | {} |", report.pulsed_version);
     let _ = writeln!(
@@ -262,24 +307,34 @@ pub fn render_markdown(report: &BaselineReport) -> String {
     );
     let _ = writeln!(out, "| Сгенерировано (unix) | {} |", report.generated_unix);
     let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "> **Шум хоста.** Замеры сделаны на loopback; клиент и сервер делят 8 vCPU \
-         (4 физических ядра × SMT). Абсолютные qps ниже, чем на выделенном стенде; \
-         сравнивать имеет смысл прогоны между собой и с этим baseline. Перед прогоном \
-         проверяйте `loadavg` и `nstat -az | grep -E 'Udp(InErrors|RcvbufErrors)'`."
-    );
+    if title.contains("Baseline") {
+        let _ = writeln!(
+            out,
+            "> **Шум хоста.** Замеры сделаны на loopback; клиент и сервер делят 8 vCPU \
+             (4 физических ядра × SMT). Абсолютные qps ниже, чем на выделенном стенде; \
+             сравнивать имеет смысл прогоны между собой и с этим baseline. Перед прогоном \
+             проверяйте `loadavg` и `nstat -az | grep -E 'Udp(InErrors|RcvbufErrors)'`."
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "> **Изоляция.** Сценарии `iso-*` пиннятся по CPU (`taskset` для сервера, \
+             `sched_setaffinity` для клиентских потоков), `shared-*` — контроль на общем \
+             наборе CPU. Перед прогоном проверяйте `loadavg` и governor; числа на одной \
+             машине сравнимы между собой, но не с другим железом."
+        );
+    }
     let _ = writeln!(out);
 
     let _ = writeln!(out, "## Нагрузка");
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "| Сценарий | Транспорт | Потоки | Цель qps | Клиент qps | Сервер qps | p50 µs | p99 µs | p999 µs | max µs | sent | recv | timeout | rcvbuf Δ | REST qps |"
+        "| Сценарий | Транспорт | Потоки | Цель qps | Клиент qps | Сервер qps | cl user% | cl sys% | srv user% | srv sys% | srv RSS MiB | srv CPUs | p50 µs | p99 µs | p999 µs | max µs | sent | recv | timeout | rcvbuf Δ | REST qps |"
     );
     let _ = writeln!(
         out,
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     );
     for scenario in &report.scenarios {
         let Some(run) = scenario.runs.get(scenario.median) else {
@@ -289,9 +344,14 @@ pub fn render_markdown(report: &BaselineReport) -> String {
         let server_qps = server.map_or(0.0, |stats| stats.qps);
         let rcvbuf = run.kernel.rcvbuf_errors();
         let rest_qps = run.rest.as_ref().map_or(0.0, |rest| rest.qps);
+        let client_cpu = scenario
+            .client_cpu
+            .get(scenario.median)
+            .copied()
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {:.0} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {} | {} | {:.1} |",
+            "| {} | {} | {} | {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {:.1} | `{}` | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {} | {} | {:.1} |",
             scenario.name,
             run.mode.as_str(),
             run.threads,
@@ -299,6 +359,12 @@ pub fn render_markdown(report: &BaselineReport) -> String {
                 .map_or_else(|| "closed".to_owned(), |qps| format!("{qps:.0}")),
             run.client_qps,
             server_qps,
+            client_cpu.user_pct,
+            client_cpu.sys_pct,
+            server.map_or(0.0, |stats| stats.cpu_user_pct),
+            server.map_or(0.0, |stats| stats.cpu_sys_pct),
+            server.map_or(0.0, |stats| stats.rss_kb as f64 / 1024.0),
+            server.map_or("", |stats| stats.cpus.as_str()),
             ns_to_us(run.latency.p50),
             ns_to_us(run.latency.p99),
             ns_to_us(run.latency.p999),
@@ -316,7 +382,9 @@ pub fn render_markdown(report: &BaselineReport) -> String {
         "`rcvbuf Δ` — `UdpRcvbufErrors` namespace за прогон; если он > 0, сервер/ядро \
          теряли датаграммы и qps-число отражает не только сервер. Клиентский qps — \
          `received / время`; серверный — `responses` из финального лога \
-         `udp_stats`/`stats` минус ответы прогрева, делённые на время измерения."
+         `udp_stats`/`stats` минус ответы прогрева, делённые на время измерения. \
+         `cl/srv user%/sys%` — `utime/stime` процесса за прогон (100% = одно ядро; \
+         включает прогрев и старт сервера), `srv RSS` — `VmRSS` после прогона."
     );
     let _ = writeln!(out);
 
@@ -327,14 +395,18 @@ pub fn render_markdown(report: &BaselineReport) -> String {
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "| Прогон | Клиент qps | p50 µs | p99 µs | p999 µs | max µs | sent | recv | timeout | invalid | suppressed | rcvbuf Δ | server qps |"
+            "| Прогон | Клиент qps | p50 µs | p99 µs | p999 µs | max µs | cl user% | cl sys% | srv user% | srv sys% | srv RSS MiB | sent | recv | timeout | invalid | suppressed | rcvbuf Δ | server qps |"
         );
-        let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+        let _ = writeln!(
+            out,
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+        );
         for (index, run) in scenario.runs.iter().enumerate() {
             let server = scenario.server.get(index);
+            let client_cpu = scenario.client_cpu.get(index).copied().unwrap_or_default();
             let _ = writeln!(
                 out,
-                "| {} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {:.0} |",
+                "| {} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} | {:.0} | {:.0} | {:.0} | {:.0} | {:.1} | {} | {} | {} | {} | {} | {} | {:.0} |",
                 if index == scenario.median {
                     "**median**"
                 } else {
@@ -345,6 +417,11 @@ pub fn render_markdown(report: &BaselineReport) -> String {
                 ns_to_us(run.latency.p99),
                 ns_to_us(run.latency.p999),
                 ns_to_us(run.latency.max),
+                client_cpu.user_pct,
+                client_cpu.sys_pct,
+                server.map_or(0.0, |stats| stats.cpu_user_pct),
+                server.map_or(0.0, |stats| stats.cpu_sys_pct),
+                server.map_or(0.0, |stats| stats.rss_kb as f64 / 1024.0),
                 run.sent,
                 run.received,
                 run.timeouts,
@@ -363,58 +440,60 @@ pub fn render_markdown(report: &BaselineReport) -> String {
         let _ = writeln!(out);
     }
 
-    let _ = writeln!(out, "## Память");
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "| Зоны | RRset | Файл MiB | Диск MiB | RSS first MiB | RSS last MiB | Δ MiB | Δ % | RssAnon last MiB | RssFile last MiB | PageCache last MiB | mmap RSS last MiB | PSS last MiB | CPU % | Вердикт |"
-    );
-    let _ = writeln!(
-        out,
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-    );
-    for memory in &report.memory {
-        let summary = &memory.summary;
+    if !report.memory.is_empty() {
+        let _ = writeln!(out, "## Память");
+        let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "| {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.2}% | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} |",
-            memory.zones,
-            memory.rrsets,
-            bytes_to_mib(summary.file_bytes),
-            bytes_to_mib(summary.disk_bytes),
-            kib_to_mib(summary.rss_first_kb),
-            kib_to_mib(summary.rss_last_kb),
-            summary.rss_growth_kb as f64 / 1024.0,
-            summary.rss_growth_pct,
-            kib_to_mib(summary.anon_last_kb),
-            kib_to_mib(summary.file_last_kb),
-            bytes_to_mib(summary.page_cache_last_bytes),
-            kib_to_mib(summary.mmap_last_kb),
-            kib_to_mib(
-                memory
-                    .samples
-                    .last()
-                    .map_or(0, |sample| sample.smaps_pss_kb)
-            ),
-            summary.cpu_pct,
-            if summary.leak_suspected {
-                "рост > 5%"
-            } else {
-                "стабильно"
-            },
+            "| Зоны | RRset | Файл MiB | Диск MiB | RSS first MiB | RSS last MiB | Δ MiB | Δ % | RssAnon last MiB | RssFile last MiB | PageCache last MiB | mmap RSS last MiB | PSS last MiB | CPU % | Вердикт |"
         );
-    }
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "v2 читает файл через `pread`/`pwrite` (`pulse-zonefile::map` используется только v1), \
+        let _ = writeln!(
+            out,
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+        );
+        for memory in &report.memory {
+            let summary = &memory.summary;
+            let _ = writeln!(
+                out,
+                "| {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.2}% | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} |",
+                memory.zones,
+                memory.rrsets,
+                bytes_to_mib(summary.file_bytes),
+                bytes_to_mib(summary.disk_bytes),
+                kib_to_mib(summary.rss_first_kb),
+                kib_to_mib(summary.rss_last_kb),
+                summary.rss_growth_kb as f64 / 1024.0,
+                summary.rss_growth_pct,
+                kib_to_mib(summary.anon_last_kb),
+                kib_to_mib(summary.file_last_kb),
+                bytes_to_mib(summary.page_cache_last_bytes),
+                kib_to_mib(summary.mmap_last_kb),
+                kib_to_mib(
+                    memory
+                        .samples
+                        .last()
+                        .map_or(0, |sample| sample.smaps_pss_kb)
+                ),
+                summary.cpu_pct,
+                if summary.leak_suspected {
+                    "рост > 5%"
+                } else {
+                    "стабильно"
+                },
+            );
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "v2 читает файл через `pread`/`pwrite` (`pulse-zonefile::map` используется только v1), \
          поэтому `mmap RSS` = 0 — это ожидаемо. `PageCache` — `fincore RES` файла зон; \
          `Диск MiB` — фактически занятые блоки (sparse-файл может быть больше). Рост \
          `RssAnon` — heap; рост `PageCache` — прогрев файла, не утечка. \
          Для серий < 60 с «Δ %» включает прогрев и не является вердиктом об утечке; \
          вердикт «стабильно/рост > 5%» выносится только для soak ≥ 60 с."
-    );
-    let _ = writeln!(out);
+        );
+        let _ = writeln!(out);
+    }
 
     if !report.alloc.is_empty() {
         let _ = writeln!(out, "## Аллокации");

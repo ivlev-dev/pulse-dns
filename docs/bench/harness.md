@@ -82,16 +82,43 @@ lease-шард каталога); 255 зон работают. Это отмеч
 - **Page cache и RSS.** `RssFile`/`PageCache` растут при прогреве файла — это
   не утечка. Утечка — рост `RssAnon`/`VmRSS` при стабильном page cache.
 - **`perf`** на этой машине: `perf stat` работает, если `perf` — parent
-  сервера (обход `yama/ptrace_scope=1`); `perf record` при
-  `kernel.perf_event_paranoid=2` **запрещён** (сэмплирование), поэтому
-  hotspots/flamegraph помечаются как недоступные. Для них нужен paranoid 1
-  или `CAP_PERFMON`; harness не понижает sysctl сам.
+  сервера (обход `yama/ptrace_scope=1`). При `kernel.perf_event_paranoid=2`
+  `perf record -e cycles:u` **без call-graph доступен**, а `-g` и
+  `--call-graph dwarf/fp` — **нет** (`Failure to open event 'cycles:u'`).
+  Harness пробует dwarf и откатывается на плоский `cycles:u`: flamegraph
+  строится, но без стеков (hotspots — по символам). Для dwarf нужен
+  paranoid 1 или `CAP_PERFMON`; harness не понижает sysctl сам.
 - **Генерация 1M RRset** в текущем v2-writer'е стоит ~6 COW-страниц на
   RRset (allocator cursor растёт, страницы уходят в free pool). Файл
   sparse; фактическая запись ~24 GiB и ~10 минут. Это отдельный вывод о
   стоимости bulk-load, а не свойство чтения.
 - **REST** измеряется с `Connection: close` на запрос; латентность включает
   TCP/TLS-подобный overhead и очередь API, а не только commit.
+
+## Изолированный стенд (anti-loopback+SMT)
+
+`pulse-bench --isolated` запускает сервер под `taskset -c <server>` и
+пиннит каждый клиентский поток через `sched_setaffinity(0, <cpu>)`;
+наборы проверяются на непересечение и вхождение в `Cpus_allowed_list`.
+Сценарии `iso-*` (UDP A/mix/NX, signed с EDNS DO, TCP, DoH h2, UDP+REST
+со split-ролями DNS/REST) идут в паре с `shared-*` — тем же сценарием без
+пиннинга. 3 прогона, медиана, HDR; `perf stat` (cycles/instructions/cache/
+TLB) и `perf record -e cycles:u` на каждый сценарий.
+
+```bash
+# авто-раскладка: целые физические ядра на сторону
+target/release/pulse-bench --isolated --reuse --auto-layout
+
+# вручную (проверит sched_getaffinity и SMT-сиблингов)
+target/release/pulse-bench --isolated --reuse   --server-cpus 0-3 --client-cpus 4-7 --rest-cpus 6-7
+```
+
+Отчёты: `docs/bench/isolated.md` и `docs/bench/isolated.json`.
+Раскладка `0,2,4,6` / `1,3,5,7` **не изолирует** ядро: каждая пара —
+SMT-сиблинги одного физического ядра; harness предупреждает об этом.
+`pulse-loadgen` принимает `--client-cpus` (и `--rest-cpus`) для ручных
+прогонов; `--server-cpus` у него информационный — сервер пиннит
+`pulse-bench`/`taskset`.
 
 ## Команды
 

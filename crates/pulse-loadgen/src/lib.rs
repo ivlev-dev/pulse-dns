@@ -17,7 +17,7 @@
 //! - [`storegen`] — генерация v2-zonefile с `zones × rrsets`;
 //! - [`report`] — JSON/Markdown-отчёт.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -26,7 +26,9 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::doc_markdown)]
 
+pub mod affinity;
 pub mod doh;
+pub mod flame;
 pub mod mem;
 pub mod mix;
 pub mod report;
@@ -109,6 +111,10 @@ pub struct ClientConfig {
     pub rest: Option<rest::RestConfig>,
     /// Максимум in-flight для open-loop (защита клиента от OOM).
     pub max_inflight: usize,
+    /// CPU для клиентских потоков (round-robin). `None` — без пиннинга.
+    pub cpus: Option<Vec<usize>>,
+    /// Добавлять EDNS0 c флагом DO в каждый запрос (DNSSEC-сценарий).
+    pub edns_do: bool,
 }
 
 impl Default for ClientConfig {
@@ -133,6 +139,8 @@ impl Default for ClientConfig {
             validate_every: 64,
             rest: None,
             max_inflight: 8192,
+            cpus: None,
+            edns_do: false,
         }
     }
 }
