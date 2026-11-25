@@ -13,8 +13,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use pulse_dns::{
-    DecodeLimits, Edns, EncodeError, EncodeOptions, EncodeScratch, Encoder, Flags, HeaderCounts,
-    Message, Name, Question, Rclass, Rcode, Record, Rtype, Ttl,
+    DecodeLimits, Edns, EdnsRef, EncodeError, EncodeOptions, EncodeScratch, Encoder, Flags,
+    HeaderCounts, Message, MessageRef, Name, Question, Rclass, Rcode, Record, Rtype, Ttl,
 };
 use pulse_tls::client::{DohClient, DotClient};
 use pulse_tls::{PoolConfig, PoolStats};
@@ -220,6 +220,54 @@ pub struct StatsSnapshot {
     pub upstream: UpstreamStats,
 }
 
+/// Метаданные ответа для транспортных политик (RRL) и метрик.
+///
+/// Заполняются без [`Message`] на горячем пути попадания в кеш: RCODE,
+/// наличие ответов и типы authority-записей берутся из компактной записи
+/// кеша. Классификация (referral/NODATA) остаётся за транспортным слоем.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseMeta {
+    /// Итоговый RCODE.
+    pub rcode: Rcode,
+    /// Число записей в секции ответа (0 — NODATA/referral/ошибка).
+    pub answers: u16,
+    /// В authority есть `NS` (признак делегирования).
+    pub authority_ns: bool,
+    /// В authority есть `SOA` (признак NODATA/NXDOMAIN).
+    pub authority_soa: bool,
+    /// Ответ отдан из кеша.
+    pub cache_hit: bool,
+    /// Ответ помечен AD (DNSSEC-secure).
+    pub secure: bool,
+}
+
+impl ResponseMeta {
+    fn from_message(response: &Message, cache_hit: bool) -> Self {
+        let authority = response.authority();
+        Self {
+            rcode: response.rcode(),
+            answers: u16::try_from(response.answers().len()).unwrap_or(u16::MAX),
+            authority_ns: authority.iter().any(|record| record.rr_type() == Rtype::NS),
+            authority_soa: authority
+                .iter()
+                .any(|record| record.rr_type() == Rtype::SOA),
+            cache_hit,
+            secure: response.flags().ad(),
+        }
+    }
+}
+
+/// Результат кодирования ответа в caller-буфер.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedResponse {
+    /// Длина записанного ответа.
+    pub len: usize,
+    /// Метаданные полного (до усечения) ответа.
+    pub meta: ResponseMeta,
+    /// Ответ усечён по лимиту клиента (TC выставлен).
+    pub truncated: bool,
+}
+
 /// Состояние одного forward-upstream для control-plane API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamStatus {
@@ -250,6 +298,73 @@ pub(crate) struct Inner {
     pub(crate) upstream_counters: Arc<UpstreamCounters>,
     pub(crate) root_hints: Vec<SocketAddr>,
     pub(crate) counters: RuntimeCounters,
+}
+
+/// Параметры EDNS0 запроса, нужные для кодирования ответа.
+#[derive(Debug, Clone, Copy)]
+struct EdnsRequest {
+    payload: u16,
+    version: u8,
+    dnssec_ok: bool,
+}
+
+impl EdnsRequest {
+    fn from_edns(edns: &Edns) -> Self {
+        Self {
+            payload: edns.udp_payload_size(),
+            version: edns.version(),
+            dnssec_ok: edns.dnssec_ok(),
+        }
+    }
+
+    fn from_ref(edns: EdnsRef) -> Self {
+        Self {
+            payload: edns.udp_payload_size(),
+            version: edns.version(),
+            dnssec_ok: edns.dnssec_ok(),
+        }
+    }
+}
+
+/// Минимальное представление запроса для горячего пути.
+///
+/// `qname` — каноническая несжатая wire-форма: её можно передать в кеш,
+/// blocklist и overrides без материализации [`Name`].
+struct RequestView<'a> {
+    id: u16,
+    flags: Flags,
+    qname: &'a [u8],
+    qtype: Rtype,
+    qclass: Rclass,
+    edns: Option<EdnsRequest>,
+    questions: usize,
+}
+
+impl<'a> RequestView<'a> {
+    fn from_message(request: &'a Message) -> Option<Self> {
+        let question = request.questions().first()?;
+        Some(Self {
+            id: request.id(),
+            flags: request.flags(),
+            qname: question.qname().as_wire(),
+            qtype: question.qtype(),
+            qclass: question.qclass(),
+            edns: request.edns().map(EdnsRequest::from_edns),
+            questions: request.questions().len(),
+        })
+    }
+
+    fn from_ref(request: &'a MessageRef<'a>) -> Option<Self> {
+        Some(Self {
+            id: request.id(),
+            flags: request.flags(),
+            qname: request.qname()?.as_wire(),
+            qtype: request.qtype(),
+            qclass: request.qclass(),
+            edns: request.edns().map(EdnsRequest::from_ref),
+            questions: 1,
+        })
+    }
 }
 
 /// Кеширующий DNS-резолвер.
@@ -376,8 +491,11 @@ impl Resolver {
     /// ошибки кодирования при некорректных данных.
     pub fn resolve_into(&self, request: &Message, out: &mut [u8]) -> Result<usize, EncodeError> {
         self.inner.counters.queries.fetch_add(1, Ordering::Relaxed);
-        if let Some(result) = self.try_cache_into(request, out) {
-            return result;
+        let view = RequestView::from_message(request);
+        if let Some(view) = &view
+            && let Some(result) = self.try_cache_view_into(view, out)
+        {
+            return result.map(|(len, _meta)| len);
         }
         let context = self.effective_context(&ResolveContext::new());
         let response = match self.resolve_inner(request, &context) {
@@ -388,6 +506,114 @@ impl Resolver {
             }
         };
         response.encode_into(out)
+    }
+
+    /// То же, что [`Resolver::resolve_into`], но с лимитом ответа клиента.
+    ///
+    /// Если полный ответ не помещается в `limit` (UDP payload из EDNS или
+    /// 512 без EDNS), в `out` записывается минимальный ответ с битом TC и
+    /// сохранённым OPT (DO-бит и payload), а [`ResolvedResponse::truncated`]
+    /// выставляется в `true`.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::BufferTooSmall`], если даже минимальный ответ не
+    /// помещается в `out`; прочие ошибки кодирования при некорректных данных.
+    pub fn resolve_into_limited(
+        &self,
+        request: &Message,
+        out: &mut [u8],
+        limit: usize,
+    ) -> Result<ResolvedResponse, EncodeError> {
+        self.inner.counters.queries.fetch_add(1, Ordering::Relaxed);
+        let view = RequestView::from_message(request);
+        if let Some(view) = &view
+            && let Some(result) = self.try_cache_view_into(view, out)
+        {
+            match result {
+                Ok((len, meta)) => {
+                    return encode_limited_result(Some(view), None, out, limit, len, meta);
+                }
+                // Кешированный RRset больше буфера: отдаём обычной
+                // резолюции, которая усечёт ответ по лимиту клиента.
+                Err(EncodeError::BufferTooSmall { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let context = self.effective_context(&ResolveContext::new());
+        let response = match self.resolve_inner(request, &context) {
+            Ok(response) => response,
+            Err(error) => {
+                self.inner.counters.servfail.fetch_add(1, Ordering::Relaxed);
+                error_response(request, error.rcode())
+            }
+        };
+        let meta = ResponseMeta::from_message(&response, false);
+        encode_message_limited(&response, view.as_ref(), out, limit, meta)
+    }
+
+    /// Разрешает простой запрос [`MessageRef`] и кодирует ответ в `out`.
+    ///
+    /// На попадании в кеш путь не строит [`Message`], не материализует
+    /// [`Name`] и не аллоцирует: запрос разбирается
+    /// [`MessageRef::decode_simple_edns`], кеш читается по wire-ключу, RRset
+    /// пишется в `out` напрямую. На промахе запрос материализуется в
+    /// [`Message`] и обслуживается обычной резолюцией.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError`] при кодировании ответа (в том числе `BufferTooSmall`).
+    pub fn resolve_ref_into(
+        &self,
+        request: &MessageRef<'_>,
+        out: &mut [u8],
+    ) -> Result<ResolvedResponse, EncodeError> {
+        let limit = out.len();
+        self.resolve_ref_into_limited(request, out, limit)
+    }
+
+    /// [`Resolver::resolve_ref_into`] с лимитом ответа клиента.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError`] при кодировании ответа (в том числе `BufferTooSmall`,
+    /// если не помещается даже минимальный TC-ответ).
+    pub fn resolve_ref_into_limited(
+        &self,
+        request: &MessageRef<'_>,
+        out: &mut [u8],
+        limit: usize,
+    ) -> Result<ResolvedResponse, EncodeError> {
+        self.inner.counters.queries.fetch_add(1, Ordering::Relaxed);
+        let Some(view) = RequestView::from_ref(request) else {
+            return Err(EncodeError::Internal {
+                reason: "MessageRef without qname",
+            });
+        };
+        if let Some(result) = self.try_cache_view_into(&view, out) {
+            match result {
+                Ok((len, meta)) => {
+                    return encode_limited_result(Some(&view), None, out, limit, len, meta);
+                }
+                Err(EncodeError::BufferTooSmall { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(message) = message_from_ref(request) else {
+            return Err(EncodeError::Internal {
+                reason: "cannot materialize MessageRef",
+            });
+        };
+        let context = self.effective_context(&ResolveContext::new());
+        let response = match self.resolve_inner(&message, &context) {
+            Ok(response) => response,
+            Err(error) => {
+                self.inner.counters.servfail.fetch_add(1, Ordering::Relaxed);
+                error_response(&message, error.rcode())
+            }
+        };
+        let meta = ResponseMeta::from_message(&response, false);
+        encode_message_limited(&response, Some(&view), out, limit, meta)
     }
 
     /// Удобная резолюция одиночного вопроса.
@@ -781,52 +1007,49 @@ impl Resolver {
     ///
     /// `None` означает, что запрос нужно обслужить обычным путём (override,
     /// blocklist, CNAME-цепочка, промах или нестандартный запрос).
-    fn try_cache_into(
+    fn try_cache_view_into(
         &self,
-        request: &Message,
+        request: &RequestView<'_>,
         out: &mut [u8],
-    ) -> Option<Result<usize, EncodeError>> {
-        if request.flags().opcode() != pulse_dns::Opcode::QUERY {
+    ) -> Option<Result<(usize, ResponseMeta), EncodeError>> {
+        if request.flags.opcode() != pulse_dns::Opcode::QUERY || request.questions != 1 {
             return None;
         }
-        if request.questions().len() != 1 {
-            return None;
-        }
-        let question = request.questions().first()?;
-        let qclass = question.qclass();
+        let qclass = request.qclass;
         if qclass != Rclass::IN && qclass != Rclass::ANY {
             return None;
         }
-        if let Some(edns) = request.edns()
-            && edns.version() != 0
+        if let Some(edns) = request.edns
+            && edns.version != 0
         {
             return None;
         }
-        let qtype = question.qtype();
+        let qtype = request.qtype;
         if matches!(
             qtype,
             Rtype::AXFR | Rtype::IXFR | Rtype::OPT | Rtype::TKEY | Rtype::TSIG | Rtype::ANY
         ) {
             return None;
         }
-        let qname = question.qname();
+        let qname = request.qname;
         if !matches!(
-            self.inner.overrides.lookup(qname, qtype),
+            self.inner.overrides.lookup_wire(qname, qtype),
             OverrideOutcome::Miss
         ) {
             return None;
         }
-        if self.is_blocked(qname) {
+        if self.is_blocked_wire(qname) {
             return None;
         }
 
         let validation_enabled = self.inner.config.dnssec.enabled;
         let accept_unvalidated = !validation_enabled;
         let cache = &self.inner.cache;
-        let hit = if let Some(hit) = cache.lookup(qname, qtype, Rclass::IN, accept_unvalidated) {
+        let hit = if let Some(hit) = cache.lookup_wire(qname, qtype, Rclass::IN, accept_unvalidated)
+        {
             hit
         } else {
-            let fallback = cache.lookup(qname, Rtype::ANY, Rclass::IN, accept_unvalidated)?;
+            let fallback = cache.lookup_wire(qname, Rtype::ANY, Rclass::IN, accept_unvalidated)?;
             if !fallback.negative() {
                 drop(fallback);
                 return None;
@@ -840,10 +1063,10 @@ impl Resolver {
 
         let mut scratch = EncodeScratch::new();
         let mut encoder = Encoder::new(out, EncodeOptions::compressed(), &mut scratch);
-        if let Err(error) = encoder.begin_message(request.id()) {
+        if let Err(error) = encoder.begin_message(request.id) {
             return Some(Err(error));
         }
-        if let Err(error) = encoder.write_question(question) {
+        if let Err(error) = encoder.write_question_wire(qname, qtype, qclass) {
             return Some(Err(error));
         }
         let stored = usize::from(hit.records());
@@ -866,7 +1089,7 @@ impl Resolver {
             && qtype != Rtype::RRSIG
             && cache.may_have_signatures()
             && let Some(signatures) =
-                cache.peek(qname, Rtype::RRSIG, Rclass::IN, accept_unvalidated)
+                cache.peek_wire(qname, Rtype::RRSIG, Rclass::IN, accept_unvalidated)
         {
             for rr in wire_rrs(signatures.rrset()) {
                 if let Err(error) = encoder.write_rr_raw(
@@ -882,37 +1105,45 @@ impl Resolver {
             }
         }
 
-        let edns = request.edns().map(|edns| {
-            Edns::new(
-                edns.udp_payload_size()
-                    .clamp(512, pulse_dns::EDNS_DEFAULT_PAYLOAD),
-            )
-            .with_dnssec_ok(edns.dnssec_ok())
+        let edns = request.edns.map(|edns| {
+            Edns::new(edns.payload.clamp(512, pulse_dns::EDNS_DEFAULT_PAYLOAD))
+                .with_dnssec_ok(edns.dnssec_ok)
         });
         if let Some(edns) = &edns
             && let Err(error) = encoder.write_edns(edns)
         {
             return Some(Err(error));
         }
-        let flags = Flags::new()
-            .with_qr(true)
-            .with_rd(request.flags().rd())
-            .with_cd(request.flags().cd())
-            .with_ra(true)
-            .with_ad(validation_enabled && secure && !request.flags().cd())
-            .with_rcode_bits(rcode.header_bits());
+        let flags = response_flags(request, rcode, validation_enabled && secure);
         let counts = HeaderCounts {
             question: 1,
             answer: u16::try_from(answers).unwrap_or(u16::MAX),
             authority: u16::try_from(authority).unwrap_or(u16::MAX),
             additional: u16::from(edns.is_some()),
         };
-        Some(encoder.finish(flags, counts))
+        let len = match encoder.finish(flags, counts) {
+            Ok(len) => len,
+            Err(error) => return Some(Err(error)),
+        };
+        let meta = ResponseMeta {
+            rcode,
+            answers: u16::try_from(answers).unwrap_or(u16::MAX),
+            authority_ns: false,
+            authority_soa: negative,
+            cache_hit: true,
+            secure: validation_enabled && secure,
+        };
+        Some(Ok((len, meta)))
     }
 
     fn is_blocked(&self, qname: &Name) -> bool {
         let blocklist = self.blocklist();
         blocklist.is_blocked(qname)
+    }
+
+    fn is_blocked_wire(&self, qname: &[u8]) -> bool {
+        let blocklist = self.blocklist();
+        blocklist.is_blocked_wire(qname)
     }
 
     pub(crate) fn root_hints(&self) -> Vec<SocketAddr> {
@@ -1161,6 +1392,233 @@ impl Resolver {
             }
         }
         Err(last_error)
+    }
+}
+
+fn message_from_ref(request: &MessageRef<'_>) -> Option<Message> {
+    let qname = request.qname()?;
+    let name = Name::from_wire(qname.as_wire()).ok()?;
+    let question = Question::new(name, request.qtype(), request.qclass());
+    let mut message = Message::query(request.id(), question);
+    let flags = request.flags();
+    message.set_flags(
+        Flags::new()
+            .with_rd(flags.rd())
+            .with_cd(flags.cd())
+            .with_opcode(flags.opcode()),
+    );
+    if let Some(edns) = request.edns() {
+        message.set_edns(Some(
+            Edns::new(edns.udp_payload_size())
+                .with_version(edns.version())
+                .with_dnssec_ok(edns.dnssec_ok()),
+        ));
+    }
+    Some(message)
+}
+
+fn response_flags(request: &RequestView<'_>, rcode: Rcode, secure: bool) -> Flags {
+    Flags::new()
+        .with_qr(true)
+        .with_rd(request.flags.rd())
+        .with_cd(request.flags.cd())
+        .with_ra(true)
+        .with_ad(secure && !request.flags.cd())
+        .with_rcode_bits(rcode.header_bits())
+}
+
+fn encode_limited_result(
+    view: Option<&RequestView<'_>>,
+    response: Option<&Message>,
+    out: &mut [u8],
+    limit: usize,
+    encoded: usize,
+    meta: ResponseMeta,
+) -> Result<ResolvedResponse, EncodeError> {
+    let limit = limit.min(out.len());
+    if encoded <= limit {
+        return Ok(ResolvedResponse {
+            len: encoded,
+            meta,
+            truncated: false,
+        });
+    }
+    let len = match (view, response) {
+        (Some(view), _) => write_minimal_view(view, out, limit, meta.rcode, meta.secure)?,
+        (None, Some(response)) => write_minimal_message(response, out, limit)?,
+        (None, None) => {
+            return Err(EncodeError::BufferTooSmall {
+                capacity: out.len(),
+                needed: encoded,
+            });
+        }
+    };
+    Ok(ResolvedResponse {
+        len,
+        meta,
+        truncated: true,
+    })
+}
+
+fn encode_message_limited(
+    response: &Message,
+    view: Option<&RequestView<'_>>,
+    out: &mut [u8],
+    limit: usize,
+    meta: ResponseMeta,
+) -> Result<ResolvedResponse, EncodeError> {
+    match response.encode_into(out) {
+        Ok(encoded) => encode_limited_result(view, Some(response), out, limit, encoded, meta),
+        Err(EncodeError::BufferTooSmall { .. }) => encode_limited_result(
+            view,
+            Some(response),
+            out,
+            limit,
+            out.len().saturating_add(1),
+            meta,
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+/// Пишет минимальный TC-ответ (заголовок + вопрос + OPT) прямо в wire-форму.
+fn write_minimal_view(
+    request: &RequestView<'_>,
+    out: &mut [u8],
+    limit: usize,
+    rcode: Rcode,
+    secure: bool,
+) -> Result<usize, EncodeError> {
+    let limit = limit.min(out.len());
+    let mut flags = response_flags(request, rcode, secure).with_tc(true);
+    flags = flags.with_rcode_bits(rcode.header_bits());
+    let question_len = request.qname.len().saturating_add(4);
+    let edns_len = usize::from(request.edns.is_some()) * 11;
+    let base = 12_usize.saturating_add(edns_len);
+    let with_question = base.saturating_add(question_len) <= limit;
+    let needed = if with_question {
+        base.saturating_add(question_len)
+    } else {
+        base
+    };
+    if needed > limit {
+        return Err(EncodeError::BufferTooSmall {
+            capacity: out.len(),
+            needed,
+        });
+    }
+    let Some(slot) = out.get_mut(..needed) else {
+        return Err(EncodeError::BufferTooSmall {
+            capacity: out.len(),
+            needed,
+        });
+    };
+    let mut position = 0_usize;
+    if let Some(header) = slot.get_mut(position..position.saturating_add(2)) {
+        header.copy_from_slice(&request.id.to_be_bytes());
+    } else {
+        return Err(EncodeError::Internal {
+            reason: "truncated response header",
+        });
+    }
+    position = position.saturating_add(2);
+    if let Some(header) = slot.get_mut(position..position.saturating_add(2)) {
+        header.copy_from_slice(&flags.bits().to_be_bytes());
+    } else {
+        return Err(EncodeError::Internal {
+            reason: "truncated response flags",
+        });
+    }
+    position = position.saturating_add(2);
+    let counts = [
+        u16::from(with_question),
+        0_u16,
+        0_u16,
+        u16::from(request.edns.is_some()),
+    ];
+    for count in counts {
+        if let Some(section) = slot.get_mut(position..position.saturating_add(2)) {
+            section.copy_from_slice(&count.to_be_bytes());
+        } else {
+            return Err(EncodeError::Internal {
+                reason: "truncated response counts",
+            });
+        }
+        position = position.saturating_add(2);
+    }
+    if with_question {
+        if let Some(dst) = slot.get_mut(position..position.saturating_add(request.qname.len())) {
+            dst.copy_from_slice(request.qname);
+        } else {
+            return Err(EncodeError::Internal {
+                reason: "truncated response question",
+            });
+        }
+        position = position.saturating_add(request.qname.len());
+        for value in [
+            request.qtype.as_u16().to_be_bytes(),
+            request.qclass.as_u16().to_be_bytes(),
+        ] {
+            if let Some(dst) = slot.get_mut(position..position.saturating_add(2)) {
+                dst.copy_from_slice(&value);
+            } else {
+                return Err(EncodeError::Internal {
+                    reason: "truncated response question tail",
+                });
+            }
+            position = position.saturating_add(2);
+        }
+    }
+    if let Some(edns) = request.edns {
+        let payload = edns.payload.clamp(512, pulse_dns::EDNS_DEFAULT_PAYLOAD);
+        let do_bit: u32 = if edns.dnssec_ok { 0x8000 } else { 0 };
+        let ttl = (u32::from(rcode.extended_bits()) << 24) | do_bit;
+        let [type_hi, type_lo] = Rtype::OPT.as_u16().to_be_bytes();
+        let [payload_hi, payload_lo] = payload.to_be_bytes();
+        let [ttl_a, ttl_b, ttl_c, ttl_d] = ttl.to_be_bytes();
+        let opt = [
+            0_u8, type_hi, type_lo, payload_hi, payload_lo, ttl_a, ttl_b, ttl_c, ttl_d, 0, 0,
+        ];
+        if let Some(dst) = slot.get_mut(position..position.saturating_add(opt.len())) {
+            dst.copy_from_slice(&opt);
+        } else {
+            return Err(EncodeError::Internal {
+                reason: "truncated response OPT",
+            });
+        }
+    }
+    Ok(needed)
+}
+
+fn write_minimal_message(
+    response: &Message,
+    out: &mut [u8],
+    limit: usize,
+) -> Result<usize, EncodeError> {
+    let mut minimal = Message::new(response.id(), response.flags().with_qr(true).with_tc(true));
+    minimal.set_rcode(response.rcode());
+    for question in response.questions().iter().take(1) {
+        minimal.add_question(question.clone());
+    }
+    minimal.set_edns(response.edns().cloned());
+    let limit = limit.min(out.len());
+    match minimal.encode_into(out) {
+        Ok(len) if len <= limit => Ok(len),
+        Ok(_) | Err(EncodeError::BufferTooSmall { .. }) => {
+            minimal = Message::new(response.id(), response.flags().with_qr(true).with_tc(true));
+            minimal.set_rcode(response.rcode());
+            minimal.set_edns(response.edns().cloned());
+            let len = minimal.encode_into(out)?;
+            if len <= limit {
+                Ok(len)
+            } else {
+                Err(EncodeError::BufferTooSmall {
+                    capacity: out.len(),
+                    needed: len,
+                })
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 

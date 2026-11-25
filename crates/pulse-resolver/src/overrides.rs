@@ -119,10 +119,16 @@ impl Overrides {
     /// `HashMap` ищется по заимствованному `&[u8]`.
     #[must_use]
     pub fn lookup(&self, name: &Name, qtype: Rtype) -> OverrideOutcome {
+        self.lookup_wire(name.as_wire(), qtype)
+    }
+
+    /// `lookup` по канонической wire-форме имени (без материализации [`Name`]).
+    #[must_use]
+    pub fn lookup_wire(&self, wire: &[u8], qtype: Rtype) -> OverrideOutcome {
         if self.exact.is_empty() && self.wildcard.is_empty() {
             return OverrideOutcome::Miss;
         }
-        let mut current = name.as_wire();
+        let mut current = wire;
         let mut answer = Vec::new();
         let mut visited = [&[][..]; 16];
         for step in 0..16 {

@@ -4,8 +4,10 @@
 //! DNSSEC-валидация) с транспортами: UDP через `pulse-runtime` (io_uring,
 //! `SO_REUSEPORT`, N worker-потоков), TCP на std с length-prefix framing,
 //! DoT/DoH/1.1/DoH/2/DoQ через `pulse-tls` и DNSCrypt v2 (UDP/TCP) через
-//! `pulse-dnscrypt`. Все транспорты используют единый путь
-//! `decode → Resolver::resolve → encode`, общий ACL и per-source rate limit.
+//! `pulse-dnscrypt`. Все транспорты используют единый горячий путь
+//! `MessageRef → Resolver::resolve_ref_into → wire`, общий ACL и per-source
+//! rate limit. Сложные запросы (несколько вопросов, сжатый QNAME, лишние
+//! секции) автоматически уходят на полный `Message::decode` + `resolve`.
 //!
 //! # Состав
 //!

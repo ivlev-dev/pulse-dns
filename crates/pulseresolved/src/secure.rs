@@ -2,8 +2,9 @@
 //! DoQ (RFC 9250) и DNSCrypt v2 (UDP/TCP).
 //!
 //! Все транспорты используют один и тот же путь обработки запроса
-//! ([`Processor`]): `decode → Resolver::resolve → encode`, поэтому ACL,
-//! per-source rate limit, blocklist, overrides и кеш ведут себя одинаково.
+//! ([`Processor`]): `MessageRef → Resolver::resolve_ref_into → wire`, поэтому
+//! ACL, per-source rate limit, blocklist, overrides и кеш ведут себя
+//! одинаково. На попадании в кеш ответ не строит `Message` и не аллоцирует.
 //! RRL применяется только к открытому UDP; на TLS/QUIC-транспортах действует
 //! token bucket по source IP.
 //!

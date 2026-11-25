@@ -239,6 +239,36 @@ impl MetricsSource {
         );
         counter(
             &mut out,
+            "pulseresolved_fast_path_total",
+            "Queries decoded by the zero-copy MessageRef path.",
+            stats.fast_path,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_full_decode_total",
+            "Queries that required a full Message decode.",
+            stats.full_decode,
+        );
+        counter(
+            &mut out,
+            "pulseresolved_zero_alloc_responses_total",
+            "Responses encoded from the cache without heap allocations.",
+            stats.zero_alloc_responses,
+        );
+        out.push_str("# HELP pulseresolved_rcode_total Responses by RCODE.\n");
+        out.push_str("# TYPE pulseresolved_rcode_total counter\n");
+        for (code, value) in stats.rcodes.iter().enumerate() {
+            let name = pulse_dns::Rcode::from_u16(u16::try_from(code).unwrap_or(15)).to_string();
+            let _ = writeln!(out, "pulseresolved_rcode_total{{rcode=\"{name}\"}} {value}");
+        }
+        counter(
+            &mut out,
+            "pulseresolved_rcode_extended_total",
+            "Responses with an extended EDNS RCODE.",
+            stats.rcode_extended,
+        );
+        counter(
+            &mut out,
             "pulseresolved_tcp_connections_total",
             "Accepted TCP connections.",
             stats.tcp_connections,

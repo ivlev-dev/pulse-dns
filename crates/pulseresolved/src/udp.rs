@@ -3,9 +3,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use pulse_runtime::{BackendKind, Reply, RuntimeConfig, RuntimeError, ServerStats, UdpServer};
-
 use crate::query::{Processor, Transport};
+use pulse_runtime::{BackendKind, Reply, RuntimeConfig, RuntimeError, ServerStats, UdpServer};
 
 /// Максимальный размер ответа (совпадает с EDNS_MAX_PAYLOAD и TX-слотом).
 const TX_SLOT_SIZE: usize = 4096;
@@ -27,8 +26,11 @@ impl UdpService {
             .with_workers(workers)
             .with_rx_buffer_size(RX_BUFFER_SIZE)
             .with_tx(512, TX_SLOT_SIZE);
-        let handler = move |request: &[u8], peer: SocketAddr, _out: &mut [u8]| {
-            Reply::from_owned(processor.handle(request, Transport::Udp, peer))
+        let handler = move |request: &[u8], peer: SocketAddr, out: &mut [u8]| match processor
+            .handle_into(request, Transport::Udp, peer, out)
+        {
+            Some(len) => Reply::Send(len),
+            None => Reply::Drop,
         };
         let server = UdpServer::bind_with(addr, handler, config)?;
         server.start()?;

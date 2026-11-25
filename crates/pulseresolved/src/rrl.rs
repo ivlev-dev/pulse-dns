@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use pulse_dns::{Message, Name, Rcode, Rtype};
+use pulse_dns::{Message, Rcode, Rtype};
 
 use crate::config::RateLimitAction;
 use crate::error::ConfigError;
@@ -353,12 +353,37 @@ impl Rrl {
     /// `check` с явным временем (для тестов).
     #[must_use]
     pub fn check_at(&self, source: IpAddr, response: &Message, now: Instant) -> RrlOutcome {
-        let config = self.config_snapshot();
-        let per_shard = per_shard(config.max_entries);
         let Some(question) = response.questions().first() else {
             return RrlOutcome::Allow;
         };
-        let class = ResponseClass::classify(response);
+        self.check_class_at(
+            source,
+            question.qname().as_wire(),
+            ResponseClass::classify(response),
+            now,
+        )
+    }
+
+    /// Проверяет уже классифицированный ответ по wire-имени вопроса.
+    ///
+    /// Нужен горячему пути без [`Message`]: класс считается по метаданным
+    /// резолвера, имя берётся из [`pulse_dns::MessageRef`].
+    #[must_use]
+    pub fn check_class(&self, source: IpAddr, qname: &[u8], class: ResponseClass) -> RrlOutcome {
+        self.check_class_at(source, qname, class, Instant::now())
+    }
+
+    /// `check_class` с явным временем (для тестов).
+    #[must_use]
+    pub fn check_class_at(
+        &self,
+        source: IpAddr,
+        qname: &[u8],
+        class: ResponseClass,
+        now: Instant,
+    ) -> RrlOutcome {
+        let config = self.config_snapshot();
+        let per_shard = per_shard(config.max_entries);
         let index = class.index();
         let rate = config.rates[index];
         let source = normalize_ip(source);
@@ -366,7 +391,7 @@ impl Rrl {
             source,
             class: u8::try_from(index).unwrap_or(u8::MAX),
             scope: 0,
-            name: hash_name(question.qname(), class),
+            name: hash_name(qname, class),
         };
         let source_key = Key {
             source,
@@ -498,12 +523,11 @@ fn normalize_ip(address: IpAddr) -> IpAddr {
     }
 }
 
-fn hash_name(qname: &Name, class: ResponseClass) -> u64 {
-    let wire = qname.as_wire();
+fn hash_name(qname: &[u8], class: ResponseClass) -> u64 {
     let bytes = if class.groups_by_parent() {
-        skip_first_label(wire).unwrap_or(wire)
+        skip_first_label(qname).unwrap_or(qname)
     } else {
-        wire
+        qname
     };
     // FNV-1a: стабильный хеш без случайного seed (таблица и так приватна).
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;

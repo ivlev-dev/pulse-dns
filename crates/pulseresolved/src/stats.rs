@@ -2,6 +2,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pulse_dns::Rcode;
+
 /// Счётчики процесса без блокировок на горячем пути.
 #[derive(Debug, Default)]
 pub struct Stats {
@@ -39,6 +41,11 @@ pub struct Stats {
     rate_limit_truncated: AtomicU64,
     truncated: AtomicU64,
     dropped: AtomicU64,
+    fast_path: AtomicU64,
+    full_decode: AtomicU64,
+    zero_alloc_responses: AtomicU64,
+    rcodes: [AtomicU64; 16],
+    rcode_extended: AtomicU64,
     tcp_active: AtomicU64,
     tcp_connections: AtomicU64,
     tcp_rejected: AtomicU64,
@@ -118,6 +125,16 @@ pub struct StatsSnapshot {
     pub truncated: u64,
     /// Отброшенные запросы (QR=1, мусор без заголовка).
     pub dropped: u64,
+    /// Запросы, разобранные zero-copy путём (`MessageRef`).
+    pub fast_path: u64,
+    /// Запросы, потребовавшие полного `Message::decode`.
+    pub full_decode: u64,
+    /// Ответы, отданные без аллокаций (cache hit wire path).
+    pub zero_alloc_responses: u64,
+    /// Счётчики по младшим 4 битам RCODE (индекс — значение).
+    pub rcodes: [u64; 16],
+    /// RCODE с расширенными битами EDNS (>= 16).
+    pub rcode_extended: u64,
     /// Активные TCP-соединения.
     pub tcp_active: u64,
     /// Всего принятых TCP-соединений.
@@ -177,6 +194,15 @@ impl Stats {
             rate_limit_truncated: self.rate_limit_truncated.load(Ordering::Relaxed),
             truncated: self.truncated.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
+            fast_path: self.fast_path.load(Ordering::Relaxed),
+            full_decode: self.full_decode.load(Ordering::Relaxed),
+            zero_alloc_responses: self.zero_alloc_responses.load(Ordering::Relaxed),
+            rcodes: std::array::from_fn(|index| {
+                self.rcodes
+                    .get(index)
+                    .map_or(0, |counter| counter.load(Ordering::Relaxed))
+            }),
+            rcode_extended: self.rcode_extended.load(Ordering::Relaxed),
             tcp_active: self.tcp_active.load(Ordering::Relaxed),
             tcp_connections: self.tcp_connections.load(Ordering::Relaxed),
             tcp_rejected: self.tcp_rejected.load(Ordering::Relaxed),
@@ -326,6 +352,27 @@ impl Stats {
 
     pub(crate) fn dropped(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn fast_path(&self) {
+        self.fast_path.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn full_decode(&self) {
+        self.full_decode.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn zero_alloc_response(&self) {
+        self.zero_alloc_responses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rcode(&self, rcode: Rcode) {
+        let value = usize::from(rcode.as_u16());
+        if let Some(counter) = self.rcodes.get(value) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.rcode_extended.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn tcp_opened(&self) {

@@ -1407,6 +1407,259 @@ fn tls_reload_replaces_certificate_for_new_connections() {
 
 // ---------------------------------------------------------------- helpers
 
+fn udp_wire(server: SocketAddr, request: &[u8]) -> Vec<u8> {
+    use std::net::UdpSocket;
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind udp client");
+    socket
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
+        .expect("udp timeout");
+    socket.send_to(request, server).expect("send udp");
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match socket.recv_from(&mut buffer) {
+            Ok((length, _)) => return buffer[..length].to_vec(),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("recv udp: {error}"),
+        }
+    }
+}
+
+fn tcp_wire(server: SocketAddr, request: &[u8]) -> Vec<u8> {
+    let mut stream = retry(
+        "tcp wire connect",
+        || format!("tcp {server}"),
+        || TcpStream::connect(server).map_err(|error| error.to_string()),
+    );
+    stream
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
+        .expect("tcp timeout");
+    let length = u16::try_from(request.len()).expect("query fits u16");
+    stream
+        .write_all(&length.to_be_bytes())
+        .expect("write length");
+    stream.write_all(request).expect("write query");
+    stream.flush().expect("flush");
+    let mut prefix = [0_u8; 2];
+    stream.read_exact(&mut prefix).expect("read length");
+    let mut response = vec![0_u8; usize::from(u16::from_be_bytes(prefix))];
+    stream.read_exact(&mut response).expect("read response");
+    response
+}
+
+fn normalize(mut bytes: Vec<u8>) -> Vec<u8> {
+    assert!(bytes.len() >= 12, "short response");
+    bytes[..2].fill(0);
+    let question_count = usize::from(u16::from_be_bytes([bytes[4], bytes[5]]));
+    let record_count = usize::from(u16::from_be_bytes([bytes[6], bytes[7]]))
+        + usize::from(u16::from_be_bytes([bytes[8], bytes[9]]))
+        + usize::from(u16::from_be_bytes([bytes[10], bytes[11]]));
+    let mut position = 12_usize;
+    for _ in 0..question_count {
+        position = skip_name(&bytes, position);
+        position = position.saturating_add(4);
+    }
+    for _ in 0..record_count {
+        position = skip_name(&bytes, position);
+        let rr_type = u16::from_be_bytes([bytes[position], bytes[position + 1]]);
+        // TTL декрементируется между запросами; у OPT в TTL лежат DO/extended
+        // RCODE, их сравниваем как есть.
+        if rr_type != 41 {
+            bytes[position + 4..position + 8].fill(0);
+        }
+        let rdlength = usize::from(u16::from_be_bytes([
+            bytes[position + 8],
+            bytes[position + 9],
+        ]));
+        position = position.saturating_add(10).saturating_add(rdlength);
+    }
+    bytes
+}
+
+fn skip_name(bytes: &[u8], mut position: usize) -> usize {
+    loop {
+        let length = bytes[position];
+        if length == 0 {
+            return position + 1;
+        }
+        if length & 0xC0 == 0xC0 {
+            return position + 2;
+        }
+        position = position.saturating_add(1 + usize::from(length));
+    }
+}
+
+fn dnscrypt_udp_wire(
+    server: SocketAddr,
+    client: &pulse_dnscrypt::DnscryptClient,
+    request: &[u8],
+) -> Vec<u8> {
+    use std::net::UdpSocket;
+    let pending = client
+        .build_query(request, pulse_dnscrypt::Transport::Udp)
+        .expect("dnscrypt udp query");
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind dnscrypt client");
+    socket
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
+        .expect("dnscrypt timeout");
+    socket
+        .send_to(pending.packet(), server)
+        .expect("send dnscrypt");
+    let mut buffer = [0_u8; 8192];
+    let (length, _) = socket.recv_from(&mut buffer).expect("recv dnscrypt");
+    client
+        .decrypt_response(&pending, &buffer[..length])
+        .expect("decrypt dnscrypt")
+}
+
+fn dnscrypt_tcp_wire(
+    server: SocketAddr,
+    client: &pulse_dnscrypt::DnscryptClient,
+    request: &[u8],
+) -> Vec<u8> {
+    let pending = client
+        .build_query(request, pulse_dnscrypt::Transport::Tcp)
+        .expect("dnscrypt tcp query");
+    let mut stream = retry(
+        "dnscrypt tcp connect",
+        || format!("tcp {server}"),
+        || TcpStream::connect(server).map_err(|error| error.to_string()),
+    );
+    stream
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
+        .expect("dnscrypt timeout");
+    stream.write_all(pending.packet()).expect("write dnscrypt");
+    stream.flush().expect("flush");
+    let mut prefix = [0_u8; 2];
+    stream
+        .read_exact(&mut prefix)
+        .expect("read dnscrypt prefix");
+    let length = usize::from(u16::from_be_bytes(prefix));
+    let mut frame = vec![0_u8; 2 + length];
+    frame[..2].copy_from_slice(&prefix);
+    stream
+        .read_exact(&mut frame[2..])
+        .expect("read dnscrypt frame");
+    client
+        .decrypt_response(&pending, &frame)
+        .expect("decrypt dnscrypt")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_transports_return_same_cache_hit_wire() {
+    let upstream = upstream();
+    let pki = TestPki::generate();
+    let fixture = DnscryptFixture::generate(pki.dir.path());
+    let mut config = config_with(upstream.address());
+    set_tls(&mut config, &pki);
+    set_dnscrypt(&mut config, &fixture);
+    config.listen_udp = Some("127.0.0.1:0".parse().expect("addr"));
+    config.listen_tcp = Some("127.0.0.1:0".parse().expect("addr"));
+    config.dot_listen = Some("127.0.0.1:0".parse().expect("addr"));
+    config.doh_listen = Some("127.0.0.1:0".parse().expect("addr"));
+    config.doh2_listen = Some("127.0.0.1:0".parse().expect("addr"));
+    config.doq_listen = Some("127.0.0.1:0".parse().expect("addr"));
+    config.dnscrypt_listen = Some("127.0.0.1:0".parse().expect("addr"));
+    config.dnscrypt_tcp_listen = Some("127.0.0.1:0".parse().expect("addr"));
+    let server = Server::start(&config).expect("server");
+    let diag = || server_diagnostics(&server);
+    let name = "wire.secure.test";
+    let request = make_query(name, Rtype::A, None);
+    let wire = query(name, Rtype::A);
+
+    // Прогрев серверного кеша.
+    let warm =
+        udp_query(server.udp_addr().expect("udp"), &request, SOCKET_TIMEOUT).expect("warmup");
+    assert_eq!(warm.rcode(), Rcode::NOERROR);
+
+    // Эталон: старый Message-путь с тем же upstream и прогретым кешем.
+    let reference =
+        pulse_resolver::Resolver::new(config.resolver_config().expect("resolver config"))
+            .expect("reference resolver");
+    assert_eq!(reference.resolve(&request).rcode(), Rcode::NOERROR);
+    let mut buffer = [0_u8; 4096];
+    let length = reference
+        .resolve(&request)
+        .encode_into(&mut buffer)
+        .expect("encode reference");
+    let expected = normalize(buffer[..length].to_vec());
+
+    // UDP и TCP — сырые байты.
+    assert_eq!(
+        normalize(udp_wire(server.udp_addr().expect("udp"), &wire)),
+        expected,
+        "UDP"
+    );
+    assert_eq!(
+        normalize(tcp_wire(server.tcp_addr().expect("tcp"), &wire)),
+        expected,
+        "TCP"
+    );
+
+    // DoT.
+    let mut dot = DotSession::new(server.dot_addr().expect("dot"), &pki.cert_der, b"dot");
+    dot.connect("wire DoT connect", diag);
+    assert_eq!(
+        normalize(dot.query(&wire, "wire DoT", diag)),
+        expected,
+        "DoT"
+    );
+
+    // DoH/1.1.
+    let mut doh = DohSession::new(server.doh_addr().expect("doh"), &pki.cert_der, b"http/1.1");
+    doh.connect("wire DoH connect", diag);
+    let response = doh.call(DohCall::Post(&wire), "wire DoH", diag);
+    assert_eq!(response.status, 200);
+    assert_eq!(normalize(response.body), expected, "DoH/1.1");
+
+    // DoH/2.
+    let mut h2 = H2Client::new(server.doh2_addr().expect("doh2"), &pki.cert_der);
+    let (status, body) = h2
+        .call(
+            Method::POST,
+            "https://localhost/dns-query",
+            &wire,
+            "wire DoH/2",
+            diag,
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(normalize(body), expected, "DoH/2");
+
+    // DoQ (ID=0).
+    let mut doq = DoqSession::new(server.doq_addr().expect("doq"), &pki.cert_der);
+    doq.connect("wire DoQ connect", diag).await;
+    let response = doq.query(&doq_wire(name, Rtype::A), "wire DoQ", diag).await;
+    assert_eq!(normalize(response), expected, "DoQ");
+
+    // DNSCrypt UDP/TCP.
+    wait_dnscrypt_udp_listening(server.dnscrypt_udp_addr().expect("dnscrypt udp"), || {
+        server.stats().dnscrypt_udp_errors
+    });
+    assert_eq!(
+        normalize(dnscrypt_udp_wire(
+            server.dnscrypt_udp_addr().expect("dnscrypt udp"),
+            &fixture.client,
+            &wire,
+        )),
+        expected,
+        "DNSCrypt UDP"
+    );
+    assert_eq!(
+        normalize(dnscrypt_tcp_wire(
+            server.dnscrypt_tcp_addr().expect("dnscrypt tcp"),
+            &fixture.client,
+            &wire,
+        )),
+        expected,
+        "DNSCrypt TCP"
+    );
+
+    let counters = server.stats();
+    assert!(counters.fast_path >= 7, "all transports use wire fast path");
+    assert!(counters.zero_alloc_responses >= 7);
+    doq.close().await;
+}
+
 fn http_get(addr: SocketAddr, path: &str) -> String {
     retry(
         "metrics GET",

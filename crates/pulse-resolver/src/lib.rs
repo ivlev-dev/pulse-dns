@@ -114,5 +114,8 @@ pub use config::{
 };
 pub use error::ResolverError;
 pub use overrides::{OverrideOutcome, Overrides};
-pub use resolver::{CancellationToken, ResolveContext, Resolver, StatsSnapshot, UpstreamStatus};
+pub use resolver::{
+    CancellationToken, ResolveContext, ResolvedResponse, Resolver, ResponseMeta, StatsSnapshot,
+    UpstreamStatus,
+};
 pub use upstream::UpstreamStats;

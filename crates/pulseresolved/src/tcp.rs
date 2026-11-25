@@ -210,6 +210,7 @@ fn handle_connection(
     stream.set_read_timeout(Some(idle_timeout))?;
     stream.set_write_timeout(Some(idle_timeout))?;
     stream.set_nodelay(true)?;
+    let mut response = vec![0_u8; pulse_dns::MAX_MESSAGE_LEN];
     loop {
         if shutdown.load(Ordering::Acquire) {
             return Ok(());
@@ -224,10 +225,13 @@ fn handle_connection(
         if !read_exact_idle(&mut stream, &mut request)? {
             return Ok(());
         }
-        let Some(response) = processor.handle(&request, Transport::Tcp, peer) else {
+        let Some(len) = processor.handle_into(&request, Transport::Tcp, peer, &mut response) else {
             return Ok(());
         };
-        write_frame(&mut stream, &response)?;
+        let Some(frame) = response.get(..len) else {
+            return Ok(());
+        };
+        write_frame(&mut stream, frame)?;
     }
 }
 

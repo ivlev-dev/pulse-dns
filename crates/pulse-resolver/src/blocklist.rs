@@ -63,11 +63,15 @@ impl Node {
     }
 
     fn contains(&self, name: &Name) -> bool {
+        self.contains_wire(name.as_wire())
+    }
+
+    fn contains_wire(&self, wire: &[u8]) -> bool {
         // Метки складываются в стековый массив: поиск на горячем пути не
         // аллоцирует даже при глубоких именах.
         let mut labels = [&[][..]; pulse_dns::MAX_LABELS];
         let mut count = 0_usize;
-        for label in name.labels() {
+        for label in pulse_dns::NameRef::from_validated(wire).labels() {
             let Some(slot) = labels.get_mut(count) else {
                 break;
             };
@@ -200,10 +204,16 @@ impl Blocklist {
     /// Заблокировано ли имя.
     #[must_use]
     pub fn is_blocked(&self, name: &Name) -> bool {
+        self.is_blocked_wire(name.as_wire())
+    }
+
+    /// `is_blocked` по канонической wire-форме (горячий путь без [`Name`]).
+    #[must_use]
+    pub fn is_blocked_wire(&self, wire: &[u8]) -> bool {
         if self.stats.blocked == 0 && self.stats.allowed == 0 {
             return false;
         }
-        self.block.contains(name) && !self.allow.contains(name)
+        self.block.contains_wire(wire) && !self.allow.contains_wire(wire)
     }
 
     /// Заблокировано ли имя без учёта allowlist (для диагностики).

@@ -682,6 +682,20 @@ impl Cache {
         class: Rclass,
         accept_unvalidated: bool,
     ) -> Option<CacheHit<'a>> {
+        self.peek_wire(name.as_wire(), rr_type, class, accept_unvalidated)
+    }
+
+    /// `peek` по канонической wire-форме имени.
+    ///
+    /// Горячий путь получает имя из [`MessageRef`](pulse_dns::MessageRef) и не
+    /// материализует [`Name`].
+    pub(crate) fn peek_wire<'a>(
+        &'a self,
+        name: &[u8],
+        rr_type: Rtype,
+        class: Rclass,
+        accept_unvalidated: bool,
+    ) -> Option<CacheHit<'a>> {
         self.lookup_inner(name, rr_type, class, accept_unvalidated, false)
     }
 
@@ -693,12 +707,23 @@ impl Cache {
         class: Rclass,
         accept_unvalidated: bool,
     ) -> Option<CacheHit<'a>> {
+        self.lookup_wire(name.as_wire(), rr_type, class, accept_unvalidated)
+    }
+
+    /// `lookup` по канонической wire-форме имени.
+    pub(crate) fn lookup_wire<'a>(
+        &'a self,
+        name: &[u8],
+        rr_type: Rtype,
+        class: Rclass,
+        accept_unvalidated: bool,
+    ) -> Option<CacheHit<'a>> {
         self.lookup_inner(name, rr_type, class, accept_unvalidated, true)
     }
 
     fn lookup_inner<'a>(
         &'a self,
-        name: &Name,
+        name: &[u8],
         rr_type: Rtype,
         class: Rclass,
         accept_unvalidated: bool,
@@ -868,7 +893,7 @@ impl Cache {
         secure: SecurityState,
     ) {
         let mut buffer = [0_u8; MAX_KEY_LEN];
-        let Some(len) = fill_key(name, rr_type, class, &mut buffer) else {
+        let Some(len) = fill_key(name.as_wire(), rr_type, class, &mut buffer) else {
             return;
         };
         let Some(key) = buffer.get(..len) else {
@@ -1040,12 +1065,11 @@ fn rr_wire_len(rr: &[u8]) -> Option<usize> {
 }
 
 fn fill_key(
-    name: &Name,
+    wire: &[u8],
     rr_type: Rtype,
     class: Rclass,
     buffer: &mut [u8; MAX_KEY_LEN],
 ) -> Option<usize> {
-    let wire = name.as_wire();
     let end = wire.len().checked_add(4)?;
     buffer.get_mut(..wire.len())?.copy_from_slice(wire);
     let tail = buffer.get_mut(wire.len()..end)?;

@@ -2386,7 +2386,7 @@ mod tests {
             ZoneStore::open_or_create(
                 &path,
                 16 * 1024 * 1024,
-                SyncModeV2::Memory,
+                SyncModeV2::Sync,
                 CommitMode::PerZone,
             )
             .expect("store"),
