@@ -5,23 +5,43 @@ const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
 /// Кодирует байты в base32hex (uppercase, без `=`).
 #[must_use]
 pub fn encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(5) * 8);
+    let mut out = vec![0_u8; bytes.len().div_ceil(5) * 8];
+    let Some(len) = encode_into(bytes, &mut out) else {
+        return String::new();
+    };
+    out.truncate(len);
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// Кодирует байты в base32hex прямо в `out`.
+///
+/// Возвращает число записанных символов либо `None`, если буфер мал.
+/// Горячий путь NSEC3 использует вариант без аллокаций.
+#[must_use]
+pub fn encode_into(bytes: &[u8], out: &mut [u8]) -> Option<usize> {
+    let needed = bytes.len().div_ceil(5) * 8;
+    if out.len() < needed {
+        return None;
+    }
     let mut buffer: u32 = 0;
     let mut bits: u32 = 0;
+    let mut written = 0_usize;
     for byte in bytes {
         buffer = (buffer << 8) | u32::from(*byte);
         bits += 8;
         while bits >= 5 {
             bits -= 5;
-            let index = ((buffer >> bits) & 0x1F) as usize;
-            out.push(char::from(ALPHABET.get(index).copied().unwrap_or(b'0')));
+            let index = usize::try_from((buffer >> bits) & 0x1F).ok()?;
+            *out.get_mut(written)? = ALPHABET.get(index).copied()?;
+            written = written.checked_add(1)?;
         }
     }
     if bits > 0 {
-        let index = ((buffer << (5 - bits)) & 0x1F) as usize;
-        out.push(char::from(ALPHABET.get(index).copied().unwrap_or(b'0')));
+        let index = usize::try_from((buffer << (5 - bits)) & 0x1F).ok()?;
+        *out.get_mut(written)? = ALPHABET.get(index).copied()?;
+        written = written.checked_add(1)?;
     }
-    out
+    Some(written)
 }
 
 /// Декодирует base32hex (регистр не важен, padding запрещён).

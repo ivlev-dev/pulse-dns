@@ -218,20 +218,33 @@ fn truncation_and_tcp_match() {
 fn non_hot_queries_fall_back() {
     let mut fixture = Fixture::new(zone());
     for (label, request) in [
-        ("delegation", query("sub.example.com", Rtype::A)),
-        ("below-cut", query("deep.sub.example.com", Rtype::A)),
         ("dname", query("host.dname.example.com", Rtype::A)),
-        ("any", query("www.example.com", Rtype::ANY)),
-        (
-            "do-bit",
-            edns_query("www.example.com", Rtype::A, EDNS_1232, true),
-        ),
         ("transfer", query("example.com", Rtype::AXFR)),
         ("outside", query("example.org", Rtype::A)),
     ] {
         assert!(
             !fixture.check(label, &request, Transport::Udp),
             "{label}: must use the full path"
+        );
+    }
+}
+
+#[test]
+fn referral_and_any_use_hot_path() {
+    let mut fixture = Fixture::new(zone());
+    for (label, request) in [
+        ("delegation", query("sub.example.com", Rtype::A)),
+        ("below-cut", query("deep.sub.example.com", Rtype::A)),
+        ("any", query("www.example.com", Rtype::ANY)),
+        ("any-alias", query("alias.example.com", Rtype::ANY)),
+        (
+            "do-bit",
+            edns_query("www.example.com", Rtype::A, EDNS_1232, true),
+        ),
+    ] {
+        assert!(
+            fixture.check(label, &request, Transport::Udp),
+            "{label}: expected hot path"
         );
     }
 }
@@ -448,7 +461,11 @@ impl ZoneSnapshot for WireZone {
         Vec::new()
     }
 
-    fn lookup_all_ref<'a>(&'a self, owner: NameRef<'a>, rr_type: Rtype) -> Vec<RrsetRef<'a>> {
+    fn lookup_all_ref<'b, 's: 'b>(
+        &'s self,
+        owner: NameRef<'b>,
+        rr_type: Rtype,
+    ) -> Vec<RrsetRef<'b>> {
         self.wire_ref(owner, rr_type).into_iter().collect()
     }
 

@@ -114,5 +114,5 @@ pub use application::{
     StatsSnapshot, Transport, ZoneSnapshot, ZoneView,
 };
 pub use domain::{
-    DenialKind, LookupOutcome, LookupOutcomeRef, RdataRef, Rdatas, RrsetRef, ZoneState,
+    DenialKind, LookupOutcome, LookupOutcomeRef, RdataRef, Rdatas, RefLookup, RrsetRef, ZoneState,
 };

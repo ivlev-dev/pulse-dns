@@ -14,7 +14,7 @@ pub use nsec::{
 };
 pub use nsec3::{
     Nsec3Params, Nsec3Proof, nsec3_ds_nodata, nsec3_nodata, nsec3_nxdomain, nsec3_owner_name,
-    nsec3_wildcard_answer, nsec3_wildcard_nodata, random_salt,
+    nsec3_owner_name_into, nsec3_wildcard_answer, nsec3_wildcard_nodata, random_salt,
 };
 
 use crate::error::DenialError;

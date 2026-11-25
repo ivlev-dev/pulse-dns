@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "negative"
 harness = false
+
+[[bench]]
+name = "signed_ref"
+harness = false

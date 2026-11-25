@@ -6,13 +6,13 @@
 //! детерминированы.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use pulse_dns::{Name, NameRef, Rclass, Rdata, Rrset, Rtype};
 use thiserror::Error;
 
 use crate::application::{ZoneSnapshot, ZoneView};
-use crate::domain::{DenialKind, LookupOutcome, LookupOutcomeRef, RrsetRef, ZoneState};
+use crate::domain::{DenialKind, LookupOutcome, LookupOutcomeRef, RefLookup, RrsetRef, ZoneState};
 
 /// Ошибка наполнения in-memory зоны.
 #[derive(Debug, Error)]
@@ -70,10 +70,10 @@ pub struct InMemoryZone {
     cuts: HashSet<Name>,
     soa: Option<Rrset>,
     ns: Option<Rrset>,
-    /// NSEC-наборы по каноническому порядку владельцев.
-    nsec: BTreeMap<CanonicalName, Rrset>,
-    /// NSEC3-наборы по hashed-владельцу (декодированный hash).
-    nsec3: BTreeMap<Vec<u8>, Rrset>,
+    /// NSEC-наборы в каноническом порядке владельцев.
+    nsec: Vec<(Name, Rrset)>,
+    /// NSEC3-наборы по hashed-владельцу (декодированный hash, возрастание).
+    nsec3: Vec<(Vec<u8>, Rrset)>,
 }
 
 impl InMemoryZone {
@@ -92,8 +92,8 @@ impl InMemoryZone {
             cuts: HashSet::new(),
             soa: None,
             ns: None,
-            nsec: BTreeMap::new(),
-            nsec3: BTreeMap::new(),
+            nsec: Vec::new(),
+            nsec3: Vec::new(),
         }
     }
 
@@ -166,7 +166,7 @@ impl InMemoryZone {
             }
         }
         let is_nsec = rrset.rr_type() == Rtype::NSEC;
-        let nsec_owner = is_nsec.then(|| (CanonicalName(rrset.owner().clone()), rrset.clone()));
+        let nsec_owner = is_nsec.then(|| (rrset.owner().clone(), rrset.clone()));
         let nsec3_entry = if rrset.rr_type() == Rtype::NSEC3 {
             nsec3_hash_of(rrset.owner()).map(|hash| (hash, rrset.clone()))
         } else {
@@ -177,12 +177,37 @@ impl InMemoryZone {
             .or_default()
             .insert(rrset.rr_type(), rrset);
         if let Some((owner, nsec)) = nsec_owner {
-            self.nsec.insert(owner, nsec);
+            Self::insert_sorted(&mut self.nsec, owner, nsec, |owner, other| {
+                owner.cmp_canonical(other)
+            });
         }
         if let Some((hash, nsec3)) = nsec3_entry {
-            self.nsec3.insert(hash, nsec3);
+            Self::insert_sorted(&mut self.nsec3, hash, nsec3, |hash, other| {
+                hash.as_slice().cmp(other.as_slice())
+            });
         }
         Ok(())
+    }
+
+    /// Вставляет элемент в отсортированный `Vec`, заменяя равный ключ.
+    fn insert_sorted<K, V>(
+        items: &mut Vec<(K, V)>,
+        key: K,
+        value: V,
+        compare: impl Fn(&K, &K) -> Ordering,
+    ) {
+        let position =
+            items.partition_point(|(existing, _)| compare(existing, &key) == Ordering::Less);
+        let equal = items
+            .get(position)
+            .is_some_and(|(existing, _)| compare(existing, &key) == Ordering::Equal);
+        if equal {
+            if let Some(slot) = items.get_mut(position) {
+                slot.1 = value;
+            }
+        } else {
+            items.insert(position, (key, value));
+        }
     }
 
     fn register_node(&mut self, owner: &Name) {
@@ -375,19 +400,16 @@ impl ZoneView for InMemoryZone {
     }
 
     fn nsec_cover(&self, name: &Name) -> Option<Rrset> {
-        let (owner, rrset) = self
-            .nsec
-            .range(..=CanonicalName(name.clone()))
-            .next_back()
-            .or_else(|| self.nsec.iter().next_back())?;
-        if &owner.0 == name {
+        let (owner, rrset) = nsec_candidate(&self.nsec, NameRef::from_name(name))?;
+        if owner.as_wire() == name.as_wire() {
             return None;
         }
         let next = rrset.rdatas().iter().find_map(|rdata| match rdata {
             Rdata::Nsec(nsec) => Some(nsec.next_domain()),
             _ => None,
         })?;
-        nsec_covers(&owner.0, next, name).then(|| rrset.clone())
+        nsec_covers_ref(owner, NameRef::from_name(next), NameRef::from_name(name))
+            .then(|| rrset.clone())
     }
 
     fn denial(&self) -> DenialKind {
@@ -408,12 +430,8 @@ impl ZoneView for InMemoryZone {
     }
 
     fn nsec3_cover(&self, hash: &[u8]) -> Option<Rrset> {
-        let (owner_hash, rrset) = self
-            .nsec3
-            .range(..=hash.to_vec())
-            .next_back()
-            .or_else(|| self.nsec3.iter().next_back())?;
-        if owner_hash.as_slice() == hash {
+        let (owner_hash, rrset) = nsec3_candidate(&self.nsec3, hash)?;
+        if owner_hash == hash {
             return None;
         }
         let next = rrset.rdatas().iter().find_map(|rdata| match rdata {
@@ -495,7 +513,7 @@ impl ZoneSnapshot for InMemoryZone {
             .unwrap_or_default()
     }
 
-    fn lookup_all_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> Vec<RrsetRef<'a>> {
+    fn lookup_all_ref<'b, 's: 'b>(&'s self, name: NameRef<'b>, rtype: Rtype) -> Vec<RrsetRef<'b>> {
         self.get_rrset_wire(name.as_wire(), rtype)
             .map(RrsetRef::from_owned)
             .into_iter()
@@ -521,33 +539,157 @@ impl ZoneSnapshot for InMemoryZone {
         self.cuts.contains(name.as_wire())
     }
 
+    fn glue_at_ref<'b, 's: 'b>(&'s self, name: NameRef<'b>, rtype: Rtype) -> RefLookup<'b> {
+        if !name.is_subdomain_of_name(&self.origin) {
+            return RefLookup::Absent;
+        }
+        self.get_rrset_wire(name.as_wire(), rtype)
+            .map(RrsetRef::from_owned)
+            .map_or(RefLookup::Absent, RefLookup::Found)
+    }
+
+    fn rrsig_ref<'b, 's: 'b>(&'s self, name: NameRef<'b>, covered: Rtype) -> RefLookup<'b> {
+        self.get_rrset_wire(name.as_wire(), Rtype::RRSIG)
+            .map(RrsetRef::from_owned)
+            .filter(|rrset| rrset.covers(covered))
+            .map_or(RefLookup::Absent, RefLookup::Found)
+    }
+
+    fn nsec_at_ref<'b, 's: 'b>(&'s self, name: NameRef<'b>) -> RefLookup<'b> {
+        if !name.is_subdomain_of_name(&self.origin) {
+            return RefLookup::Absent;
+        }
+        self.get_rrset_wire(name.as_wire(), Rtype::NSEC)
+            .map(RrsetRef::from_owned)
+            .map_or(RefLookup::Absent, RefLookup::Found)
+    }
+
+    fn nsec_cover_ref<'b, 's: 'b>(
+        &'s self,
+        name: NameRef<'_>,
+        _owner_wire: &'b mut [u8; pulse_dns::MAX_NAME_WIRE_LEN],
+    ) -> RefLookup<'b> {
+        let Some((owner, rrset)) = nsec_candidate(&self.nsec, name) else {
+            return RefLookup::Absent;
+        };
+        if owner.as_wire() == name.as_wire() {
+            return RefLookup::Absent;
+        }
+        let next = rrset.rdatas().iter().find_map(|rdata| match rdata {
+            Rdata::Nsec(nsec) => Some(NameRef::from_name(nsec.next_domain())),
+            _ => None,
+        });
+        let Some(next) = next else {
+            return RefLookup::Absent;
+        };
+        if nsec_covers_ref(owner, next, name) {
+            RefLookup::Found(RrsetRef::from_owned(rrset))
+        } else {
+            RefLookup::Absent
+        }
+    }
+
+    fn nsec3_param_ref(&self) -> RefLookup<'_> {
+        self.get_rrset(&self.origin, Rtype::NSEC3PARAM)
+            .map(RrsetRef::from_owned)
+            .map_or(RefLookup::Absent, RefLookup::Found)
+    }
+
+    fn nsec3_at_ref<'b, 's: 'b>(
+        &'s self,
+        hash: &[u8],
+        _owner_wire: &'b mut [u8; pulse_dns::MAX_NAME_WIRE_LEN],
+    ) -> RefLookup<'b> {
+        let position = self
+            .nsec3
+            .partition_point(|(owner, _)| owner.as_slice() < hash);
+        self.nsec3
+            .get(position)
+            .filter(|(owner, _)| owner.as_slice() == hash)
+            .map_or(RefLookup::Absent, |(_, rrset)| {
+                RefLookup::Found(RrsetRef::from_owned(rrset))
+            })
+    }
+
+    fn nsec3_cover_ref<'b, 's: 'b>(
+        &'s self,
+        hash: &[u8],
+        _owner_wire: &'b mut [u8; pulse_dns::MAX_NAME_WIRE_LEN],
+    ) -> RefLookup<'b> {
+        let Some((owner_hash, rrset)) = nsec3_candidate(&self.nsec3, hash) else {
+            return RefLookup::Absent;
+        };
+        if owner_hash == hash {
+            return RefLookup::Absent;
+        }
+        let next = rrset.rdatas().iter().find_map(|rdata| match rdata {
+            Rdata::Nsec3(data) => Some(data.next_hashed_owner()),
+            _ => None,
+        });
+        let Some(next) = next else {
+            return RefLookup::Absent;
+        };
+        if nsec3_covers(owner_hash, next, hash) {
+            RefLookup::Found(RrsetRef::from_owned(rrset))
+        } else {
+            RefLookup::Absent
+        }
+    }
+
+    fn denial_ref(&self) -> DenialKind {
+        if self.get_rrset(&self.origin, Rtype::NSEC3PARAM).is_some() {
+            DenialKind::Nsec3
+        } else {
+            DenialKind::Nsec
+        }
+    }
+
     fn signed_ref(&self) -> bool {
         self.get_rrset(&self.origin, Rtype::DNSKEY).is_some()
+            && self
+                .get_rrset(&self.origin, Rtype::RRSIG)
+                .is_some_and(|rrsig| RrsetRef::from_owned(rrsig).covers(Rtype::DNSKEY))
     }
 }
 
-/// Обёртка имени с `Ord` по каноническому порядку RFC 4034 §6.1.
-#[derive(Debug, Clone)]
-struct CanonicalName(Name);
-
-impl PartialEq for CanonicalName {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.cmp_canonical(&other.0) == Ordering::Equal
+/// Наибольший NSEC-владелец не больше `name` (с заворотом на последний).
+fn nsec_candidate<'a>(
+    items: &'a [(Name, Rrset)],
+    name: NameRef<'_>,
+) -> Option<(NameRef<'a>, &'a Rrset)> {
+    let position = items.partition_point(|(owner, _)| {
+        NameRef::from_name(owner).cmp_canonical(name) == Ordering::Less
+    });
+    if let Some((owner, rrset)) = items.get(position)
+        && owner.as_wire() == name.as_wire()
+    {
+        return Some((NameRef::from_name(owner), rrset));
     }
+    let (owner, rrset) = if position == 0 {
+        items.last()
+    } else {
+        items.get(position.saturating_sub(1))
+    }?;
+    Some((NameRef::from_name(owner), rrset))
 }
 
-impl Eq for CanonicalName {}
-
-impl PartialOrd for CanonicalName {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+/// Наибольший NSEC3-hash не больше `hash` (с заворотом на последний).
+fn nsec3_candidate<'a>(
+    items: &'a [(Vec<u8>, Rrset)],
+    hash: &[u8],
+) -> Option<(&'a [u8], &'a Rrset)> {
+    let position = items.partition_point(|(owner, _)| owner.as_slice() < hash);
+    if let Some((owner, rrset)) = items.get(position)
+        && owner.as_slice() == hash
+    {
+        return Some((owner.as_slice(), rrset));
     }
-}
-
-impl Ord for CanonicalName {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp_canonical(&other.0)
-    }
+    let (owner, rrset) = if position == 0 {
+        items.last()
+    } else {
+        items.get(position.saturating_sub(1))
+    }?;
+    Some((owner.as_slice(), rrset))
 }
 
 /// Декодирует hash из первой метки hashed-владельца NSEC3.
@@ -568,8 +710,8 @@ fn nsec3_covers(owner: &[u8], next: &[u8], hash: &[u8]) -> bool {
 }
 
 /// RFC 4034 §4.1.2: покрывает ли интервал `(owner, next)` имя `name`.
-fn nsec_covers(owner: &Name, next: &Name, name: &Name) -> bool {
-    if name == owner {
+fn nsec_covers_ref(owner: NameRef<'_>, next: NameRef<'_>, name: NameRef<'_>) -> bool {
+    if name.as_wire() == owner.as_wire() {
         return false;
     }
     match owner.cmp_canonical(next) {

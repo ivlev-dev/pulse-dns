@@ -49,6 +49,21 @@ impl<'a> RdataRef<'a> {
             Self::Wire { bytes, .. } => Some(bytes),
         }
     }
+
+    /// Поле `Type Covered` для `RRSIG`-RDATA.
+    ///
+    /// `None` — RDATA другого типа или повреждённая wire-форма.
+    #[must_use]
+    pub fn type_covered(self) -> Option<Rtype> {
+        match self {
+            Self::Domain(Rdata::Rrsig(signature)) => Some(signature.type_covered()),
+            Self::Wire { rr_type, bytes } if rr_type == Rtype::RRSIG => {
+                let raw: [u8; 2] = bytes.get(..2)?.try_into().ok()?;
+                Some(Rtype::from_u16(u16::from_be_bytes(raw)))
+            }
+            Self::Domain(_) | Self::Wire { .. } => None,
+        }
+    }
 }
 
 /// Источник RDATA RRset.
@@ -161,6 +176,17 @@ impl<'a> RrsetRef<'a> {
     pub fn first_record(self) -> Option<RdataRef<'a>> {
         self.records().next()
     }
+
+    /// Есть ли в наборе `RRSIG`, покрывающая `covered`.
+    ///
+    /// Для наборов других типов всегда `false`.
+    #[must_use]
+    pub fn covers(self, covered: Rtype) -> bool {
+        self.rr_type() == Rtype::RRSIG
+            && self
+                .records()
+                .any(|rdata| rdata.type_covered() == Some(covered))
+    }
 }
 
 /// Итератор заимствованных RDATA.
@@ -252,4 +278,19 @@ pub enum LookupOutcomeRef<'a> {
     Referral,
     /// Имя вне зоны.
     ZoneNotFound,
+}
+
+/// Результат заимствованного поиска необязательного набора.
+///
+/// Отличает «набора нет» от «набор есть, но без материализации его нельзя
+/// отдать»: во втором случае горячий путь обязан уступить полному, чтобы не
+/// потерять записи (например, `OVERFLOW`-payload зоны v2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefLookup<'a> {
+    /// Набор найден.
+    Found(RrsetRef<'a>),
+    /// Набора нет.
+    Absent,
+    /// Набор существует, но заимствованное представление невозможно.
+    Unsupported,
 }

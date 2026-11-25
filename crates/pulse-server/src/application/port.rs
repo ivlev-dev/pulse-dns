@@ -1,8 +1,8 @@
 //! Порт чтения зоны для авторитетного ответа.
 
-use pulse_dns::{Name, NameRef, Rclass, Rrset, Rtype};
+use pulse_dns::{MAX_NAME_WIRE_LEN, Name, NameRef, Rclass, Rrset, Rtype};
 
-use crate::domain::{DenialKind, LookupOutcome, LookupOutcomeRef, RrsetRef, ZoneState};
+use crate::domain::{DenialKind, LookupOutcome, LookupOutcomeRef, RefLookup, RrsetRef, ZoneState};
 
 /// Заимствованный снимок зоны, живущий не дольше пина читателя.
 ///
@@ -30,10 +30,85 @@ pub trait ZoneSnapshot {
     fn records_ref<'a>(&'a self, name: NameRef<'a>) -> Vec<RrsetRef<'a>>;
 
     /// Все RRset `(name, rtype)` с подтипами (например, `RRSIG`).
-    fn lookup_all_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> Vec<RrsetRef<'a>>;
+    fn lookup_all_ref<'b, 's: 'b>(&'s self, name: NameRef<'b>, rtype: Rtype) -> Vec<RrsetRef<'b>>;
 
     /// `A`/`AAAA` для additional.
     fn glue_ref<'a>(&'a self, name: NameRef<'a>) -> Vec<RrsetRef<'a>>;
+
+    /// Один `A`/`AAAA`-набор для additional без учёта zone cut.
+    ///
+    /// В отличие от [`ZoneSnapshot::lookup_ref`] возвращает glue и для имён
+    /// ниже delegation (bailiwick referral-ответа). По умолчанию строится из
+    /// [`ZoneSnapshot::glue_ref`].
+    fn glue_at_ref<'b, 's: 'b>(&'s self, name: NameRef<'b>, rtype: Rtype) -> RefLookup<'b> {
+        for rrset in self.glue_ref(name) {
+            if rrset.rr_type() == rtype {
+                return RefLookup::Found(rrset);
+            }
+        }
+        RefLookup::Absent
+    }
+
+    /// Заимствованный `RRSIG`-набор имени, покрывающий `covered`.
+    ///
+    /// По умолчанию строится из [`ZoneSnapshot::lookup_all_ref`]; адаптеры
+    /// хранящие подписи по подтипу (`type covered`) переопределяют метод,
+    /// чтобы не собирать `Vec`.
+    fn rrsig_ref<'b, 's: 'b>(&'s self, name: NameRef<'b>, covered: Rtype) -> RefLookup<'b> {
+        for rrset in self.lookup_all_ref(name, Rtype::RRSIG) {
+            if rrset.covers(covered) {
+                return RefLookup::Found(rrset);
+            }
+        }
+        RefLookup::Absent
+    }
+
+    /// Заимствованный `NSEC`-набор точного владельца.
+    fn nsec_at_ref<'b, 's: 'b>(&'s self, name: NameRef<'b>) -> RefLookup<'b> {
+        let _ = name;
+        RefLookup::Absent
+    }
+
+    /// Заимствованный `NSEC`, интервал которого покрывает `name`.
+    ///
+    /// Владелец найденного набора копируется в `owner_wire` адаптерами,
+    /// которые ищут predecessor по индексу.
+    fn nsec_cover_ref<'b, 's: 'b>(
+        &'s self,
+        name: NameRef<'_>,
+        owner_wire: &'b mut [u8; MAX_NAME_WIRE_LEN],
+    ) -> RefLookup<'b> {
+        let _ = (name, owner_wire);
+        RefLookup::Absent
+    }
+
+    /// Заимствованный `NSEC3PARAM`-набор apex.
+    fn nsec3_param_ref(&self) -> RefLookup<'_> {
+        RefLookup::Absent
+    }
+
+    /// Заимствованный `NSEC3` по hash имени.
+    ///
+    /// Владелец hashed-имени строится в `owner_wire` вызывающего: это
+    /// позволяет вернуть [`RrsetRef`] без аллокации `Name`.
+    fn nsec3_at_ref<'b, 's: 'b>(
+        &'s self,
+        hash: &[u8],
+        owner_wire: &'b mut [u8; MAX_NAME_WIRE_LEN],
+    ) -> RefLookup<'b> {
+        let _ = (hash, owner_wire);
+        RefLookup::Absent
+    }
+
+    /// Заимствованный `NSEC3`, hash-интервал которого покрывает `hash`.
+    fn nsec3_cover_ref<'b, 's: 'b>(
+        &'s self,
+        hash: &[u8],
+        owner_wire: &'b mut [u8; MAX_NAME_WIRE_LEN],
+    ) -> RefLookup<'b> {
+        let _ = (hash, owner_wire);
+        RefLookup::Absent
+    }
 
     /// Существует ли узел (включая empty non-terminal).
     fn node_exists_ref(&self, name: NameRef<'_>) -> bool;
@@ -42,8 +117,15 @@ pub trait ZoneSnapshot {
     fn is_delegation_ref(&self, name: NameRef<'_>) -> bool;
 
     /// Подписана ли зона.
+    ///
+    /// По умолчанию повторяет [`ZoneView::signed`] поверх заимствованных
+    /// lookup'ов: apex `DNSKEY` и покрывающий его `RRSIG`.
     fn signed_ref(&self) -> bool {
-        false
+        let origin = self.origin_ref();
+        matches!(
+            self.lookup_ref(origin, Rtype::DNSKEY),
+            LookupOutcomeRef::Answer(_)
+        ) && !matches!(self.rrsig_ref(origin, Rtype::DNSKEY), RefLookup::Absent)
     }
 
     /// Механизм denial-of-existence.

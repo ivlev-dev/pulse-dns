@@ -293,6 +293,9 @@ fn trim_leading_zeros(bytes: &[u8]) -> &[u8] {
     bytes.get(index..).unwrap_or(&[])
 }
 
+/// Длина NSEC3 hash для algorithm 1 (SHA-1, RFC 5155 §5).
+pub const NSEC3_SHA1_LEN: usize = 20;
+
 /// NSEC3 hash (RFC 5155 §5): `IH(salt, name, iterations)` на SHA-1.
 ///
 /// SHA-1 здесь предписан протоколом (hash algorithm 1), а не выбран для
@@ -300,19 +303,38 @@ fn trim_leading_zeros(bytes: &[u8]) -> &[u8] {
 /// Возвращает 20 байт.
 #[must_use]
 pub fn nsec3_hash(name: &Name, salt: &[u8], iterations: u16) -> Vec<u8> {
+    let mut value = [0_u8; NSEC3_SHA1_LEN];
+    nsec3_hash_into(name.as_wire(), salt, iterations, &mut value).to_vec()
+}
+
+/// NSEC3 hash в caller-provided буфер, без промежуточных `Vec`.
+///
+/// Возвращает ровно [`NSEC3_SHA1_LEN`] байт — столько же, сколько
+/// [`nsec3_hash`]; горячий путь ответа использует вариант без аллокаций.
+///
+/// # Panics
+///
+/// Не паникует: размер результата фиксирован типом буфера.
+#[must_use]
+pub fn nsec3_hash_into<'a>(
+    name_wire: &[u8],
+    salt: &[u8],
+    iterations: u16,
+    out: &'a mut [u8; NSEC3_SHA1_LEN],
+) -> &'a [u8] {
     use aws_lc_rs::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
 
     let mut context = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
-    context.update(name.as_wire());
+    context.update(name_wire);
     context.update(salt);
-    let mut value = context.finish().as_ref().to_vec();
+    out.copy_from_slice(context.finish().as_ref());
     for _ in 0..iterations {
         let mut context = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
-        context.update(&value);
+        context.update(out);
         context.update(salt);
-        value = context.finish().as_ref().to_vec();
+        out.copy_from_slice(context.finish().as_ref());
     }
-    value
+    out
 }
 
 /// SHA-256 digest (для тестов/DS).

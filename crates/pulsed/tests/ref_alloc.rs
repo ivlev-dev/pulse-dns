@@ -164,6 +164,93 @@ fn udp_allocations_over_v2_zone_by_class() {
                 .expect("wildcard a"),
             )
             .expect("wildcard write");
+        // Синтетическая подпись: DNSKEY + RRSIG(DNSKEY) делают зону
+        // подписанной, а NSEC-цепочка включает denial-путь в горячем пути.
+        let dnskey =
+            Rdata::Dnskey(pulse_dns::DnskeyData::new(257, 3, 8, vec![7_u8; 32]).expect("dnskey"))
+                .to_canonical_wire();
+        writer
+            .upsert_rrset(
+                &apex,
+                48,
+                0,
+                &RrsetData::new(300, 0, vec![dnskey]).expect("dnskey"),
+            )
+            .expect("dnskey write");
+        let signature = |covered: Rtype| {
+            Rdata::Rrsig(
+                pulse_dns::RrsigData::new(
+                    covered,
+                    8,
+                    3,
+                    300,
+                    u32::MAX,
+                    1,
+                    1,
+                    Name::parse("example.test.").expect("signer"),
+                    vec![9_u8; 64],
+                )
+                .expect("rrsig"),
+            )
+            .to_canonical_wire()
+        };
+        writer
+            .upsert_rrset(
+                &apex,
+                46,
+                Rtype::DNSKEY.as_u16(),
+                &RrsetData::new(300, 0, vec![signature(Rtype::DNSKEY)]).expect("rrsig"),
+            )
+            .expect("dnskey rrsig write");
+        writer
+            .upsert_rrset(
+                &owner,
+                46,
+                Rtype::A.as_u16(),
+                &RrsetData::new(60, 0, vec![signature(Rtype::A)]).expect("rrsig"),
+            )
+            .expect("a rrsig write");
+        let mut nsec_owners: Vec<Name> = vec![
+            Name::parse("example.test.").expect("apex name"),
+            Name::parse("www.example.test.").expect("www name"),
+            Name::parse("mail.example.test.").expect("mail name"),
+            Name::parse("alias.example.test.").expect("alias name"),
+            Name::parse("*.wild.example.test.").expect("wildcard name"),
+        ];
+        nsec_owners.sort_by(Name::cmp_canonical);
+        nsec_owners.dedup();
+        let bitmap = pulse_dns::TypeBitmap::from_types([
+            Rtype::A,
+            Rtype::NS,
+            Rtype::SOA,
+            Rtype::NSEC,
+            Rtype::RRSIG,
+        ]);
+        for (index, nsec_owner) in nsec_owners.iter().enumerate() {
+            let next = nsec_owners
+                .get(index + 1)
+                .cloned()
+                .unwrap_or_else(|| nsec_owners[0].clone());
+            let nsec = Rdata::Nsec(pulse_dns::NsecData::new(next, bitmap.clone()).expect("nsec"))
+                .to_canonical_wire();
+            let owner_rle = NameRle::from_wire(nsec_owner.as_wire()).expect("nsec owner");
+            writer
+                .upsert_rrset(
+                    &owner_rle,
+                    Rtype::NSEC.as_u16(),
+                    0,
+                    &RrsetData::new(300, 0, vec![nsec]).expect("nsec data"),
+                )
+                .expect("nsec write");
+            writer
+                .upsert_rrset(
+                    &owner_rle,
+                    Rtype::RRSIG.as_u16(),
+                    Rtype::NSEC.as_u16(),
+                    &RrsetData::new(300, 0, vec![signature(Rtype::NSEC)]).expect("rrsig"),
+                )
+                .expect("nsec rrsig write");
+        }
         writer.commit().expect("commit");
     }
     drop(zones);
@@ -197,6 +284,17 @@ fn udp_allocations_over_v2_zone_by_class() {
         message
             .encode(&EncodeOptions::compressed())
             .expect("query encode")
+    };
+
+    let signed_query = |qname: &str, qtype: Rtype| {
+        let mut message = Message::query(
+            0x1234,
+            Question::new(Name::parse(qname).expect("qname"), qtype, Rclass::IN),
+        );
+        message.set_edns(Some(pulse_dns::Edns::new(1232).with_dnssec_ok(true)));
+        message
+            .encode(&EncodeOptions::compressed())
+            .expect("signed query encode")
     };
 
     let classes = vec![
@@ -247,6 +345,24 @@ fn udp_allocations_over_v2_zone_by_class() {
             query("www.example.test.", Rtype::A, true),
             Rcode::NOERROR,
             1,
+        ),
+        (
+            "ANY",
+            query("www.example.test.", Rtype::ANY, false),
+            Rcode::NOERROR,
+            1,
+        ),
+        (
+            "DO-A",
+            signed_query("www.example.test.", Rtype::A),
+            Rcode::NOERROR,
+            2,
+        ),
+        (
+            "DO-NXDOMAIN",
+            signed_query("missing.example.test.", Rtype::A),
+            Rcode::NXDOMAIN,
+            0,
         ),
     ];
 

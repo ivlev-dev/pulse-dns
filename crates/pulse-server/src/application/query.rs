@@ -9,12 +9,15 @@ use pulse_dns::{
     Rclass, Rcode, Rdata, RdataError, Record, RecordError, Rrset, RrsetError, Rtype, Ttl, TtlError,
     edns_wire_len,
 };
+use pulse_dnssec::rdata_util::{NSEC3_SHA1_LEN, nsec3_hash_into};
 use pulse_dnssec::{DenialLimits, Nsec3Params};
 use thiserror::Error;
 
 use super::port::{ZoneSnapshot, ZoneView};
 use super::stats::QueryStats;
-use crate::domain::{DenialKind, LookupOutcome, LookupOutcomeRef, RdataRef, RrsetRef, ZoneState};
+use crate::domain::{
+    DenialKind, LookupOutcome, LookupOutcomeRef, RdataRef, RefLookup, RrsetRef, ZoneState,
+};
 
 /// UDP payload без EDNS0 (RFC 1035 §4.2.1).
 pub const UDP_PAYLOAD_WITHOUT_EDNS: u16 = 512;
@@ -375,14 +378,19 @@ impl QueryEngine {
     ///   типов (включая additional-glue для `MX`/`SRV`/`NS`/`SVCB`/`HTTPS`);
     /// * `CNAME`-цепочка в зоне до [`MAX_CNAME_CHAIN`] звеньев;
     /// * `NXDOMAIN`/`NODATA` с `SOA` и negative TTL из заимствованных данных;
-    /// * wildcard-развёртывание (кроме wildcard `CNAME`, который уходит на
-    ///   полный путь);
-    /// * EDNS0 (версия 0, `DO = 0`): OPT повторяется, payload ограничивает
-    ///   ответ, `TC` выставляется по тем же правилам, что и в полном пути.
+    /// * wildcard-развёртывание, включая wildcard `CNAME`;
+    /// * подписанные ответы (`DO = 1`): `RRSIG` из refs, `NSEC`/`NSEC3`
+    ///   denial-доказательства из индексов зоны;
+    /// * referral: `NS`/`DS`/`NSEC3` Opt-Out и glue в bailiwick, `AA = 0`;
+    /// * `QTYPE = ANY`: `HINFO`-синтез по RFC 8482 и `CNAME` владельца;
+    /// * EDNS0 (версия 0): OPT повторяется (включая `DO`), payload
+    ///   ограничивает ответ, `TC` выставляется по тем же правилам, что и в
+    ///   полном пути.
     ///
-    /// `DO = 1`, подписанные ответы, делегирования, wildcard `CNAME` и
-    /// `QTYPE = ANY` остаются на полном пути. `None` означает «случай не
-    /// горячий» — вызывающий обязан обработать пакет обычным путём.
+    /// `DNAME` выше `QNAME`, циклы `CNAME`, неподдерживаемые представления
+    /// данных (например, `OVERFLOW`-payload зоны v2) и прочие не-горячие
+    /// случаи остаются на полном пути. `None` означает «случай не горячий» —
+    /// вызывающий обязан обработать пакет обычным путём.
     #[must_use]
     pub fn respond_ref_into(
         &self,
@@ -393,14 +401,14 @@ impl QueryEngine {
     ) -> Option<usize> {
         let qname = request.qname()?;
         let qtype = request.qtype();
-        if qtype == Rtype::ANY || is_transfer_meta_qtype(qtype) {
+        if is_transfer_meta_qtype(qtype) {
             return None;
         }
         if request.qclass() != Rclass::IN {
             return None;
         }
         let request_edns = request.edns();
-        if request_edns.is_some_and(|edns| edns.version() != 0 || edns.dnssec_ok()) {
+        if request_edns.is_some_and(|edns| edns.version() != 0) {
             return None;
         }
         let zone = self.find_zone_wire(qname.as_wire())?;
@@ -411,7 +419,9 @@ impl QueryEngine {
             return None;
         }
         let response_edns = request_edns.map(|edns| {
-            Edns::new(negotiated_payload_size(edns.udp_payload_size())).with_version(0)
+            Edns::new(negotiated_payload_size(edns.udp_payload_size()))
+                .with_version(0)
+                .with_dnssec_ok(edns.dnssec_ok())
         });
 
         let mut wildcard_wire = [0_u8; MAX_NAME_WIRE_LEN];
@@ -425,6 +435,7 @@ impl QueryEngine {
                 out,
                 scratch,
                 response_edns.as_ref(),
+                self.config.any_hinfo_ttl,
             );
         });
         if !available {
@@ -435,7 +446,7 @@ impl QueryEngine {
         match response.status {
             FastStatus::NxDomain => self.stats.record_nxdomain(),
             FastStatus::NoData => self.stats.record_nodata(),
-            FastStatus::Answer => {}
+            FastStatus::Answer | FastStatus::Referral => {}
         }
         if response.truncated {
             self.stats.record_truncated();
@@ -453,6 +464,7 @@ impl QueryEngine {
         out: &'a mut [u8],
         scratch: &'a mut Scratch,
         response_edns: Option<&Edns>,
+        hinfo_ttl: Ttl,
     ) -> Option<FastResponse> {
         let qname = request.qname()?;
         let qtype = request.qtype();
@@ -465,92 +477,22 @@ impl QueryEngine {
         if dname_above(snapshot, qname, origin) {
             return None;
         }
+        let do_bit = response_edns.is_some_and(Edns::dnssec_ok);
+        let signed = do_bit && snapshot.signed_ref();
 
-        let mut answers: [Option<FastAnswer<'a>>; FAST_ANSWER_SLOTS] = [None; FAST_ANSWER_SLOTS];
-        let mut answer_len = 0_usize;
-        let mut visited = [ROOT_NAME; MAX_CNAME_CHAIN];
-        let mut visited_len = 0_usize;
-        let mut current = qname;
-        let mut status = FastStatus::Answer;
-        let mut needs_soa = false;
-
-        loop {
-            match snapshot.lookup_ref(current, qtype) {
-                LookupOutcomeRef::Answer(rrset) => {
-                    *answers.get_mut(answer_len)? = Some(FastAnswer {
-                        owner: current,
-                        rrset,
-                    });
-                    answer_len = answer_len.saturating_add(1);
-                    break;
-                }
-                LookupOutcomeRef::Cname(rrset, target) => {
-                    *answers.get_mut(answer_len)? = Some(FastAnswer {
-                        owner: current,
-                        rrset,
-                    });
-                    answer_len = answer_len.saturating_add(1);
-                    let loops = target.as_wire() == current.as_wire()
-                        || visited.get(..visited_len).is_some_and(|seen| {
-                            seen.iter().any(|name| name.as_wire() == target.as_wire())
-                        });
-                    if loops {
-                        // Цикл даёт SERVFAIL: пусть его сформирует полный путь.
-                        return None;
-                    }
-                    if visited_len.saturating_add(1) >= MAX_CNAME_CHAIN
-                        || !target.is_subdomain_of(origin)
-                        || delegation_above(snapshot, target, origin)
-                        || dname_above(snapshot, target, origin)
-                    {
-                        break;
-                    }
-                    *visited.get_mut(visited_len)? = current;
-                    visited_len = visited_len.saturating_add(1);
-                    current = target;
-                }
-                LookupOutcomeRef::NoData => {
-                    status = FastStatus::NoData;
-                    needs_soa = true;
-                    break;
-                }
-                LookupOutcomeRef::NxDomain => {
-                    match wildcard_lookup(snapshot, current, qtype, origin, wildcard_wire) {
-                        WildcardOutcome::Answer(rrset) => {
-                            *answers.get_mut(answer_len)? = Some(FastAnswer {
-                                owner: current,
-                                rrset,
-                            });
-                            answer_len = answer_len.saturating_add(1);
-                            status = FastStatus::Answer;
-                        }
-                        WildcardOutcome::NoData => {
-                            status = FastStatus::NoData;
-                            needs_soa = true;
-                        }
-                        WildcardOutcome::NxDomain => {
-                            status = FastStatus::NxDomain;
-                            needs_soa = true;
-                        }
-                        WildcardOutcome::Unsupported => return None,
-                    }
-                    break;
-                }
-                LookupOutcomeRef::Delegation { .. }
-                | LookupOutcomeRef::Referral
-                | LookupOutcomeRef::ZoneNotFound => {
-                    // Делегирование — не горячий случай. Внутри цепочки
-                    // `CNAME` это штатная остановка (status остаётся Answer).
-                    if answer_len == 0 {
-                        return None;
-                    }
-                    break;
-                }
-            }
-        }
+        let mut plan = FastPlan::new();
+        resolve_fast(
+            snapshot,
+            qname,
+            qtype,
+            origin,
+            wildcard_wire,
+            hinfo_ttl,
+            &mut plan,
+        )?;
 
         let mut targets = NameSlots::new();
-        for entry in answers.iter().take(answer_len).flatten() {
+        for entry in plan.answers.iter().take(plan.answer_len).flatten() {
             add_targets(entry.rrset, &mut targets)?;
         }
         let mut glue_targets = NameSlots::new();
@@ -561,6 +503,24 @@ impl QueryEngine {
                 && !glue_targets.push(target)
             {
                 return None;
+            }
+        }
+        if let Some(referral) = plan.referral {
+            let mut referral_targets = NameSlots::new();
+            add_targets(referral.ns, &mut referral_targets)?;
+            for index in 0..referral_targets.len {
+                let &target = referral_targets.items.get(index)?;
+                if !target.is_subdomain_of(origin) {
+                    continue;
+                }
+                // Bailiwick: glue допустим для имён вне cut или в этом же cut.
+                let in_bailiwick = match find_delegation_ref(snapshot, target, origin) {
+                    None => true,
+                    Some(found) => found.as_wire() == referral.cut.as_wire(),
+                };
+                if in_bailiwick && !glue_targets.push(target) {
+                    return None;
+                }
             }
         }
         glue_targets.sort_dedup();
@@ -577,16 +537,16 @@ impl QueryEngine {
             None => 0,
         };
         let buffer = out.get_mut(..capacity)?;
-        let rcode = match status {
+        let rcode = match plan.status {
             FastStatus::NxDomain => Rcode::NXDOMAIN,
-            FastStatus::Answer | FastStatus::NoData => Rcode::NOERROR,
+            FastStatus::Answer | FastStatus::NoData | FastStatus::Referral => Rcode::NOERROR,
         };
         let flags = Flags::new()
             .with_qr(true)
             .with_opcode(Opcode::QUERY)
             .with_rd(request.flags().rd())
             .with_cd(request.flags().cd())
-            .with_aa(true)
+            .with_aa(plan.aa)
             .with_ra(false)
             .with_ad(false)
             .with_tc(false)
@@ -607,7 +567,34 @@ impl QueryEngine {
         let mut truncated = false;
         let mut stopped = false;
 
-        for entry in answers.iter().take(answer_len).flatten() {
+        if let Some(ttl) = plan.hinfo {
+            stopped = write_fast_hinfo(
+                &mut encoder,
+                transport,
+                budget,
+                &mut truncated,
+                qname,
+                ttl,
+                &mut counts,
+            )
+            .ok()?
+                == Flow::Stop;
+            if !stopped && signed {
+                stopped = write_signature_fast(
+                    snapshot,
+                    &mut encoder,
+                    transport,
+                    budget,
+                    &mut truncated,
+                    Section::Answer,
+                    qname,
+                    HINFO_TYPE,
+                    qname,
+                    &mut counts,
+                )? == Flow::Stop;
+            }
+        }
+        for entry in plan.answers.iter().take(plan.answer_len).flatten() {
             if stopped {
                 break;
             }
@@ -620,39 +607,66 @@ impl QueryEngine {
                 entry.owner,
                 entry.rrset,
                 None,
+                None,
                 &mut counts,
             )
             .ok()?;
-            stopped = flow == Flow::Stop;
+            if flow == Flow::Stop {
+                stopped = true;
+                break;
+            }
+            if signed {
+                let source = entry.sig_source.unwrap_or(entry.owner);
+                let flow = write_signature_fast(
+                    snapshot,
+                    &mut encoder,
+                    transport,
+                    budget,
+                    &mut truncated,
+                    Section::Answer,
+                    entry.owner,
+                    entry.rrset.rr_type(),
+                    source,
+                    &mut counts,
+                )?;
+                if flow == Flow::Stop {
+                    stopped = true;
+                }
+            }
         }
-        if !stopped && needs_soa {
-            let soa = snapshot.soa_ref()?;
-            let ttl = negative_ttl(soa)?;
-            let flow = write_fast_group(
+        if !stopped {
+            stopped = write_authority_fast(
+                snapshot,
                 &mut encoder,
                 transport,
                 budget,
                 &mut truncated,
-                Section::Authority,
-                soa.owner(),
-                soa,
-                Some(ttl),
                 &mut counts,
-            )
-            .ok()?;
-            stopped = flow == Flow::Stop;
+                &plan,
+                signed,
+                do_bit,
+                qname,
+                origin,
+            )? == Flow::Stop;
         }
         if !stopped {
-            for target in glue_targets.iter() {
+            'glue: for target in glue_targets.iter() {
                 for rr_type in [Rtype::A, Rtype::AAAA] {
-                    let LookupOutcomeRef::Answer(rrset) = snapshot.lookup_ref(target, rr_type)
-                    else {
-                        continue;
+                    let rrset = match snapshot.glue_at_ref(target, rr_type) {
+                        RefLookup::Found(rrset) => rrset,
+                        RefLookup::Absent => continue,
+                        RefLookup::Unsupported => return None,
                     };
-                    if answers.iter().take(answer_len).flatten().any(|entry| {
-                        entry.owner.as_wire() == rrset.owner().as_wire()
-                            && entry.rrset.rr_type() == rrset.rr_type()
-                    }) {
+                    let already =
+                        plan.answers
+                            .iter()
+                            .take(plan.answer_len)
+                            .flatten()
+                            .any(|entry| {
+                                entry.owner.as_wire() == rrset.owner().as_wire()
+                                    && entry.rrset.rr_type() == rrset.rr_type()
+                            });
+                    if already {
                         continue;
                     }
                     let flow = write_fast_group(
@@ -664,16 +678,30 @@ impl QueryEngine {
                         rrset.owner(),
                         rrset,
                         None,
+                        None,
                         &mut counts,
                     )
                     .ok()?;
                     if flow == Flow::Stop {
-                        stopped = true;
-                        break;
+                        break 'glue;
                     }
-                }
-                if stopped {
-                    break;
+                    if signed {
+                        let flow = write_signature_fast(
+                            snapshot,
+                            &mut encoder,
+                            transport,
+                            budget,
+                            &mut truncated,
+                            Section::Additional,
+                            rrset.owner(),
+                            rrset.rr_type(),
+                            rrset.owner(),
+                            &mut counts,
+                        )?;
+                        if flow == Flow::Stop {
+                            break 'glue;
+                        }
+                    }
                 }
             }
         }
@@ -697,7 +725,7 @@ impl QueryEngine {
             .ok()?;
         Some(FastResponse {
             len,
-            status,
+            status: plan.status,
             truncated,
         })
     }
@@ -1234,6 +1262,8 @@ impl QueryEngine {
 const FAST_ANSWER_SLOTS: usize = MAX_CNAME_CHAIN + 1;
 /// Максимум целей additional, обрабатываемых без аллокаций.
 const FAST_TARGET_SLOTS: usize = 16;
+/// Максимум proof-владельцев, запоминаемых для dedup в быстром пути.
+const FAST_PROOF_SLOTS: usize = 4;
 /// Корневое имя как значение-заглушка для стековых массивов [`NameRef`].
 const ROOT_NAME: NameRef<'static> = NameRef::from_validated(&[0]);
 
@@ -1243,6 +1273,7 @@ enum FastStatus {
     Answer,
     NoData,
     NxDomain,
+    Referral,
 }
 
 /// Запись ответа с возможным переименованием владельца (wildcard).
@@ -1250,6 +1281,53 @@ enum FastStatus {
 struct FastAnswer<'a> {
     owner: NameRef<'a>,
     rrset: RrsetRef<'a>,
+    /// Имя, под которым хранятся подписи: wildcard-владелец для
+    /// развёрнутого ответа. `None` — подписи под владельцем набора.
+    sig_source: Option<NameRef<'a>>,
+}
+
+/// Referral-план: `NS`/`DS` и точка cut из refs.
+#[derive(Debug, Clone, Copy)]
+struct FastReferral<'a> {
+    cut: NameRef<'a>,
+    ns: RrsetRef<'a>,
+    ds: Option<RrsetRef<'a>>,
+}
+
+/// Собранный план быстрого ответа.
+struct FastPlan<'a> {
+    answers: [Option<FastAnswer<'a>>; FAST_ANSWER_SLOTS],
+    answer_len: usize,
+    status: FastStatus,
+    aa: bool,
+    needs_soa: bool,
+    /// TTL синтезированного `HINFO`; `Some` — ответ на `QTYPE = ANY`.
+    hinfo: Option<Ttl>,
+    referral: Option<FastReferral<'a>>,
+    /// Wildcard-владелец для denial-доказательств.
+    wildcard: Option<NameRef<'a>>,
+}
+
+impl<'a> FastPlan<'a> {
+    const fn new() -> Self {
+        Self {
+            answers: [None; FAST_ANSWER_SLOTS],
+            answer_len: 0,
+            status: FastStatus::Answer,
+            aa: true,
+            needs_soa: false,
+            hinfo: None,
+            referral: None,
+            wildcard: None,
+        }
+    }
+
+    /// Добавляет запись ответа; `None` — переполнение (полный путь).
+    fn push(&mut self, answer: FastAnswer<'a>) -> Option<()> {
+        *self.answers.get_mut(self.answer_len)? = Some(answer);
+        self.answer_len = self.answer_len.checked_add(1)?;
+        Some(())
+    }
 }
 
 /// Результат кодирования быстрого пути.
@@ -1266,6 +1344,47 @@ struct FastCounts {
     answer: u16,
     authority: u16,
     additional: u16,
+}
+
+/// Стековый dedup proof-владельцев по wire-форме (имя или NSEC3-hash).
+struct FastSeen {
+    owners: [[u8; MAX_NAME_WIRE_LEN]; FAST_PROOF_SLOTS],
+    lens: [usize; FAST_PROOF_SLOTS],
+    len: usize,
+}
+
+impl FastSeen {
+    const fn new() -> Self {
+        Self {
+            owners: [[0_u8; MAX_NAME_WIRE_LEN]; FAST_PROOF_SLOTS],
+            lens: [0_usize; FAST_PROOF_SLOTS],
+            len: 0,
+        }
+    }
+
+    fn contains(&self, wire: &[u8]) -> bool {
+        self.lens
+            .iter()
+            .zip(self.owners.iter())
+            .take(self.len)
+            .any(|(&len, owner)| owner.get(..len) == Some(wire))
+    }
+
+    /// Запоминает владельца; `false` — переполнение (полный путь).
+    fn insert(&mut self, wire: &[u8]) -> bool {
+        let Some(slot) = self.owners.get_mut(self.len) else {
+            return false;
+        };
+        let Some(target) = slot.get_mut(..wire.len()) else {
+            return false;
+        };
+        target.copy_from_slice(wire);
+        if let Some(len) = self.lens.get_mut(self.len) {
+            *len = wire.len();
+        }
+        self.len = self.len.saturating_add(1);
+        true
+    }
 }
 
 /// Стековый список имён без аллокаций.
@@ -1340,20 +1459,35 @@ impl<'a> NameSlots<'a> {
 /// Итог поиска по wildcard.
 #[derive(Debug, Clone, Copy)]
 enum WildcardOutcome<'a> {
-    Answer(RrsetRef<'a>),
-    NoData,
+    /// Ответ из wildcard; владелец набора — `*.<closest>`.
+    Answer {
+        rrset: RrsetRef<'a>,
+        wildcard: NameRef<'a>,
+    },
+    /// `CNAME` из wildcard и его каноническая цель.
+    Cname {
+        rrset: RrsetRef<'a>,
+        target: NameRef<'a>,
+        wildcard: NameRef<'a>,
+    },
+    /// Wildcard существует, но типа в нём нет.
+    NoData { wildcard: NameRef<'a> },
+    /// Wildcard не найден.
     NxDomain,
+    /// Не представимо заимствованно (полный путь).
     Unsupported,
 }
 
-/// Ищет wildcard-ответ для несуществующего имени (RFC 4592).
-fn wildcard_lookup<'a>(
-    snapshot: &'a dyn ZoneSnapshot,
+/// Строит `*.<closest encloser>` в caller-provided буфере (RFC 4592).
+///
+/// `None` — у имени нет существующего предка внутри зоны либо имя не
+/// помещается в буфер.
+fn wildcard_owner_ref<'a>(
+    snapshot: &dyn ZoneSnapshot,
     name: NameRef<'a>,
-    qtype: Rtype,
-    origin: NameRef<'a>,
+    origin: NameRef<'_>,
     buffer: &'a mut [u8; MAX_NAME_WIRE_LEN],
-) -> WildcardOutcome<'a> {
+) -> Option<NameRef<'a>> {
     let mut closest = None;
     let mut candidate = name.parent();
     while let Some(current) = candidate {
@@ -1371,29 +1505,32 @@ fn wildcard_lookup<'a>(
             if snapshot.node_exists_ref(origin) {
                 origin
             } else {
-                return WildcardOutcome::NxDomain;
+                return None;
             }
         }
     };
-    let Some(length) = closest.wire_len().checked_add(2) else {
-        return WildcardOutcome::Unsupported;
-    };
-    let Some(slot) = buffer.get_mut(..length) else {
-        return WildcardOutcome::Unsupported;
-    };
-    let Some((header, rest)) = slot.split_first_mut() else {
-        return WildcardOutcome::Unsupported;
-    };
+    let length = closest.wire_len().checked_add(2)?;
+    let slot = buffer.get_mut(..length)?;
+    let (header, rest) = slot.split_first_mut()?;
     *header = 1;
-    let Some((marker, tail)) = rest.split_first_mut() else {
-        return WildcardOutcome::Unsupported;
-    };
+    let (marker, tail) = rest.split_first_mut()?;
     *marker = b'*';
     tail.copy_from_slice(closest.as_wire());
-    let Some(slot) = buffer.get(..length) else {
-        return WildcardOutcome::Unsupported;
+    let wire = buffer.get(..length)?;
+    Some(NameRef::from_validated(wire))
+}
+
+/// Ищет wildcard-ответ для несуществующего имени (RFC 4592).
+fn wildcard_lookup<'a>(
+    snapshot: &'a dyn ZoneSnapshot,
+    name: NameRef<'a>,
+    qtype: Rtype,
+    origin: NameRef<'a>,
+    buffer: &'a mut [u8; MAX_NAME_WIRE_LEN],
+) -> WildcardOutcome<'a> {
+    let Some(wildcard) = wildcard_owner_ref(snapshot, name, origin, buffer) else {
+        return WildcardOutcome::NxDomain;
     };
-    let wildcard = NameRef::from_validated(slot);
     // Wildcard-владелец, которого нет в зоне, даёт NxDomain без полного
     // поиска: это заметно дешевле на больших зонах (нет проверки
     // делегирования и RRset).
@@ -1401,14 +1538,1198 @@ fn wildcard_lookup<'a>(
         return WildcardOutcome::NxDomain;
     }
     match snapshot.lookup_ref(wildcard, qtype) {
-        LookupOutcomeRef::Answer(rrset) => WildcardOutcome::Answer(rrset),
-        LookupOutcomeRef::NoData => WildcardOutcome::NoData,
+        LookupOutcomeRef::Answer(rrset) => WildcardOutcome::Answer { rrset, wildcard },
+        LookupOutcomeRef::Cname(rrset, target) => WildcardOutcome::Cname {
+            rrset,
+            target,
+            wildcard,
+        },
+        LookupOutcomeRef::NoData => WildcardOutcome::NoData { wildcard },
         LookupOutcomeRef::NxDomain => WildcardOutcome::NxDomain,
-        LookupOutcomeRef::Cname(..)
-        | LookupOutcomeRef::Delegation { .. }
+        LookupOutcomeRef::Delegation { .. }
         | LookupOutcomeRef::Referral
         | LookupOutcomeRef::ZoneNotFound => WildcardOutcome::Unsupported,
     }
+}
+
+/// Точка делегирования для имени (deepest cut ниже origin).
+fn find_delegation_ref<'a>(
+    snapshot: &dyn ZoneSnapshot,
+    name: NameRef<'a>,
+    origin: NameRef<'_>,
+) -> Option<NameRef<'a>> {
+    let mut current = Some(name);
+    while let Some(candidate) = current {
+        if candidate.as_wire() == origin.as_wire() || !candidate.is_subdomain_of(origin) {
+            return None;
+        }
+        if snapshot.is_delegation_ref(candidate) {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+/// Можно ли продолжать `CNAME`-цепочку и не замыкается ли она.
+///
+/// `None` — цикл (полный путь вернёт `SERVFAIL`); `Some(false)` — остановка
+/// на уже собранном ответе.
+fn chase_allowed<'a>(
+    snapshot: &dyn ZoneSnapshot,
+    current: NameRef<'a>,
+    target: NameRef<'a>,
+    origin: NameRef<'_>,
+    visited: &[NameRef<'a>],
+) -> Option<bool> {
+    if target.as_wire() == current.as_wire()
+        || visited
+            .iter()
+            .any(|name| name.as_wire() == target.as_wire())
+    {
+        return None;
+    }
+    if visited.len().saturating_add(1) >= MAX_CNAME_CHAIN
+        || !target.is_subdomain_of(origin)
+        || delegation_above(snapshot, target, origin)
+        || dname_above(snapshot, target, origin)
+    {
+        return Some(false);
+    }
+    Some(true)
+}
+
+/// Разбирает ответ по заимствованному снимку: referral, `ANY` или цепочка.
+#[allow(clippy::too_many_lines)]
+fn resolve_fast<'a>(
+    snapshot: &'a dyn ZoneSnapshot,
+    qname: NameRef<'a>,
+    qtype: Rtype,
+    origin: NameRef<'a>,
+    wildcard_wire: &'a mut [u8; MAX_NAME_WIRE_LEN],
+    hinfo_ttl: Ttl,
+    plan: &mut FastPlan<'a>,
+) -> Option<()> {
+    if let Some(cut) = find_delegation_ref(snapshot, qname, origin) {
+        if cut.as_wire() == qname.as_wire() && qtype == Rtype::DS {
+            return match snapshot.lookup_ref(qname, Rtype::DS) {
+                LookupOutcomeRef::Answer(ds) => plan.push(FastAnswer {
+                    owner: qname,
+                    rrset: ds,
+                    sig_source: None,
+                }),
+                LookupOutcomeRef::NoData => {
+                    plan.status = FastStatus::NoData;
+                    plan.needs_soa = true;
+                    Some(())
+                }
+                _ => None,
+            };
+        }
+        let LookupOutcomeRef::Delegation { ns, ds } = snapshot.lookup_ref(cut, Rtype::NS) else {
+            return None;
+        };
+        plan.status = FastStatus::Referral;
+        plan.aa = false;
+        plan.referral = Some(FastReferral { cut, ns, ds });
+        return Some(());
+    }
+    if qtype == Rtype::ANY {
+        return resolve_any_fast(snapshot, qname, origin, wildcard_wire, hinfo_ttl, plan);
+    }
+
+    let mut visited = [ROOT_NAME; MAX_CNAME_CHAIN];
+    let mut visited_len = 0_usize;
+    let mut current = qname;
+    loop {
+        match snapshot.lookup_ref(current, qtype) {
+            LookupOutcomeRef::Answer(rrset) => {
+                plan.push(FastAnswer {
+                    owner: current,
+                    rrset,
+                    sig_source: None,
+                })?;
+                plan.status = FastStatus::Answer;
+                return Some(());
+            }
+            LookupOutcomeRef::Cname(rrset, target) => {
+                plan.push(FastAnswer {
+                    owner: current,
+                    rrset,
+                    sig_source: None,
+                })?;
+                if !chase_allowed(
+                    snapshot,
+                    current,
+                    target,
+                    origin,
+                    visited.get(..visited_len)?,
+                )? {
+                    return Some(());
+                }
+                *visited.get_mut(visited_len)? = current;
+                visited_len = visited_len.checked_add(1)?;
+                current = target;
+            }
+            LookupOutcomeRef::NoData => {
+                plan.status = FastStatus::NoData;
+                plan.aa = true;
+                plan.needs_soa = true;
+                return Some(());
+            }
+            LookupOutcomeRef::NxDomain => {
+                match wildcard_lookup(snapshot, current, qtype, origin, wildcard_wire) {
+                    WildcardOutcome::Answer { rrset, wildcard } => {
+                        plan.push(FastAnswer {
+                            owner: current,
+                            rrset,
+                            sig_source: Some(wildcard),
+                        })?;
+                        plan.status = FastStatus::Answer;
+                        plan.wildcard = Some(wildcard);
+                        return Some(());
+                    }
+                    WildcardOutcome::Cname {
+                        rrset,
+                        target,
+                        wildcard,
+                    } => {
+                        plan.push(FastAnswer {
+                            owner: current,
+                            rrset,
+                            sig_source: Some(wildcard),
+                        })?;
+                        plan.status = FastStatus::Answer;
+                        plan.wildcard = Some(wildcard);
+                        if !chase_allowed(
+                            snapshot,
+                            current,
+                            target,
+                            origin,
+                            visited.get(..visited_len)?,
+                        )? {
+                            return Some(());
+                        }
+                        *visited.get_mut(visited_len)? = current;
+                        visited_len = visited_len.checked_add(1)?;
+                        // После wildcard-CNAME цепочка продолжается только
+                        // точными данными: повторный wildcard-поиск и
+                        // негативный ответ остаются полному пути.
+                        return chase_exact_fast(
+                            snapshot,
+                            target,
+                            qtype,
+                            origin,
+                            &mut visited,
+                            &mut visited_len,
+                            plan,
+                        );
+                    }
+                    WildcardOutcome::NoData { wildcard } => {
+                        plan.status = FastStatus::NoData;
+                        plan.aa = true;
+                        plan.needs_soa = true;
+                        plan.wildcard = Some(wildcard);
+                        return Some(());
+                    }
+                    WildcardOutcome::NxDomain => {
+                        plan.status = FastStatus::NxDomain;
+                        plan.aa = true;
+                        plan.needs_soa = true;
+                        return Some(());
+                    }
+                    WildcardOutcome::Unsupported => return None,
+                }
+            }
+            LookupOutcomeRef::Delegation { .. }
+            | LookupOutcomeRef::Referral
+            | LookupOutcomeRef::ZoneNotFound => {
+                // Делегирование в цепочке — штатная остановка; в начале —
+                // не горячий случай.
+                return if plan.answer_len == 0 { None } else { Some(()) };
+            }
+        }
+    }
+}
+
+/// Продолжает цепочку после wildcard-`CNAME`: только точные данные.
+#[allow(clippy::too_many_arguments)]
+fn chase_exact_fast<'a>(
+    snapshot: &'a dyn ZoneSnapshot,
+    mut current: NameRef<'a>,
+    qtype: Rtype,
+    origin: NameRef<'a>,
+    visited: &mut [NameRef<'a>; MAX_CNAME_CHAIN],
+    visited_len: &mut usize,
+    plan: &mut FastPlan<'a>,
+) -> Option<()> {
+    loop {
+        match snapshot.lookup_ref(current, qtype) {
+            LookupOutcomeRef::Answer(rrset) => {
+                plan.push(FastAnswer {
+                    owner: current,
+                    rrset,
+                    sig_source: None,
+                })?;
+                plan.status = FastStatus::Answer;
+                return Some(());
+            }
+            LookupOutcomeRef::Cname(rrset, target) => {
+                plan.push(FastAnswer {
+                    owner: current,
+                    rrset,
+                    sig_source: None,
+                })?;
+                if !chase_allowed(
+                    snapshot,
+                    current,
+                    target,
+                    origin,
+                    visited.get(..*visited_len)?,
+                )? {
+                    return Some(());
+                }
+                *visited.get_mut(*visited_len)? = current;
+                *visited_len = visited_len.checked_add(1)?;
+                current = target;
+            }
+            LookupOutcomeRef::NoData => {
+                // Полный путь сохранил бы wildcard-владельца в resolution —
+                // такой NODATA обслуживает он.
+                return None;
+            }
+            LookupOutcomeRef::NxDomain => return None,
+            LookupOutcomeRef::Delegation { .. }
+            | LookupOutcomeRef::Referral
+            | LookupOutcomeRef::ZoneNotFound => {
+                return if plan.answer_len == 0 { None } else { Some(()) };
+            }
+        }
+    }
+}
+
+/// `QTYPE = ANY`: `CNAME` владельца либо `HINFO`-синтез (RFC 8482).
+fn resolve_any_fast<'a>(
+    snapshot: &'a dyn ZoneSnapshot,
+    qname: NameRef<'a>,
+    origin: NameRef<'a>,
+    wildcard_wire: &'a mut [u8; MAX_NAME_WIRE_LEN],
+    hinfo_ttl: Ttl,
+    plan: &mut FastPlan<'a>,
+) -> Option<()> {
+    match snapshot.lookup_ref(qname, Rtype::CNAME) {
+        LookupOutcomeRef::Answer(cname) => {
+            plan.push(FastAnswer {
+                owner: qname,
+                rrset: cname,
+                sig_source: None,
+            })?;
+            plan.status = FastStatus::Answer;
+            return Some(());
+        }
+        LookupOutcomeRef::NoData | LookupOutcomeRef::NxDomain => {}
+        _ => return None,
+    }
+    if snapshot.node_exists_ref(qname) {
+        plan.hinfo = Some(hinfo_ttl);
+        plan.status = FastStatus::Answer;
+        return Some(());
+    }
+    let Some(wildcard) = wildcard_owner_ref(snapshot, qname, origin, wildcard_wire) else {
+        plan.status = FastStatus::NxDomain;
+        plan.needs_soa = true;
+        return Some(());
+    };
+    match snapshot.lookup_ref(wildcard, Rtype::CNAME) {
+        LookupOutcomeRef::Answer(cname) => {
+            // Полный путь переименовывает CNAME в QNAME и не помечает
+            // источник подписи: подпись ищется у QNAME.
+            plan.push(FastAnswer {
+                owner: qname,
+                rrset: cname,
+                sig_source: None,
+            })?;
+            plan.status = FastStatus::Answer;
+        }
+        LookupOutcomeRef::NoData | LookupOutcomeRef::NxDomain => {
+            if snapshot.node_exists_ref(wildcard) {
+                plan.hinfo = Some(hinfo_ttl);
+                plan.status = FastStatus::Answer;
+            } else {
+                plan.status = FastStatus::NxDomain;
+                plan.needs_soa = true;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Запрос denial-доказательства: точный владелец либо покрытие.
+#[derive(Debug, Clone, Copy)]
+enum ProofQuery<'a> {
+    Exact(NameRef<'a>),
+    Cover(NameRef<'a>),
+}
+
+impl<'a> ProofQuery<'a> {
+    const fn name(self) -> NameRef<'a> {
+        match self {
+            Self::Exact(name) | Self::Cover(name) => name,
+        }
+    }
+}
+
+/// Повод для denial-доказательств (`NSEC`/`NSEC3`).
+#[derive(Debug, Clone, Copy)]
+enum ProofReason<'a> {
+    NxDomain,
+    NoData { wildcard: Option<NameRef<'a>> },
+    WildcardAnswer { wildcard: NameRef<'a> },
+    Referral { cut: NameRef<'a> },
+}
+
+/// Параметры NSEC3-цепочки из `NSEC3PARAM` для hash-пространства.
+#[derive(Debug, Clone, Copy)]
+struct FastNsec3Params<'a> {
+    iterations: u16,
+    salt: &'a [u8],
+}
+
+/// Итог чтения параметров NSEC3.
+#[derive(Debug, Clone, Copy)]
+enum FastParams<'a> {
+    Params(FastNsec3Params<'a>),
+    /// Параметров нет или они невалидны: полный путь тоже не даёт proof.
+    Absent,
+    /// Заимствованное представление недоступно (полный путь).
+    Unsupported,
+}
+
+/// Читает и валидирует `NSEC3PARAM` так же, как `Nsec3Params::from_nsec3param`.
+fn fast_nsec3_params(snapshot: &dyn ZoneSnapshot) -> FastParams<'_> {
+    let rrset = match snapshot.nsec3_param_ref() {
+        RefLookup::Found(rrset) => rrset,
+        RefLookup::Absent => return FastParams::Absent,
+        RefLookup::Unsupported => return FastParams::Unsupported,
+    };
+    let parsed = match rrset.first_record() {
+        Some(RdataRef::Domain(Rdata::Nsec3Param(param))) => Some((
+            param.hash_algorithm(),
+            param.flags(),
+            param.iterations(),
+            param.salt(),
+        )),
+        Some(RdataRef::Domain(_)) | None => None,
+        Some(RdataRef::Wire { bytes, .. }) => parse_nsec3param_wire(bytes),
+    };
+    let Some((algorithm, flags, iterations, salt)) = parsed else {
+        return FastParams::Absent;
+    };
+    if flags != 0
+        || algorithm != Nsec3Params::HASH_SHA1
+        || iterations > DenialLimits::new().max_nsec3_iterations
+    {
+        return FastParams::Absent;
+    }
+    FastParams::Params(FastNsec3Params { iterations, salt })
+}
+
+/// Разбирает wire-форму `NSEC3PARAM`.
+fn parse_nsec3param_wire(bytes: &[u8]) -> Option<(u8, u8, u16, &[u8])> {
+    let algorithm = *bytes.first()?;
+    let flags = *bytes.get(1)?;
+    let iterations: [u8; 2] = bytes.get(2..4)?.try_into().ok()?;
+    let salt_len = usize::from(*bytes.get(4)?);
+    let start = 5_usize;
+    let end = start.checked_add(salt_len)?;
+    let salt = bytes.get(start..end)?;
+    if end != bytes.len() {
+        return None;
+    }
+    Some((algorithm, flags, u16::from_be_bytes(iterations), salt))
+}
+
+/// Самый длинный существующий предок `qname` (включая apex).
+fn closest_encloser_ref<'a>(
+    snapshot: &dyn ZoneSnapshot,
+    qname: NameRef<'a>,
+    origin: NameRef<'a>,
+) -> NameRef<'a> {
+    let mut current = qname.parent();
+    while let Some(name) = current {
+        if snapshot.node_exists_ref(name) || name.as_wire() == origin.as_wire() {
+            return name;
+        }
+        current = name.parent();
+    }
+    origin
+}
+
+/// Ближайшее к `qname` имя ниже `closest_encloser` (суффикс `qname`).
+fn next_closer_ref<'a>(qname: NameRef<'a>, closest_encloser: NameRef<'a>) -> Option<NameRef<'a>> {
+    if qname.as_wire() == closest_encloser.as_wire() || !qname.is_subdomain_of(closest_encloser) {
+        return None;
+    }
+    let mut current = qname;
+    while let Some(parent) = current.parent() {
+        if parent.as_wire() == closest_encloser.as_wire() {
+            return Some(current);
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Строит `*.<parent>` в caller-provided буфере.
+fn wildcard_name_ref<'a>(
+    parent: NameRef<'_>,
+    buffer: &'a mut [u8; MAX_NAME_WIRE_LEN],
+) -> Option<NameRef<'a>> {
+    let length = parent.wire_len().checked_add(2)?;
+    let slot = buffer.get_mut(..length)?;
+    let (header, rest) = slot.split_first_mut()?;
+    *header = 1;
+    let (marker, tail) = rest.split_first_mut()?;
+    *marker = b'*';
+    tail.copy_from_slice(parent.as_wire());
+    let wire = buffer.get(..length)?;
+    Some(NameRef::from_validated(wire))
+}
+
+/// Нужны ли denial-доказательства для собранного плана.
+fn proof_reason<'a>(plan: &FastPlan<'a>) -> Option<ProofReason<'a>> {
+    match plan.status {
+        FastStatus::NxDomain => Some(ProofReason::NxDomain),
+        FastStatus::NoData => Some(ProofReason::NoData {
+            wildcard: plan.wildcard,
+        }),
+        FastStatus::Answer => plan
+            .wildcard
+            .map(|wildcard| ProofReason::WildcardAnswer { wildcard }),
+        FastStatus::Referral => plan
+            .referral
+            .map(|referral| ProofReason::Referral { cut: referral.cut }),
+    }
+}
+
+/// Пишет authority-секцию: `NS`/`DS`/`SOA` и denial-доказательства.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn write_authority_fast<'a>(
+    snapshot: &'a dyn ZoneSnapshot,
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    counts: &mut FastCounts,
+    plan: &FastPlan<'a>,
+    signed: bool,
+    do_bit: bool,
+    qname: NameRef<'a>,
+    origin: NameRef<'a>,
+) -> Option<Flow> {
+    if let Some(referral) = plan.referral {
+        let flow = write_fast_group(
+            encoder,
+            transport,
+            budget,
+            truncated,
+            Section::Authority,
+            referral.ns.owner(),
+            referral.ns,
+            None,
+            None,
+            counts,
+        )
+        .ok()?;
+        if flow == Flow::Stop {
+            return Some(Flow::Stop);
+        }
+        if signed {
+            let flow = write_signature_fast(
+                snapshot,
+                encoder,
+                transport,
+                budget,
+                truncated,
+                Section::Authority,
+                referral.ns.owner(),
+                Rtype::NS,
+                referral.ns.owner(),
+                counts,
+            )?;
+            if flow == Flow::Stop {
+                return Some(Flow::Stop);
+            }
+        }
+        if do_bit {
+            if let Some(ds) = referral.ds {
+                let flow = write_fast_group(
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    Section::Authority,
+                    ds.owner(),
+                    ds,
+                    None,
+                    None,
+                    counts,
+                )
+                .ok()?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+                if signed {
+                    let flow = write_signature_fast(
+                        snapshot,
+                        encoder,
+                        transport,
+                        budget,
+                        truncated,
+                        Section::Authority,
+                        ds.owner(),
+                        Rtype::DS,
+                        ds.owner(),
+                        counts,
+                    )?;
+                    if flow == Flow::Stop {
+                        return Some(Flow::Stop);
+                    }
+                }
+            } else if signed {
+                let flow = write_denial_at_fast(
+                    snapshot,
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    counts,
+                    referral.cut,
+                )?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+            }
+        }
+    } else if plan.needs_soa {
+        let soa = snapshot.soa_ref()?;
+        let ttl = negative_ttl(soa)?;
+        let flow = write_fast_group(
+            encoder,
+            transport,
+            budget,
+            truncated,
+            Section::Authority,
+            soa.owner(),
+            soa,
+            Some(ttl),
+            None,
+            counts,
+        )
+        .ok()?;
+        if flow == Flow::Stop {
+            return Some(Flow::Stop);
+        }
+        if signed {
+            let flow = write_signature_fast(
+                snapshot,
+                encoder,
+                transport,
+                budget,
+                truncated,
+                Section::Authority,
+                soa.owner(),
+                Rtype::SOA,
+                soa.owner(),
+                counts,
+            )?;
+            if flow == Flow::Stop {
+                return Some(Flow::Stop);
+            }
+        }
+    }
+    if signed && let Some(reason) = proof_reason(plan) {
+        let flow = write_denial_fast(
+            snapshot, encoder, transport, budget, truncated, counts, qname, origin, reason,
+        )?;
+        if flow == Flow::Stop {
+            return Some(Flow::Stop);
+        }
+    }
+    Some(Flow::Continue)
+}
+
+/// Пишет denial-доказательства выбранного зоной механизма.
+#[allow(clippy::too_many_arguments)]
+fn write_denial_fast<'a>(
+    snapshot: &'a dyn ZoneSnapshot,
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    counts: &mut FastCounts,
+    qname: NameRef<'a>,
+    origin: NameRef<'a>,
+    reason: ProofReason<'a>,
+) -> Option<Flow> {
+    match snapshot.denial_ref() {
+        DenialKind::Nsec => write_nsec_denial(
+            snapshot, encoder, transport, budget, truncated, counts, qname, origin, reason,
+        ),
+        DenialKind::Nsec3 => write_nsec3_denial(
+            snapshot, encoder, transport, budget, truncated, counts, qname, origin, reason,
+        ),
+    }
+}
+
+/// Пишет `NSEC`-доказательства в том же порядке, что и полный путь.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn write_nsec_denial<'a>(
+    snapshot: &'a dyn ZoneSnapshot,
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    counts: &mut FastCounts,
+    qname: NameRef<'a>,
+    origin: NameRef<'a>,
+    reason: ProofReason<'a>,
+) -> Option<Flow> {
+    let mut seen = FastSeen::new();
+    let mut owner_wire = [0_u8; MAX_NAME_WIRE_LEN];
+    let mut name_wire = [0_u8; MAX_NAME_WIRE_LEN];
+    match reason {
+        ProofReason::NxDomain => {
+            step_nsec(
+                snapshot,
+                encoder,
+                transport,
+                budget,
+                truncated,
+                counts,
+                ProofQuery::Cover(qname),
+                &mut seen,
+                &mut owner_wire,
+            )?;
+            let closest = closest_encloser_ref(snapshot, qname, origin);
+            let Some(wildcard) = wildcard_name_ref(closest, &mut name_wire) else {
+                return Some(Flow::Continue);
+            };
+            let flow = step_nsec(
+                snapshot,
+                encoder,
+                transport,
+                budget,
+                truncated,
+                counts,
+                ProofQuery::Exact(wildcard),
+                &mut seen,
+                &mut owner_wire,
+            )?;
+            if flow.0 == Flow::Stop {
+                return Some(Flow::Stop);
+            }
+            if !flow.1 {
+                let (flow, _) = step_nsec(
+                    snapshot,
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    counts,
+                    ProofQuery::Cover(wildcard),
+                    &mut seen,
+                    &mut owner_wire,
+                )?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+            }
+        }
+        ProofReason::NoData { wildcard } => {
+            if let Some(wildcard) = wildcard {
+                let (flow, _) = step_nsec(
+                    snapshot,
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    counts,
+                    ProofQuery::Exact(wildcard),
+                    &mut seen,
+                    &mut owner_wire,
+                )?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+                let (flow, _) = step_nsec(
+                    snapshot,
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    counts,
+                    ProofQuery::Cover(qname),
+                    &mut seen,
+                    &mut owner_wire,
+                )?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+            } else {
+                let (flow, _) = step_nsec(
+                    snapshot,
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    counts,
+                    ProofQuery::Exact(qname),
+                    &mut seen,
+                    &mut owner_wire,
+                )?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+            }
+        }
+        ProofReason::WildcardAnswer { wildcard } => {
+            let Some(closest) = wildcard.parent() else {
+                return Some(Flow::Continue);
+            };
+            let Some(next) = next_closer_ref(qname, closest) else {
+                return Some(Flow::Continue);
+            };
+            let (flow, _) = step_nsec(
+                snapshot,
+                encoder,
+                transport,
+                budget,
+                truncated,
+                counts,
+                ProofQuery::Cover(next),
+                &mut seen,
+                &mut owner_wire,
+            )?;
+            if flow == Flow::Stop {
+                return Some(Flow::Stop);
+            }
+        }
+        ProofReason::Referral { .. } => {}
+    }
+    Some(Flow::Continue)
+}
+
+/// Один шаг `NSEC`-доказательства: выделение, dedup и запись.
+#[allow(clippy::too_many_arguments)]
+fn step_nsec<'s: 'b, 'b>(
+    snapshot: &'s dyn ZoneSnapshot,
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    counts: &mut FastCounts,
+    query: ProofQuery<'b>,
+    seen: &mut FastSeen,
+    owner_wire: &'b mut [u8; MAX_NAME_WIRE_LEN],
+) -> Option<(Flow, bool)> {
+    let lookup = match query {
+        ProofQuery::Exact(name) => snapshot.nsec_at_ref(name),
+        ProofQuery::Cover(name) => snapshot.nsec_cover_ref(name, owner_wire),
+    };
+    let rrset = match lookup {
+        RefLookup::Found(rrset) => rrset,
+        RefLookup::Absent => return Some((Flow::Continue, false)),
+        RefLookup::Unsupported => return None,
+    };
+    if seen.contains(rrset.owner().as_wire()) {
+        return Some((Flow::Continue, true));
+    }
+    if !seen.insert(rrset.owner().as_wire()) {
+        return None;
+    }
+    let flow = write_found_proof(
+        snapshot, encoder, transport, budget, truncated, counts, rrset,
+    )?;
+    Some((flow, true))
+}
+
+/// Пишет `NSEC3`-доказательства в том же порядке, что и полный путь.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn write_nsec3_denial<'a>(
+    snapshot: &'a dyn ZoneSnapshot,
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    counts: &mut FastCounts,
+    qname: NameRef<'a>,
+    origin: NameRef<'a>,
+    reason: ProofReason<'a>,
+) -> Option<Flow> {
+    let params = match fast_nsec3_params(snapshot) {
+        FastParams::Params(params) => params,
+        FastParams::Absent => return Some(Flow::Continue),
+        FastParams::Unsupported => return None,
+    };
+    let mut seen = FastSeen::new();
+    let mut owner_wire = [0_u8; MAX_NAME_WIRE_LEN];
+    let mut name_wire = [0_u8; MAX_NAME_WIRE_LEN];
+    match reason {
+        ProofReason::NxDomain => {
+            let closest = closest_encloser_ref(snapshot, qname, origin);
+            let (flow, _) = step_nsec3(
+                snapshot,
+                encoder,
+                transport,
+                budget,
+                truncated,
+                counts,
+                &params,
+                ProofQuery::Exact(closest),
+                &mut seen,
+                &mut owner_wire,
+            )?;
+            if flow == Flow::Stop {
+                return Some(Flow::Stop);
+            }
+            if let Some(next) = next_closer_ref(qname, closest) {
+                let (flow, _) = step_nsec3(
+                    snapshot,
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    counts,
+                    &params,
+                    ProofQuery::Cover(next),
+                    &mut seen,
+                    &mut owner_wire,
+                )?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+            }
+            if let Some(wildcard) = wildcard_name_ref(closest, &mut name_wire) {
+                let (flow, _) = step_nsec3(
+                    snapshot,
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    counts,
+                    &params,
+                    ProofQuery::Cover(wildcard),
+                    &mut seen,
+                    &mut owner_wire,
+                )?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+            }
+        }
+        ProofReason::NoData { wildcard } => {
+            if let Some(wildcard) = wildcard {
+                let Some(closest) = wildcard.parent() else {
+                    return Some(Flow::Continue);
+                };
+                let (flow, _) = step_nsec3(
+                    snapshot,
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    counts,
+                    &params,
+                    ProofQuery::Exact(closest),
+                    &mut seen,
+                    &mut owner_wire,
+                )?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+                if let Some(next) = next_closer_ref(qname, closest) {
+                    let (flow, _) = step_nsec3(
+                        snapshot,
+                        encoder,
+                        transport,
+                        budget,
+                        truncated,
+                        counts,
+                        &params,
+                        ProofQuery::Cover(next),
+                        &mut seen,
+                        &mut owner_wire,
+                    )?;
+                    if flow == Flow::Stop {
+                        return Some(Flow::Stop);
+                    }
+                }
+                let (flow, _) = step_nsec3(
+                    snapshot,
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    counts,
+                    &params,
+                    ProofQuery::Exact(wildcard),
+                    &mut seen,
+                    &mut owner_wire,
+                )?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+            } else {
+                let (flow, found) = step_nsec3(
+                    snapshot,
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    counts,
+                    &params,
+                    ProofQuery::Exact(qname),
+                    &mut seen,
+                    &mut owner_wire,
+                )?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+                if !found {
+                    // Opt-Out: у insecure-делегирования нет точного NSEC3.
+                    let closest = closest_encloser_ref(snapshot, qname, origin);
+                    let (flow, _) = step_nsec3(
+                        snapshot,
+                        encoder,
+                        transport,
+                        budget,
+                        truncated,
+                        counts,
+                        &params,
+                        ProofQuery::Exact(closest),
+                        &mut seen,
+                        &mut owner_wire,
+                    )?;
+                    if flow == Flow::Stop {
+                        return Some(Flow::Stop);
+                    }
+                    let (flow, _) = step_nsec3(
+                        snapshot,
+                        encoder,
+                        transport,
+                        budget,
+                        truncated,
+                        counts,
+                        &params,
+                        ProofQuery::Cover(qname),
+                        &mut seen,
+                        &mut owner_wire,
+                    )?;
+                    if flow == Flow::Stop {
+                        return Some(Flow::Stop);
+                    }
+                }
+            }
+        }
+        ProofReason::WildcardAnswer { wildcard } => {
+            let Some(closest) = wildcard.parent() else {
+                return Some(Flow::Continue);
+            };
+            let (flow, _) = step_nsec3(
+                snapshot,
+                encoder,
+                transport,
+                budget,
+                truncated,
+                counts,
+                &params,
+                ProofQuery::Exact(closest),
+                &mut seen,
+                &mut owner_wire,
+            )?;
+            if flow == Flow::Stop {
+                return Some(Flow::Stop);
+            }
+            if let Some(next) = next_closer_ref(qname, closest) {
+                let (flow, _) = step_nsec3(
+                    snapshot,
+                    encoder,
+                    transport,
+                    budget,
+                    truncated,
+                    counts,
+                    &params,
+                    ProofQuery::Cover(next),
+                    &mut seen,
+                    &mut owner_wire,
+                )?;
+                if flow == Flow::Stop {
+                    return Some(Flow::Stop);
+                }
+            }
+        }
+        ProofReason::Referral { cut } => {
+            let closest = closest_encloser_ref(snapshot, cut, origin);
+            let (flow, _) = step_nsec3(
+                snapshot,
+                encoder,
+                transport,
+                budget,
+                truncated,
+                counts,
+                &params,
+                ProofQuery::Exact(closest),
+                &mut seen,
+                &mut owner_wire,
+            )?;
+            if flow == Flow::Stop {
+                return Some(Flow::Stop);
+            }
+            let (flow, _) = step_nsec3(
+                snapshot,
+                encoder,
+                transport,
+                budget,
+                truncated,
+                counts,
+                &params,
+                ProofQuery::Cover(cut),
+                &mut seen,
+                &mut owner_wire,
+            )?;
+            if flow == Flow::Stop {
+                return Some(Flow::Stop);
+            }
+        }
+    }
+    Some(Flow::Continue)
+}
+
+/// Один шаг `NSEC3`-доказательства: hash, выделение, dedup и запись.
+#[allow(clippy::too_many_arguments)]
+fn step_nsec3<'s: 'b, 'b>(
+    snapshot: &'s dyn ZoneSnapshot,
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    counts: &mut FastCounts,
+    params: &FastNsec3Params<'_>,
+    query: ProofQuery<'b>,
+    seen: &mut FastSeen,
+    owner_wire: &'b mut [u8; MAX_NAME_WIRE_LEN],
+) -> Option<(Flow, bool)> {
+    let mut hash = [0_u8; NSEC3_SHA1_LEN];
+    let hash_bytes = nsec3_hash_into(
+        query.name().as_wire(),
+        params.salt,
+        params.iterations,
+        &mut hash,
+    );
+    let lookup = match query {
+        ProofQuery::Exact(_) => snapshot.nsec3_at_ref(hash_bytes, owner_wire),
+        ProofQuery::Cover(_) => snapshot.nsec3_cover_ref(hash_bytes, owner_wire),
+    };
+    let rrset = match lookup {
+        RefLookup::Found(rrset) => rrset,
+        RefLookup::Absent => return Some((Flow::Continue, false)),
+        RefLookup::Unsupported => return None,
+    };
+    // Dedup по владельцу proof-записи, как в полном пути: разные hash-входы
+    // могут покрываться одной и той же NSEC3.
+    if seen.contains(rrset.owner().as_wire()) {
+        return Some((Flow::Continue, true));
+    }
+    if !seen.insert(rrset.owner().as_wire()) {
+        return None;
+    }
+    let flow = write_found_proof(
+        snapshot, encoder, transport, budget, truncated, counts, rrset,
+    )?;
+    Some((flow, true))
+}
+
+/// Пишет denial-запись, доказывающую отсутствие `DS` в точке cut.
+#[allow(clippy::too_many_arguments)]
+fn write_denial_at_fast<'a>(
+    snapshot: &'a dyn ZoneSnapshot,
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    counts: &mut FastCounts,
+    cut: NameRef<'a>,
+) -> Option<Flow> {
+    match snapshot.denial_ref() {
+        DenialKind::Nsec => match snapshot.nsec_at_ref(cut) {
+            RefLookup::Found(rrset) => write_found_proof(
+                snapshot, encoder, transport, budget, truncated, counts, rrset,
+            ),
+            RefLookup::Absent => Some(Flow::Continue),
+            RefLookup::Unsupported => None,
+        },
+        DenialKind::Nsec3 => {
+            let params = match fast_nsec3_params(snapshot) {
+                FastParams::Params(params) => params,
+                FastParams::Absent => return Some(Flow::Continue),
+                FastParams::Unsupported => return None,
+            };
+            let mut hash = [0_u8; NSEC3_SHA1_LEN];
+            let hash_bytes =
+                nsec3_hash_into(cut.as_wire(), params.salt, params.iterations, &mut hash);
+            let mut owner_wire = [0_u8; MAX_NAME_WIRE_LEN];
+            match snapshot.nsec3_at_ref(hash_bytes, &mut owner_wire) {
+                RefLookup::Found(rrset) => write_found_proof(
+                    snapshot, encoder, transport, budget, truncated, counts, rrset,
+                ),
+                RefLookup::Absent => Some(Flow::Continue),
+                RefLookup::Unsupported => None,
+            }
+        }
+    }
+}
+
+/// Пишет denial-набор и его `RRSIG` в authority.
+#[allow(clippy::too_many_arguments)]
+fn write_found_proof<'s: 'b, 'b>(
+    snapshot: &'s dyn ZoneSnapshot,
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    counts: &mut FastCounts,
+    rrset: RrsetRef<'b>,
+) -> Option<Flow> {
+    let flow = write_fast_group(
+        encoder,
+        transport,
+        budget,
+        truncated,
+        Section::Authority,
+        rrset.owner(),
+        rrset,
+        None,
+        None,
+        counts,
+    )
+    .ok()?;
+    if flow == Flow::Stop {
+        return Some(Flow::Stop);
+    }
+    write_signature_fast(
+        snapshot,
+        encoder,
+        transport,
+        budget,
+        truncated,
+        Section::Authority,
+        rrset.owner(),
+        rrset.rr_type(),
+        rrset.owner(),
+        counts,
+    )
 }
 
 /// Есть ли `DNAME` на предке имени (исключая origin).
@@ -1509,7 +2830,16 @@ fn negative_ttl(soa: RrsetRef<'_>) -> Option<Ttl> {
     Ttl::new(ttl).ok()
 }
 
+/// Есть ли в RRSIG-RDATA поле `Type Covered`, равное `covered`.
+fn rdata_covers(rdata: RdataRef<'_>, covered: Rtype) -> bool {
+    rdata.type_covered() == Some(covered)
+}
+
 /// Записывает RRset в секцию с теми же правилами усечения, что у `WireSink`.
+///
+/// `covered` фильтрует записи `RRSIG` по полю `Type Covered`: в in-memory
+/// зоне подписи всех типов владельца лежат одним набором, тогда как полный
+/// путь отдаёт только покрывающие `covered`.
 #[allow(clippy::too_many_arguments)]
 fn write_fast_group(
     encoder: &mut Encoder<'_>,
@@ -1520,11 +2850,17 @@ fn write_fast_group(
     owner: NameRef<'_>,
     rrset: RrsetRef<'_>,
     ttl_override: Option<Ttl>,
+    covered: Option<Rtype>,
     counts: &mut FastCounts,
 ) -> Result<Flow, ()> {
     let group_start = encoder.checkpoint();
     let ttl = ttl_override.unwrap_or_else(|| rrset.ttl());
     for rdata in rrset.records() {
+        if let Some(covered) = covered
+            && !rdata_covers(rdata, covered)
+        {
+            continue;
+        }
         let checkpoint = encoder.checkpoint();
         let result = match rdata {
             RdataRef::Domain(rdata) => encoder.write_rr_wire_name(
@@ -1581,6 +2917,76 @@ fn write_fast_group(
         }
     }
     Ok(Flow::Continue)
+}
+
+/// Записывает синтезированный `HINFO` (RFC 8482 §4.1) в answer.
+fn write_fast_hinfo(
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    owner: NameRef<'_>,
+    ttl: Ttl,
+    counts: &mut FastCounts,
+) -> Result<Flow, ()> {
+    let checkpoint = encoder.checkpoint();
+    let result = encoder.write_rr_raw(owner.as_wire(), HINFO_TYPE, Rclass::IN, ttl, &HINFO_RFC8482);
+    let mut stop = false;
+    match result {
+        Ok(()) => {}
+        Err(EncodeError::BufferTooSmall { .. }) if transport == Transport::Udp => {
+            encoder.rollback(checkpoint);
+            *truncated = true;
+            stop = true;
+        }
+        Err(_) => return Err(()),
+    }
+    if !stop && transport == Transport::Udp && encoder.len() > budget {
+        encoder.rollback(checkpoint);
+        *truncated = true;
+        stop = true;
+    }
+    if stop {
+        return Ok(Flow::Stop);
+    }
+    counts.answer = counts.answer.saturating_add(1);
+    Ok(Flow::Continue)
+}
+
+/// Прикладывает `RRSIG`, покрывающие `covered`, к записям `owner`.
+///
+/// `source` — имя, под которым подписи хранятся в зоне (wildcard-владелец
+/// для развёрнутого ответа). `None` — полный путь (refs недоступны).
+#[allow(clippy::too_many_arguments)]
+fn write_signature_fast<'s: 'b, 'b>(
+    snapshot: &'s dyn ZoneSnapshot,
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    section: Section,
+    owner: NameRef<'b>,
+    covered: Rtype,
+    source: NameRef<'b>,
+    counts: &mut FastCounts,
+) -> Option<Flow> {
+    match snapshot.rrsig_ref(source, covered) {
+        RefLookup::Absent => Some(Flow::Continue),
+        RefLookup::Unsupported => None,
+        RefLookup::Found(rrset) => write_fast_group(
+            encoder,
+            transport,
+            budget,
+            truncated,
+            section,
+            owner,
+            rrset,
+            None,
+            Some(covered),
+            counts,
+        )
+        .ok(),
+    }
 }
 
 /// Секция DNS-сообщения, в которую добавляется RRset.

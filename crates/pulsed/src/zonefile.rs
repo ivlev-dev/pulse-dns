@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use pulse_api::{Denial, ZoneFileMetrics, ZoneKind};
 use pulse_dns::{Name, NameRef, Rclass, Rdata, Rrset, Rtype, Ttl};
 use pulse_server::{
-    DenialKind, LookupOutcome, LookupOutcomeRef, RrsetRef as ServerRrsetRef,
+    DenialKind, LookupOutcome, LookupOutcomeRef, RefLookup, RrsetRef as ServerRrsetRef,
     ZoneSnapshot as ServerZoneSnapshot, ZoneState as ServerZoneState, ZoneView,
 };
 use pulse_transfer::ZoneSnapshot;
@@ -1442,6 +1442,126 @@ impl FileZoneView {
             nsec3_covers(&owner_hash, next, hash)
         })
     }
+
+    /// NSEC-владелец, покрывающий `name`, по индексу; wire копируется в `out`.
+    ///
+    /// `Unsupported` — индекса нет или цепочка нетипична: полный путь сам
+    /// применит `prev`/линейный fallback.
+    fn nsec_cover_ref_in<'s: 'b, 'b>(
+        &'s self,
+        reader: &'s ZoneReader<'_>,
+        name: NameRef<'_>,
+        out: &'b mut [u8; pulse_dns::MAX_NAME_WIRE_LEN],
+    ) -> RefLookup<'b> {
+        let len = {
+            let Some(index) = self.denial_index(DenialKind::Nsec, reader) else {
+                return RefLookup::Unsupported;
+            };
+            let DenialIndexData::Nsec(owners) = &index.data else {
+                return RefLookup::Unsupported;
+            };
+            let position = owners.partition_point(|owner| {
+                NameRef::from_name(owner).cmp_canonical(name) == std::cmp::Ordering::Less
+            });
+            if owners
+                .get(position)
+                .is_some_and(|owner| owner.as_wire() == name.as_wire())
+            {
+                return RefLookup::Absent;
+            }
+            let candidate = if position == 0 {
+                owners.last()
+            } else {
+                owners.get(position.saturating_sub(1))
+            };
+            let Some(owner) = candidate else {
+                return RefLookup::Absent;
+            };
+            let wire = owner.as_wire();
+            let Some(slot) = out.get_mut(..wire.len()) else {
+                return RefLookup::Unsupported;
+            };
+            slot.copy_from_slice(wire);
+            wire.len()
+        };
+        let Some(slot) = out.get(..len) else {
+            return RefLookup::Unsupported;
+        };
+        let owner = NameRef::from_validated(slot);
+        let RefLookup::Found(rrset) = stored_lookup_ref(reader, owner, Rtype::NSEC, 0) else {
+            return RefLookup::Unsupported;
+        };
+        let Some(next) = nsec_next_ref(rrset) else {
+            return RefLookup::Unsupported;
+        };
+        if nsec_covers_ref(owner, next, name) {
+            RefLookup::Found(rrset)
+        } else {
+            RefLookup::Unsupported
+        }
+    }
+
+    /// NSEC3-владелец, hash-интервал которого покрывает `hash`, по индексу.
+    fn nsec3_cover_ref_in<'s: 'b, 'b>(
+        &'s self,
+        reader: &'s ZoneReader<'_>,
+        hash: &[u8],
+        out: &'b mut [u8; pulse_dns::MAX_NAME_WIRE_LEN],
+    ) -> RefLookup<'b> {
+        let mut owner_hash = [0_u8; 64];
+        let hash_len = {
+            let Some(index) = self.denial_index(DenialKind::Nsec3, reader) else {
+                return RefLookup::Unsupported;
+            };
+            let DenialIndexData::Nsec3(hashes) = &index.data else {
+                return RefLookup::Unsupported;
+            };
+            let position = hashes.partition_point(|owner| owner.as_slice() < hash);
+            if hashes
+                .get(position)
+                .is_some_and(|owner| owner.as_slice() == hash)
+            {
+                return RefLookup::Absent;
+            }
+            let candidate = if position == 0 {
+                hashes.last()
+            } else {
+                hashes.get(position.saturating_sub(1))
+            };
+            let Some(owner) = candidate else {
+                return RefLookup::Absent;
+            };
+            let len = owner.len();
+            let Some(slot) = owner_hash.get_mut(..len) else {
+                return RefLookup::Unsupported;
+            };
+            slot.copy_from_slice(owner);
+            len
+        };
+        let Some(owner_bytes) = owner_hash.get(..hash_len) else {
+            return RefLookup::Unsupported;
+        };
+        let Some(total) =
+            pulse_dnssec::denial::nsec3_owner_name_into(self.origin.as_wire(), owner_bytes, out)
+        else {
+            return RefLookup::Unsupported;
+        };
+        let Some(slot) = out.get(..total) else {
+            return RefLookup::Unsupported;
+        };
+        let owner = NameRef::from_validated(slot);
+        let RefLookup::Found(rrset) = stored_lookup_ref(reader, owner, Rtype::NSEC3, 0) else {
+            return RefLookup::Unsupported;
+        };
+        let Some(next) = nsec3_next_ref(rrset) else {
+            return RefLookup::Unsupported;
+        };
+        if nsec3_covers(owner_bytes, next, hash) {
+            RefLookup::Found(rrset)
+        } else {
+            RefLookup::Unsupported
+        }
+    }
 }
 
 impl ZoneView for FileZoneView {
@@ -1678,23 +1798,15 @@ struct FileZoneSnapshot<'a, 'z> {
 }
 
 impl FileZoneSnapshot<'_, '_> {
-    fn stored_ref<'a>(&'a self, name: NameRef<'a>, rr_type: Rtype) -> Option<ServerRrsetRef<'a>> {
-        let owner = NameRle::from_wire(name.as_wire()).ok()?;
-        let stored = self
-            .reader
-            .lookup_ref(&owner, rr_type.as_u16(), 0)
-            .ok()
-            .flatten()?;
-        if stored.value.kind != ValueKind::Inline {
-            return None;
+    fn stored_ref<'b, 's: 'b>(
+        &'s self,
+        name: NameRef<'b>,
+        rr_type: Rtype,
+    ) -> Option<ServerRrsetRef<'b>> {
+        match stored_lookup_ref(self.reader, name, rr_type, 0) {
+            RefLookup::Found(rrset) => Some(rrset),
+            RefLookup::Absent | RefLookup::Unsupported => None,
         }
-        Some(ServerRrsetRef::from_wire(
-            name,
-            rr_type,
-            Rclass::IN,
-            Ttl::from_wire(stored.ttl),
-            stored.payload,
-        ))
     }
 
     fn delegation_of_ref<'a>(&self, name: NameRef<'a>) -> Option<NameRef<'a>> {
@@ -1713,6 +1825,108 @@ impl FileZoneSnapshot<'_, '_> {
             current = candidate.parent();
         }
         None
+    }
+}
+
+/// Заимствованный поиск RRset по точному ключу `(owner, type, subtype)`.
+///
+/// `OVERFLOW`-payload и ошибки чтения дают [`RefLookup::Unsupported`]:
+/// вызывающий обязан уступить полному пути, чтобы не потерять записи.
+fn stored_lookup_ref<'s: 'b, 'b>(
+    reader: &'s ZoneReader<'_>,
+    name: NameRef<'b>,
+    rr_type: Rtype,
+    subtype: u16,
+) -> RefLookup<'b> {
+    let Ok(owner) = NameRle::from_wire(name.as_wire()) else {
+        return RefLookup::Unsupported;
+    };
+    match reader.lookup_ref(&owner, rr_type.as_u16(), subtype) {
+        Ok(Some(stored)) => {
+            if stored.value.kind != ValueKind::Inline {
+                return RefLookup::Unsupported;
+            }
+            RefLookup::Found(ServerRrsetRef::from_wire(
+                name,
+                rr_type,
+                Rclass::IN,
+                Ttl::from_wire(stored.ttl),
+                stored.payload,
+            ))
+        }
+        Ok(None) => RefLookup::Absent,
+        Err(_) => RefLookup::Unsupported,
+    }
+}
+
+/// `Next Domain Name` из заимствованного NSEC.
+fn nsec_next_ref(rrset: ServerRrsetRef<'_>) -> Option<NameRef<'_>> {
+    match rrset.first_record()? {
+        pulse_server::RdataRef::Domain(Rdata::Nsec(nsec)) => {
+            Some(NameRef::from_name(nsec.next_domain()))
+        }
+        pulse_server::RdataRef::Domain(_) => None,
+        pulse_server::RdataRef::Wire { bytes, .. } => wire_name(bytes, 0),
+    }
+}
+
+/// `Next Hashed Owner Name` из заимствованного NSEC3.
+fn nsec3_next_ref(rrset: ServerRrsetRef<'_>) -> Option<&[u8]> {
+    match rrset.first_record()? {
+        pulse_server::RdataRef::Domain(Rdata::Nsec3(data)) => Some(data.next_hashed_owner()),
+        pulse_server::RdataRef::Domain(_) => None,
+        pulse_server::RdataRef::Wire { bytes, .. } => {
+            // algorithm(1) flags(1) iterations(2) salt_len(1) salt next_len(1) next…
+            let salt_len = usize::from(*bytes.get(4)?);
+            let next_len_offset = 5_usize.checked_add(salt_len)?;
+            let next_len = usize::from(*bytes.get(next_len_offset)?);
+            let start = next_len_offset.checked_add(1)?;
+            let end = start.checked_add(next_len)?;
+            bytes.get(start..end)
+        }
+    }
+}
+
+/// Несжатое имя в начале `bytes[offset..]`.
+fn wire_name(bytes: &[u8], offset: usize) -> Option<NameRef<'_>> {
+    let mut end = offset;
+    let mut labels = 0_usize;
+    loop {
+        let length = *bytes.get(end)?;
+        if length == 0 {
+            end = end.checked_add(1)?;
+            break;
+        }
+        if length & 0xC0 != 0 {
+            return None;
+        }
+        labels = labels.saturating_add(1);
+        if labels > pulse_dns::MAX_LABELS {
+            return None;
+        }
+        end = end.checked_add(1 + usize::from(length))?;
+        if end > bytes.len() {
+            return None;
+        }
+    }
+    NameRef::from_wire(bytes.get(offset..end)?).ok()
+}
+
+/// RFC 4034 §4.1.2 для заимствованных имён.
+fn nsec_covers_ref(owner: NameRef<'_>, next: NameRef<'_>, name: NameRef<'_>) -> bool {
+    use std::cmp::Ordering;
+    if name.as_wire() == owner.as_wire() {
+        return false;
+    }
+    match owner.cmp_canonical(next) {
+        Ordering::Less => {
+            owner.cmp_canonical(name) == Ordering::Less
+                && name.cmp_canonical(next) == Ordering::Less
+        }
+        Ordering::Greater | Ordering::Equal => {
+            owner.cmp_canonical(name) == Ordering::Less
+                || name.cmp_canonical(next) == Ordering::Less
+        }
     }
 }
 
@@ -1780,11 +1994,22 @@ impl ServerZoneSnapshot for FileZoneSnapshot<'_, '_> {
         Vec::new()
     }
 
-    fn lookup_all_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> Vec<ServerRrsetRef<'a>> {
+    fn lookup_all_ref<'b, 's: 'b>(
+        &'s self,
+        name: NameRef<'b>,
+        rtype: Rtype,
+    ) -> Vec<ServerRrsetRef<'b>> {
         if rtype == Rtype::RRSIG {
             return Vec::new();
         }
         self.stored_ref(name, rtype).into_iter().collect()
+    }
+
+    fn glue_at_ref<'b, 's: 'b>(&'s self, name: NameRef<'b>, rtype: Rtype) -> RefLookup<'b> {
+        if !name.is_subdomain_of_name(&self.view.origin) {
+            return RefLookup::Absent;
+        }
+        stored_lookup_ref(self.reader, name, rtype, 0)
     }
 
     fn glue_ref<'a>(&'a self, name: NameRef<'a>) -> Vec<ServerRrsetRef<'a>> {
@@ -1795,6 +2020,67 @@ impl ServerZoneSnapshot for FileZoneSnapshot<'_, '_> {
             .into_iter()
             .filter_map(|rtype| self.stored_ref(name, rtype))
             .collect()
+    }
+
+    fn rrsig_ref<'b, 's: 'b>(&'s self, name: NameRef<'b>, covered: Rtype) -> RefLookup<'b> {
+        if covered == Rtype::RRSIG {
+            return RefLookup::Absent;
+        }
+        stored_lookup_ref(self.reader, name, Rtype::RRSIG, covered.as_u16())
+    }
+
+    fn nsec_at_ref<'b, 's: 'b>(&'s self, name: NameRef<'b>) -> RefLookup<'b> {
+        if !name.is_subdomain_of_name(&self.view.origin) {
+            return RefLookup::Absent;
+        }
+        stored_lookup_ref(self.reader, name, Rtype::NSEC, 0)
+    }
+
+    fn nsec_cover_ref<'b, 's: 'b>(
+        &'s self,
+        name: NameRef<'_>,
+        owner_wire: &'b mut [u8; pulse_dns::MAX_NAME_WIRE_LEN],
+    ) -> RefLookup<'b> {
+        if !name.is_subdomain_of_name(&self.view.origin) {
+            return RefLookup::Absent;
+        }
+        self.view.nsec_cover_ref_in(self.reader, name, owner_wire)
+    }
+
+    fn nsec3_param_ref(&self) -> RefLookup<'_> {
+        stored_lookup_ref(
+            self.reader,
+            NameRef::from_name(&self.view.origin),
+            Rtype::NSEC3PARAM,
+            0,
+        )
+    }
+
+    fn nsec3_at_ref<'b, 's: 'b>(
+        &'s self,
+        hash: &[u8],
+        owner_wire: &'b mut [u8; pulse_dns::MAX_NAME_WIRE_LEN],
+    ) -> RefLookup<'b> {
+        let Some(total) = pulse_dnssec::denial::nsec3_owner_name_into(
+            self.view.origin.as_wire(),
+            hash,
+            owner_wire,
+        ) else {
+            return RefLookup::Unsupported;
+        };
+        let Some(slot) = owner_wire.get(..total) else {
+            return RefLookup::Unsupported;
+        };
+        let owner = NameRef::from_validated(slot);
+        stored_lookup_ref(self.reader, owner, Rtype::NSEC3, 0)
+    }
+
+    fn nsec3_cover_ref<'b, 's: 'b>(
+        &'s self,
+        hash: &[u8],
+        owner_wire: &'b mut [u8; pulse_dns::MAX_NAME_WIRE_LEN],
+    ) -> RefLookup<'b> {
+        self.view.nsec3_cover_ref_in(self.reader, hash, owner_wire)
     }
 
     fn node_exists_ref(&self, name: NameRef<'_>) -> bool {
@@ -1812,6 +2098,24 @@ impl ServerZoneSnapshot for FileZoneSnapshot<'_, '_> {
             return false;
         }
         self.stored_ref(name, Rtype::NS).is_some() && self.stored_ref(name, Rtype::SOA).is_none()
+    }
+
+    fn denial_ref(&self) -> DenialKind {
+        match self.nsec3_param_ref() {
+            RefLookup::Absent => DenialKind::Nsec,
+            RefLookup::Found(_) | RefLookup::Unsupported => DenialKind::Nsec3,
+        }
+    }
+
+    fn signed_ref(&self) -> bool {
+        let origin = NameRef::from_name(&self.view.origin);
+        if !matches!(
+            stored_lookup_ref(self.reader, origin, Rtype::DNSKEY, 0),
+            RefLookup::Found(_) | RefLookup::Unsupported
+        ) {
+            return false;
+        }
+        !matches!(self.rrsig_ref(origin, Rtype::DNSKEY), RefLookup::Absent)
     }
 }
 
@@ -2069,7 +2373,7 @@ mod tests {
     }
 
     struct Fixture {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         store: Arc<ZoneStore>,
         view: FileZoneView,
     }
@@ -2103,11 +2407,7 @@ mod tests {
             .expect("zone exists");
         let view =
             FileZoneView::new(Arc::clone(&store), &entry, ServerZoneState::Serving).expect("view");
-        Fixture {
-            _dir: dir,
-            store,
-            view,
-        }
+        Fixture { dir, store, view }
     }
 
     #[test]
@@ -2248,6 +2548,240 @@ mod tests {
                 "cover for {}",
                 pulse_dnssec::denial::base32hex::encode(target)
             );
+        }
+    }
+
+    /// Синтетическая подпись: байтовая эквивалентность путей не зависит от
+    /// криптографии, важен только `Type Covered` и набор подписей.
+    fn rrsig(owner: &Name, covered: Rtype) -> Rrset {
+        rrset(
+            owner,
+            Rtype::RRSIG,
+            vec![Rdata::Rrsig(
+                pulse_dns::RrsigData::new(
+                    covered,
+                    8,
+                    3,
+                    300,
+                    u32::MAX,
+                    1,
+                    1,
+                    name("example.com"),
+                    vec![9_u8; 64],
+                )
+                .expect("rrsig"),
+            )],
+        )
+    }
+
+    /// Подписанная зона v2: NSEC/NSEC3-цепочка, RRSIG по подтипам, referral и
+    /// wildcard — всё, что обслуживает расширенный zero-copy путь.
+    fn signed_v2_records(origin: &Name, nsec3: bool) -> Vec<Rrset> {
+        let www = name("www.example.com");
+        let wild = name("*.wild.example.com");
+        let wc = name("*.wc.example.com");
+        let alias = name("alias.example.com");
+        let sub = name("sub.example.com");
+        let glue = name("ns1.sub.example.com");
+        let insecure = name("insecure.example.com");
+        let insecure_glue = name("ns.insecure.example.com");
+        let mut owners = vec![
+            origin.clone(),
+            www.clone(),
+            wild.clone(),
+            wc.clone(),
+            alias.clone(),
+            sub.clone(),
+            glue.clone(),
+            insecure.clone(),
+            insecure_glue.clone(),
+        ];
+        owners.sort_by(Name::cmp_canonical);
+        let mut records = base_data(origin);
+        records.push(rrset(
+            origin,
+            Rtype::DNSKEY,
+            vec![Rdata::Dnskey(
+                pulse_dns::DnskeyData::new(257, 3, 8, vec![7_u8; 32]).expect("dnskey"),
+            )],
+        ));
+        records.push(rrsig(origin, Rtype::DNSKEY));
+        records.push(rrset(
+            &www,
+            Rtype::A,
+            vec![Rdata::A("192.0.2.20".parse().expect("ipv4"))],
+        ));
+        records.push(rrsig(&www, Rtype::A));
+        records.push(rrset(
+            &wild,
+            Rtype::A,
+            vec![Rdata::A("192.0.2.99".parse().expect("ipv4"))],
+        ));
+        records.push(rrsig(&wild, Rtype::A));
+        records.push(rrset(&wc, Rtype::CNAME, vec![Rdata::Cname(www.clone())]));
+        records.push(rrsig(&wc, Rtype::CNAME));
+        records.push(rrset(&alias, Rtype::CNAME, vec![Rdata::Cname(www.clone())]));
+        records.push(rrsig(&alias, Rtype::CNAME));
+        records.push(rrset(&sub, Rtype::NS, vec![Rdata::Ns(glue.clone())]));
+        records.push(rrset(
+            &sub,
+            Rtype::DS,
+            vec![Rdata::Ds(
+                pulse_dns::DsData::new(12_345, 8, 2, vec![0xAB; 32]).expect("ds"),
+            )],
+        ));
+        records.push(rrsig(&sub, Rtype::DS));
+        records.push(rrset(
+            &glue,
+            Rtype::A,
+            vec![Rdata::A("192.0.2.53".parse().expect("ipv4"))],
+        ));
+        records.push(rrset(
+            &insecure,
+            Rtype::NS,
+            vec![Rdata::Ns(insecure_glue.clone())],
+        ));
+        records.push(rrset(
+            &insecure_glue,
+            Rtype::A,
+            vec![Rdata::A("192.0.2.54".parse().expect("ipv4"))],
+        ));
+        if nsec3 {
+            let chain = nsec3_chain(origin, &owners, &[0xAA, 0xBB]);
+            for chain_rrset in &chain {
+                records.push(chain_rrset.clone());
+                records.push(rrsig(chain_rrset.owner(), chain_rrset.rr_type()));
+            }
+        } else {
+            let chain = nsec_chain(origin, &owners);
+            for chain_rrset in &chain {
+                records.push(chain_rrset.clone());
+                records.push(rrsig(chain_rrset.owner(), chain_rrset.rr_type()));
+            }
+        }
+        records
+    }
+
+    fn fast_matches_full(records: &[Rrset], cases: &[(&str, &str, Rtype)]) {
+        use pulse_server::application::{QueryEngine, Scratch, Transport};
+        let origin = name("example.com");
+        let fixture = fixture(records);
+        let engine = QueryEngine::new(vec![
+            Arc::new(fixture.view) as Arc<dyn pulse_server::ZoneView>
+        ]);
+        let mut scratch = Scratch::new();
+        let mut legacy_scratch = Scratch::new();
+        let mut fast = vec![0_u8; 65_535];
+        let mut legacy = vec![0_u8; 65_535];
+        for (label, qname, qtype) in cases {
+            let mut request = pulse_dns::Message::query(
+                0x1234,
+                pulse_dns::Question::new(name(qname), *qtype, Rclass::IN),
+            );
+            request.set_edns(Some(pulse_dns::Edns::new(1232).with_dnssec_ok(true)));
+            let wire = request
+                .encode(&pulse_dns::EncodeOptions::compressed())
+                .expect("query encode");
+            let parsed = pulse_dns::MessageRef::decode_simple_edns(&wire).expect("simple query");
+            let fast_len = engine
+                .respond_ref_into(&parsed, Transport::Udp, &mut fast, &mut scratch)
+                .unwrap_or_else(|| panic!("{label}: expected hot path"));
+            let legacy_len = engine
+                .respond_into(&request, Transport::Udp, &mut legacy, &mut legacy_scratch)
+                .expect("full path");
+            assert_eq!(
+                &fast[..fast_len],
+                &legacy[..legacy_len],
+                "{label}: fast path bytes differ ({origin})"
+            );
+        }
+        drop(fixture.dir);
+    }
+
+    #[test]
+    fn signed_fast_path_handles_large_nsec_chain() {
+        use pulse_server::application::{QueryEngine, Scratch, Transport};
+        let _guard = ZONE_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let origin = name("example.com");
+        let www = name("www.example.com");
+        let mut owners: Vec<Name> = (0..1000)
+            .map(|index| name(&format!("n{index}.example.com")))
+            .collect();
+        owners.push(origin.clone());
+        owners.push(www.clone());
+        owners.sort_by(Name::cmp_canonical);
+        owners.dedup();
+        let mut records = base_data(&origin);
+        records.push(rrset(
+            &origin,
+            Rtype::DNSKEY,
+            vec![Rdata::Dnskey(
+                pulse_dns::DnskeyData::new(257, 3, 8, vec![7_u8; 32]).expect("dnskey"),
+            )],
+        ));
+        records.push(rrsig(&origin, Rtype::DNSKEY));
+        records.push(rrset(
+            &www,
+            Rtype::A,
+            vec![Rdata::A("192.0.2.20".parse().expect("ipv4"))],
+        ));
+        records.push(rrsig(&www, Rtype::A));
+        let chain = nsec_chain(&origin, &owners);
+        for chain_rrset in &chain {
+            records.push(chain_rrset.clone());
+            records.push(rrsig(chain_rrset.owner(), Rtype::NSEC));
+        }
+        let fixture = fixture(&records);
+        let engine = QueryEngine::new(vec![
+            Arc::new(fixture.view) as Arc<dyn pulse_server::ZoneView>
+        ]);
+        let mut scratch = Scratch::new();
+        let mut legacy_scratch = Scratch::new();
+        let mut fast = vec![0_u8; 65_535];
+        let mut legacy = vec![0_u8; 65_535];
+        for qname in [
+            "missing.example.com",
+            "n500.example.com",
+            "nope.n500.example.com",
+        ] {
+            let mut request = pulse_dns::Message::query(
+                0x1234,
+                pulse_dns::Question::new(name(qname), Rtype::A, Rclass::IN),
+            );
+            request.set_edns(Some(pulse_dns::Edns::new(1232).with_dnssec_ok(true)));
+            let wire = request
+                .encode(&pulse_dns::EncodeOptions::compressed())
+                .expect("query encode");
+            let parsed = pulse_dns::MessageRef::decode_simple_edns(&wire).expect("simple");
+            let fast_len = engine
+                .respond_ref_into(&parsed, Transport::Udp, &mut fast, &mut scratch)
+                .unwrap_or_else(|| panic!("{qname}: expected hot path"));
+            let legacy_len = engine
+                .respond_into(&request, Transport::Udp, &mut legacy, &mut legacy_scratch)
+                .expect("full path");
+            assert_eq!(&fast[..fast_len], &legacy[..legacy_len], "{qname}");
+        }
+        drop(fixture.dir);
+    }
+
+    #[test]
+    fn signed_fast_path_matches_full_on_v2_zone() {
+        let _guard = ZONE_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let cases = [
+            ("positive", "www.example.com", Rtype::A),
+            ("nxdomain", "missing.example.com", Rtype::A),
+            ("nodata", "www.example.com", Rtype::AAAA),
+            ("wildcard", "foo.wild.example.com", Rtype::A),
+            ("wildcard-nodata", "foo.wild.example.com", Rtype::AAAA),
+            ("wildcard-cname", "x.wc.example.com", Rtype::A),
+            ("cname", "alias.example.com", Rtype::A),
+            ("referral-secure", "host.sub.example.com", Rtype::A),
+            ("referral-insecure", "host.insecure.example.com", Rtype::A),
+            ("any", "www.example.com", Rtype::ANY),
+        ];
+        for nsec3 in [false, true] {
+            let records = signed_v2_records(&name("example.com"), nsec3);
+            fast_matches_full(&records, &cases);
         }
     }
 }

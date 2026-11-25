@@ -32,6 +32,36 @@ pub fn nsec3_owner_name(zone: &Name, hash: &[u8]) -> Result<Name, DenialError> {
     })
 }
 
+/// Строит hashed-имя NSEC3 прямо в caller-provided буфер.
+///
+/// `zone_wire` — каноническая несжатая wire-форма origin зоны. Возвращает
+/// длину записанного имени; `None`, если буфер мал, hash пуст или метка не
+/// помещается в DNS-метку. Горячий путь ответа использует вариант без
+/// аллокаций.
+#[must_use]
+pub fn nsec3_owner_name_into(zone_wire: &[u8], hash: &[u8], out: &mut [u8]) -> Option<usize> {
+    let label_len = hash.len().div_ceil(5) * 8;
+    if label_len == 0 || label_len > usize::from(u8::MAX) || label_len > 63 {
+        return None;
+    }
+    let total = 1_usize
+        .checked_add(label_len)?
+        .checked_add(zone_wire.len())?;
+    let slot = out.get_mut(..total)?;
+    let (header, rest) = slot.split_first_mut()?;
+    *header = u8::try_from(label_len).ok()?;
+    let (label, tail) = rest.split_at_mut(label_len);
+    if base32hex::encode_into(hash, label)? != label_len {
+        return None;
+    }
+    // Каноническая wire-форма имени — нижний регистр (как хранит зона).
+    for byte in label.iter_mut() {
+        byte.make_ascii_lowercase();
+    }
+    tail.copy_from_slice(zone_wire);
+    Some(total)
+}
+
 /// Генерирует случайную соль NSEC3 заданной длины.
 ///
 /// # Errors
