@@ -8,11 +8,11 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype};
+use pulse_dns::{Name, NameRef, Rclass, Rdata, Rrset, Rtype};
 use thiserror::Error;
 
-use crate::application::ZoneView;
-use crate::domain::{DenialKind, LookupOutcome, ZoneState};
+use crate::application::{ZoneSnapshot, ZoneView};
+use crate::domain::{DenialKind, LookupOutcome, LookupOutcomeRef, RrsetRef, ZoneState};
 
 /// Ошибка наполнения in-memory зоны.
 #[derive(Debug, Error)]
@@ -65,7 +65,7 @@ pub struct InMemoryZone {
     origin: Name,
     class: Rclass,
     state: ZoneState,
-    rrsets: HashMap<(Name, Rtype), Rrset>,
+    rrsets: HashMap<Name, HashMap<Rtype, Rrset>>,
     nodes: HashSet<Name>,
     cuts: HashSet<Name>,
     soa: Option<Rrset>,
@@ -173,7 +173,9 @@ impl InMemoryZone {
             None
         };
         self.rrsets
-            .insert((rrset.owner().clone(), rrset.rr_type()), rrset);
+            .entry(rrset.owner().clone())
+            .or_default()
+            .insert(rrset.rr_type(), rrset);
         if let Some((owner, nsec)) = nsec_owner {
             self.nsec.insert(owner, nsec);
         }
@@ -195,10 +197,29 @@ impl InMemoryZone {
         }
     }
 
+    fn rrsets_at(&self, name: &Name) -> Option<&HashMap<Rtype, Rrset>> {
+        self.rrsets.get(name.as_wire())
+    }
+
+    fn get_rrset(&self, name: &Name, rtype: Rtype) -> Option<&Rrset> {
+        self.rrsets_at(name)?.get(&rtype)
+    }
+
+    fn get_rrset_wire(&self, wire: &[u8], rtype: Rtype) -> Option<&Rrset> {
+        self.rrsets.get(wire)?.get(&rtype)
+    }
+
     fn delegation_for(&self, name: &Name) -> Option<&Name> {
         self.cuts
             .iter()
             .filter(|cut| name.is_subdomain_of(cut))
+            .max_by_key(|cut| cut.label_count())
+    }
+
+    fn delegation_for_ref(&self, name: NameRef<'_>) -> Option<&Name> {
+        self.cuts
+            .iter()
+            .filter(|cut| name.is_subdomain_of_name(cut))
             .max_by_key(|cut| cut.label_count())
     }
 }
@@ -238,13 +259,13 @@ impl ZoneView for InMemoryZone {
                 return LookupOutcome::Referral;
             }
             if rtype == Rtype::DS {
-                return match self.rrsets.get(&(name.clone(), Rtype::DS)) {
+                return match self.get_rrset(name, Rtype::DS) {
                     Some(ds) => LookupOutcome::Answer(ds.clone()),
                     None => LookupOutcome::NoData,
                 };
             }
-            let ns = self.rrsets.get(&(cut.clone(), Rtype::NS));
-            let ds = self.rrsets.get(&(cut.clone(), Rtype::DS));
+            let ns = self.get_rrset(cut, Rtype::NS);
+            let ds = self.get_rrset(cut, Rtype::DS);
             return match ns {
                 Some(ns) => LookupOutcome::Delegation {
                     ns: ns.clone(),
@@ -254,11 +275,11 @@ impl ZoneView for InMemoryZone {
             };
         }
 
-        if let Some(rrset) = self.rrsets.get(&(name.clone(), rtype)) {
+        if let Some(rrset) = self.get_rrset(name, rtype) {
             return LookupOutcome::Answer(rrset.clone());
         }
         if rtype != Rtype::CNAME
-            && let Some(cname) = self.rrsets.get(&(name.clone(), Rtype::CNAME))
+            && let Some(cname) = self.get_rrset(name, Rtype::CNAME)
         {
             let target = cname.rdatas().iter().find_map(|rdata| match rdata {
                 Rdata::Cname(target) => Some(target.clone()),
@@ -276,7 +297,7 @@ impl ZoneView for InMemoryZone {
     }
 
     fn lookup_all_rrsig(&self, name: &Name, covered: Rtype) -> Vec<Rrset> {
-        let Some(rrsig) = self.rrsets.get(&(name.clone(), Rtype::RRSIG)) else {
+        let Some(rrsig) = self.get_rrset(name, Rtype::RRSIG) else {
             return Vec::new();
         };
         let rdatas: Vec<Rdata> = rrsig
@@ -313,7 +334,7 @@ impl ZoneView for InMemoryZone {
         }
         let mut result = Vec::new();
         for rtype in [Rtype::A, Rtype::AAAA] {
-            if let Some(rrset) = self.rrsets.get(&(name.clone(), rtype)) {
+            if let Some(rrset) = self.get_rrset(name, rtype) {
                 result.push(rrset.clone());
             }
         }
@@ -324,8 +345,33 @@ impl ZoneView for InMemoryZone {
         self.nodes.contains(name)
     }
 
+    fn with_snapshot(&self, f: &mut dyn FnMut(&dyn ZoneSnapshot)) -> bool {
+        f(self);
+        true
+    }
+
+    fn soa_ref(&self) -> Option<RrsetRef<'_>> {
+        <Self as ZoneSnapshot>::soa_ref(self)
+    }
+
+    fn ns_ref(&self) -> Option<RrsetRef<'_>> {
+        <Self as ZoneSnapshot>::ns_ref(self)
+    }
+
+    fn records_ref<'a>(&'a self, name: NameRef<'a>) -> Vec<RrsetRef<'a>> {
+        <Self as ZoneSnapshot>::records_ref(self, name)
+    }
+
+    fn lookup_all_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> Vec<RrsetRef<'a>> {
+        <Self as ZoneSnapshot>::lookup_all_ref(self, name, rtype)
+    }
+
+    fn lookup_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> LookupOutcomeRef<'a> {
+        <Self as ZoneSnapshot>::lookup_ref(self, name, rtype)
+    }
+
     fn nsec_at(&self, name: &Name) -> Option<Rrset> {
-        self.rrsets.get(&(name.clone(), Rtype::NSEC)).cloned()
+        self.get_rrset(name, Rtype::NSEC).cloned()
     }
 
     fn nsec_cover(&self, name: &Name) -> Option<Rrset> {
@@ -345,10 +391,7 @@ impl ZoneView for InMemoryZone {
     }
 
     fn denial(&self) -> DenialKind {
-        if self
-            .rrsets
-            .contains_key(&(self.origin.clone(), Rtype::NSEC3PARAM))
-        {
+        if self.get_rrset(&self.origin, Rtype::NSEC3PARAM).is_some() {
             DenialKind::Nsec3
         } else {
             DenialKind::Nsec
@@ -356,14 +399,12 @@ impl ZoneView for InMemoryZone {
     }
 
     fn nsec3_param(&self) -> Option<Rrset> {
-        self.rrsets
-            .get(&(self.origin.clone(), Rtype::NSEC3PARAM))
-            .cloned()
+        self.get_rrset(&self.origin, Rtype::NSEC3PARAM).cloned()
     }
 
     fn nsec3_at(&self, hash: &[u8]) -> Option<Rrset> {
         let owner = pulse_dnssec::denial::nsec3_owner_name(&self.origin, hash).ok()?;
-        self.rrsets.get(&(owner, Rtype::NSEC3)).cloned()
+        self.get_rrset(&owner, Rtype::NSEC3).cloned()
     }
 
     fn nsec3_cover(&self, hash: &[u8]) -> Option<Rrset> {
@@ -380,6 +421,108 @@ impl ZoneView for InMemoryZone {
             _ => None,
         })?;
         nsec3_covers(owner_hash, next, hash).then(|| rrset.clone())
+    }
+}
+
+impl ZoneSnapshot for InMemoryZone {
+    fn origin_ref(&self) -> NameRef<'_> {
+        NameRef::from_name(&self.origin)
+    }
+
+    fn class_ref(&self) -> Rclass {
+        self.class
+    }
+
+    fn lookup_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> LookupOutcomeRef<'a> {
+        if !name.is_subdomain_of_name(&self.origin) {
+            return LookupOutcomeRef::ZoneNotFound;
+        }
+
+        if let Some(cut) = self.delegation_for_ref(name) {
+            if name.as_wire() != cut.as_wire() {
+                return LookupOutcomeRef::Referral;
+            }
+            if rtype == Rtype::DS {
+                return match self.get_rrset(cut, Rtype::DS) {
+                    Some(ds) => LookupOutcomeRef::Answer(RrsetRef::from_owned(ds)),
+                    None => LookupOutcomeRef::NoData,
+                };
+            }
+            let ns = self.get_rrset(cut, Rtype::NS);
+            let ds = self.get_rrset(cut, Rtype::DS);
+            return match ns {
+                Some(ns) => LookupOutcomeRef::Delegation {
+                    ns: RrsetRef::from_owned(ns),
+                    ds: ds.map(RrsetRef::from_owned),
+                },
+                None => LookupOutcomeRef::Referral,
+            };
+        }
+
+        if let Some(rrset) = self.get_rrset_wire(name.as_wire(), rtype) {
+            return LookupOutcomeRef::Answer(RrsetRef::from_owned(rrset));
+        }
+        if rtype != Rtype::CNAME
+            && let Some(cname) = self.get_rrset_wire(name.as_wire(), Rtype::CNAME)
+        {
+            let target = cname.rdatas().iter().find_map(|rdata| match rdata {
+                Rdata::Cname(target) => Some(NameRef::from_name(target)),
+                _ => None,
+            });
+            if let Some(target) = target {
+                return LookupOutcomeRef::Cname(RrsetRef::from_owned(cname), target);
+            }
+        }
+        if self.nodes.contains(name.as_wire()) {
+            LookupOutcomeRef::NoData
+        } else {
+            LookupOutcomeRef::NxDomain
+        }
+    }
+
+    fn soa_ref(&self) -> Option<RrsetRef<'_>> {
+        self.soa.as_ref().map(RrsetRef::from_owned)
+    }
+
+    fn ns_ref(&self) -> Option<RrsetRef<'_>> {
+        self.ns.as_ref().map(RrsetRef::from_owned)
+    }
+
+    fn records_ref<'a>(&'a self, name: NameRef<'a>) -> Vec<RrsetRef<'a>> {
+        self.rrsets
+            .get(name.as_wire())
+            .map(|by_type| by_type.values().map(RrsetRef::from_owned).collect())
+            .unwrap_or_default()
+    }
+
+    fn lookup_all_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> Vec<RrsetRef<'a>> {
+        self.get_rrset_wire(name.as_wire(), rtype)
+            .map(RrsetRef::from_owned)
+            .into_iter()
+            .collect()
+    }
+
+    fn glue_ref<'a>(&'a self, name: NameRef<'a>) -> Vec<RrsetRef<'a>> {
+        if !name.is_subdomain_of_name(&self.origin) {
+            return Vec::new();
+        }
+        [Rtype::A, Rtype::AAAA]
+            .into_iter()
+            .filter_map(|rtype| self.get_rrset_wire(name.as_wire(), rtype))
+            .map(RrsetRef::from_owned)
+            .collect()
+    }
+
+    fn node_exists_ref(&self, name: NameRef<'_>) -> bool {
+        self.nodes.contains(name.as_wire())
+    }
+
+    fn is_delegation_ref(&self, name: NameRef<'_>) -> bool {
+        self.cuts.contains(name.as_wire())
+    }
+
+    fn signed_ref(&self) -> bool {
+        self.get_rrset(&self.origin, Rtype::DNSKEY).is_some()
     }
 }
 

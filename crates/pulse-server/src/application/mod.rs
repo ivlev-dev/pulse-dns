@@ -4,7 +4,7 @@ mod port;
 mod query;
 mod stats;
 
-pub use port::ZoneView;
+pub use port::{ZoneSnapshot, ZoneView};
 pub use query::{
     DEFAULT_ANY_HINFO_TTL, EDNS_DEFAULT_PAYLOAD, EncodedResponse, EngineConfig, MAX_CNAME_CHAIN,
     MAX_UDP_PAYLOAD, NEGATIVE_TTL_CAP, QueryEngine, QueryError, Scratch, Transport,

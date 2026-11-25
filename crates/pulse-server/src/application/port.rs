@@ -1,8 +1,56 @@
 //! Порт чтения зоны для авторитетного ответа.
 
-use pulse_dns::{Name, Rclass, Rrset, Rtype};
+use pulse_dns::{Name, NameRef, Rclass, Rrset, Rtype};
 
-use crate::domain::{DenialKind, LookupOutcome, ZoneState};
+use crate::domain::{DenialKind, LookupOutcome, LookupOutcomeRef, RrsetRef, ZoneState};
+
+/// Заимствованный снимок зоны, живущий не дольше пина читателя.
+///
+/// Снимок отдаётся через [`ZoneView::with_snapshot`] на время одного ответа:
+/// все [`RrsetRef`] валидны, пока callback не вернулся. Это позволяет v2-адаптеру
+/// держать один `ZoneReader`/`PageCache`-пин на запрос и не материализовать
+/// RRset на каждый lookup.
+pub trait ZoneSnapshot {
+    /// Origin зоны.
+    fn origin_ref(&self) -> NameRef<'_>;
+
+    /// Класс зоны.
+    fn class_ref(&self) -> Rclass;
+
+    /// Точный поиск без композиции.
+    fn lookup_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> LookupOutcomeRef<'a>;
+
+    /// `SOA` apex.
+    fn soa_ref(&self) -> Option<RrsetRef<'_>>;
+
+    /// `NS` apex.
+    fn ns_ref(&self) -> Option<RrsetRef<'_>>;
+
+    /// Все RRset имени (все типы).
+    fn records_ref<'a>(&'a self, name: NameRef<'a>) -> Vec<RrsetRef<'a>>;
+
+    /// Все RRset `(name, rtype)` с подтипами (например, `RRSIG`).
+    fn lookup_all_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> Vec<RrsetRef<'a>>;
+
+    /// `A`/`AAAA` для additional.
+    fn glue_ref<'a>(&'a self, name: NameRef<'a>) -> Vec<RrsetRef<'a>>;
+
+    /// Существует ли узел (включая empty non-terminal).
+    fn node_exists_ref(&self, name: NameRef<'_>) -> bool;
+
+    /// Точка делегирования.
+    fn is_delegation_ref(&self, name: NameRef<'_>) -> bool;
+
+    /// Подписана ли зона.
+    fn signed_ref(&self) -> bool {
+        false
+    }
+
+    /// Механизм denial-of-existence.
+    fn denial_ref(&self) -> DenialKind {
+        DenialKind::Nsec
+    }
+}
 
 /// Синхронный порт зоны (driven port авторитетного сервиса).
 ///
@@ -128,4 +176,47 @@ pub trait ZoneView: Send + Sync {
     /// (RFC 4592 §2.2.1): без него нельзя отличить существующий предок от
     /// отсутствующего. Для имени вне зоны — `false`.
     fn node_exists(&self, name: &Name) -> bool;
+
+    /// Выполняет `f` под снимком зоны с заимствованными lookup'ами.
+    ///
+    /// Возвращает `false`, если адаптер не поддерживает заимствованный путь;
+    /// тогда вызывающий использует владеющие методы [`ZoneView::lookup`].
+    /// Для v2 снимок держит `ZoneReader`/пин до конца callback'а.
+    fn with_snapshot(&self, f: &mut dyn FnMut(&dyn ZoneSnapshot)) -> bool {
+        let _ = f;
+        false
+    }
+
+    /// Заимствованный точный поиск.
+    ///
+    /// По умолчанию не поддерживается: адаптер должен переопределить метод
+    /// вместе с [`ZoneView::with_snapshot`]. Значение по умолчанию —
+    /// [`LookupOutcomeRef::ZoneNotFound`] — никогда не используется движком,
+    /// потому что он сначала проверяет `with_snapshot`.
+    fn lookup_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> LookupOutcomeRef<'a> {
+        let _ = (name, rtype);
+        LookupOutcomeRef::ZoneNotFound
+    }
+
+    /// Заимствованный `SOA` apex; `None` по умолчанию.
+    fn soa_ref(&self) -> Option<RrsetRef<'_>> {
+        None
+    }
+
+    /// Заимствованный `NS` apex; `None` по умолчанию.
+    fn ns_ref(&self) -> Option<RrsetRef<'_>> {
+        None
+    }
+
+    /// Заимствованные RRset имени; по умолчанию пусто.
+    fn records_ref<'a>(&'a self, name: NameRef<'a>) -> Vec<RrsetRef<'a>> {
+        let _ = name;
+        Vec::new()
+    }
+
+    /// Заимствованные RRset `(name, rtype)`; по умолчанию пусто.
+    fn lookup_all_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> Vec<RrsetRef<'a>> {
+        let _ = (name, rtype);
+        Vec::new()
+    }
 }

@@ -1,5 +1,6 @@
 //! Доменное имя (`domain-model.md` §2.1, INV-11).
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::fmt::Write as _;
@@ -181,8 +182,12 @@ impl Name {
         if bytes.len() > MAX_NAME_WIRE_LEN {
             return Err(NameError::TooLong { len: bytes.len() });
         }
-        let mut labels: Vec<Vec<u8>> = Vec::new();
+        // Одна аллокация под каноническую wire-форму вместо `Vec<Vec<u8>>`
+        // промежуточных меток: имя на горячем пути декодируется на каждый
+        // запрос.
+        let mut wire = Vec::with_capacity(bytes.len());
         let mut index = 0_usize;
+        let mut labels = 0_usize;
         loop {
             let Some(&length) = bytes.get(index) else {
                 return Err(NameError::MalformedWire);
@@ -199,18 +204,19 @@ impl Name {
                 .checked_add(length as usize)
                 .ok_or(NameError::MalformedWire)?;
             let label = bytes.get(start..end).ok_or(NameError::MalformedWire)?;
-            labels.push(label.to_ascii_lowercase());
+            labels = labels.saturating_add(1);
+            if labels > MAX_LABELS {
+                return Err(NameError::TooManyLabels { count: labels });
+            }
+            wire.push(length);
+            wire.extend(label.iter().map(u8::to_ascii_lowercase));
             index = end;
         }
         if index != bytes.len() {
             return Err(NameError::MalformedWire);
         }
-        Self::from_label_bytes(labels)
-    }
-
-    /// Собирает имя из уже проверенных меток.
-    pub(crate) fn from_labels(labels: Vec<Vec<u8>>) -> Result<Self, NameError> {
-        Self::from_label_bytes(labels)
+        wire.push(0);
+        Ok(Self { wire })
     }
 
     /// Собирает имя из уже проверенных меток.
@@ -320,16 +326,7 @@ impl Name {
     /// Является ли имя поддоменом `ancestor` (включая равенство).
     #[must_use]
     pub fn is_subdomain_of(&self, ancestor: &Self) -> bool {
-        let own_labels: Vec<&[u8]> = self.labels().collect();
-        let ancestor_labels: Vec<&[u8]> = ancestor.labels().collect();
-        if ancestor_labels.len() > own_labels.len() {
-            return false;
-        }
-        own_labels
-            .iter()
-            .rev()
-            .zip(ancestor_labels.iter().rev())
-            .all(|(own, expected)| own == expected)
+        is_wire_subdomain(&self.wire, &ancestor.wire)
     }
 
     /// Является ли имя wildcard-владельцем зоны.
@@ -369,24 +366,220 @@ impl Name {
     /// нормализован. Предок сортируется перед потомком.
     #[must_use]
     pub fn cmp_canonical(&self, other: &Self) -> Ordering {
-        let mut left: Vec<&[u8]> = self.labels().collect();
-        let mut right: Vec<&[u8]> = other.labels().collect();
-        left.reverse();
-        right.reverse();
+        // Метки собираются в стековые массивы: `Vec` на каждый вызов
+        // недопустим на горячем пути.
+        let mut left = [&[][..]; MAX_LABELS];
+        let mut right = [&[][..]; MAX_LABELS];
+        let left_len = collect_labels(&self.wire, &mut left);
+        let right_len = collect_labels(&other.wire, &mut right);
 
-        for (a, b) in left.iter().zip(right.iter()) {
+        for index in 0..left_len.min(right_len) {
+            let Some(a) = left.get(left_len - 1 - index) else {
+                break;
+            };
+            let Some(b) = right.get(right_len - 1 - index) else {
+                break;
+            };
             match a.cmp(b) {
                 Ordering::Equal => {}
                 ordering => return ordering,
             }
         }
-        left.len().cmp(&right.len())
+        left_len.cmp(&right_len)
     }
 
     /// Проверяет инварианты (для данных, собранных внутри крейта).
     #[must_use]
     pub fn is_valid(&self) -> bool {
         Self::from_wire(&self.wire).is_ok()
+    }
+}
+
+/// Заимствованное каноническое имя (`&[u8]` в несжатой wire-форме).
+///
+/// Используется на горячем пути ответа: `NameRef` не владеет буфером и не
+/// аллоцирует при сравнении/проверке суффикса. Байты должны быть в нижнем
+/// регистре и завершаться нулём — это гарантирует [`NameRef::from_wire`] и
+/// [`NameRef::from_name`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NameRef<'a> {
+    wire: &'a [u8],
+}
+
+impl<'a> NameRef<'a> {
+    /// Оборачивает уже провалидированную каноническую wire-форму.
+    #[must_use]
+    pub const fn from_validated(wire: &'a [u8]) -> Self {
+        Self { wire }
+    }
+
+    /// Проверяет и оборачивает wire-форму без копирования.
+    ///
+    /// Принимаются только имена в каноническом нижнем регистре: иначе
+    /// сравнение `NameRef` с [`Name`] было бы некорректным.
+    ///
+    /// # Errors
+    ///
+    /// [`NameError`] при некорректной wire-форме или наличии `A..=Z`.
+    pub fn from_wire(wire: &'a [u8]) -> Result<Self, NameError> {
+        if wire.is_empty() {
+            return Err(NameError::EmptyName);
+        }
+        if wire.len() > MAX_NAME_WIRE_LEN {
+            return Err(NameError::TooLong { len: wire.len() });
+        }
+        let mut index = 0_usize;
+        let mut labels = 0_usize;
+        loop {
+            let Some(&length) = wire.get(index) else {
+                return Err(NameError::MalformedWire);
+            };
+            if length == 0 {
+                index += 1;
+                break;
+            }
+            if length > u8::try_from(MAX_LABEL_LEN).unwrap_or(u8::MAX) {
+                return Err(NameError::MalformedWire);
+            }
+            let start = index + 1;
+            let end = start
+                .checked_add(length as usize)
+                .ok_or(NameError::MalformedWire)?;
+            let label = wire.get(start..end).ok_or(NameError::MalformedWire)?;
+            if label.iter().any(u8::is_ascii_uppercase) {
+                return Err(NameError::MalformedWire);
+            }
+            labels = labels.saturating_add(1);
+            if labels > MAX_LABELS {
+                return Err(NameError::TooManyLabels { count: labels });
+            }
+            index = end;
+        }
+        if index != wire.len() {
+            return Err(NameError::MalformedWire);
+        }
+        Ok(Self { wire })
+    }
+
+    /// Ссылается на каноническую wire-форму владеющего имени.
+    #[must_use]
+    pub fn from_name(name: &'a Name) -> Self {
+        Self {
+            wire: name.as_wire(),
+        }
+    }
+
+    /// Несжатая wire-форма.
+    #[must_use]
+    pub const fn as_wire(self) -> &'a [u8] {
+        self.wire
+    }
+
+    /// Длина wire-формы.
+    #[must_use]
+    pub const fn wire_len(self) -> usize {
+        self.wire.len()
+    }
+
+    /// Итератор по меткам.
+    #[must_use]
+    pub fn labels(self) -> Labels<'a> {
+        Labels {
+            wire: self.wire,
+            position: 0,
+        }
+    }
+
+    /// Первая (левая) метка.
+    #[must_use]
+    pub fn first_label(self) -> Option<&'a [u8]> {
+        self.labels().next()
+    }
+
+    /// Число меток.
+    #[must_use]
+    pub fn label_count(self) -> usize {
+        self.labels().count()
+    }
+
+    /// Родительское имя.
+    #[must_use]
+    pub fn parent(self) -> Option<Self> {
+        let first = self.first_label()?;
+        let offset = first.len().saturating_add(1);
+        self.wire.get(offset..).map(Self::from_validated)
+    }
+
+    /// Является ли имя поддоменом `ancestor`.
+    #[must_use]
+    pub fn is_subdomain_of(self, ancestor: Self) -> bool {
+        is_wire_subdomain(self.wire, ancestor.wire)
+    }
+
+    /// Является ли имя поддоменом владеющего [`Name`].
+    #[must_use]
+    pub fn is_subdomain_of_name(self, ancestor: &Name) -> bool {
+        is_wire_subdomain(self.wire, ancestor.as_wire())
+    }
+
+    /// Каноническое сравнение (RFC 4034 §6.1) без аллокаций.
+    #[must_use]
+    pub fn cmp_canonical(self, other: Self) -> Ordering {
+        let mut left = [&[][..]; MAX_LABELS];
+        let mut right = [&[][..]; MAX_LABELS];
+        let left_len = collect_labels(self.wire, &mut left);
+        let right_len = collect_labels(other.wire, &mut right);
+        for index in 0..left_len.min(right_len) {
+            let Some(a) = left.get(left_len - 1 - index) else {
+                break;
+            };
+            let Some(b) = right.get(right_len - 1 - index) else {
+                break;
+            };
+            match a.cmp(b) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            }
+        }
+        left_len.cmp(&right_len)
+    }
+
+    /// Материализует владеющее имя (единственная аллокация — при переходе на
+    /// APIs, которым нужен [`Name`]).
+    ///
+    /// # Errors
+    ///
+    /// [`NameError`], если имя не помещается в лимиты.
+    pub fn to_name(self) -> Result<Name, NameError> {
+        Name::from_wire(self.wire)
+    }
+}
+
+impl core::fmt::Debug for NameRef<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = self.to_name();
+        match name {
+            Ok(name) => write!(f, "NameRef({name})"),
+            Err(_) => write!(f, "NameRef(<invalid>)"),
+        }
+    }
+}
+
+impl PartialEq<Name> for NameRef<'_> {
+    fn eq(&self, other: &Name) -> bool {
+        self.wire == other.as_wire()
+    }
+}
+
+impl PartialEq<NameRef<'_>> for Name {
+    fn eq(&self, other: &NameRef<'_>) -> bool {
+        self.as_wire() == other.as_wire()
+    }
+}
+
+impl Borrow<[u8]> for Name {
+    fn borrow(&self) -> &[u8] {
+        self.as_wire()
     }
 }
 
@@ -448,10 +641,57 @@ impl<'a> Iterator for Labels<'a> {
     }
 }
 
+/// Проверяет, что `ancestor` — суффикс `name` ровно по границе метки.
+///
+/// Сравнение `ends_with` недостаточно: байты метки могут сами образовывать
+/// валидную wire-форму, начинающуюся в середине метки. Функция не аллоцирует.
+fn is_wire_subdomain(name: &[u8], ancestor: &[u8]) -> bool {
+    let Some(start) = name.len().checked_sub(ancestor.len()) else {
+        return false;
+    };
+    if name.get(start..) != Some(ancestor) {
+        return false;
+    }
+    let mut position = 0_usize;
+    while position < start {
+        let Some(&length) = name.get(position) else {
+            return false;
+        };
+        if length == 0 {
+            return false;
+        }
+        position = position.saturating_add(1 + usize::from(length));
+    }
+    position == start
+}
+
 /// Свободная функция канонического сравнения имён (RFC 4034 §6.1).
 #[must_use]
 pub fn name_cmp(left: &Name, right: &Name) -> Ordering {
     left.cmp_canonical(right)
+}
+
+/// Собирает метки wire-формы в стековый массив; возвращает их число.
+fn collect_labels<'a>(wire: &'a [u8], out: &mut [&'a [u8]; MAX_LABELS]) -> usize {
+    let mut count = 0_usize;
+    let mut position = 0_usize;
+    while let Some(&length) = wire.get(position) {
+        if length == 0 {
+            break;
+        }
+        let start = position + 1;
+        let end = start.saturating_add(usize::from(length));
+        let Some(label) = wire.get(start..end) else {
+            break;
+        };
+        let Some(slot) = out.get_mut(count) else {
+            break;
+        };
+        *slot = label;
+        count = count.saturating_add(1);
+        position = end;
+    }
+    count
 }
 
 fn parse_escape(bytes: &[u8], backslash: usize) -> Result<(u8, usize), NameError> {
@@ -495,4 +735,52 @@ fn write_escaped_label(f: &mut fmt::Formatter<'_>, label: &[u8]) -> fmt::Result 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subdomain_does_not_match_inside_label() {
+        // Левая метка содержит байты, которые сами образуют валидное имя
+        // `\x01a\x00`; суффикс не должен считаться поддоменом.
+        let parent = Name::from_wire(b"\x02\x01a\x00").unwrap();
+        let ancestor = Name::from_wire(b"\x01a\x00").unwrap();
+        assert!(!parent.is_subdomain_of(&ancestor));
+        let parent_ref = NameRef::from_name(&parent);
+        let ancestor_ref = NameRef::from_name(&ancestor);
+        assert!(!parent_ref.is_subdomain_of(ancestor_ref));
+    }
+
+    #[test]
+    fn name_ref_matches_owned_name() {
+        let owned = Name::parse("WWW.Example.COM.").unwrap();
+        let reference = NameRef::from_name(&owned);
+        assert_eq!(reference.as_wire(), b"\x03www\x07example\x03com\x00");
+        assert_eq!(reference.to_name().unwrap(), owned);
+        assert!(reference.is_subdomain_of_name(&Name::parse("example.com.").unwrap()));
+        assert_eq!(reference.label_count(), 3);
+        assert_eq!(
+            reference.parent().unwrap().as_wire(),
+            b"\x07example\x03com\x00"
+        );
+    }
+
+    #[test]
+    fn canonical_cmp_matches_owned() {
+        let left = Name::parse("a.example.com.").unwrap();
+        let right = Name::parse("b.example.com.").unwrap();
+        let left_ref = NameRef::from_name(&left);
+        let right_ref = NameRef::from_name(&right);
+        assert_eq!(
+            left.cmp_canonical(&right),
+            left_ref.cmp_canonical(right_ref)
+        );
+    }
+
+    #[test]
+    fn name_ref_rejects_uppercase_wire() {
+        assert!(NameRef::from_wire(b"\x03WWW\x00").is_err());
+    }
 }

@@ -288,10 +288,11 @@ impl<'a> Decoder<'a> {
     #[allow(clippy::too_many_lines)]
     fn name_at(&self, start: usize, allow_compression: bool) -> Result<(Name, usize), DecodeError> {
         let mut position = start;
-        let mut labels: Vec<Vec<u8>> = Vec::new();
+        let mut wire = [0_u8; MAX_NAME_WIRE_LEN];
+        let mut written = 0_usize;
         let mut end_of_name: Option<usize> = None;
         let mut jumps = 0_usize;
-        let mut total = 1_usize;
+        let mut labels = 0_usize;
         self.valid_starts.borrow_mut().insert(start);
 
         loop {
@@ -304,6 +305,10 @@ impl<'a> Decoder<'a> {
             if octet == 0 {
                 self.valid_starts.borrow_mut().insert(position);
                 position = position.saturating_add(1);
+                if let Some(slot) = wire.get_mut(written) {
+                    *slot = 0;
+                    written = written.saturating_add(1);
+                }
                 break;
             }
             if octet & 0xC0 == 0xC0 {
@@ -370,25 +375,45 @@ impl<'a> Decoder<'a> {
                     field: "label",
                 });
             };
-            total = total.saturating_add(1 + length);
-            if total > MAX_NAME_WIRE_LEN {
+            labels = labels.saturating_add(1);
+            if labels > MAX_LABELS {
                 return Err(DecodeError::NameTooLong {
                     offset: start,
                     max: MAX_NAME_WIRE_LEN,
                 });
             }
-            if labels.len() >= MAX_LABELS {
+            let Some(slot) = wire.get_mut(written) else {
                 return Err(DecodeError::NameTooLong {
                     offset: start,
                     max: MAX_NAME_WIRE_LEN,
                 });
+            };
+            *slot = u8::try_from(length).map_err(|_| DecodeError::NameTooLong {
+                offset: start,
+                max: MAX_NAME_WIRE_LEN,
+            })?;
+            written = written.saturating_add(1);
+            let Some(dst) = wire.get_mut(written..written + length) else {
+                return Err(DecodeError::NameTooLong {
+                    offset: start,
+                    max: MAX_NAME_WIRE_LEN,
+                });
+            };
+            for (dst, src) in dst.iter_mut().zip(label) {
+                *dst = src.to_ascii_lowercase();
             }
-            labels.push(label.to_ascii_lowercase());
+            written = written.saturating_add(length);
             position = label_end;
         }
 
         let end = end_of_name.unwrap_or(position);
-        let name = Name::from_labels(labels).map_err(|source| DecodeError::InvalidName {
+        let Some(raw) = wire.get(..written) else {
+            return Err(DecodeError::NameTooLong {
+                offset: start,
+                max: MAX_NAME_WIRE_LEN,
+            });
+        };
+        let name = Name::from_wire(raw).map_err(|source| DecodeError::InvalidName {
             offset: start,
             source,
         })?;

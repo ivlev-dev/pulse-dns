@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use pulse_dns::{
     Checkpoint, Edns, EncodeError, EncodeOptions, EncodeScratch, Encoder, Flags, HeaderCounts,
-    MAX_MESSAGE_LEN, MAX_NAME_WIRE_LEN, Message, Name, Opcode, Rclass, Rcode, Rdata, RdataError,
-    Record, RecordError, Rrset, RrsetError, Rtype, Ttl, TtlError, edns_wire_len,
+    MAX_MESSAGE_LEN, MAX_NAME_WIRE_LEN, Message, MessageRef, Name, Opcode, Rclass, Rcode, Rdata,
+    RdataError, Record, RecordError, Rrset, RrsetError, Rtype, Ttl, TtlError, edns_wire_len,
 };
 use pulse_dnssec::{DenialLimits, Nsec3Params};
 use thiserror::Error;
 
 use super::port::ZoneView;
 use super::stats::QueryStats;
-use crate::domain::{DenialKind, LookupOutcome, ZoneState};
+use crate::domain::{DenialKind, LookupOutcome, LookupOutcomeRef, RdataRef, RrsetRef, ZoneState};
 
 /// UDP payload без EDNS0 (RFC 1035 §4.2.1).
 pub const UDP_PAYLOAD_WITHOUT_EDNS: u16 = 512;
@@ -365,6 +365,131 @@ impl QueryEngine {
         Self::error_into(request, Rcode::SERVFAIL, out, &mut scratch.encode).map(|r| r.len)
     }
 
+    /// Zero-copy ответ на простой запрос [`MessageRef`].
+    ///
+    /// Обслуживает только горячий случай: один вопрос, без EDNS, `QTYPE =
+    /// A/AAAA`, зона `Serving`, точное совпадение с RRset. Ответ кодируется
+    /// прямо в `out` из заимствованных [`RrsetRef`] без `Message` и без
+    /// материализации RRset. `None` означает «случай не горячий» — вызывающий
+    /// обязан обработать пакет обычным путём через [`Message::decode`].
+    #[must_use]
+    pub fn respond_ref_into(
+        &self,
+        request: &MessageRef<'_>,
+        transport: Transport,
+        out: &mut [u8],
+        scratch: &mut Scratch,
+    ) -> Option<usize> {
+        let qname = request.qname()?;
+        let qtype = request.qtype();
+        if !matches!(qtype, Rtype::A | Rtype::AAAA) {
+            return None;
+        }
+        if request.qclass() != Rclass::IN {
+            return None;
+        }
+        let zone = self.find_zone_wire(qname.as_wire())?;
+        if zone.state() != ZoneState::Serving || zone.class() != Rclass::IN {
+            return None;
+        }
+        if !qname.is_subdomain_of_name(zone.origin()) {
+            return None;
+        }
+
+        let mut encoded = None;
+        let snapshot_available = zone.with_snapshot(&mut |snapshot| {
+            if let LookupOutcomeRef::Answer(rrset) = snapshot.lookup_ref(qname, qtype) {
+                encoded = self.encode_ref_answer(request, rrset, transport, out, scratch);
+            }
+        });
+        if !snapshot_available {
+            return None;
+        }
+        if encoded.is_some() {
+            self.stats.record_query();
+        }
+        encoded
+    }
+
+    /// Кодирует точный ответ из заимствованного RRset.
+    fn encode_ref_answer(
+        &self,
+        request: &MessageRef<'_>,
+        rrset: RrsetRef<'_>,
+        transport: Transport,
+        out: &mut [u8],
+        scratch: &mut Scratch,
+    ) -> Option<usize> {
+        let qname = request.qname()?;
+        let limit = match transport {
+            Transport::Udp => usize::from(UDP_PAYLOAD_WITHOUT_EDNS),
+            Transport::Tcp => MAX_MESSAGE_LEN,
+        };
+        let capacity = out.len().min(limit);
+        let buffer = out.get_mut(..capacity)?;
+        let flags = Flags::new()
+            .with_qr(true)
+            .with_opcode(Opcode::QUERY)
+            .with_rd(request.flags().rd())
+            .with_cd(request.flags().cd())
+            .with_aa(true)
+            .with_ra(false)
+            .with_ad(false)
+            .with_tc(false);
+        let mut encoder = Encoder::new(buffer, EncodeOptions::compressed(), &mut scratch.encode);
+        encoder.begin_message(request.id()).ok()?;
+        encoder
+            .write_question_wire(qname.as_wire(), request.qtype(), request.qclass())
+            .ok()?;
+
+        let owner = rrset.owner();
+        let mut answers = 0_u16;
+        let mut truncated = false;
+        for rdata in rrset.records() {
+            let checkpoint = encoder.checkpoint();
+            let result = match rdata {
+                RdataRef::Domain(rdata) => encoder.write_rr_wire_name(
+                    owner.as_wire(),
+                    rrset.rr_type(),
+                    rrset.class(),
+                    rrset.ttl(),
+                    rdata,
+                ),
+                RdataRef::Wire { bytes, .. } => encoder.write_rr_raw(
+                    owner.as_wire(),
+                    rrset.rr_type(),
+                    rrset.class(),
+                    rrset.ttl(),
+                    bytes,
+                ),
+            };
+            match result {
+                Ok(()) => answers = answers.saturating_add(1),
+                Err(EncodeError::BufferTooSmall { .. }) if transport == Transport::Udp => {
+                    encoder.rollback(checkpoint);
+                    truncated = true;
+                    break;
+                }
+                Err(_) => return None,
+            }
+        }
+        let len = encoder
+            .finish(
+                flags.with_tc(truncated),
+                HeaderCounts {
+                    question: 1,
+                    answer: answers,
+                    authority: 0,
+                    additional: 0,
+                },
+            )
+            .ok()?;
+        if truncated {
+            self.stats.record_truncated();
+        }
+        Some(len)
+    }
+
     /// Потоковая версия [`QueryEngine::try_respond`].
     ///
     /// Заголовок резервируется первым, записи пишутся в `out` по мере обхода
@@ -562,7 +687,10 @@ impl QueryEngine {
     }
 
     fn find_zone(&self, qname: &Name) -> Option<&dyn ZoneView> {
-        let wire = qname.as_wire();
+        self.find_zone_wire(qname.as_wire())
+    }
+
+    fn find_zone_wire(&self, wire: &[u8]) -> Option<&dyn ZoneView> {
         let mut position = 0_usize;
         loop {
             let suffix = wire.get(position..)?;

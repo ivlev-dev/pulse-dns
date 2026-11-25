@@ -111,6 +111,8 @@ pub mod testkit;
 
 pub use application::{
     EncodedResponse, EngineConfig, NEGATIVE_TTL_CAP, QueryEngine, QueryError, QueryStats, Scratch,
-    StatsSnapshot, Transport, ZoneView,
+    StatsSnapshot, Transport, ZoneSnapshot, ZoneView,
 };
-pub use domain::{DenialKind, LookupOutcome, ZoneState};
+pub use domain::{
+    DenialKind, LookupOutcome, LookupOutcomeRef, RdataRef, Rdatas, RrsetRef, ZoneState,
+};

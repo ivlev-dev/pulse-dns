@@ -13,7 +13,8 @@ pub mod question;
 
 pub use message::{Edns, EdnsError, EdnsOption, Flags, Header, Message};
 pub use name::{
-    MAX_LABEL_LEN, MAX_LABELS, MAX_NAME_TEXT_LEN, MAX_NAME_WIRE_LEN, Name, NameError, name_cmp,
+    MAX_LABEL_LEN, MAX_LABELS, MAX_NAME_TEXT_LEN, MAX_NAME_WIRE_LEN, Name, NameError, NameRef,
+    name_cmp,
 };
 pub use question::Question;
 pub use rdata::{

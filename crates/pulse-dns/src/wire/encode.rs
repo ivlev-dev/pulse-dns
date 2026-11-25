@@ -256,9 +256,31 @@ impl<'a> Encoder<'a> {
     ///
     /// [`EncodeError::BufferTooSmall`] или [`EncodeError::MessageTooLong`].
     pub fn write_question(&mut self, question: &Question) -> Result<(), EncodeError> {
-        self.write_name(question.qname(), true);
-        self.push(&question.qtype().as_u16().to_be_bytes());
-        self.push(&question.qclass().as_u16().to_be_bytes());
+        self.write_question_wire(
+            question.qname().as_wire(),
+            question.qtype(),
+            question.qclass(),
+        )
+    }
+
+    /// Записывает вопрос из несжатой wire-формы имени.
+    ///
+    /// `qname` должен быть канонической wire-формой (нижний регистр,
+    /// терминальный ноль) и проходить [`crate::NameRef::from_wire`] или
+    /// [`crate::NameRef::from_name`].
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::BufferTooSmall`] или [`EncodeError::MessageTooLong`].
+    pub fn write_question_wire(
+        &mut self,
+        qname: &[u8],
+        qtype: Rtype,
+        qclass: Rclass,
+    ) -> Result<(), EncodeError> {
+        self.write_name_wire(qname, true);
+        self.push(&qtype.as_u16().to_be_bytes());
+        self.push(&qclass.as_u16().to_be_bytes());
         self.check_overflow()?;
         self.check_size()
     }
@@ -293,6 +315,25 @@ impl<'a> Encoder<'a> {
         ttl: Ttl,
         rdata: &Rdata,
     ) -> Result<(), EncodeError> {
+        self.write_rr_wire_name(owner.as_wire(), rr_type, class, ttl, rdata)
+    }
+
+    /// Записывает RR с владельцем в несжатой wire-форме.
+    ///
+    /// `owner` должен быть канонической wire-формой; RDATA валидируется.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError`] при несоответствии типа, невалидной RDATA,
+    /// превышении `RDLENGTH` или нехватке места в буфере.
+    pub fn write_rr_wire_name(
+        &mut self,
+        owner: &[u8],
+        rr_type: Rtype,
+        class: Rclass,
+        ttl: Ttl,
+        rdata: &Rdata,
+    ) -> Result<(), EncodeError> {
         if rdata.rr_type() != rr_type {
             return Err(EncodeError::RecordTypeMismatch {
                 declared: rr_type,
@@ -305,7 +346,7 @@ impl<'a> Encoder<'a> {
         if self.overflowed {
             return Err(self.overflow_error());
         }
-        self.write_name(owner, true);
+        self.write_name_wire(owner, true);
         self.push(&rr_type.as_u16().to_be_bytes());
         self.push(&class.as_u16().to_be_bytes());
         self.push(&ttl.as_u32().to_be_bytes());
@@ -313,6 +354,51 @@ impl<'a> Encoder<'a> {
         self.push(&[0, 0]);
         let rdata_start = self.len();
         write_rdata(rdata, self);
+        self.finish_rr(rr_type, length_position, rdata_start)
+    }
+
+    /// Записывает RR из уже сериализованной RDATA (zero-copy).
+    ///
+    /// Вызывающий гарантирует, что `rdata` — валидная wire-форма для
+    /// `rr_type` (обычно это проверенные данные зоны). Имена внутри RDATA
+    /// пишутся без компрессии; это корректная, но чуть менее компактная
+    /// форма.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::RdataTooLong`] или [`EncodeError::BufferTooSmall`].
+    pub fn write_rr_raw(
+        &mut self,
+        owner: &[u8],
+        rr_type: Rtype,
+        class: Rclass,
+        ttl: Ttl,
+        rdata: &[u8],
+    ) -> Result<(), EncodeError> {
+        if self.overflowed {
+            return Err(self.overflow_error());
+        }
+        let Ok(length) = u16::try_from(rdata.len()) else {
+            return Err(EncodeError::RdataTooLong {
+                rr_type,
+                len: rdata.len(),
+            });
+        };
+        self.write_name_wire(owner, true);
+        self.push(&rr_type.as_u16().to_be_bytes());
+        self.push(&class.as_u16().to_be_bytes());
+        self.push(&ttl.as_u32().to_be_bytes());
+        self.push(&length.to_be_bytes());
+        self.push(rdata);
+        self.check_size()
+    }
+
+    fn finish_rr(
+        &mut self,
+        rr_type: Rtype,
+        length_position: usize,
+        rdata_start: usize,
+    ) -> Result<(), EncodeError> {
         if self.overflowed {
             return Err(self.overflow_error());
         }
@@ -522,10 +608,13 @@ impl<'a> Encoder<'a> {
     }
 
     fn write_name(&mut self, name: &Name, compressible: bool) {
+        self.write_name_wire(name.as_wire(), compressible);
+    }
+
+    fn write_name_wire(&mut self, wire: &[u8], compressible: bool) {
         if self.overflowed {
             return;
         }
-        let wire = name.as_wire();
         if !self.compress || !compressible {
             self.push(wire);
             return;

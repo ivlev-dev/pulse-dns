@@ -53,12 +53,12 @@ pub mod wire;
 pub use domain::{
     CaaTag, Class, DnskeyData, DsData, Edns, EdnsError, EdnsOption, Flags, Header, MAX_LABEL_LEN,
     MAX_LABELS, MAX_NAME_TEXT_LEN, MAX_NAME_WIRE_LEN, MAX_RRSET_RECORDS, Message, Name, NameError,
-    Nsec3Data, Nsec3ParamData, NsecData, Opcode, Question, Rclass, Rcode, Rdata, RdataError,
-    Record, RecordError, RrType, Rrset, RrsetError, RrsigData, Rtype, Serial, SoaData, SvcParam,
-    SvcbData, TTL_MAX, TlsaData, Ttl, TtlError, TxtData, TypeBitmap, name_cmp,
+    NameRef, Nsec3Data, Nsec3ParamData, NsecData, Opcode, Question, Rclass, Rcode, Rdata,
+    RdataError, Record, RecordError, RrType, Rrset, RrsetError, RrsigData, Rtype, Serial, SoaData,
+    SvcParam, SvcbData, TTL_MAX, TlsaData, Ttl, TtlError, TxtData, TypeBitmap, name_cmp,
 };
 pub use wire::{
     Checkpoint, DecodeError, DecodeLimits, EDNS_DEFAULT_PAYLOAD, EDNS_MAX_PAYLOAD, EncodeError,
     EncodeOptions, EncodeScratch, Encoder, HeaderCounts, MAX_COMPRESSION_POINTERS, MAX_MESSAGE_LEN,
-    MAX_RECORDS, MAX_UDP_PAYLOAD, edns_wire_len,
+    MAX_RECORDS, MAX_UDP_PAYLOAD, MessageRef, edns_wire_len,
 };
