@@ -1,0 +1,57 @@
+[package]
+name = "pulse-loadgen"
+description = "Load-generation and measurement harness for pulsed: DNS load, RSS sampling, allocation and perf reports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# Counting allocator (dhat) для `pulse-alloc`; в обычной сборке выключен.
+alloc = ["dep:dhat"]
+
+[dependencies]
+bytes = "1"
+clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
+dhat = { version = "0.3", optional = true }
+h2 = "0.4"
+hdrhistogram = "7.6"
+http = "1"
+pulse-dns = { path = "../pulse-dns" }
+pulse-tls = { path = "../pulse-tls" }
+pulse-zonefile = { path = "../pulse-zonefile" }
+pulsed = { path = "../pulsed" }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
+rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
+
+[[bin]]
+name = "pulse-loadgen"
+path = "src/bin/pulse-loadgen.rs"
+
+[[bin]]
+name = "pulse-zonegen"
+path = "src/bin/pulse-zonegen.rs"
+
+[[bin]]
+name = "pulse-mem"
+path = "src/bin/pulse-mem.rs"
+
+[[bin]]
+name = "pulse-bench"
+path = "src/bin/pulse-bench.rs"
+
+[[bin]]
+name = "pulse-alloc"
+path = "src/bin/pulse-alloc.rs"
+required-features = ["alloc"]
+
+[lints]
+workspace = true

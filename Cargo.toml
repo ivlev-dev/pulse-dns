@@ -13,6 +13,7 @@ members = [
     "crates/pulse-master",
     "crates/pulse-transfer",
     "crates/pulse-tls",
+    "crates/pulse-loadgen",
 ]
 resolver = "3"
 
