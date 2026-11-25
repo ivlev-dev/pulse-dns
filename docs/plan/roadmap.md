@@ -12,7 +12,7 @@
 
 ## Остаточные ограничения (не блокируют v1)
 
-- Multi-process: каталог (`create/delete zone`, meta) — один писатель; durable-пулы в multi не переиспользуются (bump-only, рекламация в quiescent/repair); `freeze()` локальный.
+- Multi-process: каталог (`create/delete zone`, meta) может менять любой процесс (catalog lease + commit-lock); durable-пулы переиспользуются под lease зоны при `drop_txn < min(D_z, MP всех процессов, freeze)`, `high_water` стабилизируется; `freeze()` пока локальный; `fsck --repair` — офлайн.
 - DoH3/DoQ — серверные транспорты; upstream-клиенты резолвера остаются HTTP/1.1/DoT.
 - Jobs/audit в памяти (TTL 24 ч / ring 4096); import только `text/plain`.
 - DNSCrypt-сертификат без hot-reload; 0-RTT выключен; нет HSM/PKCS#11.
