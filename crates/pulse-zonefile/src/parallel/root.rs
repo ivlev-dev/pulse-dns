@@ -251,9 +251,29 @@ impl RootEntry {
     /// Возвращает `None` для torn/нулевой записи (не паникует на мусоре).
     #[must_use]
     pub fn decode(raw: &[u8]) -> Option<Self> {
+        Self::decode_impl(raw, true)
+    }
+
+    /// Декодирует образ, уже проверенный seqlock-протоколом публикации.
+    ///
+    /// CRC на диске защищает от torn-записи и проверяется при чтении/открытии;
+    /// в памяти [`crate::parallel::store`] публикует целостный 64-байтный образ
+    /// под seqlock, поэтому повторный CRC на каждом снапшоте не нужен. Поля
+    /// (`flags`, `state`, границы) по-прежнему валидируются.
+    #[must_use]
+    pub(crate) fn decode_published(raw: &[u8]) -> Option<Self> {
+        Self::decode_impl(raw, false)
+    }
+
+    fn decode_impl(raw: &[u8], verify_crc: bool) -> Option<Self> {
         let record = raw.get(..ROOT_ENTRY_SIZE as usize)?;
         let stored_crc = get_u32(record, ROOT_OFF_CRC)?;
-        if root_crc(record) != stored_crc {
+        if verify_crc {
+            if root_crc(record) != stored_crc {
+                return None;
+            }
+        } else if record.iter().all(|&byte| byte == 0) {
+            // Нулевой образ — сентинел «головы нет» (`PublishedHead::new`).
             return None;
         }
         let flags = RootFlags::from_bits(get_u8(record, ROOT_OFF_FLAGS)?)?;

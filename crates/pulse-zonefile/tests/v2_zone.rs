@@ -2,7 +2,9 @@
 //! каталог, конкурентность, reopen и негативы владельца/`txn`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use pulse_zonefile::checksum;
 use pulse_zonefile::key::NameRle;
@@ -362,6 +364,59 @@ fn wildcard_ent_overflow_and_iterate() {
 }
 
 #[test]
+fn predecessor_and_owner_walk_are_canonical() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("zones.v2");
+    let store = ParallelStore::create(&path, config()).unwrap();
+    let apex = NameRle::from_ascii("example.com").unwrap();
+    let mut zones = ParallelZones::open(&store).unwrap();
+    zones
+        .create_zone(&apex, ZoneCreateMeta { soa_serial: 1 })
+        .unwrap();
+    let owners = [
+        NameRle::from_ascii("example.com").unwrap(),
+        NameRle::from_ascii("a.example.com").unwrap(),
+        NameRle::from_ascii("m.example.com").unwrap(),
+        NameRle::from_ascii("z.example.com").unwrap(),
+    ];
+    {
+        let mut writer = zones.writer(&apex).unwrap();
+        for (index, owner) in owners.iter().enumerate() {
+            writer
+                .upsert_rrset(
+                    owner,
+                    1,
+                    0,
+                    &rr(300, &[192, 0, 2, u8::try_from(index).unwrap()]),
+                )
+                .unwrap();
+            writer.upsert_rrset(owner, 47, 0, &rr(300, &[0])).unwrap();
+        }
+        writer.commit().unwrap();
+    }
+    let reader = store.reader().unwrap();
+    let view = zones.read(&reader, &apex).unwrap();
+    let mut forward = Vec::new();
+    let mut after = None;
+    while let Some(name) = view.next_name(after.as_ref()).unwrap() {
+        forward.push(name);
+        after = Some(name);
+    }
+    let mut backward = Vec::new();
+    let mut before = None;
+    while let Some(name) = view.prev_name(before.as_ref()).unwrap() {
+        backward.push(name);
+        before = Some(name);
+    }
+    forward.reverse();
+    assert_eq!(forward, backward, "prev_name must mirror next_name");
+    let mut nsec_owners = Vec::new();
+    view.for_each_owner(47, |owner| nsec_owners.push(*owner))
+        .unwrap();
+    assert_eq!(nsec_owners, owners, "NSEC owners in canonical order");
+}
+
+#[test]
 fn foreign_owner_and_page_txn_are_corrupt() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("zones.v2");
@@ -560,6 +615,36 @@ fn empty_zone_iterates_and_commits() {
 }
 
 #[test]
+fn create_zones_across_all_lease_shards() {
+    // Зоны 256/512 пересекали бы шард каталога при старом `zone % 256`:
+    // теперь каталог занимает выделенный шард 0, а lease зоны отпускается
+    // до правки каталога. Регресс — self-deadlock.
+    const ZONES: u32 = 300;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shards.v2");
+    let store = ParallelStore::create(&path, StoreConfig::small(ZONES + 2, 1 << 16)).unwrap();
+    let mut zones = ParallelZones::open(&store).unwrap();
+    for index in 0..ZONES {
+        zones
+            .create_zone(
+                &origin(index),
+                ZoneCreateMeta {
+                    soa_serial: index + 1,
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(zones.zones().len(), usize::try_from(ZONES).unwrap());
+    let reader = store.reader().unwrap();
+    for index in 0..ZONES {
+        let view = zones.read(&reader, &origin(index)).unwrap();
+        assert!(view.version() >= 2);
+        assert_eq!(view.origin(), &origin(index));
+    }
+    assert!(store.fsck_lite().unwrap().ok);
+}
+
+#[test]
 fn many_keys_split_and_reopen() {
     const KEYS: usize = 400;
     let dir = tempfile::tempdir().unwrap();
@@ -652,4 +737,202 @@ fn create_skips_orphan_zone_head() {
     );
     assert_eq!(zones.zone_seq(&apex), Some(2));
     assert_eq!(zones.zones().len(), 1);
+}
+
+/// Сторож зависаний: если тест не уложился в дедлайн, процесс аварийно
+/// завершается — «завис» виден как провал, а не как вечное ожидание CI.
+struct Deadline {
+    done: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Deadline {
+    fn new(limit: Duration) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let handle = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < limit {
+                if flag.load(Ordering::Acquire) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            if !flag.load(Ordering::Acquire) {
+                eprintln!("тест превысил дедлайн {limit:?}: вероятное зависание (deadlock)");
+                std::process::abort();
+            }
+        });
+        Self {
+            done,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn memory_config(max_zones: u32, page_count_max: u32) -> StoreConfig {
+    StoreConfig {
+        sync_mode: SyncModeV2::Memory,
+        ..StoreConfig::small(max_zones, page_count_max)
+    }
+}
+
+#[test]
+fn thousand_zones_create_read_delete_and_recreate() {
+    const ZONES: u32 = 1000;
+    let _deadline = Deadline::new(Duration::from_secs(30));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("z1000.v2");
+    let store = ParallelStore::create(&path, memory_config(ZONES + 8, 1 << 17)).unwrap();
+    let mut zones = ParallelZones::open(&store).unwrap();
+
+    for index in 1..=ZONES {
+        let seq = zones
+            .create_zone(&origin(index), ZoneCreateMeta { soa_serial: index })
+            .unwrap();
+        assert_eq!(seq, index, "zone_seq должен идти подряд");
+    }
+    assert_eq!(zones.zones().len(), usize::try_from(ZONES).unwrap());
+    {
+        let reader = store.reader().unwrap();
+        for index in 1..=ZONES {
+            let view = zones.read(&reader, &origin(index)).unwrap();
+            assert_eq!(view.origin(), &origin(index));
+            assert!(view.version() >= 2);
+        }
+    }
+
+    for index in 1..=ZONES {
+        zones.delete_zone(&origin(index)).unwrap();
+    }
+    store.sync().unwrap();
+    let removed = zones.gc_catalog().unwrap();
+    assert_eq!(removed.len(), usize::try_from(ZONES).unwrap());
+    assert_eq!(zones.zones().len(), 0);
+
+    // Повторное создание после удаления переиспользует durable-tombstone слот,
+    // а не выдаёт `zone_seq` за пределом.
+    let recreated = zones
+        .create_zone(&origin(1), ZoneCreateMeta { soa_serial: 42 })
+        .unwrap();
+    assert!(
+        (1..=ZONES).contains(&recreated),
+        "слот должен переиспользоваться: {recreated}"
+    );
+    assert_eq!(zones.zone_seq(&origin(1)), Some(recreated));
+    assert_eq!(zones.zones().len(), 1);
+    // (issues выводятся ниже при провале)
+    let report = store.fsck_lite().unwrap();
+    assert!(report.ok, "fsck после удаления: {report:?}");
+    drop(zones);
+    drop(store);
+
+    let reopened = ParallelStore::open(&path, OpenConfigV2::default()).unwrap();
+    let catalog = ParallelZones::open(&reopened).unwrap();
+    assert_eq!(catalog.zones().len(), 1);
+    assert_eq!(catalog.zone_seq(&origin(1)), Some(recreated));
+    assert!(reopened.fsck_lite().unwrap().ok);
+}
+
+#[test]
+fn zone_seq_4096_limit_and_reuse() {
+    // Слот 0 — каталог, поэтому `max_zones = 4097` даёт 4096 зон.
+    const SLOTS: u32 = 4097;
+    const ZONES: u32 = SLOTS - 1;
+    let _deadline = Deadline::new(Duration::from_secs(30));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("z4096.v2");
+    let store = ParallelStore::create(&path, memory_config(SLOTS, 1 << 16)).unwrap();
+    let mut zones = ParallelZones::open(&store).unwrap();
+    for index in 1..=ZONES {
+        let seq = zones
+            .create_zone(&origin(index), ZoneCreateMeta { soa_serial: index })
+            .unwrap();
+        assert_eq!(seq, index);
+    }
+    assert_eq!(zones.zones().len(), usize::try_from(ZONES).unwrap());
+
+    // Следующая зона упирается в `max_zones`, `zone_seq` не выходит за предел.
+    let error = zones
+        .create_zone(&origin(ZONES + 1), ZoneCreateMeta { soa_serial: 1 })
+        .unwrap_err();
+    assert!(
+        matches!(error, ParallelError::InvalidArgument { field: "max_zones" }),
+        "неожиданная ошибка на пределе: {error:?}"
+    );
+
+    // Освобождённый слот переиспользуется и остаётся внутри `max_zones`.
+    zones.delete_zone(&origin(1)).unwrap();
+    store.sync().unwrap();
+    assert_eq!(zones.gc_catalog().unwrap().len(), 1);
+    let reused = zones
+        .create_zone(&origin(ZONES + 2), ZoneCreateMeta { soa_serial: 1 })
+        .unwrap();
+    assert!((1..ZONES + 1).contains(&reused), "reused={reused}");
+    assert_eq!(zones.zones().len(), usize::try_from(ZONES).unwrap());
+    assert!(store.fsck_lite().unwrap().ok);
+}
+
+#[test]
+fn four_threads_create_zones_without_hang() {
+    const ZONES: u32 = 600;
+    const THREADS: u32 = 4;
+    let _deadline = Deadline::new(Duration::from_secs(30));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("z4t.v2");
+    let store = ParallelStore::create(&path, memory_config(ZONES + 8, 1 << 17)).unwrap();
+    // Каталог — один writer (ADR 0007 §8, R4): потоки сериализуют правку
+    // каталога, но создание зоны (lease зоны → каталог) идёт из 4 потоков и
+    // проверяет отсутствие self-deadlock на слотах 256/512.
+    let catalog = Mutex::new(ParallelZones::open(&store).unwrap());
+    let next = AtomicU64::new(1);
+    let seqs = Mutex::new(std::collections::HashSet::new());
+    thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                loop {
+                    let index = u32::try_from(next.fetch_add(1, Ordering::Relaxed)).unwrap();
+                    if index > ZONES {
+                        break;
+                    }
+                    let created = {
+                        let mut zones = catalog.lock().unwrap();
+                        zones.create_zone(&origin(index), ZoneCreateMeta { soa_serial: index })
+                    };
+                    seqs.lock().unwrap().insert(created.unwrap());
+                }
+            });
+        }
+    });
+    let zones = catalog.into_inner().unwrap();
+    assert_eq!(zones.zones().len(), usize::try_from(ZONES).unwrap());
+    let seqs = seqs.into_inner().unwrap();
+    assert_eq!(seqs.len(), usize::try_from(ZONES).unwrap());
+    assert!((1..=ZONES).all(|seq| seqs.contains(&seq)));
+    store.sync().unwrap();
+    assert!(store.fsck_lite().unwrap().ok);
+}
+
+#[test]
+fn max_zones_geometry_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    for max_zones in [0, pulse_zonefile::parallel::consts::MAX_ZONES_V2 + 1] {
+        let path = dir.path().join(format!("guard-{max_zones}.v2"));
+        let error = ParallelStore::create(&path, StoreConfig::small(max_zones, 1 << 16))
+            .expect_err("max_zones вне допустимого диапазона должен отвергаться");
+        assert!(
+            matches!(error, ParallelError::InvalidArgument { field: "max_zones" }),
+            "max_zones={max_zones}: {error:?}"
+        );
+        assert!(!path.exists(), "файл не должен создаваться при отказе");
+    }
 }

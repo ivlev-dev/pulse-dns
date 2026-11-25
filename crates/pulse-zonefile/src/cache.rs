@@ -80,6 +80,12 @@ struct CacheSet {
 }
 
 /// Потокобезопасный кеш валидированных страниц узлов.
+///
+/// Роль — только метаданные узла (`Arc<NodeMeta>`); сырые байты страниц живут
+/// в [`PageCacheV2`](crate::parallel::pagecache::PageCacheV2). Hit-путь не
+/// пишет в разделяемые атомики: метка `used` обновляется при вставке, поэтому
+/// вытеснение приближённо FIFO внутри 4-way набора (для read-only кеша это
+/// дешевле и не создаёт cache-line ping-pong).
 pub struct PageCache {
     page_size: u32,
     capacity: usize,
@@ -87,6 +93,7 @@ pub struct PageCache {
     entries: RwLock<Vec<CacheSet>>,
     hits: AtomicU64,
     misses: AtomicU64,
+    evictions: AtomicU64,
     clock: AtomicU64,
 }
 
@@ -119,6 +126,7 @@ impl PageCache {
             entries: RwLock::new(vec![CacheSet::default(); capacity.div_ceil(ways)]),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
             clock: AtomicU64::new(0),
         }
     }
@@ -149,12 +157,33 @@ impl PageCache {
     pub fn reset_stats(&self) {
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
+        self.evictions.store(0, Ordering::Relaxed);
+    }
+
+    /// Число вытеснений с момента создания/сброса метрик.
+    #[must_use]
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
+    }
+
+    /// Оценка памяти, занятой метаданными кеша (без `Arc`-оверхеда).
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        let Ok(sets) = self.entries.read() else {
+            return 0;
+        };
+        sets.iter()
+            .flat_map(|set| set.ways.iter().flatten())
+            .map(|entry| std::mem::size_of::<CacheEntry>() + entry.meta.heap_bytes())
+            .sum()
     }
 
     /// Полностью очищает кеш (используется при смене снапшота/бенчмарками).
     pub fn clear(&self) {
         if let Ok(mut entries) = self.entries.write() {
-            entries.clear();
+            for set in entries.iter_mut() {
+                set.ways = std::array::from_fn(|_| None);
+            }
         }
     }
 
@@ -254,11 +283,8 @@ impl PageCache {
             .iter()
             .flatten()
             .find(|entry| entry.meta.page_no == key.0 && entry.meta.txn == key.1)?;
-        let entry = Arc::clone(entry);
-        drop(sets);
-        let clock = self.clock.fetch_add(1, Ordering::Relaxed);
-        entry.used.store(clock, Ordering::Relaxed);
-        Some(entry)
+        // Hit не пишет в разделяемые атомики (см. doc-комментарий типа).
+        Some(Arc::clone(entry))
     }
 
     fn set_index_for(page_no: u32, set_count: usize) -> usize {
@@ -306,6 +332,7 @@ impl PageCache {
             && let Some(way) = set.ways.get_mut(victim)
         {
             *way = Some(entry);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

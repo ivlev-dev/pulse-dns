@@ -446,7 +446,36 @@ const ZONE_DEGRADED: u8 = 1 << 0;
 const ZONE_NEEDS_FSCK: u8 = 1 << 1;
 const CHAIN_UNKNOWN: u32 = u32::MAX;
 const LEASE_SHARDS: usize = 256;
+/// Шард lease каталога зон (`owner_zone = 0`).
+///
+/// Зарезервирован: зоны в него не отображаются (см. [`lease_shard`]). Иначе
+/// `zone_seq % LEASE_SHARDS == 0` даёт зоне тот же **нереентерабельный**
+/// `Mutex`, что и каталогу, и `create_zone` (lease зоны → правка каталога)
+/// встаёт в self-deadlock на 256-й зоне.
+const CATALOG_LEASE_SHARD: usize = 0;
+/// Число шардов, доступных зонам: все, кроме каталога.
+const ZONE_LEASE_SHARDS: usize = LEASE_SHARDS - 1;
 const FREE_POOL_SHARDS: usize = 256;
+/// Порог числа bucket-групп каталога, после которого append-цепочка
+/// сливается в одну группу (компакция с переиспользованием страниц).
+const CATALOG_COMPACT_GROUPS: usize = 64;
+
+/// Шард lease для `zone` (`0` — каталог).
+///
+/// Каталог занимает выделенный шард `CATALOG_LEASE_SHARD`, зоны — остальные
+/// `ZONE_LEASE_SHARDS`; пересечения каталога и зоны нет ни при каком
+/// `zone_seq`. Совпадение шардов **разных зон** по-прежнему допустимо: оно
+/// лишь сериализует их открытие/коммит (точное исключение даёт per-zone
+/// `fcntl`-lease в multi-режиме, ADR 0007 §5.1).
+const fn lease_shard(zone: u32) -> usize {
+    if zone == 0 {
+        CATALOG_LEASE_SHARD
+    } else {
+        // `+1` — пропуск шарда каталога; `zone >= 1`, поэтому индекс <
+        // `LEASE_SHARDS`.
+        1 + (zone as usize) % ZONE_LEASE_SHARDS
+    }
+}
 static FALLBACK_LEASE: Mutex<()> = Mutex::new(());
 /// Запасной шард пула (используется только при нарушении индексации).
 static FALLBACK_POOL: std::sync::LazyLock<Mutex<FreePoolShard>> =
@@ -1109,6 +1138,19 @@ impl ParallelStore {
         self.node_cache.as_ref()
     }
 
+    /// Оценка памяти обоих кешей чтения (образы страниц + метаданные узлов).
+    ///
+    /// Не учитывает заголовки аллокатора и `Arc`; лимит задаётся
+    /// [`StoreConfig::page_cache_entries`].
+    #[must_use]
+    pub fn cache_memory_bytes(&self) -> usize {
+        self.raw_cache.as_ref().map_or(0, PageCacheV2::memory_bytes)
+            + self
+                .node_cache
+                .as_ref()
+                .map_or(0, crate::cache::PageCache::memory_bytes)
+    }
+
     /// Текущий `high_water` (первая невыданная страница).
     #[must_use]
     pub fn high_water(&self) -> u64 {
@@ -1164,6 +1206,19 @@ impl ParallelStore {
     fn pool_shard(&self, zone: u32) -> &Mutex<FreePoolShard> {
         let index = (zone as usize) % FREE_POOL_SHARDS;
         self.pools.get(index).unwrap_or(&FALLBACK_POOL)
+    }
+
+    /// Можно ли каталогу (single-process) писать пул append-only.
+    ///
+    /// Append дешёвый, но не умеет выдёргивать страницы из уже записанных
+    /// групп. Поэтому он допустим, только пока в пуле нет переиспользованных
+    /// страниц (`dirty`) и групп меньше [`CATALOG_COMPACT_GROUPS`]; иначе
+    /// каталог идёт COW-путём со слиянием групп (reclaim + компакция).
+    fn catalog_append_allowed(&self) -> bool {
+        let shard = lock_unpoison(self.pool_shard(0));
+        shard.zones.get(&0).is_none_or(|entry| {
+            !entry.dirty && entry.chain.buckets().len() < CATALOG_COMPACT_GROUPS
+        })
     }
 
     fn load_zone_chain(&self, zone: u32) -> Result<FreeChain, ParallelError> {
@@ -1435,7 +1490,7 @@ impl ParallelStore {
         // fdatasync; более новые публикации останутся неdurable (консервативно).
         let mut durable_heads = Vec::new();
         for (index, block) in self.heads.iter().enumerate() {
-            if let HeadRead::Stable(entry) = block.load()
+            if let HeadRead::Stable { entry, .. } = block.load()
                 && let Ok(zone) = u32::try_from(index)
             {
                 durable_heads.push((zone, entry.version));
@@ -2214,6 +2269,16 @@ impl ParallelStore {
         if self.is_multi() {
             return self.prepare_reclaim_multi(zone, version, drops, needs_chain, max_allocated);
         }
+        // Каталог получает коммит на каждое создание/удаление зоны. Пока
+        // страницы пула не reclaimed (Memory/no durable) и групп немного —
+        // пишем append-only (O(1) на коммит вместо COW-перестройки O(n),
+        // которая на 1000+ зонах давала минуты). Как только появляется
+        // reclaimable-страница (`dirty`) или групп становится много, каталог
+        // идёт по COW-пути with merge (см. ниже): это и переиспользует
+        // страницы, и не даёт цепочке расти бесконечно.
+        if zone == 0 && self.catalog_append_allowed() {
+            return self.prepare_reclaim_multi(zone, version, drops, needs_chain, max_allocated);
+        }
         let durable = self.durable_version(zone);
         let rv = self.reclaim_ceiling(zone);
         let data_first = self.geometry.page_data_first();
@@ -2255,6 +2320,7 @@ impl ParallelStore {
                 rv,
                 version,
                 max_allocated,
+                true,
             )?);
         }
         let rebuild = pool.dirty || !drops.is_empty() || !pool.immediate.is_empty() || needs_chain;
@@ -2283,10 +2349,19 @@ impl ParallelStore {
             freed.push(page);
             Ok(())
         };
+        // Каталог: слить все группы в одну. Иначе COW-перестройка сохраняет
+        // по группе на каждый коммит, и append-фаза (Memory) оставляла бы
+        // цепочку из тысяч bucket'ов, которые потом переписываются целиком.
+        let merge_catalog = zone == 0;
         for bucket in pool.chain.buckets() {
             // Страница 0 — группа, созданная GC и ещё не закодированная.
             if bucket.page != 0 {
                 push(bucket.page)?;
+            }
+            if merge_catalog {
+                for page in &bucket.pages {
+                    push(*page)?;
+                }
             }
         }
         for page in drops {
@@ -2294,6 +2369,9 @@ impl ParallelStore {
         }
         for page in std::mem::take(&mut pool.immediate) {
             push(page)?;
+        }
+        if merge_catalog {
+            pool.chain = FreeChain::empty();
         }
         pool.chain.push_group(version, &freed, data_first)?;
 
@@ -2320,6 +2398,7 @@ impl ParallelStore {
                     rv,
                     version,
                     max_allocated,
+                    true,
                 )?;
                 if !assigned.insert(page) || page == chain_page.unwrap_or(0) {
                     return Err(ParallelError::Corrupt {
@@ -2370,6 +2449,9 @@ impl ParallelStore {
         let rv = self.reclaim_ceiling(zone);
         let mut chain_page = None;
         if needs_chain {
+            // Append-путь не пересобирает цепочку, поэтому выдача страницы
+            // из неё оставила бы её же в старой bucket-группе (дубль).
+            let reuse = !self.is_multi() && zone != 0;
             chain_page = Some(Self::allocate_from_pool(
                 self,
                 &mut entry.chain,
@@ -2377,6 +2459,7 @@ impl ParallelStore {
                 rv,
                 version,
                 max_allocated,
+                reuse,
             )?);
         }
         let immediate = std::mem::take(&mut entry.immediate);
@@ -2477,13 +2560,13 @@ impl ParallelStore {
         rv: u64,
         version: u64,
         max_allocated: &mut u64,
+        reuse: bool,
     ) -> Result<u32, ParallelError> {
-        // Межпроцессный режим не переиспользует durable-пул: кэш `FreeChain`
-        // локален для процесса, и выдача из чужого bucket'а дала бы двойную
-        // аллокацию. Bump-only сохраняет инвариант «страница выдана один раз».
-        if !self.is_multi()
-            && let Some(page) = chain.take_eligible(durable, rv, version)
-        {
+        // Межпроцессный режим и append-only каталог не переиспользуют
+        // durable-пул: выдача из него без пересборки цепочки дала бы дубль
+        // страницы в bucket-группах. Bump-only сохраняет инвариант «страница
+        // выдана один раз».
+        if reuse && let Some(page) = chain.take_eligible(durable, rv, version) {
             return Ok(page);
         }
         let ticket = self.allocator.reserve_exact(1)?;
@@ -2586,8 +2669,8 @@ impl ParallelStore {
         let e0 = self.published_txn.load(Ordering::Acquire);
         let mut stuck_odd: Option<(u32, std::time::Instant)> = None;
         for attempt in 0..PIN_ATTEMPTS {
-            let head = match self.head_read(zone) {
-                HeadRead::Stable(entry) => entry,
+            let (head, head_nonce) = match self.head_read(zone) {
+                HeadRead::Stable { entry, nonce } => (entry, nonce),
                 HeadRead::Empty => return Err(ParallelError::NoZoneVersion { zone }),
                 HeadRead::Unstable => {
                     if attempt + 1 == PIN_ATTEMPTS {
@@ -2607,11 +2690,11 @@ impl ParallelStore {
             let c1 = self.load_guard(zone);
             let e2 = self.published_txn.load(Ordering::Acquire);
             let c2 = self.load_guard(zone);
-            let head2 = self.head_read(zone);
-            let stable = c1 == c2
-                && c1.is_multiple_of(2)
-                && e2 == e0
-                && matches!(head2, HeadRead::Stable(entry) if entry.version == head.version);
+            // Полный повторный `head_read` не нужен: seqlock-счётчик меняется
+            // при каждой публикации, поэтому равенство nonce гарантирует ту же
+            // версию головы без повторного CRC/декодирования.
+            let head_stable = self.head_nonce(zone) == Some(head_nonce);
+            let stable = c1 == c2 && c1.is_multiple_of(2) && e2 == e0 && head_stable;
             if stable {
                 return Ok(ZoneSnapshot {
                     root: head,
@@ -3232,7 +3315,7 @@ impl ParallelStore {
         }
         match self.heads.get(zone as usize) {
             Some(block) => match block.load() {
-                HeadRead::Stable(entry) => Some(entry),
+                HeadRead::Stable { entry, .. } => Some(entry),
                 HeadRead::Empty | HeadRead::Unstable => None,
             },
             None => None,
@@ -3245,8 +3328,12 @@ impl ParallelStore {
             .map_or(HeadRead::Empty, PublishedHead::load)
     }
 
+    fn head_nonce(&self, zone: u32) -> Option<u64> {
+        self.heads.get(zone as usize).map(PublishedHead::read_nonce)
+    }
+
     fn lease(&self, zone: u32) -> &Mutex<()> {
-        let index = (zone as usize) % LEASE_SHARDS;
+        let index = lease_shard(zone);
         match self.leases.get(index) {
             Some(lease) => lease,
             None => self.leases.first().unwrap_or(&FALLBACK_LEASE),
@@ -3583,7 +3670,7 @@ struct ChainStats {
 
 enum HeadRead {
     Empty,
-    Stable(RootEntry),
+    Stable { entry: RootEntry, nonce: u64 },
     Unstable,
 }
 
@@ -3631,10 +3718,18 @@ impl PublishedHead {
         if first != second || !second.is_multiple_of(2) {
             return HeadRead::Unstable;
         }
-        match RootEntry::decode(&raw) {
-            Some(entry) => HeadRead::Stable(entry),
+        match RootEntry::decode_published(&raw) {
+            Some(entry) => HeadRead::Stable {
+                entry,
+                nonce: second,
+            },
             None => HeadRead::Empty,
         }
+    }
+
+    /// Текущее значение seqlock-счётчика (чётное — запись не идёт).
+    fn read_nonce(&self) -> u64 {
+        self.nonce.load(Ordering::Acquire)
     }
 }
 
@@ -3895,4 +3990,35 @@ pub fn fsck_repair(path: &Path) -> Result<RepairReport, ParallelError> {
         },
     )?;
     store.repair_leaks()
+}
+
+#[cfg(test)]
+mod lease_shard_tests {
+    use super::{CATALOG_LEASE_SHARD, LEASE_SHARDS, ParallelStore, StoreConfig, lease_shard};
+
+    #[test]
+    fn catalog_shard_is_reserved_for_zone_zero() {
+        assert_eq!(lease_shard(0), CATALOG_LEASE_SHARD);
+        // Ни одна зона, включая предел `MAX_ZONES_V2`, не попадает в шард
+        // каталога и не выходит за пределы массива lease.
+        for zone in 1..=crate::parallel::consts::MAX_ZONES_V2 {
+            let shard = lease_shard(zone);
+            assert_ne!(shard, CATALOG_LEASE_SHARD, "zone {zone}");
+            assert!(shard < LEASE_SHARDS, "zone {zone} -> shard {shard}");
+        }
+    }
+
+    #[test]
+    fn catalog_lease_mutex_differs_from_every_zone_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease-shards.v2");
+        let store = ParallelStore::create(&path, StoreConfig::small(8, 64)).unwrap();
+        let catalog = store.lease(0);
+        for zone in [1, 255, 256, 511, 512, 4095, 4096] {
+            assert!(
+                !std::ptr::eq(catalog, store.lease(zone)),
+                "zone {zone} shares the catalog lease mutex"
+            );
+        }
+    }
 }

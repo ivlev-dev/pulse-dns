@@ -150,6 +150,23 @@ impl NameRle {
         Ok(Self { buf, len })
     }
 
+    /// Копирует уже провалидированное RLE-имя без повторной проверки.
+    ///
+    /// Используется на горячем пути чтения: байты имени прошли валидацию
+    /// страницы/ключа раньше. `None` — имя не помещается в [`NAME_MAX`].
+    #[must_use]
+    pub(crate) fn from_validated(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > NAME_MAX {
+            return None;
+        }
+        let mut buf = [0_u8; NAME_MAX];
+        buf.get_mut(..bytes.len())?.copy_from_slice(bytes);
+        Some(Self {
+            buf,
+            len: u8::try_from(bytes.len()).ok()?,
+        })
+    }
+
     /// Нормализует RLE-имя: проверяет структуру и приводит метки к lowercase.
     ///
     /// Используется для входных имён, а не для чтения файла.
@@ -642,6 +659,101 @@ pub(crate) fn compare_raw_to_key_len(
     Ordering::Equal
 }
 
+/// Длина байтово-сравнимого префикса ключа ([`OrderKey`]).
+pub(crate) const ORDER_KEY_BYTES: usize = 16;
+
+/// Байтово-сравнимый префикс ключа для `memcmp`-поиска.
+///
+/// Кодирование сохраняет канонический порядок [`compare_keys`] для первых
+/// [`ORDER_KEY_BYTES`] байт:
+///
+/// * метки идут в порядке хранения (TLD → owner);
+/// * содержимое метки кодируется как есть, байт `0x00` экранируется в
+///   `0x00 0xFF` (экранирование сохраняет порядок), после метки — `0x00`;
+/// * после последней метки — ещё один `0x00` (терминатор имени), поэтому
+///   предок всегда меньше потомка;
+/// * затем `type`, `class`, `subtype` как big-endian `u16`;
+/// * короткий ключ добивается нулями.
+///
+/// Равенство префиксов **не** означает равенства ключей: в этом случае
+/// вызывающий обязан сравнить ключи полностью. Префикс — производная в
+/// памяти, на диске его нет.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) struct OrderKey {
+    bytes: [u8; ORDER_KEY_BYTES],
+}
+
+impl std::fmt::Debug for OrderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OrderKey({:02x?})", self.bytes)
+    }
+}
+
+impl OrderKey {
+    /// Префикс провалидированного [`Key`].
+    #[must_use]
+    pub(crate) fn of_key(key: &Key) -> Self {
+        Self::from_validated(key.as_bytes(), key.owner_len())
+    }
+
+    /// Префикс провалидированного ключа `RLE(name) || u16 || u16 || u16`.
+    #[must_use]
+    pub(crate) fn from_validated(bytes: &[u8], name_len: usize) -> Self {
+        let mut out = [0_u8; ORDER_KEY_BYTES];
+        let mut written = 0_usize;
+        let mut offset = 0_usize;
+        while written < ORDER_KEY_BYTES {
+            let Some(&label_len) = bytes.get(offset) else {
+                break;
+            };
+            offset += 1;
+            if label_len == 0 {
+                push_order_byte(&mut out, &mut written, 0);
+                break;
+            }
+            let end = offset.saturating_add(usize::from(label_len));
+            let Some(label) = bytes.get(offset..end) else {
+                break;
+            };
+            offset = end;
+            for &byte in label {
+                if written >= ORDER_KEY_BYTES {
+                    break;
+                }
+                if byte == 0 {
+                    push_order_byte(&mut out, &mut written, 0);
+                    push_order_byte(&mut out, &mut written, 0xFF);
+                } else {
+                    push_order_byte(&mut out, &mut written, byte);
+                }
+            }
+            push_order_byte(&mut out, &mut written, 0);
+        }
+        if written < ORDER_KEY_BYTES && name_len <= bytes.len() {
+            for index in 0..3_usize {
+                let value = wire::read_u16(bytes, name_len + index * 2).unwrap_or(0);
+                for byte in value.to_be_bytes() {
+                    push_order_byte(&mut out, &mut written, byte);
+                }
+            }
+        }
+        Self { bytes: out }
+    }
+
+    /// Порядок префиксов (`memcmp`).
+    #[must_use]
+    pub(crate) fn cmp(&self, other: &Self) -> Ordering {
+        self.bytes.cmp(&other.bytes)
+    }
+}
+
+fn push_order_byte(out: &mut [u8; ORDER_KEY_BYTES], written: &mut usize, byte: u8) {
+    if let Some(slot) = out.get_mut(*written) {
+        *slot = byte;
+        *written += 1;
+    }
+}
+
 /// Сравнивает два уже валидированных ключа без повторной RLE-проверки.
 pub(crate) fn compare_validated(left: &Key, right: &Key) -> Ordering {
     let name_order = cmp_rle(left.owner_bytes(), right.owner_bytes());
@@ -1085,5 +1197,60 @@ mod tests {
         assert!(NameRle::parse(&[1, b'a']).is_err());
         assert!(NameRle::parse(&[1, b'A', 0]).is_err());
         assert!(NameRle::normalize(&[1, b'A', 0]).is_ok());
+    }
+
+    fn rle(labels: &[&[u8]]) -> NameRle {
+        let mut bytes = Vec::new();
+        for label in labels {
+            bytes.push(u8::try_from(label.len()).unwrap());
+            bytes.extend_from_slice(label);
+        }
+        bytes.push(0);
+        NameRle::parse(&bytes).unwrap()
+    }
+
+    /// Если префиксы различаются, их порядок обязан совпадать с полным
+    /// компаратором (включая метки с `0x00`, предков и длинные имена).
+    #[test]
+    fn order_key_matches_full_comparator() {
+        let names = [
+            rle(&[b"com"]),
+            rle(&[b"com", b"example"]),
+            rle(&[b"com", b"example", b"www"]),
+            rle(&[b"com", b"example", b"a"]),
+            rle(&[b"com", b"example", b"ab"]),
+            rle(&[b"com", b"example", b"b"]),
+            rle(&[b"com", b"example", &[0x00]]),
+            rle(&[b"com", b"example", &[0x00, 0x00]]),
+            rle(&[b"com", b"example", &[0x00, 0x01]]),
+            rle(&[b"com", b"example", &[0x01]]),
+            rle(&[b"com", b"example", &[0x00, 0xFF]]),
+            rle(&[b"org"]),
+            rle(&[
+                b"org",
+                b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ]),
+        ];
+        let mut keys = Vec::new();
+        for name in &names {
+            for rr_type in [T_NODE, 1, 16, 46] {
+                for subtype in [0, 1, 24] {
+                    keys.push(Key::new(name, rr_type, CLASS_IN, subtype).unwrap());
+                    keys.push(Key::new(name, rr_type, 0, subtype).unwrap());
+                }
+            }
+        }
+        for left in &keys {
+            for right in &keys {
+                let full = compare_validated(left, right);
+                let prefix = OrderKey::of_key(left).cmp(&OrderKey::of_key(right));
+                if prefix != Ordering::Equal {
+                    assert_eq!(
+                        prefix, full,
+                        "префикс разошёлся с полным компаратором: {left:?} vs {right:?}"
+                    );
+                }
+            }
+        }
     }
 }

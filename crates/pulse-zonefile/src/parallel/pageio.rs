@@ -22,7 +22,8 @@
 //! * dirty-страницы пишутся одной пачкой при коммите.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use crate::consts::PAGE_OFF_TXN;
@@ -38,38 +39,62 @@ use crate::wire;
 /// Размер страницы v2 (фаза A/B1 — только 4096).
 pub const V2_PAGE_BYTES: u32 = PAGE_SIZE_V2;
 
-/// Арена прочитанных страниц: только append, слоты не переиспользуются.
+/// Арена прочитанных страниц: append-only, слоты не переиспользуются.
 ///
 /// Ссылка на страницу живёт столько же, сколько `&self`; буферы — отдельные
-/// `Arc<[u8]>`, поэтому рост `Vec` их не перемещает.
+/// `Arc<[u8]>`, поэтому рост/перестроение таблицы их не перемещает.
+///
+/// Таблица — хеш-карта `page_no → Arc<[u8]>`: поиск `O(1)` вместо линейного
+/// скана (на широких зонах арена держит тысячи страниц).
 #[derive(Debug, Default)]
 struct PageArena {
-    pages: RefCell<Vec<(u32, Arc<[u8]>)>>,
+    pages: RefCell<PageMap>,
 }
+
+/// Быстрый хешер номеров страниц (номер уже равномерный, `SipHash` избыточен).
+#[derive(Default)]
+struct PageHasher(u64);
+
+impl Hasher for PageHasher {
+    fn finish(&self) -> u64 {
+        self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 << 8) | u64::from(byte);
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0 = u64::from(value);
+    }
+}
+
+type PageMap = HashMap<u32, Arc<[u8]>, BuildHasherDefault<PageHasher>>;
 
 impl PageArena {
     // Обоснование `unsafe`: арена только дополняется, `Arc<[u8]>` не
-    // перемещаются при росте `Vec`, а очистка доступна лишь через `&mut self`,
-    // поэтому выданный срез живёт не дольше заимствования арены.
+    // перемещаются при росте таблицы (данные лежат в отдельной аллокации),
+    // а очистка доступна лишь через `&mut self`, поэтому выданный срез живёт
+    // не дольше заимствования арены.
     #[allow(unsafe_code)]
     fn lookup(&self, page: u32) -> Option<&[u8]> {
         let pages = self.pages.borrow();
-        let (_, buffer) = pages.iter().rev().find(|(number, _)| *number == page)?;
+        let buffer = pages.get(&page)?;
         let pointer = buffer.as_ptr();
         let length = buffer.len();
-        // SAFETY: `pages` — append-only арена; `Arc<[u8]>` не перемещаются и не
-        // освобождаются, пока жив `&self`. Возвращаемый срез привязан к
-        // `&self`, а `PageArena` очищается только через `&mut self`.
+        // SAFETY: см. комментарий к `PageArena`; буфер не освобождается, пока
+        // жив `&self`.
         Some(unsafe { std::slice::from_raw_parts(pointer, length) })
     }
 
     #[allow(unsafe_code)]
     fn store(&self, page: u32, buffer: Arc<[u8]>) -> &[u8] {
         let mut pages = self.pages.borrow_mut();
-        pages.push((page, buffer));
-        let Some((_, buffer)) = pages.last() else {
-            return &[];
-        };
+        // Повторная вставка не подменяет образ: на него могут ссылаться
+        // выданные ранее срезы.
+        let buffer = pages.entry(page).or_insert(buffer);
         let pointer = buffer.as_ptr();
         let length = buffer.len();
         // SAFETY: см. `lookup`; буфер только что добавлен и не будет

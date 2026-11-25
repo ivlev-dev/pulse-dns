@@ -2285,7 +2285,13 @@ mod tests {
 
 use std::sync::Arc;
 
-use crate::key::{KEY_MAX, compare_raw_to_key_len};
+use crate::key::{KEY_MAX, OrderKey, compare_raw_to_key_len};
+
+/// Минимальное число item'ов в узле, при котором `memcmp`-префикс окупается.
+///
+/// На маленьких узлах (типичный горячий лист) полный компаратор дешевле
+/// вычисления `OrderKey` целиком.
+const ORDER_KEY_MIN_ITEMS: usize = 16;
 
 /// Метаданные валидированного узла, отделённые от байтов страницы.
 ///
@@ -2299,10 +2305,12 @@ pub(crate) struct NodeMeta {
     pub(crate) header: NodeHeader,
     pub(crate) interval: usize,
     pub(crate) page_size: usize,
-    slots: [u16; MAX_ITEMS_PER_PAGE],
-    restarts: [u16; MAX_RESTARTS_PER_PAGE],
-    name_lens: [u8; MAX_ITEMS_PER_PAGE],
-    zone_entry: [u64; MAX_ZONE_BITS],
+    slots: Box<[u16]>,
+    restarts: Box<[u16]>,
+    name_lens: Box<[u8]>,
+    zone_entry: Box<[u64]>,
+    /// Байтово-сравнимый префикс каждого item'а (`memcmp` на горячем пути).
+    order_keys: Box<[OrderKey]>,
 }
 
 impl std::fmt::Debug for NodeMeta {
@@ -2317,6 +2325,17 @@ impl std::fmt::Debug for NodeMeta {
 }
 
 impl NodeMeta {
+    /// Оценка heap-памяти метаданных (без заголовков аллокатора).
+    #[must_use]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.slots.len() * std::mem::size_of::<u16>()
+            + self.restarts.len() * std::mem::size_of::<u16>()
+            + self.name_lens.len()
+            + self.zone_entry.len() * std::mem::size_of::<u64>()
+            + self.order_keys.len() * std::mem::size_of::<OrderKey>()
+    }
+
     /// Валидирует лист целиком (структура + элементы) и сохраняет метаданные.
     pub(crate) fn validate_leaf(
         page: &[u8],
@@ -2334,7 +2353,8 @@ impl NodeMeta {
         }
         let mut raw = RawNode::decode(page, page_no, page_size, 0, LEAF_INTERVAL)?;
         raw.validate_leaf_items()?;
-        Ok(raw.into_meta(true, header.txn))
+        let order_keys = raw.collect_order_keys()?;
+        Ok(raw.into_meta(true, header.txn, order_keys))
     }
 
     /// Строит метаданные только что закодированного листа без перечитывания
@@ -2399,19 +2419,13 @@ impl NodeMeta {
         }
         let restart_base = NODE_HEADER_BYTES;
         let slot_base = restart_base + 2 * n_restarts_usize;
-        let mut slots = [0_u16; MAX_ITEMS_PER_PAGE];
-        let mut restarts = [0_u16; MAX_RESTARTS_PER_PAGE];
+        let mut restarts = Vec::with_capacity(n_restarts_usize);
         for index in 0..n_restarts_usize {
-            let value = get_u16(page, restart_base + 2 * index, page_no)?;
-            if let Some(slot) = restarts.get_mut(index) {
-                *slot = value;
-            }
+            restarts.push(get_u16(page, restart_base + 2 * index, page_no)?);
         }
+        let mut slots = Vec::with_capacity(n_items_usize);
         for index in 0..n_items_usize {
-            let value = get_u16(page, slot_base + 2 * index, page_no)?;
-            if let Some(slot) = slots.get_mut(index) {
-                *slot = value;
-            }
+            slots.push(get_u16(page, slot_base + 2 * index, page_no)?);
         }
         Ok(Self {
             page_no,
@@ -2433,10 +2447,11 @@ impl NodeMeta {
                     CorruptDetail::OffsetOutOfRange,
                 )
             })?,
-            slots,
-            restarts,
-            name_lens: [0_u8; MAX_ITEMS_PER_PAGE],
-            zone_entry: [0_u64; MAX_ZONE_BITS],
+            slots: slots.into_boxed_slice(),
+            restarts: restarts.into_boxed_slice(),
+            name_lens: vec![0_u8; n_items_usize].into_boxed_slice(),
+            zone_entry: vec![0_u64; n_items_usize.div_ceil(64)].into_boxed_slice(),
+            order_keys: vec![OrderKey::default(); n_items_usize].into_boxed_slice(),
         })
     }
 
@@ -2463,6 +2478,9 @@ impl NodeMeta {
             })?;
             if let Some(slot) = self.name_lens.get_mut(index) {
                 *slot = name_len;
+            }
+            if let Some(slot) = self.order_keys.get_mut(index) {
+                *slot = OrderKey::of_key(key);
             }
             if let Some(value) = value(index)
                 && matches!(value, ItemValue::ZoneEntry(_))
@@ -2499,12 +2517,24 @@ impl NodeMeta {
         }
         let mut raw = RawNode::decode(page, page_no, page_size, level, BRANCH_INTERVAL)?;
         raw.validate_branch_items()?;
-        Ok(raw.into_meta(false, header.txn))
+        let order_keys = raw.collect_order_keys()?;
+        Ok(raw.into_meta(false, header.txn, order_keys))
     }
 }
 
 impl RawNode<'_> {
-    fn into_meta(self, is_leaf: bool, txn: u64) -> NodeMeta {
+    /// Собирает байтово-сравнимые префиксы всех item'ов (холодный путь).
+    fn collect_order_keys(&self) -> Result<Box<[OrderKey]>, ZoneFileError> {
+        let mut keys = Vec::with_capacity(self.n_items());
+        let mut prev = Key::placeholder();
+        for index in 0..self.n_items() {
+            prev = self.next_key(&prev, index)?;
+            keys.push(OrderKey::of_key(&prev));
+        }
+        Ok(keys.into_boxed_slice())
+    }
+
+    fn into_meta(self, is_leaf: bool, txn: u64, order_keys: Box<[OrderKey]>) -> NodeMeta {
         NodeMeta {
             page_no: self.page_no,
             txn,
@@ -2512,10 +2542,31 @@ impl RawNode<'_> {
             header: self.header,
             interval: self.interval,
             page_size: self.page_size,
-            slots: self.slots,
-            restarts: self.restarts,
-            name_lens: self.name_lens,
-            zone_entry: self.zone_entry,
+            slots: self
+                .slots
+                .get(..self.n_items())
+                .unwrap_or(&[])
+                .to_vec()
+                .into_boxed_slice(),
+            restarts: self
+                .restarts
+                .get(..self.n_restarts())
+                .unwrap_or(&[])
+                .to_vec()
+                .into_boxed_slice(),
+            name_lens: self
+                .name_lens
+                .get(..self.n_items())
+                .unwrap_or(&[])
+                .to_vec()
+                .into_boxed_slice(),
+            zone_entry: self
+                .zone_entry
+                .get(..self.n_items().div_ceil(64))
+                .unwrap_or(&[])
+                .to_vec()
+                .into_boxed_slice(),
+            order_keys,
         }
     }
 }
@@ -2844,16 +2895,129 @@ impl<'a> NodeRef<'a> {
             .map(|(index, _)| index)
     }
 
+    fn order_key_at(&self, index: usize) -> Result<OrderKey, ZoneFileError> {
+        self.meta.order_keys.get(index).copied().ok_or_else(|| {
+            corrupt(
+                Some(self.meta.page_no),
+                CorruptKind::Bounds,
+                CorruptDetail::OffsetOutOfRange,
+            )
+        })
+    }
+
+    /// Обход группы с `memcmp`-префиксом: ключ собирается только при равных
+    /// префиксах (редкий случай) или для захвата найденного item'а.
+    fn walk_group_order(
+        &self,
+        group: usize,
+        target: &Key,
+        target_order: &OrderKey,
+        strict: bool,
+        capture: bool,
+    ) -> Result<(usize, Option<Key>), ZoneFileError> {
+        let start = group.saturating_mul(self.meta.interval);
+        let end = (start + self.meta.interval).min(self.len());
+        let mut buffer = [0_u8; KEY_MAX];
+        let mut prev_len = 0_usize;
+        let mut index = start;
+        while index < end {
+            let parts = self.item_parts(index)?;
+            let prefix = self.order_key_at(index)?.cmp(target_order);
+            if prefix == Ordering::Less {
+                // Ключ не может быть `>= target`: поддерживаем префикс для
+                // следующего item'а и идём дальше.
+                prev_len = Self::assemble_key(prev_len, &parts, &mut buffer)?;
+                index += 1;
+                continue;
+            }
+            prev_len = Self::assemble_key(prev_len, &parts, &mut buffer)?;
+            let order = if prefix == Ordering::Equal {
+                let name_len =
+                    usize::from(self.meta.name_lens.get(index).copied().ok_or_else(|| {
+                        corrupt(
+                            Some(self.meta.page_no),
+                            CorruptKind::Bounds,
+                            CorruptDetail::OffsetOutOfRange,
+                        )
+                    })?);
+                compare_raw_to_key_len(buffer.get(..prev_len).unwrap_or(&[]), name_len, target)
+            } else {
+                prefix
+            };
+            let matched = if strict {
+                order == Ordering::Greater
+            } else {
+                order != Ordering::Less
+            };
+            if matched {
+                let key = if capture {
+                    Key::from_validated(buffer.get(..prev_len).unwrap_or(&[]))
+                } else {
+                    None
+                };
+                return Ok((index, key));
+            }
+            index += 1;
+        }
+        Ok((end, None))
+    }
+
+    fn bound_by_order(
+        &self,
+        target: &Key,
+        target_order: &OrderKey,
+        strict: bool,
+        capture: bool,
+    ) -> Result<(usize, Option<Key>), ZoneFileError> {
+        if self.is_empty() {
+            return Ok((0, None));
+        }
+        let mut low = 0_usize;
+        let mut high = usize::from(self.meta.header.n_restarts);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let index = middle.saturating_mul(self.meta.interval);
+            let prefix = self.order_key_at(index)?.cmp(target_order);
+            let order = if prefix == Ordering::Equal {
+                let (bytes, name_len) = self.restart_bytes(middle)?;
+                compare_raw_to_key_len(bytes, name_len, target)
+            } else {
+                prefix
+            };
+            let matched = if strict {
+                order == Ordering::Greater
+            } else {
+                order != Ordering::Less
+            };
+            if matched {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        let group = low.saturating_sub(1);
+        let (index, key) = self.walk_group_order(group, target, target_order, strict, capture)?;
+        if capture && key.is_none() && index < self.len() {
+            return Ok((index, Some(self.key_at(index)?)));
+        }
+        Ok((index, key))
+    }
+
     /// Первый индекс с `key >= target`.
     ///
     /// # Errors
     ///
     /// `Corrupt` — недостижимо после валидации.
     pub fn lower_bound(&self, target: &Key) -> Result<usize, ZoneFileError> {
-        self.bound_by(
-            |bytes, name_len| Ok(compare_raw_to_key_len(bytes, name_len, target)),
-            false,
-        )
+        if self.len() < ORDER_KEY_MIN_ITEMS {
+            return self.bound_by(
+                |bytes, name_len| Ok(compare_raw_to_key_len(bytes, name_len, target)),
+                false,
+            );
+        }
+        let order = OrderKey::of_key(target);
+        self.bound_by_order(target, &order, false, false)
+            .map(|(index, _)| index)
     }
 
     /// `lower_bound` с одновременной материализацией найденного ключа.
@@ -2864,11 +3028,15 @@ impl<'a> NodeRef<'a> {
     ///
     /// `Corrupt` — недостижимо после валидации.
     pub fn lower_bound_capture(&self, target: &Key) -> Result<(usize, Option<Key>), ZoneFileError> {
-        self.bound_by_capture(
-            |bytes, name_len| Ok(compare_raw_to_key_len(bytes, name_len, target)),
-            false,
-            true,
-        )
+        if self.len() < ORDER_KEY_MIN_ITEMS {
+            return self.bound_by_capture(
+                |bytes, name_len| Ok(compare_raw_to_key_len(bytes, name_len, target)),
+                false,
+                true,
+            );
+        }
+        let order = OrderKey::of_key(target);
+        self.bound_by_order(target, &order, false, true)
     }
 
     /// Первый индекс с `key > target`.
@@ -2877,10 +3045,15 @@ impl<'a> NodeRef<'a> {
     ///
     /// `Corrupt` — недостижимо после валидации.
     pub fn upper_bound(&self, target: &Key) -> Result<usize, ZoneFileError> {
-        self.bound_by(
-            |bytes, name_len| Ok(compare_raw_to_key_len(bytes, name_len, target)),
-            true,
-        )
+        if self.len() < ORDER_KEY_MIN_ITEMS {
+            return self.bound_by(
+                |bytes, name_len| Ok(compare_raw_to_key_len(bytes, name_len, target)),
+                true,
+            );
+        }
+        let order = OrderKey::of_key(target);
+        self.bound_by_order(target, &order, true, false)
+            .map(|(index, _)| index)
     }
 
     /// Последний индекс с `key <= target`.

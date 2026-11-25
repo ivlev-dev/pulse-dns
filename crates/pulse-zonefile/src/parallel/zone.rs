@@ -493,6 +493,10 @@ impl<'a> ParallelZones<'a> {
         self.store.reset_zone_slot(zone_seq);
         let mut zone = ParallelZone::open_new(self.store, *origin, zone_seq, meta.soa_serial)?;
         let outcome = zone.commit_with(self.store.effective_mode())?;
+        // Порядок локов (ADR 0007 §8): lease зоны не удерживается при правке
+        // каталога. Каталог живёт в выделенном шарде (`CATALOG_LEASE_SHARD`),
+        // поэтому зоны 256/512/… не делят с ним нереентерабельный mutex.
+        drop(zone);
         let value = CatalogValue {
             zone_seq,
             soa_serial: meta.soa_serial,
@@ -631,7 +635,10 @@ impl<'a> ParallelZones<'a> {
 
     fn write_catalog_edit(&mut self, edit: CatalogEdit<'_>) -> Result<bool, ParallelError> {
         let _lease = self.store.lease_guard(0)?;
-        let mut io = WriteIo::new(self.store, 0, self.version);
+        // Правка каталога короткоживущая: локальный батч `WriteIo::new`
+        // (64 страницы) терялся бы на каждом коммите каталога, раздувая файл
+        // на ~64 страницы на зону. Каталог резервирует страницы точно.
+        let mut io = WriteIo::new_exact(self.store, 0, self.version);
         io.clear_cache();
         let txn = io.next_txn()?;
         io.set_version(txn);
@@ -1502,8 +1509,12 @@ fn record_from_value<P: PageIo + ?Sized>(
         ValueKind::Overflow => overflow_rdata(tree, io, version, &leaf)?,
         ValueKind::Node => return Ok(None),
     };
+    let name = NameRle::from_validated(key.owner_bytes()).ok_or(ParallelError::Corrupt {
+        kind: crate::parallel::error::V2CorruptKind::Bounds,
+        page: None,
+    })?;
     Ok(Some(RrsetRecord {
-        name: key.owner()?,
+        name,
         rr_type: key.rr_type(),
         subtype: key.subtype(),
         ttl: leaf.ttl,
@@ -1797,8 +1808,14 @@ impl ZoneReader<'_> {
         if value.kind == ValueKind::Node {
             return Ok(None);
         }
+        // Имя/тип уже провалидированы при разборе ключа страницы.
+        let name =
+            NameRle::from_validated(entry.key.owner_bytes()).ok_or(ParallelError::Corrupt {
+                kind: crate::parallel::error::V2CorruptKind::Bounds,
+                page: None,
+            })?;
         Ok(Some(RrsetRef {
-            name: entry.key.owner()?,
+            name,
             rr_type: entry.key.rr_type(),
             subtype: entry.key.subtype(),
             ttl: value.ttl,
@@ -1866,6 +1883,39 @@ impl ZoneReader<'_> {
     pub fn next_name(&self, after: Option<&NameRle>) -> Result<Option<NameRle>, ParallelError> {
         self.tree
             .next_name(&self.io, self.version(), after)
+            .map_err(|error| tree_error(&self.io, error))
+    }
+
+    /// Предыдущее имя (`predecessor`) в каноническом порядке до `before`
+    /// (`None` — последнее имя зоны).
+    ///
+    /// Спуск по B+tree, без обхода зоны.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt`/`Io`.
+    pub fn prev_name(&self, before: Option<&NameRle>) -> Result<Option<NameRle>, ParallelError> {
+        self.tree
+            .prev_name(&self.io, self.version(), before)
+            .map_err(|error| tree_error(&self.io, error))
+    }
+
+    /// Обходит владельцев записей заданного типа в каноническом порядке.
+    ///
+    /// Ключи читаются курсором (без материализации RDATA/overflow). Для
+    /// `RRSIG` обратный вызов срабатывает на каждый `subtype`; `NSEC`/`NSEC3`
+    /// имеют один ключ на владельца.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt`/`Io`.
+    pub fn for_each_owner(
+        &self,
+        rr_type: u16,
+        mut visit: impl FnMut(&NameRle),
+    ) -> Result<(), ParallelError> {
+        self.tree
+            .for_each_owner(&self.io, self.version(), rr_type, &mut visit)
             .map_err(|error| tree_error(&self.io, error))
     }
 

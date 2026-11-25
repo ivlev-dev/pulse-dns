@@ -25,6 +25,8 @@ const ZONE: &str = "PULSE_MP_ZONE";
 const ITERS: &str = "PULSE_MP_ITERS";
 const READY: &str = "PULSE_MP_READY";
 const RESULT: &str = "PULSE_MP_RESULT";
+const GO: &str = "PULSE_MP_GO";
+const CREATE_LOCK: &str = "PULSE_MP_CREATE_LOCK";
 
 fn config() -> StoreConfig {
     StoreConfig {
@@ -349,6 +351,60 @@ fn child_body() -> Result<(), String> {
             }
             Ok(())
         }
+        "create_zones" => {
+            let store = open_multi(&path).map_err(|error| error.to_string())?;
+            let zones = parse_list(ZONES);
+            let lock_path = PathBuf::from(
+                std::env::var(CREATE_LOCK).map_err(|_| "no create lock".to_string())?,
+            );
+            // Каталог — один writer (ADR 0007 §8, R4): сериализуем create
+            // между процессами файловым `flock`, внутри — свежий каталог под
+            // lease. Так тест проверяет lease/шарды (зоны 256/512), а не
+            // потерянные обновления каталога.
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .map_err(|error| error.to_string())?;
+            let ready = PathBuf::from(std::env::var(READY).map_err(|_| "no ready".to_string())?);
+            std::fs::write(&ready, b"ready").map_err(|error| error.to_string())?;
+            let go = PathBuf::from(std::env::var(GO).map_err(|_| "no go".to_string())?);
+            let start = Instant::now();
+            while !go.exists() {
+                if start.elapsed() > Duration::from_secs(10) {
+                    return Err("no go signal".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            for zone in zones {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+                        .map_err(|error| error.to_string())?;
+                    let result = {
+                        let mut catalog =
+                            ParallelZones::open(&store).map_err(|error| error.to_string())?;
+                        catalog
+                            .create_zone(&origin(zone), ZoneCreateMeta { soa_serial: zone })
+                            .map(|_| ())
+                    };
+                    rustix::fs::flock(&lock, rustix::fs::FlockOperation::Unlock)
+                        .map_err(|error| error.to_string())?;
+                    match result {
+                        Ok(()) => break,
+                        Err(error) => {
+                            if Instant::now() >= deadline {
+                                return Err(format!("create zone {zone}: {error}"));
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
         other => Err(format!("unknown child mode {other}")),
     }
 }
@@ -440,6 +496,78 @@ fn four_processes_four_zones_each_without_loss_or_duplicates() {
     }
 
     verify_zones(&path, 16, 20);
+}
+
+/// Два процесса создают зоны одного файла параллельно. Каталог — один
+/// writer (ADR 0007 §8, R4), поэтому create сериализован файловым `flock`;
+/// проверяем, что зоны 256/512 (шард каталога в старом маппинге) не дают
+/// self-deadlock и каталог не теряет записи. Дедлайн 30 с — зависание = провал.
+#[test]
+fn two_processes_create_zones_without_hang() {
+    const PER_PROCESS: u32 = 260;
+    const TOTAL: u32 = PER_PROCESS * 2;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("create2p.v2");
+    let cfg = StoreConfig {
+        multi_process: true,
+        sync_mode: SyncModeV2::Memory,
+        ..StoreConfig::small(TOTAL + 64, 1 << 16)
+    };
+    drop(ParallelStore::create(&path, cfg).expect("create"));
+
+    let create_lock = dir.path().join("create.lock");
+    let go = dir.path().join("go");
+    let mut children = Vec::new();
+    for process in 0..2_u32 {
+        let start = process * PER_PROCESS + 1;
+        let end = start + PER_PROCESS - 1;
+        let zones: Vec<String> = (start..=end).map(|zone| zone.to_string()).collect();
+        let ready = dir.path().join(format!("ready-{process}"));
+        children.push(spawn_child(
+            "create_zones",
+            &path,
+            &[
+                (ZONES, zones.join(",")),
+                (CREATE_LOCK, create_lock.display().to_string()),
+                (READY, ready.display().to_string()),
+                (GO, go.display().to_string()),
+            ],
+        ));
+    }
+    for process in 0..2_u32 {
+        wait_ready(&dir.path().join(format!("ready-{process}")));
+    }
+    std::fs::write(&go, b"go").expect("go signal");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for mut child in children {
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                assert!(status.success(), "create child failed: {status:?}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "create в двух процессах завис (>30 с)"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let store = open_multi(&path).expect("reopen multi");
+    let catalog = ParallelZones::open(&store).expect("catalog");
+    assert_eq!(
+        catalog.zones().len(),
+        usize::try_from(TOTAL).unwrap(),
+        "каталог потерял зоны"
+    );
+    for zone in 1..=TOTAL {
+        assert!(
+            catalog.zone_seq(&origin(zone)).is_some(),
+            "зона {zone} потеряна"
+        );
+    }
+    assert!(store.fsck_lite().expect("fsck").ok);
 }
 
 /// Два процесса на одну зону: второй получает `Busy`; после `kill -9`

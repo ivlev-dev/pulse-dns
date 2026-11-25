@@ -1579,6 +1579,35 @@ impl<'a, P: PageIo + ?Sized> Cursor<'a, P> {
         Err(bounds(Some(page_no), CorruptDetail::DepthExceeded))
     }
 
+    /// Позиционируется на последний ключ, для которого `compare` даёт
+    /// `< Equal` (строгий предшественник).
+    ///
+    /// Возвращает `false`, если в дереве нет ключа строго меньше `target`.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённая страница; ошибка компаратора.
+    pub fn seek_prev_by<F>(&mut self, mut compare: F) -> Result<bool, ZoneFileError>
+    where
+        F: FnMut(&Key) -> Result<Ordering, ZoneFileError>,
+    {
+        // `seek_by` встаёт на первый ключ `>= target`. Ключи одного владельца
+        // могут пересекать границу листа, поэтому шагаем назад до первого
+        // ключа, который компаратор действительно считает меньшим.
+        let _ = self.seek_by(&mut compare)?;
+        loop {
+            if !self.retreat()? {
+                return Ok(false);
+            }
+            let Some(key) = self.key()? else {
+                return Ok(false);
+            };
+            if compare(&key)? == Ordering::Less {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Позиционируется на первый ключ дерева.
     ///
     /// # Errors
@@ -1602,6 +1631,26 @@ impl<'a, P: PageIo + ?Sized> Cursor<'a, P> {
             .is_some_and(|leaf| self.index < leaf.len()))
     }
 
+    /// Позиционируется на последний ключ дерева.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённая страница.
+    pub fn seek_last(&mut self) -> Result<bool, ZoneFileError> {
+        self.path.clear();
+        self.leaf = None;
+        self.index = 0;
+        if self.root == 0 {
+            return Ok(false);
+        }
+        let node_level = self
+            .level
+            .checked_sub(1)
+            .ok_or_else(|| bounds(None, CorruptDetail::DepthExceeded))?;
+        self.descend_rightmost(self.root, node_level)?;
+        Ok(self.leaf.as_ref().is_some_and(|leaf| !leaf.is_empty()))
+    }
+
     fn descend_leftmost(
         &mut self,
         mut page_no: u32,
@@ -1623,6 +1672,60 @@ impl<'a, P: PageIo + ?Sized> Cursor<'a, P> {
             self.path.push((page_no, 0, node_level));
             page_no = branch.child(0)?;
             node_level -= 1;
+        }
+    }
+
+    fn descend_rightmost(
+        &mut self,
+        mut page_no: u32,
+        mut node_level: u16,
+    ) -> Result<(), ZoneFileError> {
+        let page_size = self.io.page_size();
+        loop {
+            let page = self.io.read_page(page_no)?;
+            if node_level == 0 {
+                let leaf = DecodedLeaf::decode(page, page_no, self.txn, page_size)?;
+                self.index = leaf.len().saturating_sub(1);
+                self.leaf = Some(leaf);
+                return Ok(());
+            }
+            let branch = DecodedBranch::decode(page, page_no, self.txn, page_size)?;
+            if branch.level() != node_level {
+                return Err(bounds(Some(page_no), CorruptDetail::PageType));
+            }
+            let index = branch.len().saturating_sub(1);
+            self.path.push((page_no, index, node_level));
+            page_no = branch.child(index)?;
+            node_level -= 1;
+        }
+    }
+
+    /// Шаг назад к предыдущему item'у дерева.
+    ///
+    /// `false` — курсор уже на первом item'е (или дерево пусто).
+    fn retreat(&mut self) -> Result<bool, ZoneFileError> {
+        loop {
+            if self.leaf.is_some() && self.index > 0 {
+                self.index -= 1;
+                return Ok(true);
+            }
+            let page_size = self.io.page_size();
+            let Some(&(page_no, index, node_level)) = self.path.last() else {
+                return Ok(false);
+            };
+            if index == 0 {
+                self.path.pop();
+                continue;
+            }
+            let page = self.io.read_page(page_no)?;
+            let branch = DecodedBranch::decode(page, page_no, self.txn, page_size)?;
+            let previous = index - 1;
+            let child = branch.child(previous)?;
+            if let Some(entry) = self.path.last_mut() {
+                *entry = (page_no, previous, node_level);
+            }
+            self.descend_rightmost(child, node_level - 1)?;
+            return Ok(self.leaf.as_ref().is_some_and(|leaf| !leaf.is_empty()));
         }
     }
 
@@ -2145,6 +2248,65 @@ impl ZoneTree {
                 return Ok(None);
             }
         }
+    }
+
+    /// Предыдущее имя в каноническом порядке до `before` (`None` — последнее).
+    ///
+    /// Возвращает наибольшее имя строго меньше `before`. Предшественник
+    /// ищется спуском по B+tree (O(log n)), без обхода зоны.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево.
+    pub fn prev_name<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        txn: u64,
+        before: Option<&NameRle>,
+    ) -> Result<Option<NameRle>, ZoneFileError> {
+        let mut cursor = self.tree.cursor(io, txn);
+        let found = match before {
+            Some(before) => cursor.seek_prev_by(|key| {
+                let owner = key.owner()?;
+                name_cmp(owner.as_rle(), before.as_rle())
+            })?,
+            None => cursor.seek_last()?,
+        };
+        if !found {
+            return Ok(None);
+        }
+        let Some(key) = cursor.key()? else {
+            return Ok(None);
+        };
+        Ok(Some(key.owner()?))
+    }
+
+    /// Обходит владельцев ключей заданного типа в каноническом порядке.
+    ///
+    /// Читаются только ключи листьев (RDATA/overflow не материализуются).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево.
+    pub fn for_each_owner<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        txn: u64,
+        rr_type: u16,
+        mut visit: impl FnMut(&NameRle),
+    ) -> Result<(), ZoneFileError> {
+        let mut cursor = self.tree.cursor(io, txn);
+        let mut found = cursor.seek_first()?;
+        while found {
+            if let Some(key) = cursor.key()?
+                && key.rr_type() == rr_type
+                && let Ok(owner) = key.owner()
+            {
+                visit(&owner);
+            }
+            found = cursor.advance()?;
+        }
+        Ok(())
     }
 
     fn desired_flags<P: PageIo + ?Sized>(

@@ -142,6 +142,12 @@ impl PageCacheV2 {
         }
     }
 
+    /// Оценка памяти, занятой образами страниц (`Arc`-оверхед не учтён).
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        self.stats().entries * (PAGE_SIZE_V2 as usize + std::mem::size_of::<Entry>())
+    }
+
     /// Сбрасывает метрики (не кеш).
     pub fn reset_stats(&self) {
         self.hits.store(0, Ordering::Relaxed);
@@ -182,10 +188,8 @@ impl PageCacheV2 {
             return None;
         };
         let data = Arc::clone(&entry.data);
-        let used = entry.used.load(Ordering::Relaxed);
-        drop(sets);
-        self.clock
-            .fetch_max(used.saturating_add(1), Ordering::Relaxed);
+        // Hit без записи в разделяемый `clock`: метка recency ставится при
+        // вставке (приближённый LRU/FIFO внутри набора).
         self.hits.fetch_add(1, Ordering::Relaxed);
         Some(data)
     }

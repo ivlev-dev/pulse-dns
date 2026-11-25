@@ -389,6 +389,82 @@ fn next_name_walks_canonical_order() {
 }
 
 #[test]
+fn prev_name_walks_canonical_order_backwards() {
+    let mut store = store(4096);
+    let mut tree = zone();
+    let raw = [
+        "z.example.com",
+        "a.example.com",
+        "m.example.com",
+        "*.example.com",
+    ];
+    for text in raw {
+        insert_a(&mut tree, &mut store, &name(text), 1);
+    }
+    let expected = [
+        "z.example.com",
+        "m.example.com",
+        "a.example.com",
+        "*.example.com",
+        "example.com",
+    ];
+    let mut walked = Vec::new();
+    let mut current = tree.prev_name(&store, TXN, None).unwrap();
+    while let Some(name) = current {
+        walked.push(name);
+        current = tree.prev_name(&store, TXN, Some(&name)).unwrap();
+    }
+    assert_eq!(walked.len(), expected.len());
+    for (got, want) in walked.iter().zip(expected.iter()) {
+        assert_eq!(got, &name(want), "unexpected predecessor order");
+    }
+    for pair in walked.windows(2) {
+        let [left, right] = pair else { unreachable!() };
+        assert_eq!(
+            name_cmp(left.as_rle(), right.as_rle()).unwrap(),
+            Ordering::Greater
+        );
+    }
+    // Строгий предшественник: для самого первого имени — `None`.
+    assert!(
+        tree.prev_name(&store, TXN, Some(&name("example.com")))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn prev_name_crosses_leaf_pages() {
+    let mut store = store(4096);
+    let mut tree = zone();
+    for index in 0..600_u32 {
+        let owner = name(&format!("h{index:04}.example.com"));
+        insert_a(&mut tree, &mut store, &owner, 1);
+    }
+    let mut forward = Vec::new();
+    let mut after = None;
+    while let Some(name) = tree.next_name(&store, TXN, after.as_ref()).unwrap() {
+        forward.push(name);
+        after = Some(name);
+    }
+    assert!(forward.len() >= 600);
+    let mut backward = Vec::new();
+    let mut before = None;
+    while let Some(name) = tree.prev_name(&store, TXN, before.as_ref()).unwrap() {
+        backward.push(name);
+        before = Some(name);
+    }
+    forward.reverse();
+    assert_eq!(
+        forward, backward,
+        "prev_name must mirror next_name across pages"
+    );
+    // Начало и конец последовательности — реальные владельцы зоны.
+    assert_eq!(backward.last(), Some(&name("example.com")));
+    assert_eq!(backward.first(), Some(&name("h0599.example.com")));
+}
+
+#[test]
 fn lookup_all_rrsig_by_subtype() {
     let mut store = store(4096);
     let mut tree = zone();

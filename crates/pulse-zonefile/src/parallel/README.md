@@ -76,7 +76,7 @@ assert!(repair.ok || repair.remaining_leaks == 0);
 
 | Раздел спеки | Реализация |
 |---|---|
-| §5.7/§8.1 `PageCache` | `PageCacheV2` (лимит 1024, 16 шардов × 4 way, метка recency при вставке): страница валидируется один раз на `page_no` (CRC, `owner_zone`, `page.txn ≤ snapshot.version`, структура) и отдаётся `Arc<[u8]>`; warm lookup — без syscall/CRC/аллокаций. Второй уровень — v1 `PageCache` узлов (`store.node_cache()`), поэтому `ZoneReader::lookup/lookup_ref` не декодирует страницу повторно. Метрики: `store.page_cache_stats()`, `store.node_cache_stats()`, `StoreStats::{page_cache_hits, page_cache_misses}` |
+| §5.7/§8.1 `PageCache` | `PageCacheV2` (лимит `page_cache_entries`, 16 шардов × 4 way, метка recency при вставке): страница валидируется один раз на `page_no` (CRC, `owner_zone`, `page.txn ≤ snapshot.version`, структура) и отдаётся `Arc<[u8]>`; warm lookup — без syscall/CRC/аллокаций. Второй уровень — v1 `PageCache` узлов (`store.node_cache()`), поэтому `ZoneReader::lookup/lookup_ref` не декодирует страницу повторно: кеш хранит только метаданные (`NodeMeta` с точными `Box<[T]>`, без фиксированных массивов на 1024 item'а) и байтово-сравнимые 16-Б префиксы ключей. Роли разделены: `PageCacheV2` — образы страниц, `PageCache` — разобранные узлы; hit не пишет в разделяемые атомики. Метрики: `store.page_cache_stats()`, `store.node_cache_stats()`, `store.cache_memory_bytes()`, `PageCache::evictions()`, `StoreStats::{page_cache_hits, page_cache_misses}` |
 | §6.1 bucket | `PAGE_TYPE_FREELIST = 5`: `next_bucket`, `owner_zone`, `drop_txn`, `count`, `flags`, `page_ids[]` (1008 @ 4096); цепочка отсортирована по `drop_txn`, COW-пересборка в коммите; `RootEntry.free_head` |
 | §6.2 `is_reclaimable` | `parallel::is_reclaimable(drop_txn, D_z, RV_z, current_version)`; `RV_z = min(D_z−1, MP, freeze)`; выдача только после durable `D_z > drop_txn` |
 | §6.3 порядок | bucket `dropped(V)` + старые bucket-образы пишутся в фазе 1; `free_head` — в `RootEntry V`; коммит фиксирует пул в памяти только после fsync фазы 2 (retry `ReaderContended` не удваивает `dropped(V)`) |
@@ -346,6 +346,13 @@ let _snap = store.zone_snapshot(&reader, 1)?; // seqlock + пин
   возвращается через `is_reclaimable`).
 - **B2a:** `ZoneReader` берёт валидированные страницы из `PageCacheV2` и узлы из
   v1 `PageCache`; холодный первый lookup читает с диска и валидирует CRC.
+  Арена снапшота — `HashMap<page_no, Arc<[u8]>>` (поиск `O(1)`).
+- **read-path:** поиск в узле сравнивает 16-Б байтово-сравнимый префикс ключа
+  (`memcmp`) и собирает полный ключ только при равных префиксах; префикс —
+  производная в памяти, на диске его нет. `lookup_ref` отдаёт заимствованный
+  payload без копирования; `NameRle` берётся из уже провалидированного ключа.
+- **snapshot:** `zone_snapshot` подтверждает стабильность головы повторным
+  чтением seqlock-счётчика, а не полным CRC/декодированием `RootEntry`.
 - **B2a:** аллокатор сначала выдаёт durable-eligible страницы пула, затем
   bump-курсор (спека §6.5 допускает bump-first; выбран пул-first ради
   стабилизации `high_water`).
