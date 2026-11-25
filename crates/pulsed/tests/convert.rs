@@ -1,9 +1,10 @@
 //! E2E `pulsed convert`: v1 → v2 без потери зон, записей и настроек,
 //! плюс понятная ошибка при открытии v1-файла как `--data`.
 
+mod common;
+
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use pulse_dns::{
@@ -98,7 +99,8 @@ fn write_v1(path: &Path) -> usize {
 }
 
 fn run_convert(from: &Path, to: &Path) {
-    let output = Command::new(env!("CARGO_BIN_EXE_pulsed"))
+    let mut command = common::pulsed();
+    command
         .arg("convert")
         .arg("--from")
         .arg(from)
@@ -106,9 +108,8 @@ fn run_convert(from: &Path, to: &Path) {
         .arg(to)
         .arg("--durability")
         .arg("sync")
-        .env_remove("PULSED_API_TOKEN")
-        .output()
-        .expect("run pulsed convert");
+        .env_remove("PULSED_API_TOKEN");
+    let output = common::run_cli("pulsed convert", &mut command, common::CLI_TIMEOUT);
     assert!(
         output.status.success(),
         "convert failed: {} {}",

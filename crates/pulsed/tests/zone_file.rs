@@ -5,7 +5,6 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use pulse_dns::{
@@ -218,16 +217,20 @@ fn broken_master_file_exits_with_code_two_and_location() {
     let data = directory.path().join("bad.pulse");
 
     let started = Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_pulsed"))
+    let mut command = common::pulsed();
+    command
         .arg("import")
         .arg("--data")
         .arg(&data)
         .arg("--origin")
         .arg("bad.test.")
         .arg(&zone)
-        .env_remove("PULSED_API_TOKEN")
-        .output()
-        .expect("run pulsed import");
+        .env_remove("PULSED_API_TOKEN");
+    let output = common::run_cli(
+        "pulsed import (bad zone)",
+        &mut command,
+        common::CLI_TIMEOUT,
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("bad.zone"), "stderr: {stderr}");

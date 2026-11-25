@@ -445,7 +445,8 @@ fn import_sign_writes_rrsig_to_zonefile() {
     let zone_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("examples/example.com.zone");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pulsed"))
+    let mut command = common::pulsed();
+    command
         .arg("import")
         .arg("--sign")
         .arg("--data")
@@ -457,9 +458,8 @@ fn import_sign_writes_rrsig_to_zonefile() {
         .arg("--dnssec-key")
         .arg(format!("example.com.=zsk:{}", zsk_paths.private.display()))
         .arg(&zone_path)
-        .env_remove("PULSED_API_TOKEN")
-        .output()
-        .expect("run import --sign");
+        .env_remove("PULSED_API_TOKEN");
+    let output = common::run_cli("pulsed import --sign", &mut command, common::CLI_TIMEOUT);
     assert!(
         output.status.success(),
         "{}",

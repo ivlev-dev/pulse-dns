@@ -8,11 +8,15 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+mod common;
+
+use common::PulsedChild;
 
 use pulse_dns::{
     DecodeLimits, EncodeOptions, Message, Name, Question, Rclass, Rcode, Rdata, Rtype,
@@ -63,22 +67,21 @@ fn http(
     head.lines().next()?.split(' ').nth(1)?.parse::<u16>().ok()
 }
 
-fn wait_ready(addr: SocketAddr, child: &mut Child) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if http(addr, "GET", "/api/v1/zones", None, false) == Some(200) {
-            return true;
-        }
-        if child.try_wait().ok().flatten().is_some() {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
+fn wait_ready(addr: SocketAddr, child: &mut PulsedChild) -> bool {
+    child.wait_ready(common::CHILD_READY_TIMEOUT, || {
+        http(addr, "GET", "/api/v1/zones", None, false) == Some(200)
+    })
 }
 
-fn spawn_server(config: &Path, data: &Path, api: SocketAddr, mode: CommitMode) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_pulsed"))
+fn spawn_server(
+    label: &str,
+    config: &Path,
+    data: &Path,
+    api: SocketAddr,
+    mode: CommitMode,
+) -> PulsedChild {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pulsed"));
+    command
         .arg("--config")
         .arg(config)
         .arg("--data")
@@ -92,10 +95,9 @@ fn spawn_server(config: &Path, data: &Path, api: SocketAddr, mode: CommitMode) -
         .arg("--api-token")
         .arg(TOKEN)
         .env_remove("PULSED_API_TOKEN")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn pulsed")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    PulsedChild::spawn(format!("crash-reopen/{label}"), &mut command)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -172,7 +174,7 @@ fn crash_scenario(label: &str, mode: CommitMode) {
     .expect("config");
     let api_port = free_port();
     let api: SocketAddr = format!("127.0.0.1:{api_port}").parse().expect("api addr");
-    let mut child = spawn_server(&config_path, &data, api, mode);
+    let mut child = spawn_server(label, &config_path, &data, api, mode);
     assert!(wait_ready(api, &mut child), "{label}: server did not start");
 
     assert_eq!(
@@ -221,8 +223,9 @@ fn crash_scenario(label: &str, mode: CommitMode) {
     std::thread::sleep(Duration::from_millis(500));
 
     // `SIGKILL` в момент активных коммитов.
-    child.kill().expect("kill -9");
-    let _ = child.wait();
+    let status = child.kill();
+    assert!(status.is_some(), "{label}: kill did not reap the child");
+    child.assert_dead();
     stop.store(true, Ordering::Release);
     for handle in writers {
         handle.join().expect("writer thread");

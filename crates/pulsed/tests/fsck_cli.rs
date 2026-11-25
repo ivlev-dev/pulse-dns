@@ -1,7 +1,8 @@
 //! E2E `pulsed fsck --data <file> [--repair]` на настоящем v2-файле.
 
+mod common;
+
 use std::os::unix::fs::FileExt;
-use std::process::Command;
 
 use pulse_zonefile::key::NameRle;
 use pulse_zonefile::parallel::{
@@ -46,11 +47,9 @@ fn verify_and_repair_via_cli() {
     let path = dir.path().join("fsck.v2");
     let _root = build(&path);
 
-    let verify = Command::new(env!("CARGO_BIN_EXE_pulsed"))
-        .args(["fsck", "--data"])
-        .arg(&path)
-        .output()
-        .unwrap();
+    let mut command = common::pulsed();
+    command.args(["fsck", "--data"]).arg(&path);
+    let verify = common::run_cli("pulsed fsck", &mut command, common::CLI_TIMEOUT);
     assert!(
         verify.status.success(),
         "stdout: {}\nstderr: {}",
@@ -64,12 +63,9 @@ fn verify_and_repair_via_cli() {
         leak(&store, 8);
     }
 
-    let repair = Command::new(env!("CARGO_BIN_EXE_pulsed"))
-        .args(["fsck", "--data"])
-        .arg(&path)
-        .arg("--repair")
-        .output()
-        .unwrap();
+    let mut command = common::pulsed();
+    command.args(["fsck", "--data"]).arg(&path).arg("--repair");
+    let repair = common::run_cli("pulsed fsck --repair", &mut command, common::CLI_TIMEOUT);
     assert!(
         repair.status.success(),
         "stdout: {}\nstderr: {}",
@@ -81,11 +77,13 @@ fn verify_and_repair_via_cli() {
     assert!(text.contains("ok=true"), "{text}");
 
     // Идемпотентность: повторная проверка после repair.
-    let again = Command::new(env!("CARGO_BIN_EXE_pulsed"))
-        .args(["fsck", "--data"])
-        .arg(&path)
-        .output()
-        .unwrap();
+    let mut command = common::pulsed();
+    command.args(["fsck", "--data"]).arg(&path);
+    let again = common::run_cli(
+        "pulsed fsck (after repair)",
+        &mut command,
+        common::CLI_TIMEOUT,
+    );
     assert!(
         again.status.success(),
         "stdout: {}\nstderr: {}",
@@ -112,22 +110,24 @@ fn verify_reports_damaged_zone_and_repair_quarantines_it() {
     file.write_all_at(&byte, offset).unwrap();
     drop(file);
 
-    let verify = Command::new(env!("CARGO_BIN_EXE_pulsed"))
-        .args(["fsck", "--data"])
-        .arg(&path)
-        .output()
-        .unwrap();
+    let mut command = common::pulsed();
+    command.args(["fsck", "--data"]).arg(&path);
+    let verify = common::run_cli("pulsed fsck (damaged)", &mut command, common::CLI_TIMEOUT);
     assert_eq!(verify.status.code(), Some(1));
     let text = String::from_utf8_lossy(&verify.stdout);
     assert!(text.contains("ok=false"), "{text}");
     assert!(text.contains("damaged=["), "{text}");
 
-    let repair = Command::new(env!("CARGO_BIN_EXE_pulsed"))
+    let mut command = common::pulsed();
+    command
         .args(["fsck", "--data"])
         .arg(&path)
-        .args(["--repair"])
-        .output()
-        .unwrap();
+        .args(["--repair"]);
+    let repair = common::run_cli(
+        "pulsed fsck --repair (damaged)",
+        &mut command,
+        common::CLI_TIMEOUT,
+    );
     assert!(
         repair.status.success(),
         "{}",

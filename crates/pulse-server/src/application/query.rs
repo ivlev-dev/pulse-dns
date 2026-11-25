@@ -5,13 +5,14 @@ use std::sync::Arc;
 
 use pulse_dns::{
     Checkpoint, Edns, EncodeError, EncodeOptions, EncodeScratch, Encoder, Flags, HeaderCounts,
-    MAX_MESSAGE_LEN, MAX_NAME_WIRE_LEN, Message, MessageRef, Name, Opcode, Rclass, Rcode, Rdata,
-    RdataError, Record, RecordError, Rrset, RrsetError, Rtype, Ttl, TtlError, edns_wire_len,
+    MAX_LABELS, MAX_MESSAGE_LEN, MAX_NAME_WIRE_LEN, Message, MessageRef, Name, NameRef, Opcode,
+    Rclass, Rcode, Rdata, RdataError, Record, RecordError, Rrset, RrsetError, Rtype, Ttl, TtlError,
+    edns_wire_len,
 };
 use pulse_dnssec::{DenialLimits, Nsec3Params};
 use thiserror::Error;
 
-use super::port::ZoneView;
+use super::port::{ZoneSnapshot, ZoneView};
 use super::stats::QueryStats;
 use crate::domain::{DenialKind, LookupOutcome, LookupOutcomeRef, RdataRef, RrsetRef, ZoneState};
 
@@ -367,11 +368,21 @@ impl QueryEngine {
 
     /// Zero-copy ответ на простой запрос [`MessageRef`].
     ///
-    /// Обслуживает только горячий случай: один вопрос, без EDNS, `QTYPE =
-    /// A/AAAA`, зона `Serving`, точное совпадение с RRset. Ответ кодируется
-    /// прямо в `out` из заимствованных [`RrsetRef`] без `Message` и без
-    /// материализации RRset. `None` означает «случай не горячий» — вызывающий
-    /// обязан обработать пакет обычным путём через [`Message::decode`].
+    /// Обслуживает горячий путь авторитетного ответа без `Message`, без
+    /// материализации RRset и без аллокаций:
+    ///
+    /// * точное совпадение `A`/`AAAA`/`MX`/`TXT`/`SRV`/`CNAME`/`NS` и других
+    ///   типов (включая additional-glue для `MX`/`SRV`/`NS`/`SVCB`/`HTTPS`);
+    /// * `CNAME`-цепочка в зоне до [`MAX_CNAME_CHAIN`] звеньев;
+    /// * `NXDOMAIN`/`NODATA` с `SOA` и negative TTL из заимствованных данных;
+    /// * wildcard-развёртывание (кроме wildcard `CNAME`, который уходит на
+    ///   полный путь);
+    /// * EDNS0 (версия 0, `DO = 0`): OPT повторяется, payload ограничивает
+    ///   ответ, `TC` выставляется по тем же правилам, что и в полном пути.
+    ///
+    /// `DO = 1`, подписанные ответы, делегирования, wildcard `CNAME` и
+    /// `QTYPE = ANY` остаются на полном пути. `None` означает «случай не
+    /// горячий» — вызывающий обязан обработать пакет обычным путём.
     #[must_use]
     pub fn respond_ref_into(
         &self,
@@ -382,10 +393,14 @@ impl QueryEngine {
     ) -> Option<usize> {
         let qname = request.qname()?;
         let qtype = request.qtype();
-        if !matches!(qtype, Rtype::A | Rtype::AAAA) {
+        if qtype == Rtype::ANY || is_transfer_meta_qtype(qtype) {
             return None;
         }
         if request.qclass() != Rclass::IN {
+            return None;
+        }
+        let request_edns = request.edns();
+        if request_edns.is_some_and(|edns| edns.version() != 0 || edns.dnssec_ok()) {
             return None;
         }
         let zone = self.find_zone_wire(qname.as_wire())?;
@@ -395,38 +410,177 @@ impl QueryEngine {
         if !qname.is_subdomain_of_name(zone.origin()) {
             return None;
         }
-
-        let mut encoded = None;
-        let snapshot_available = zone.with_snapshot(&mut |snapshot| {
-            if let LookupOutcomeRef::Answer(rrset) = snapshot.lookup_ref(qname, qtype) {
-                encoded = self.encode_ref_answer(request, rrset, transport, out, scratch);
-            }
+        let response_edns = request_edns.map(|edns| {
+            Edns::new(negotiated_payload_size(edns.udp_payload_size())).with_version(0)
         });
-        if !snapshot_available {
+
+        let mut wildcard_wire = [0_u8; MAX_NAME_WIRE_LEN];
+        let mut encoded = None;
+        let available = zone.with_snapshot(&mut |snapshot| {
+            encoded = Self::encode_fast(
+                request,
+                snapshot,
+                transport,
+                &mut wildcard_wire,
+                out,
+                scratch,
+                response_edns.as_ref(),
+            );
+        });
+        if !available {
             return None;
         }
-        if encoded.is_some() {
-            self.stats.record_query();
+        let response = encoded?;
+        self.stats.record_query();
+        match response.status {
+            FastStatus::NxDomain => self.stats.record_nxdomain(),
+            FastStatus::NoData => self.stats.record_nodata(),
+            FastStatus::Answer => {}
         }
-        encoded
+        if response.truncated {
+            self.stats.record_truncated();
+        }
+        Some(response.len)
     }
 
-    /// Кодирует точный ответ из заимствованного RRset.
-    fn encode_ref_answer(
-        &self,
-        request: &MessageRef<'_>,
-        rrset: RrsetRef<'_>,
+    /// Собирает и кодирует ответ по заимствованному снимку зоны.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn encode_fast<'a>(
+        request: &'a MessageRef<'_>,
+        snapshot: &'a dyn ZoneSnapshot,
         transport: Transport,
-        out: &mut [u8],
-        scratch: &mut Scratch,
-    ) -> Option<usize> {
+        wildcard_wire: &'a mut [u8; MAX_NAME_WIRE_LEN],
+        out: &'a mut [u8],
+        scratch: &'a mut Scratch,
+        response_edns: Option<&Edns>,
+    ) -> Option<FastResponse> {
         let qname = request.qname()?;
+        let qtype = request.qtype();
+        let origin = snapshot.origin_ref();
+        if !qname.is_subdomain_of(origin) {
+            return None;
+        }
+        // DNAME на предке перекрывает и точное совпадение, и NXDOMAIN:
+        // такие имена обслуживает полный путь.
+        if dname_above(snapshot, qname, origin) {
+            return None;
+        }
+
+        let mut answers: [Option<FastAnswer<'a>>; FAST_ANSWER_SLOTS] = [None; FAST_ANSWER_SLOTS];
+        let mut answer_len = 0_usize;
+        let mut visited = [ROOT_NAME; MAX_CNAME_CHAIN];
+        let mut visited_len = 0_usize;
+        let mut current = qname;
+        let mut status = FastStatus::Answer;
+        let mut needs_soa = false;
+
+        loop {
+            match snapshot.lookup_ref(current, qtype) {
+                LookupOutcomeRef::Answer(rrset) => {
+                    *answers.get_mut(answer_len)? = Some(FastAnswer {
+                        owner: current,
+                        rrset,
+                    });
+                    answer_len = answer_len.saturating_add(1);
+                    break;
+                }
+                LookupOutcomeRef::Cname(rrset, target) => {
+                    *answers.get_mut(answer_len)? = Some(FastAnswer {
+                        owner: current,
+                        rrset,
+                    });
+                    answer_len = answer_len.saturating_add(1);
+                    let loops = target.as_wire() == current.as_wire()
+                        || visited.get(..visited_len).is_some_and(|seen| {
+                            seen.iter().any(|name| name.as_wire() == target.as_wire())
+                        });
+                    if loops {
+                        // Цикл даёт SERVFAIL: пусть его сформирует полный путь.
+                        return None;
+                    }
+                    if visited_len.saturating_add(1) >= MAX_CNAME_CHAIN
+                        || !target.is_subdomain_of(origin)
+                        || delegation_above(snapshot, target, origin)
+                        || dname_above(snapshot, target, origin)
+                    {
+                        break;
+                    }
+                    *visited.get_mut(visited_len)? = current;
+                    visited_len = visited_len.saturating_add(1);
+                    current = target;
+                }
+                LookupOutcomeRef::NoData => {
+                    status = FastStatus::NoData;
+                    needs_soa = true;
+                    break;
+                }
+                LookupOutcomeRef::NxDomain => {
+                    match wildcard_lookup(snapshot, current, qtype, origin, wildcard_wire) {
+                        WildcardOutcome::Answer(rrset) => {
+                            *answers.get_mut(answer_len)? = Some(FastAnswer {
+                                owner: current,
+                                rrset,
+                            });
+                            answer_len = answer_len.saturating_add(1);
+                            status = FastStatus::Answer;
+                        }
+                        WildcardOutcome::NoData => {
+                            status = FastStatus::NoData;
+                            needs_soa = true;
+                        }
+                        WildcardOutcome::NxDomain => {
+                            status = FastStatus::NxDomain;
+                            needs_soa = true;
+                        }
+                        WildcardOutcome::Unsupported => return None,
+                    }
+                    break;
+                }
+                LookupOutcomeRef::Delegation { .. }
+                | LookupOutcomeRef::Referral
+                | LookupOutcomeRef::ZoneNotFound => {
+                    // Делегирование — не горячий случай. Внутри цепочки
+                    // `CNAME` это штатная остановка (status остаётся Answer).
+                    if answer_len == 0 {
+                        return None;
+                    }
+                    break;
+                }
+            }
+        }
+
+        let mut targets = NameSlots::new();
+        for entry in answers.iter().take(answer_len).flatten() {
+            add_targets(entry.rrset, &mut targets)?;
+        }
+        let mut glue_targets = NameSlots::new();
+        for index in 0..targets.len {
+            let &target = targets.items.get(index)?;
+            if target.is_subdomain_of(origin)
+                && !delegation_above(snapshot, target, origin)
+                && !glue_targets.push(target)
+            {
+                return None;
+            }
+        }
+        glue_targets.sort_dedup();
+
         let limit = match transport {
-            Transport::Udp => usize::from(UDP_PAYLOAD_WITHOUT_EDNS),
+            Transport::Udp => {
+                usize::from(response_edns.map_or(UDP_PAYLOAD_WITHOUT_EDNS, negotiated_payload))
+            }
             Transport::Tcp => MAX_MESSAGE_LEN,
         };
         let capacity = out.len().min(limit);
+        let opt_len = match response_edns {
+            Some(edns) => edns_wire_len(edns).ok()?,
+            None => 0,
+        };
         let buffer = out.get_mut(..capacity)?;
+        let rcode = match status {
+            FastStatus::NxDomain => Rcode::NXDOMAIN,
+            FastStatus::Answer | FastStatus::NoData => Rcode::NOERROR,
+        };
         let flags = Flags::new()
             .with_qr(true)
             .with_opcode(Opcode::QUERY)
@@ -435,59 +589,117 @@ impl QueryEngine {
             .with_aa(true)
             .with_ra(false)
             .with_ad(false)
-            .with_tc(false);
+            .with_tc(false)
+            .with_rcode_bits(rcode.header_bits());
         let mut encoder = Encoder::new(buffer, EncodeOptions::compressed(), &mut scratch.encode);
         encoder.begin_message(request.id()).ok()?;
         encoder
-            .write_question_wire(qname.as_wire(), request.qtype(), request.qclass())
+            .write_question_wire(qname.as_wire(), qtype, request.qclass())
             .ok()?;
-
-        let owner = rrset.owner();
-        let mut answers = 0_u16;
+        if encoder.len().saturating_add(opt_len) > capacity {
+            return None;
+        }
+        let budget = match transport {
+            Transport::Udp => capacity.saturating_sub(opt_len),
+            Transport::Tcp => capacity,
+        };
+        let mut counts = FastCounts::default();
         let mut truncated = false;
-        for rdata in rrset.records() {
-            let checkpoint = encoder.checkpoint();
-            let result = match rdata {
-                RdataRef::Domain(rdata) => encoder.write_rr_wire_name(
-                    owner.as_wire(),
-                    rrset.rr_type(),
-                    rrset.class(),
-                    rrset.ttl(),
-                    rdata,
-                ),
-                RdataRef::Wire { bytes, .. } => encoder.write_rr_raw(
-                    owner.as_wire(),
-                    rrset.rr_type(),
-                    rrset.class(),
-                    rrset.ttl(),
-                    bytes,
-                ),
-            };
-            match result {
-                Ok(()) => answers = answers.saturating_add(1),
-                Err(EncodeError::BufferTooSmall { .. }) if transport == Transport::Udp => {
-                    encoder.rollback(checkpoint);
-                    truncated = true;
+        let mut stopped = false;
+
+        for entry in answers.iter().take(answer_len).flatten() {
+            if stopped {
+                break;
+            }
+            let flow = write_fast_group(
+                &mut encoder,
+                transport,
+                budget,
+                &mut truncated,
+                Section::Answer,
+                entry.owner,
+                entry.rrset,
+                None,
+                &mut counts,
+            )
+            .ok()?;
+            stopped = flow == Flow::Stop;
+        }
+        if !stopped && needs_soa {
+            let soa = snapshot.soa_ref()?;
+            let ttl = negative_ttl(soa)?;
+            let flow = write_fast_group(
+                &mut encoder,
+                transport,
+                budget,
+                &mut truncated,
+                Section::Authority,
+                soa.owner(),
+                soa,
+                Some(ttl),
+                &mut counts,
+            )
+            .ok()?;
+            stopped = flow == Flow::Stop;
+        }
+        if !stopped {
+            for target in glue_targets.iter() {
+                for rr_type in [Rtype::A, Rtype::AAAA] {
+                    let LookupOutcomeRef::Answer(rrset) = snapshot.lookup_ref(target, rr_type)
+                    else {
+                        continue;
+                    };
+                    if answers.iter().take(answer_len).flatten().any(|entry| {
+                        entry.owner.as_wire() == rrset.owner().as_wire()
+                            && entry.rrset.rr_type() == rrset.rr_type()
+                    }) {
+                        continue;
+                    }
+                    let flow = write_fast_group(
+                        &mut encoder,
+                        transport,
+                        budget,
+                        &mut truncated,
+                        Section::Additional,
+                        rrset.owner(),
+                        rrset,
+                        None,
+                        &mut counts,
+                    )
+                    .ok()?;
+                    if flow == Flow::Stop {
+                        stopped = true;
+                        break;
+                    }
+                }
+                if stopped {
                     break;
                 }
-                Err(_) => return None,
             }
         }
+
+        if let Some(edns) = response_edns {
+            encoder.write_edns(edns).ok()?;
+        }
+        let additional = counts
+            .additional
+            .saturating_add(u16::from(response_edns.is_some()));
         let len = encoder
             .finish(
                 flags.with_tc(truncated),
                 HeaderCounts {
                     question: 1,
-                    answer: answers,
-                    authority: 0,
-                    additional: 0,
+                    answer: counts.answer,
+                    authority: counts.authority,
+                    additional,
                 },
             )
             .ok()?;
-        if truncated {
-            self.stats.record_truncated();
-        }
-        Some(len)
+        Some(FastResponse {
+            len,
+            status,
+            truncated,
+        })
     }
 
     /// Потоковая версия [`QueryEngine::try_respond`].
@@ -1016,6 +1228,359 @@ impl QueryEngine {
         message.set_rcode(Rcode::BADVERS);
         message
     }
+}
+
+/// Максимум записей ответа в быстром пути: цепочка `CNAME` + финальный RRset.
+const FAST_ANSWER_SLOTS: usize = MAX_CNAME_CHAIN + 1;
+/// Максимум целей additional, обрабатываемых без аллокаций.
+const FAST_TARGET_SLOTS: usize = 16;
+/// Корневое имя как значение-заглушка для стековых массивов [`NameRef`].
+const ROOT_NAME: NameRef<'static> = NameRef::from_validated(&[0]);
+
+/// Итог быстрого разбора.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastStatus {
+    Answer,
+    NoData,
+    NxDomain,
+}
+
+/// Запись ответа с возможным переименованием владельца (wildcard).
+#[derive(Debug, Clone, Copy)]
+struct FastAnswer<'a> {
+    owner: NameRef<'a>,
+    rrset: RrsetRef<'a>,
+}
+
+/// Результат кодирования быстрого пути.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FastResponse {
+    len: usize,
+    status: FastStatus,
+    truncated: bool,
+}
+
+/// Счётчики записанных записей по секциям.
+#[derive(Debug, Clone, Copy, Default)]
+struct FastCounts {
+    answer: u16,
+    authority: u16,
+    additional: u16,
+}
+
+/// Стековый список имён без аллокаций.
+#[derive(Debug, Clone, Copy)]
+struct NameSlots<'a> {
+    items: [NameRef<'a>; FAST_TARGET_SLOTS],
+    len: usize,
+}
+
+impl<'a> NameSlots<'a> {
+    const fn new() -> Self {
+        Self {
+            items: [ROOT_NAME; FAST_TARGET_SLOTS],
+            len: 0,
+        }
+    }
+
+    /// Добавляет имя; `false` — переполнение (нужен полный путь).
+    fn push(&mut self, name: NameRef<'a>) -> bool {
+        let Some(slot) = self.items.get_mut(self.len) else {
+            return false;
+        };
+        *slot = name;
+        self.len = self.len.saturating_add(1);
+        true
+    }
+
+    /// Сортирует по каноническому порядку и убирает дубликаты.
+    fn sort_dedup(&mut self) {
+        for index in 1..self.len {
+            let mut position = index;
+            while position > 0 {
+                let (Some(previous), Some(current)) = (
+                    self.items.get(position - 1).copied(),
+                    self.items.get(position).copied(),
+                ) else {
+                    break;
+                };
+                if previous.cmp_canonical(current) != core::cmp::Ordering::Greater {
+                    break;
+                }
+                self.items.swap(position - 1, position);
+                position -= 1;
+            }
+        }
+        let mut unique = 0_usize;
+        for index in 0..self.len {
+            let Some(&candidate) = self.items.get(index) else {
+                break;
+            };
+            let duplicate = index > 0
+                && self
+                    .items
+                    .get(unique.saturating_sub(1))
+                    .is_some_and(|last| last.as_wire() == candidate.as_wire());
+            if duplicate {
+                continue;
+            }
+            if let Some(slot) = self.items.get_mut(unique) {
+                *slot = candidate;
+                unique = unique.saturating_add(1);
+            }
+        }
+        self.len = unique;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = NameRef<'a>> + '_ {
+        self.items.iter().take(self.len).copied()
+    }
+}
+
+/// Итог поиска по wildcard.
+#[derive(Debug, Clone, Copy)]
+enum WildcardOutcome<'a> {
+    Answer(RrsetRef<'a>),
+    NoData,
+    NxDomain,
+    Unsupported,
+}
+
+/// Ищет wildcard-ответ для несуществующего имени (RFC 4592).
+fn wildcard_lookup<'a>(
+    snapshot: &'a dyn ZoneSnapshot,
+    name: NameRef<'a>,
+    qtype: Rtype,
+    origin: NameRef<'a>,
+    buffer: &'a mut [u8; MAX_NAME_WIRE_LEN],
+) -> WildcardOutcome<'a> {
+    let mut closest = None;
+    let mut candidate = name.parent();
+    while let Some(current) = candidate {
+        // Origin обслуживающей зоны существует всегда (SOA/NS), поэтому его
+        // не нужно проверять отдельным спуском в дерево.
+        if current.as_wire() == origin.as_wire() || snapshot.node_exists_ref(current) {
+            closest = Some(current);
+            break;
+        }
+        candidate = current.parent();
+    }
+    let closest = match closest {
+        Some(closest) => closest,
+        None => {
+            if snapshot.node_exists_ref(origin) {
+                origin
+            } else {
+                return WildcardOutcome::NxDomain;
+            }
+        }
+    };
+    let Some(length) = closest.wire_len().checked_add(2) else {
+        return WildcardOutcome::Unsupported;
+    };
+    let Some(slot) = buffer.get_mut(..length) else {
+        return WildcardOutcome::Unsupported;
+    };
+    let Some((header, rest)) = slot.split_first_mut() else {
+        return WildcardOutcome::Unsupported;
+    };
+    *header = 1;
+    let Some((marker, tail)) = rest.split_first_mut() else {
+        return WildcardOutcome::Unsupported;
+    };
+    *marker = b'*';
+    tail.copy_from_slice(closest.as_wire());
+    let Some(slot) = buffer.get(..length) else {
+        return WildcardOutcome::Unsupported;
+    };
+    let wildcard = NameRef::from_validated(slot);
+    // Wildcard-владелец, которого нет в зоне, даёт NxDomain без полного
+    // поиска: это заметно дешевле на больших зонах (нет проверки
+    // делегирования и RRset).
+    if !snapshot.node_exists_ref(wildcard) {
+        return WildcardOutcome::NxDomain;
+    }
+    match snapshot.lookup_ref(wildcard, qtype) {
+        LookupOutcomeRef::Answer(rrset) => WildcardOutcome::Answer(rrset),
+        LookupOutcomeRef::NoData => WildcardOutcome::NoData,
+        LookupOutcomeRef::NxDomain => WildcardOutcome::NxDomain,
+        LookupOutcomeRef::Cname(..)
+        | LookupOutcomeRef::Delegation { .. }
+        | LookupOutcomeRef::Referral
+        | LookupOutcomeRef::ZoneNotFound => WildcardOutcome::Unsupported,
+    }
+}
+
+/// Есть ли `DNAME` на предке имени (исключая origin).
+fn dname_above(snapshot: &dyn ZoneSnapshot, name: NameRef<'_>, origin: NameRef<'_>) -> bool {
+    let mut current = name.parent();
+    while let Some(candidate) = current {
+        if candidate.as_wire() == origin.as_wire() || !candidate.is_subdomain_of(origin) {
+            break;
+        }
+        if matches!(
+            snapshot.lookup_ref(candidate, Rtype::DNAME),
+            LookupOutcomeRef::Answer(_)
+        ) {
+            return true;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+/// Находится ли имя в делегированной зоне (включая саму точку cut).
+fn delegation_above(snapshot: &dyn ZoneSnapshot, name: NameRef<'_>, origin: NameRef<'_>) -> bool {
+    let mut current = Some(name);
+    while let Some(candidate) = current {
+        if candidate.as_wire() == origin.as_wire() || !candidate.is_subdomain_of(origin) {
+            return false;
+        }
+        if snapshot.is_delegation_ref(candidate) {
+            return true;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+/// Собирает цели additional из ответа так же, как полный путь.
+fn add_targets<'a>(rrset: RrsetRef<'a>, slots: &mut NameSlots<'a>) -> Option<()> {
+    let offset = match rrset.rr_type() {
+        Rtype::NS => 0,
+        Rtype::MX | Rtype::SVCB | Rtype::HTTPS => 2,
+        Rtype::SRV => 6,
+        _ => return Some(()),
+    };
+    for rdata in rrset.records() {
+        let target = match rdata {
+            RdataRef::Domain(Rdata::Ns(name)) => NameRef::from_name(name),
+            RdataRef::Domain(Rdata::Mx { exchange, .. }) => NameRef::from_name(exchange),
+            RdataRef::Domain(Rdata::Srv { target, .. }) => NameRef::from_name(target),
+            RdataRef::Domain(Rdata::Svcb(data) | Rdata::Https(data)) => {
+                NameRef::from_name(data.target())
+            }
+            RdataRef::Domain(_) => continue,
+            RdataRef::Wire { bytes, .. } => name_at(bytes, offset)?,
+        };
+        if !slots.push(target) {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// Разбирает несжатое имя из начала `bytes[offset..]`.
+fn name_at(bytes: &[u8], offset: usize) -> Option<NameRef<'_>> {
+    let mut end = offset;
+    let mut labels = 0_usize;
+    loop {
+        let length = *bytes.get(end)?;
+        if length == 0 {
+            end = end.checked_add(1)?;
+            break;
+        }
+        if length & 0xC0 != 0 {
+            return None;
+        }
+        labels = labels.saturating_add(1);
+        if labels > MAX_LABELS {
+            return None;
+        }
+        end = end.checked_add(1 + usize::from(length))?;
+        if end > bytes.len() {
+            return None;
+        }
+    }
+    NameRef::from_wire(bytes.get(offset..end)?).ok()
+}
+
+/// TTL негативного ответа: `min(SOA.ttl, SOA.minimum, NEGATIVE_TTL_CAP)`.
+fn negative_ttl(soa: RrsetRef<'_>) -> Option<Ttl> {
+    let minimum = match soa.first_record()? {
+        RdataRef::Domain(Rdata::Soa(data)) => data.minimum,
+        RdataRef::Domain(_) => return None,
+        RdataRef::Wire { bytes, .. } => {
+            let start = bytes.len().checked_sub(4)?;
+            u32::from_be_bytes(bytes.get(start..)?.try_into().ok()?)
+        }
+    };
+    let ttl = soa.ttl().as_u32().min(minimum).min(NEGATIVE_TTL_CAP);
+    Ttl::new(ttl).ok()
+}
+
+/// Записывает RRset в секцию с теми же правилами усечения, что у `WireSink`.
+#[allow(clippy::too_many_arguments)]
+fn write_fast_group(
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    section: Section,
+    owner: NameRef<'_>,
+    rrset: RrsetRef<'_>,
+    ttl_override: Option<Ttl>,
+    counts: &mut FastCounts,
+) -> Result<Flow, ()> {
+    let group_start = encoder.checkpoint();
+    let ttl = ttl_override.unwrap_or_else(|| rrset.ttl());
+    for rdata in rrset.records() {
+        let checkpoint = encoder.checkpoint();
+        let result = match rdata {
+            RdataRef::Domain(rdata) => encoder.write_rr_wire_name(
+                owner.as_wire(),
+                rrset.rr_type(),
+                rrset.class(),
+                ttl,
+                rdata,
+            ),
+            RdataRef::Wire { bytes, .. } => encoder.write_rr_zone_raw(
+                owner.as_wire(),
+                rrset.rr_type(),
+                rrset.class(),
+                ttl,
+                bytes,
+            ),
+        };
+        let mut stop = false;
+        match result {
+            Ok(()) => {}
+            Err(EncodeError::BufferTooSmall { .. }) if transport == Transport::Udp => {
+                let rollback = if section == Section::Additional {
+                    group_start
+                } else {
+                    checkpoint
+                };
+                encoder.rollback(rollback);
+                if section != Section::Additional {
+                    *truncated = true;
+                }
+                stop = true;
+            }
+            Err(_) => return Err(()),
+        }
+        if !stop && transport == Transport::Udp && encoder.len() > budget {
+            let rollback = if section == Section::Additional {
+                group_start
+            } else {
+                checkpoint
+            };
+            encoder.rollback(rollback);
+            if section != Section::Additional {
+                *truncated = true;
+            }
+            stop = true;
+        }
+        if stop {
+            return Ok(Flow::Stop);
+        }
+        match section {
+            Section::Answer => counts.answer = counts.answer.saturating_add(1),
+            Section::Authority => counts.authority = counts.authority.saturating_add(1),
+            Section::Additional => counts.additional = counts.additional.saturating_add(1),
+        }
+    }
+    Ok(Flow::Continue)
 }
 
 /// Секция DNS-сообщения, в которую добавляется RRset.
@@ -1880,8 +2445,11 @@ fn collect_targets(rrset: &Rrset, targets: &mut Vec<Name>) {
 }
 
 fn negotiated_payload(edns: &Edns) -> u16 {
-    edns.udp_payload_size()
-        .clamp(UDP_PAYLOAD_WITHOUT_EDNS, MAX_UDP_PAYLOAD)
+    negotiated_payload_size(edns.udp_payload_size())
+}
+
+fn negotiated_payload_size(payload: u16) -> u16 {
+    payload.clamp(UDP_PAYLOAD_WITHOUT_EDNS, MAX_UDP_PAYLOAD)
 }
 
 fn response_edns(request: &Edns) -> Edns {

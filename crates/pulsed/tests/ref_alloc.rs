@@ -10,7 +10,9 @@ use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use pulse_dns::{EncodeOptions, Message, Name, Question, Rclass, Rdata, Rtype, Serial, SoaData};
+use pulse_dns::{
+    EncodeOptions, Message, Name, Question, Rclass, Rcode, Rdata, Rtype, Serial, SoaData,
+};
 use pulse_zonefile::key::NameRle;
 use pulse_zonefile::parallel::{
     ParallelStore, ParallelZones, RrsetData, StoreConfig, ZoneCreateMeta,
@@ -57,12 +59,16 @@ fn recv(socket: &UdpSocket, buffer: &mut [u8]) -> usize {
 }
 
 #[test]
-fn udp_a_allocations_over_v2_zone() {
+#[allow(clippy::too_many_lines)]
+fn udp_allocations_over_v2_zone_by_class() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("ref.v2");
     let store = ParallelStore::create(&path, StoreConfig::small(8, 4096)).expect("store");
     let apex = NameRle::from_ascii("example.test").expect("apex");
     let owner = NameRle::from_ascii("www.example.test").expect("owner");
+    let mail = NameRle::from_ascii("mail.example.test").expect("mail");
+    let alias = NameRle::from_ascii("alias.example.test").expect("alias");
+    let wildcard = NameRle::from_ascii("*.wild.example.test").expect("wildcard");
     let mut zones = ParallelZones::open(&store).expect("catalog");
     zones
         .create_zone(&apex, ZoneCreateMeta { soa_serial: 1 })
@@ -81,6 +87,16 @@ fn udp_a_allocations_over_v2_zone() {
         .to_canonical_wire();
         let ns = Rdata::Ns(Name::parse("ns.example.test.").expect("ns")).to_canonical_wire();
         let a = Rdata::A("192.0.2.1".parse().expect("ipv4")).to_canonical_wire();
+        let aaaa = Rdata::Aaaa("2001:db8::1".parse().expect("ipv6")).to_canonical_wire();
+        let mx = Rdata::Mx {
+            preference: 10,
+            exchange: Name::parse("mail.example.test.").expect("exchange"),
+        }
+        .to_canonical_wire();
+        let txt = Rdata::Txt(pulse_dns::TxtData::new([b"hello".to_vec()]).expect("txt"))
+            .to_canonical_wire();
+        let cname =
+            Rdata::Cname(Name::parse("www.example.test.").expect("target")).to_canonical_wire();
         writer
             .upsert_rrset(
                 &apex,
@@ -93,8 +109,61 @@ fn udp_a_allocations_over_v2_zone() {
             .upsert_rrset(&apex, 2, 0, &RrsetData::new(3600, 0, vec![ns]).expect("ns"))
             .expect("ns write");
         writer
+            .upsert_rrset(&apex, 15, 0, &RrsetData::new(600, 0, vec![mx]).expect("mx"))
+            .expect("mx write");
+        writer
+            .upsert_rrset(
+                &apex,
+                16,
+                0,
+                &RrsetData::new(300, 0, vec![txt]).expect("txt"),
+            )
+            .expect("txt write");
+        writer
             .upsert_rrset(&owner, 1, 0, &RrsetData::new(60, 0, vec![a]).expect("a"))
             .expect("a write");
+        writer
+            .upsert_rrset(
+                &owner,
+                28,
+                0,
+                &RrsetData::new(60, 0, vec![aaaa]).expect("aaaa"),
+            )
+            .expect("aaaa write");
+        writer
+            .upsert_rrset(
+                &mail,
+                1,
+                0,
+                &RrsetData::new(
+                    60,
+                    0,
+                    vec![Rdata::A("192.0.2.2".parse().expect("ipv4")).to_canonical_wire()],
+                )
+                .expect("mail a"),
+            )
+            .expect("mail write");
+        writer
+            .upsert_rrset(
+                &alias,
+                5,
+                0,
+                &RrsetData::new(60, 0, vec![cname]).expect("cname"),
+            )
+            .expect("alias write");
+        writer
+            .upsert_rrset(
+                &wildcard,
+                1,
+                0,
+                &RrsetData::new(
+                    60,
+                    0,
+                    vec![Rdata::A("192.0.2.3".parse().expect("ipv4")).to_canonical_wire()],
+                )
+                .expect("wildcard a"),
+            )
+            .expect("wildcard write");
         writer.commit().expect("commit");
     }
     drop(zones);
@@ -115,46 +184,109 @@ fn udp_a_allocations_over_v2_zone() {
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("timeout");
-    let query = Message::query(
-        0x1234,
-        Question::new(
-            Name::parse("www.example.test.").expect("qname"),
-            Rtype::A,
-            Rclass::IN,
-        ),
-    )
-    .encode(&EncodeOptions::compressed())
-    .expect("query encode");
     let mut buffer = [0_u8; 4096];
 
-    for _ in 0..200 {
-        socket.send_to(&query, address).expect("send");
-        let len = recv(&socket, &mut buffer);
-        let response =
-            Message::decode(&buffer[..len], &pulse_dns::DecodeLimits::default()).expect("decode");
-        assert_eq!(response.answers().len(), 1, "warm A response");
-    }
+    let query = |qname: &str, qtype: Rtype, edns: bool| {
+        let mut message = Message::query(
+            0x1234,
+            Question::new(Name::parse(qname).expect("qname"), qtype, Rclass::IN),
+        );
+        if edns {
+            message.set_edns(Some(pulse_dns::Edns::new(1232)));
+        }
+        message
+            .encode(&EncodeOptions::compressed())
+            .expect("query encode")
+    };
 
-    let ops = 1000_u64;
-    ALLOCS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
-    let mut total_bytes = 0_usize;
-    for _ in 0..ops {
-        socket.send_to(&query, address).expect("send");
-        total_bytes = total_bytes.saturating_add(recv(&socket, &mut buffer));
+    let classes = vec![
+        (
+            "A",
+            query("www.example.test.", Rtype::A, false),
+            Rcode::NOERROR,
+            1,
+        ),
+        (
+            "AAAA",
+            query("www.example.test.", Rtype::AAAA, false),
+            Rcode::NOERROR,
+            1,
+        ),
+        (
+            "MX",
+            query("example.test.", Rtype::MX, false),
+            Rcode::NOERROR,
+            1,
+        ),
+        (
+            "TXT",
+            query("example.test.", Rtype::TXT, false),
+            Rcode::NOERROR,
+            1,
+        ),
+        (
+            "CNAME",
+            query("alias.example.test.", Rtype::A, false),
+            Rcode::NOERROR,
+            2,
+        ),
+        (
+            "wildcard",
+            query("foo.wild.example.test.", Rtype::A, false),
+            Rcode::NOERROR,
+            1,
+        ),
+        (
+            "NXDOMAIN",
+            query("missing.example.test.", Rtype::A, false),
+            Rcode::NXDOMAIN,
+            0,
+        ),
+        (
+            "EDNS-A",
+            query("www.example.test.", Rtype::A, true),
+            Rcode::NOERROR,
+            1,
+        ),
+    ];
+
+    for (label, bytes, rcode, answers) in &classes {
+        for _ in 0..100 {
+            socket.send_to(bytes, address).expect("send");
+            recv(&socket, &mut buffer);
+        }
+        let mut verified = false;
+        for _ in 0..5 {
+            socket.send_to(bytes, address).expect("send");
+            let len = recv(&socket, &mut buffer);
+            let response = Message::decode(&buffer[..len], &pulse_dns::DecodeLimits::default())
+                .expect("decode");
+            assert_eq!(response.rcode(), *rcode, "{label}: rcode");
+            assert_eq!(response.answers().len(), *answers, "{label}: answers");
+            verified = true;
+        }
+        assert!(verified, "{label}: warm response");
+
+        let ops = 500_u64;
+        ALLOCS.store(0, Ordering::Relaxed);
+        COUNTING.store(true, Ordering::Relaxed);
+        let mut total_bytes = 0_usize;
+        for _ in 0..ops {
+            socket.send_to(bytes, address).expect("send");
+            total_bytes = total_bytes.saturating_add(recv(&socket, &mut buffer));
+        }
+        COUNTING.store(false, Ordering::Relaxed);
+        let allocations = ALLOCS.load(Ordering::Relaxed);
+        let per_op = allocations as f64 / ops as f64;
+        let bytes_per_op = total_bytes as f64 / ops as f64;
+        println!(
+            "udp-e2e v2 {label}: {allocations} allocs / {ops} = {per_op:.4} allocs/op,              {bytes_per_op:.1} bytes/op"
+        );
+        assert!(per_op <= 5.0, "{label}: allocs/op {per_op:.4} exceeds 5");
+        assert!(
+            bytes_per_op <= 512.0,
+            "{label}: bytes/op {bytes_per_op:.1} exceeds 512"
+        );
     }
-    COUNTING.store(false, Ordering::Relaxed);
-    let allocations = ALLOCS.load(Ordering::Relaxed);
-    let per_op = allocations as f64 / ops as f64;
-    let bytes_per_op = total_bytes as f64 / ops as f64;
-    println!(
-        "udp-e2e v2 A: {allocations} allocs / {ops} ops = {per_op:.4} allocs/op, \
-         {bytes_per_op:.1} bytes/op"
-    );
     server.shutdown().expect("shutdown");
-    assert!(per_op <= 5.0, "allocs/op {per_op:.4} exceeds 5");
-    assert!(
-        bytes_per_op <= 512.0,
-        "bytes/op {bytes_per_op:.1} exceeds 512"
-    );
 }

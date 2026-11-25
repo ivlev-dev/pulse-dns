@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use pulse_dns::{
-    Edns, EncodeOptions, Message, Name, Question, Rclass, Rdata, Rrset, Rtype, Serial, SoaData,
-    Ttl, TxtData,
+    Edns, EncodeOptions, Message, MessageRef, Name, Question, Rclass, Rdata, Rrset, Rtype, Serial,
+    SoaData, Ttl, TxtData,
 };
 use pulse_server::application::{QueryEngine, Scratch, Transport};
 use pulse_server::testkit::InMemoryZone;
@@ -67,6 +67,29 @@ fn zone() -> InMemoryZone {
         (0..4_u8).map(|index| Rdata::A([192, 0, 2, index].into())),
     ))
     .expect("a");
+    zone.insert(rrset(
+        "example.com",
+        Rtype::MX,
+        [Rdata::Mx {
+            preference: 10,
+            exchange: name("mail.example.com"),
+        }],
+    ))
+    .expect("mx");
+    zone.insert(rrset(
+        "mail.example.com",
+        Rtype::A,
+        [Rdata::A([192, 0, 2, 25].into())],
+    ))
+    .expect("mail");
+    zone.insert(rrset(
+        "txt.example.com",
+        Rtype::TXT,
+        [Rdata::Txt(
+            TxtData::new([b"hello".to_vec(), b"world".to_vec()]).expect("txt"),
+        )],
+    ))
+    .expect("txt");
     zone.insert(rrset(
         "big.example.com",
         Rtype::TXT,
@@ -144,6 +167,33 @@ fn main() {
             engine
                 .respond_into(&request, Transport::Udp, &mut out, &mut scratch)
                 .expect("streaming")
+        });
+    }
+
+    // Zero-copy путь: сравнение с потоковым для каждого класса запросов.
+    println!();
+    for (label, request) in [
+        ("A", query("www.example.com", Rtype::A, None)),
+        ("AAAA", query("example.com", Rtype::AAAA, None)),
+        ("MX", query("example.com", Rtype::MX, None)),
+        ("TXT", query("txt.example.com", Rtype::TXT, None)),
+        ("NXDOMAIN", query("missing.example.com", Rtype::A, None)),
+        ("A + EDNS", query("www.example.com", Rtype::A, Some(1232))),
+        ("MX + EDNS", query("example.com", Rtype::MX, Some(1232))),
+    ] {
+        let bytes = request
+            .encode(&EncodeOptions::compressed())
+            .expect("query encode");
+        let parsed = MessageRef::decode_simple_edns(&bytes).expect("simple query");
+        bench(&format!("{label} | respond_into"), iterations, || {
+            engine
+                .respond_into(&request, Transport::Udp, &mut out, &mut scratch)
+                .expect("streaming")
+        });
+        bench(&format!("{label} | zero-copy"), iterations, || {
+            engine
+                .respond_ref_into(&parsed, Transport::Udp, &mut out, &mut scratch)
+                .expect("zero-copy")
         });
     }
 

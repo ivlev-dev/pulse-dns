@@ -9,8 +9,12 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
+
+mod common;
+
+use common::PulsedChild;
 
 use pulsed::config::{Config, Durability, TcpConfig};
 use pulsed::server::{ApiOptions, Server};
@@ -87,18 +91,10 @@ fn parse_response(raw: &[u8]) -> Option<Response> {
     })
 }
 
-fn wait_ready(addr: SocketAddr, child: &mut Child) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if http(addr, "GET", "/api/v1/zones", &[], None).is_some_and(|r| r.status == 200) {
-            return true;
-        }
-        if child.try_wait().ok().flatten().is_some() {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
+fn wait_ready(addr: SocketAddr, child: &mut PulsedChild) -> bool {
+    child.wait_ready(common::CHILD_READY_TIMEOUT, || {
+        http(addr, "GET", "/api/v1/zones", &[], None).is_some_and(|r| r.status == 200)
+    })
 }
 
 fn write_config(dir: &Path) -> PathBuf {
@@ -111,7 +107,13 @@ fn write_config(dir: &Path) -> PathBuf {
     path
 }
 
-fn spawn(config: &Path, data: &Path, api: SocketAddr, journal_env: Option<(&str, &str)>) -> Child {
+fn spawn(
+    label: &str,
+    config: &Path,
+    data: &Path,
+    api: SocketAddr,
+    journal_env: Option<(&str, &str)>,
+) -> PulsedChild {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsed"));
     command
         .arg("--config")
@@ -125,12 +127,12 @@ fn spawn(config: &Path, data: &Path, api: SocketAddr, journal_env: Option<(&str,
         .arg("--api-token")
         .arg(TOKEN)
         .env_remove("PULSED_API_TOKEN")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     if let Some((name, value)) = journal_env {
         command.env(name, value);
     }
-    command.spawn().expect("spawn pulsed")
+    PulsedChild::spawn(format!("journal/{label}"), &mut command)
 }
 
 fn open_server(data: &Path) -> Server {
@@ -228,13 +230,14 @@ fn crash_after_intent_replays_once() {
     let data = dir.path().join("crash-intent.v2");
     let config = write_config(dir.path());
     let api: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().expect("api");
-    let mut child = spawn(&config, &data, api, None);
+    let mut child = spawn("base", &config, &data, api, None);
     assert!(wait_ready(api, &mut child), "server did not start");
     create_zone(api);
-    child.kill().expect("kill");
-    let _ = child.wait();
+    let _ = child.kill();
+    child.assert_dead();
     // Следующая мутация обрывает процесс сразу после записи intent.
     let mut child = spawn(
+        "intent-crash",
         &config,
         &data,
         api,
@@ -244,15 +247,9 @@ fn crash_after_intent_replays_once() {
     let body = r#"{"ttl":60,"records":["192.0.2.77"]}"#.to_owned();
     let path = format!("{ZONE_PATH}/records/crash.after-intent.{ZONE}/A");
     let _ = http(api, "PUT", &path, &[], Some(body.as_bytes()));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        child.try_wait().ok().flatten().is_some(),
-        "child did not crash"
-    );
-    let _ = child.wait();
+    let status = child.wait_for_exit(Duration::from_secs(10));
+    assert!(status.is_some(), "child did not crash");
+    child.assert_dead();
 
     let mut server = open_server(&data);
     assert_eq!(a_records(&server, &format!("crash.after-intent.{ZONE}")), 1);
@@ -287,11 +284,11 @@ fn crash_after_apply_does_not_double_apply() {
     let data = dir.path().join("crash-apply.v2");
     let config = write_config(dir.path());
     let api: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().expect("api");
-    let mut child = spawn(&config, &data, api, None);
+    let mut child = spawn("base", &config, &data, api, None);
     assert!(wait_ready(api, &mut child), "server did not start");
     create_zone(api);
-    child.kill().expect("kill");
-    let _ = child.wait();
+    let _ = child.kill();
+    child.assert_dead();
 
     let baseline = {
         let mut server = open_server(&data);
@@ -303,6 +300,7 @@ fn crash_after_apply_does_not_double_apply() {
     // Новый процесс: PUT A коммитится в zonefile, затем процесс убивается до
     // записи committed.
     let mut child = spawn(
+        "apply-crash",
         &config,
         &data,
         api,
@@ -312,15 +310,9 @@ fn crash_after_apply_does_not_double_apply() {
     let body = r#"{"ttl":60,"records":["192.0.2.88"]}"#.to_owned();
     let path = format!("{ZONE_PATH}/records/crash.after-apply.{ZONE}/A");
     let _ = http(api, "PUT", &path, &[], Some(body.as_bytes()));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        child.try_wait().ok().flatten().is_some(),
-        "child did not crash"
-    );
-    let _ = child.wait();
+    let status = child.wait_for_exit(Duration::from_secs(10));
+    assert!(status.is_some(), "child did not crash");
+    child.assert_dead();
 
     let mut server = open_server(&data);
     assert_eq!(a_records(&server, &format!("crash.after-apply.{ZONE}")), 1);
@@ -338,11 +330,11 @@ fn corrupt_tail_is_truncated_without_losing_committed_ops() {
     let data = dir.path().join("crash-tail.v2");
     let config = write_config(dir.path());
     let api: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().expect("api");
-    let mut child = spawn(&config, &data, api, None);
+    let mut child = spawn("base", &config, &data, api, None);
     assert!(wait_ready(api, &mut child), "server did not start");
     create_zone(api);
-    child.kill().expect("kill");
-    let _ = child.wait();
+    let _ = child.kill();
+    child.assert_dead();
 
     let journal = journal_path(&data);
     let mut file = std::fs::OpenOptions::new()
@@ -371,6 +363,7 @@ fn commit_fault_keeps_intent_and_retry_succeeds() {
     let config = write_config(dir.path());
     let api: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().expect("api");
     let mut child = spawn(
+        "commit-fault",
         &config,
         &data,
         api,
@@ -392,8 +385,8 @@ fn commit_fault_keeps_intent_and_retry_succeeds() {
         retry.status
     );
     assert_eq!(retry.json()["origin"], ZONE);
-    child.kill().expect("kill");
-    let _ = child.wait();
+    let _ = child.kill();
+    child.assert_dead();
 }
 
 #[test]
@@ -402,7 +395,7 @@ fn idempotent_replay_same_key_is_stable() {
     let data = dir.path().join("idempotent.v2");
     let config = write_config(dir.path());
     let api: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().expect("api");
-    let mut child = spawn(&config, &data, api, None);
+    let mut child = spawn("base", &config, &data, api, None);
     assert!(wait_ready(api, &mut child), "server did not start");
 
     let headers = [
@@ -430,8 +423,8 @@ fn idempotent_replay_same_key_is_stable() {
     ] {
         assert!(metrics.contains(name), "missing metric {name}: {metrics}");
     }
-    child.kill().expect("kill");
-    let _ = child.wait();
+    let _ = child.kill();
+    child.assert_dead();
 }
 
 #[test]
@@ -440,13 +433,14 @@ fn crash_after_committed_reopens_cleanly() {
     let data = dir.path().join("crash-committed.v2");
     let config = write_config(dir.path());
     let api: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().expect("api");
-    let mut child = spawn(&config, &data, api, None);
+    let mut child = spawn("base", &config, &data, api, None);
     assert!(wait_ready(api, &mut child), "server did not start");
     create_zone(api);
-    child.kill().expect("kill");
-    let _ = child.wait();
+    let _ = child.kill();
+    child.assert_dead();
 
     let mut child = spawn(
+        "committed-crash",
         &config,
         &data,
         api,
@@ -456,15 +450,9 @@ fn crash_after_committed_reopens_cleanly() {
     let body = r#"{"ttl":60,"records":["192.0.2.99"]}"#.to_owned();
     let path = format!("{ZONE_PATH}/records/crash.after-committed.{ZONE}/A");
     let _ = http(api, "PUT", &path, &[], Some(body.as_bytes()));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        child.try_wait().ok().flatten().is_some(),
-        "child did not crash"
-    );
-    let _ = child.wait();
+    let status = child.wait_for_exit(Duration::from_secs(10));
+    assert!(status.is_some(), "child did not crash");
+    child.assert_dead();
 
     let mut server = open_server(&data);
     assert_eq!(
@@ -498,13 +486,14 @@ fn idempotent_retry_after_crash_returns_same_result() {
     let data = dir.path().join("crash-retry.v2");
     let config = write_config(dir.path());
     let api: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().expect("api");
-    let mut child = spawn(&config, &data, api, None);
+    let mut child = spawn("base", &config, &data, api, None);
     assert!(wait_ready(api, &mut child), "server did not start");
     create_zone(api);
-    child.kill().expect("kill");
-    let _ = child.wait();
+    let _ = child.kill();
+    child.assert_dead();
 
     let mut child = spawn(
+        "retry-crash",
         &config,
         &data,
         api,
@@ -516,15 +505,9 @@ fn idempotent_retry_after_crash_returns_same_result() {
     let body = r#"{"ttl":60,"records":["192.0.2.123"]}"#.to_owned();
     let headers = [("Idempotency-Key", "journal-crash-retry-0001")];
     let _ = http(api, "PUT", &path, &headers, Some(body.as_bytes()));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        child.try_wait().ok().flatten().is_some(),
-        "child did not crash"
-    );
-    let _ = child.wait();
+    let status = child.wait_for_exit(Duration::from_secs(10));
+    assert!(status.is_some(), "child did not crash");
+    child.assert_dead();
 
     let mut server = open_server(&data);
     let retry = http(

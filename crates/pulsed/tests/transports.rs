@@ -11,7 +11,6 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -643,7 +642,8 @@ fn dnscrypt_gencert_sets_permissions_and_hides_secrets() {
         .tempdir()
         .expect("temp dir");
     let out = dir.path().join("keys");
-    let output = Command::new(env!("CARGO_BIN_EXE_pulsed"))
+    let mut command = common::pulsed();
+    command
         .args([
             "dnscrypt-gencert",
             "--out",
@@ -655,8 +655,8 @@ fn dnscrypt_gencert_sets_permissions_and_hides_secrets() {
             "--validity-days",
             "10",
         ])
-        .output()
-        .expect("run dnscrypt-gencert");
+        .env_remove("PULSED_API_TOKEN");
+    let output = common::run_cli("pulsed dnscrypt-gencert", &mut command, common::CLI_TIMEOUT);
     assert!(
         output.status.success(),
         "gencert failed: {}",
@@ -709,7 +709,8 @@ fn dnscrypt_gencert_sets_permissions_and_hides_secrets() {
     assert!(txt.contains("2.dnscrypt-cert.example.com. 3600 IN TXT"));
     assert!(txt.contains("2.pubkey.2.dnscrypt-cert.example.com."));
 
-    let again = Command::new(env!("CARGO_BIN_EXE_pulsed"))
+    let mut command = common::pulsed();
+    command
         .args([
             "dnscrypt-gencert",
             "--out",
@@ -717,8 +718,12 @@ fn dnscrypt_gencert_sets_permissions_and_hides_secrets() {
             "--provider-name",
             "2.dnscrypt-cert.example.com.",
         ])
-        .output()
-        .expect("run dnscrypt-gencert again");
+        .env_remove("PULSED_API_TOKEN");
+    let again = common::run_cli(
+        "pulsed dnscrypt-gencert again",
+        &mut command,
+        common::CLI_TIMEOUT,
+    );
     assert!(
         !again.status.success(),
         "gencert must not overwrite secrets without --force"
@@ -741,7 +746,8 @@ fn generate_dnscrypt() -> DnscryptMaterial {
         .tempdir()
         .expect("temp dir");
     let out = dir.path().join("keys");
-    let output = Command::new(env!("CARGO_BIN_EXE_pulsed"))
+    let mut command = common::pulsed();
+    command
         .args([
             "dnscrypt-gencert",
             "--out",
@@ -749,8 +755,12 @@ fn generate_dnscrypt() -> DnscryptMaterial {
             "--provider-name",
             "2.dnscrypt-cert.example.com.",
         ])
-        .output()
-        .expect("run dnscrypt-gencert");
+        .env_remove("PULSED_API_TOKEN");
+    let output = common::run_cli(
+        "pulsed dnscrypt-gencert (material)",
+        &mut command,
+        common::CLI_TIMEOUT,
+    );
     assert!(
         output.status.success(),
         "gencert failed: {}",

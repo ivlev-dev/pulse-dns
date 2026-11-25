@@ -22,7 +22,7 @@ mod message_ref;
 pub(crate) mod rdata;
 
 pub use encode::{Checkpoint, EncodeScratch, Encoder, HeaderCounts, edns_wire_len};
-pub use message_ref::MessageRef;
+pub use message_ref::{EdnsRef, MessageRef};
 
 /// Максимальная длина DNS-сообщения (TCP, RFC 1035 §4.2.2).
 pub const MAX_MESSAGE_LEN: usize = 65_535;

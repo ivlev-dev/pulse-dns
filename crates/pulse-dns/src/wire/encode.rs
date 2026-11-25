@@ -393,6 +393,156 @@ impl<'a> Encoder<'a> {
         self.check_size()
     }
 
+    /// Записывает RR из сырой RDATA зоны, применяя ту же компрессию имён,
+    /// что и [`Encoder::write_rr`].
+    ///
+    /// `rdata` — валидированная wire-форма из хранилища зоны (без
+    /// `RDLENGTH`). Имена внутри RDATA кодируются по правилам своего типа:
+    /// `NS`/`CNAME`/`PTR`/`MX`/`SOA` сжимаются, `DNAME`/`SRV`/`SVCB`/`HTTPS`
+    /// пишутся без сжатия (RFC 1035, RFC 2782, RFC 6672, RFC 9460). Для
+    /// остальных типов байты копируются как есть — это совпадает с
+    /// [`Encoder::write_rr`].
+    ///
+    /// Метод нужен горячему пути ответа: он позволяет кодировать RRset прямо
+    /// из payload'а зоны, не материализуя [`Rdata`], но получая байт-в-байт
+    /// тот же ответ, что и через доменную форму.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::RdataTooLong`], [`EncodeError::BufferTooSmall`] или
+    /// [`EncodeError::Internal`], если сырая RDATA структурно некорректна
+    /// (повреждение зоны).
+    pub fn write_rr_zone_raw(
+        &mut self,
+        owner: &[u8],
+        rr_type: Rtype,
+        class: Rclass,
+        ttl: Ttl,
+        rdata: &[u8],
+    ) -> Result<(), EncodeError> {
+        if self.overflowed {
+            return Err(self.overflow_error());
+        }
+        if u16::try_from(rdata.len()).is_err() {
+            return Err(EncodeError::RdataTooLong {
+                rr_type,
+                len: rdata.len(),
+            });
+        }
+        self.write_name_wire(owner, true);
+        self.push(&rr_type.as_u16().to_be_bytes());
+        self.push(&class.as_u16().to_be_bytes());
+        self.push(&ttl.as_u32().to_be_bytes());
+        let length_position = self.len();
+        self.push(&[0, 0]);
+        let rdata_start = self.len();
+        self.write_zone_rdata(rr_type, rdata)?;
+        self.finish_rr(rr_type, length_position, rdata_start)
+    }
+
+    /// Пишет сырую RDATA зоны, повторяя раскладку [`write_rdata`].
+    fn write_zone_rdata(&mut self, rr_type: Rtype, rdata: &[u8]) -> Result<(), EncodeError> {
+        match rr_type {
+            Rtype::NS | Rtype::CNAME | Rtype::PTR => {
+                let end = self.write_zone_name(rdata, 0, true)?;
+                Self::expect_zone_end(rdata, end)
+            }
+            Rtype::DNAME => {
+                let end = self.write_zone_name(rdata, 0, false)?;
+                Self::expect_zone_end(rdata, end)
+            }
+            Rtype::SOA => {
+                let rname_start = self.write_zone_name(rdata, 0, true)?;
+                let tail_start = self.write_zone_name(rdata, rname_start, true)?;
+                let Some(tail) = rdata.get(tail_start..) else {
+                    return Err(malformed_zone_rdata());
+                };
+                if tail.len() != 20 {
+                    return Err(malformed_zone_rdata());
+                }
+                self.push(tail);
+                Ok(())
+            }
+            Rtype::MX => {
+                let Some(prefix) = rdata.get(..2) else {
+                    return Err(malformed_zone_rdata());
+                };
+                self.push(prefix);
+                let end = self.write_zone_name(rdata, 2, true)?;
+                Self::expect_zone_end(rdata, end)
+            }
+            Rtype::SRV => {
+                let Some(prefix) = rdata.get(..6) else {
+                    return Err(malformed_zone_rdata());
+                };
+                self.push(prefix);
+                let end = self.write_zone_name(rdata, 6, false)?;
+                Self::expect_zone_end(rdata, end)
+            }
+            Rtype::SVCB | Rtype::HTTPS => {
+                let Some(prefix) = rdata.get(..2) else {
+                    return Err(malformed_zone_rdata());
+                };
+                self.push(prefix);
+                let target_start = 2;
+                let rest_start = self.write_zone_name(rdata, target_start, false)?;
+                let Some(rest) = rdata.get(rest_start..) else {
+                    return Err(malformed_zone_rdata());
+                };
+                self.push(rest);
+                Ok(())
+            }
+            _ => {
+                self.push(rdata);
+                Ok(())
+            }
+        }
+    }
+
+    fn expect_zone_end(rdata: &[u8], end: usize) -> Result<(), EncodeError> {
+        if end == rdata.len() {
+            Ok(())
+        } else {
+            Err(malformed_zone_rdata())
+        }
+    }
+
+    /// Пишет доменное имя из сырой RDATA и возвращает смещение за ним.
+    fn write_zone_name(
+        &mut self,
+        rdata: &[u8],
+        offset: usize,
+        compressible: bool,
+    ) -> Result<usize, EncodeError> {
+        let mut end = offset;
+        let mut labels = 0_usize;
+        loop {
+            let Some(&length) = rdata.get(end) else {
+                return Err(malformed_zone_rdata());
+            };
+            if length == 0 {
+                end = end.saturating_add(1);
+                break;
+            }
+            if length & 0xC0 != 0 {
+                return Err(malformed_zone_rdata());
+            }
+            labels = labels.saturating_add(1);
+            if labels > crate::domain::MAX_LABELS {
+                return Err(malformed_zone_rdata());
+            }
+            end = end.saturating_add(1 + usize::from(length));
+            if end > rdata.len() {
+                return Err(malformed_zone_rdata());
+            }
+        }
+        let Some(wire) = rdata.get(offset..end) else {
+            return Err(malformed_zone_rdata());
+        };
+        self.write_name_wire(wire, compressible);
+        Ok(end)
+    }
+
     fn finish_rr(
         &mut self,
         rr_type: Rtype,
@@ -853,6 +1003,13 @@ pub fn edns_wire_len(edns: &Edns) -> Result<usize, EncodeError> {
         });
     }
     Ok(total)
+}
+
+/// Структурно некорректная сырая RDATA зоны (повреждение хранилища).
+fn malformed_zone_rdata() -> EncodeError {
+    EncodeError::Internal {
+        reason: "malformed zone rdata",
+    }
 }
 
 fn count_u16(section: &'static str, count: usize) -> Result<u16, EncodeError> {

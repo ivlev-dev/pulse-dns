@@ -39,7 +39,7 @@ pub(crate) fn respond_into(
     // Горячий путь: простой запрос разбирается без аллокаций, ответ
     // кодируется из заимствованных RRset прямо в TX-слот. Любой не-горячий
     // случай уходит в полный декодер ниже без изменения поведения.
-    if let Some(parsed) = MessageRef::decode_simple(request) {
+    if let Some(parsed) = MessageRef::decode_simple_edns(request) {
         let fast = SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
             engine.respond_ref_into(&parsed, transport, out, &mut scratch)
@@ -257,6 +257,29 @@ mod tests {
         let mut out = [0_u8; 4096];
         let len = respond_into(&bytes, Transport::Udp, &engine, &stats, &mut out).unwrap();
         assert_eq!(&out[..len], owned.as_slice());
+    }
+
+    #[test]
+    fn zero_copy_edns_a_matches_owned_path() {
+        let stats = Stats::new();
+        let engine = engine();
+        let mut query = Message::query(
+            13,
+            Question::new(
+                Name::parse("www.example.com.").unwrap(),
+                Rtype::A,
+                Rclass::IN,
+            ),
+        );
+        query.set_edns(Some(pulse_dns::Edns::new(1232)));
+        let bytes = query.encode(&EncodeOptions::compressed()).unwrap();
+        let owned = respond(&bytes, Transport::Udp, &engine, &stats).unwrap();
+        let mut out = [0_u8; 4096];
+        let len = respond_into(&bytes, Transport::Udp, &engine, &stats, &mut out).unwrap();
+        assert_eq!(&out[..len], owned.as_slice());
+        let decoded = Message::decode(&out[..len], &DecodeLimits::default()).unwrap();
+        let edns = decoded.edns().expect("OPT echoed");
+        assert_eq!(edns.udp_payload_size(), 1232);
     }
 
     #[test]
