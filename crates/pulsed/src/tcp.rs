@@ -233,6 +233,10 @@ fn handle_connection(
     stream.set_read_timeout(Some(idle_timeout))?;
     stream.set_write_timeout(Some(idle_timeout))?;
     stream.set_nodelay(true)?;
+    // Переиспользуемые буферы на соединение: запрос и ответ не аллоцируются
+    // на каждый кадр.
+    let mut request = Vec::new();
+    let mut response = vec![0_u8; pulse_dns::MAX_MESSAGE_LEN];
     loop {
         if shutdown.load(Ordering::Acquire) {
             return Ok(());
@@ -243,7 +247,8 @@ fn handle_connection(
         if length == 0 {
             return Ok(());
         }
-        let mut request = vec![0_u8; usize::from(length)];
+        request.clear();
+        request.resize(usize::from(length), 0);
         if !read_exact_idle(&mut stream, &mut request)? {
             return Ok(());
         }
@@ -282,10 +287,14 @@ fn handle_connection(
             continue;
         }
         let engine = admin.engine();
-        let Some(response) = dns::respond(&request, Transport::Tcp, &engine, stats) else {
+        let Some(len) = dns::respond_into(&request, Transport::Tcp, &engine, stats, &mut response)
+        else {
             continue;
         };
-        write_frame(&mut stream, &response)?;
+        let Some(frame) = response.get(..len) else {
+            continue;
+        };
+        write_frame(&mut stream, frame)?;
     }
 }
 

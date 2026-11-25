@@ -1,15 +1,69 @@
 //! Преобразование wire-пакета в ответ: decode → `QueryEngine` → encode.
+//!
+//! Горячий путь ([`respond_into`]) пишет ответ прямо в caller-provided буфер
+//! (TX-слот UDP, буфер соединения TCP) без промежуточного `Vec` и без копии.
+//! [`respond`] сохранён для обработчиков, которым нужен владеемый `Vec`
+//! (DoT/DoH/DoQ в `pulse-tls`).
 
-use pulse_dns::{DecodeLimits, EncodeOptions, Flags, Message, Rcode};
-use pulse_server::{QueryEngine, Transport};
+use std::cell::RefCell;
+
+use pulse_dns::DecodeLimits;
+use pulse_dns::{EncodeOptions, EncodeScratch, Encoder, Flags, HeaderCounts, Message, Rcode};
+use pulse_server::{QueryEngine, Scratch, Transport};
 
 use crate::stats::Stats;
 
-/// Обрабатывает один DNS-пакет.
+thread_local! {
+    /// Переиспользуемое состояние ответа на worker-потоке.
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::new());
+}
+
+/// Обрабатывает один DNS-пакет, записывая ответ в `out`.
 ///
 /// `None` означает, что ответа нет: пакет короче заголовка, помечен как ответ
-/// (защита от петель) или ответ не кодируется. Некорректный запрос с читаемым
-/// заголовком получает `FORMERR` с тем же ID.
+/// (защита от петель) или ответ не помещается в `out`. Некорректный запрос с
+/// читаемым заголовком получает `FORMERR` с тем же ID.
+pub(crate) fn respond_into(
+    request: &[u8],
+    transport: Transport,
+    engine: &QueryEngine,
+    stats: &Stats,
+    out: &mut [u8],
+) -> Option<usize> {
+    if request.len() < 12 {
+        stats.decode_error();
+        return None;
+    }
+    let Ok(message) = Message::decode(request, &DecodeLimits::default()) else {
+        stats.decode_error();
+        if request.get(2).is_some_and(|flags| flags & 0x80 != 0) {
+            return None;
+        }
+        return formerr_into(request, out)
+            .map_err(|()| stats.encode_error())
+            .ok();
+    };
+    match transport {
+        Transport::Udp => stats.udp_query(),
+        Transport::Tcp => stats.tcp_query(),
+    }
+    let outcome = SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        engine.respond_into(&message, transport, out, &mut scratch)
+    });
+    if let Ok(len) = outcome {
+        stats.response();
+        Some(len)
+    } else {
+        stats.encode_error();
+        None
+    }
+}
+
+/// Обрабатывает один DNS-пакет и возвращает владеемый ответ.
+///
+/// Используется транспортами, чей handler-контракт требует `Vec<u8>`
+/// (DoT/DoH/DoQ). Для UDP/TCP предпочтителен [`respond_into`].
 pub(crate) fn respond(
     request: &[u8],
     transport: Transport,
@@ -45,19 +99,36 @@ fn formerr(request: &[u8]) -> Result<Vec<u8>, ()> {
     let id = u16::from_be_bytes([*request.first().ok_or(())?, *request.get(1).ok_or(())?]);
     let raw_flags = u16::from_be_bytes([*request.get(2).ok_or(())?, *request.get(3).ok_or(())?]);
     let flags = Flags::from_bits(raw_flags);
-    let response_flags = Flags::new()
-        .with_qr(true)
-        .with_opcode(flags.opcode())
-        .with_rd(flags.rd())
-        .with_cd(flags.cd())
-        .with_aa(false)
-        .with_ra(false)
-        .with_tc(false);
+    let response_flags = error_flags(flags);
     let mut response = Message::new(id, response_flags);
     response.set_rcode(Rcode::FORMERR);
     response
         .encode(&EncodeOptions::compressed())
         .map_err(|_| ())
+}
+
+fn formerr_into(request: &[u8], out: &mut [u8]) -> Result<usize, ()> {
+    let id = u16::from_be_bytes([*request.first().ok_or(())?, *request.get(1).ok_or(())?]);
+    let raw_flags = u16::from_be_bytes([*request.get(2).ok_or(())?, *request.get(3).ok_or(())?]);
+    let flags =
+        error_flags(Flags::from_bits(raw_flags)).with_rcode_bits(Rcode::FORMERR.header_bits());
+    let mut scratch = EncodeScratch::new();
+    let mut encoder = Encoder::new(out, EncodeOptions::compressed(), &mut scratch);
+    encoder.begin_message(id).map_err(|_| ())?;
+    encoder
+        .finish(flags, HeaderCounts::default())
+        .map_err(|_| ())
+}
+
+fn error_flags(request: Flags) -> Flags {
+    Flags::new()
+        .with_qr(true)
+        .with_opcode(request.opcode())
+        .with_rd(request.rd())
+        .with_cd(request.cd())
+        .with_aa(false)
+        .with_ra(false)
+        .with_tc(false)
 }
 
 #[cfg(test)]
@@ -115,12 +186,28 @@ mod tests {
             Question::new(Name::parse("example.com.").unwrap(), Rtype::SOA, Rclass::IN),
         );
         let bytes = query.encode(&EncodeOptions::compressed()).unwrap();
-        let response = respond(&bytes, Transport::Udp, &engine(), &stats).unwrap();
-        let decoded = Message::decode(&response, &DecodeLimits::default()).unwrap();
+        let mut out = [0_u8; 4096];
+        let len = respond_into(&bytes, Transport::Udp, &engine(), &stats, &mut out).unwrap();
+        let decoded = Message::decode(&out[..len], &DecodeLimits::default()).unwrap();
         assert_eq!(decoded.id(), 7);
         assert_eq!(decoded.answers().len(), 1);
         assert_eq!(stats.snapshot().udp_queries, 1);
         assert_eq!(stats.snapshot().responses, 1);
+    }
+
+    #[test]
+    fn streaming_matches_owned_path() {
+        let stats = Stats::new();
+        let engine = engine();
+        let query = Message::query(
+            9,
+            Question::new(Name::parse("example.com.").unwrap(), Rtype::SOA, Rclass::IN),
+        );
+        let bytes = query.encode(&EncodeOptions::compressed()).unwrap();
+        let owned = respond(&bytes, Transport::Udp, &engine, &stats).unwrap();
+        let mut out = [0_u8; 4096];
+        let len = respond_into(&bytes, Transport::Udp, &engine, &stats, &mut out).unwrap();
+        assert_eq!(&out[..len], owned.as_slice());
     }
 
     #[test]
@@ -131,8 +218,9 @@ mod tests {
         bytes[1] = 0x34;
         bytes[4] = 0;
         bytes[5] = 1;
-        let response = respond(&bytes, Transport::Udp, &engine(), &stats).unwrap();
-        let decoded = Message::decode(&response, &DecodeLimits::default()).unwrap();
+        let mut out = [0_u8; 4096];
+        let len = respond_into(&bytes, Transport::Udp, &engine(), &stats, &mut out).unwrap();
+        let decoded = Message::decode(&out[..len], &DecodeLimits::default()).unwrap();
         assert_eq!(decoded.id(), 0x1234);
         assert_eq!(decoded.rcode(), Rcode::FORMERR);
         assert_eq!(stats.snapshot().decode_errors, 1);
@@ -141,7 +229,8 @@ mod tests {
     #[test]
     fn short_packet_is_dropped() {
         let stats = Stats::new();
-        assert!(respond(&[1, 2, 3], Transport::Udp, &engine(), &stats).is_none());
+        let mut out = [0_u8; 4096];
+        assert!(respond_into(&[1, 2, 3], Transport::Udp, &engine(), &stats, &mut out).is_none());
         assert_eq!(stats.snapshot().decode_errors, 1);
     }
 
@@ -151,6 +240,7 @@ mod tests {
         let mut bytes = vec![0_u8; 12];
         bytes[2] = 0x80;
         bytes[5] = 1; // QDCOUNT = 1 without a question: decode fails.
-        assert!(respond(&bytes, Transport::Udp, &engine(), &stats).is_none());
+        let mut out = [0_u8; 4096];
+        assert!(respond_into(&bytes, Transport::Udp, &engine(), &stats, &mut out).is_none());
     }
 }

@@ -1125,6 +1125,8 @@ pub(crate) struct FileZoneView {
     soa: Option<Rrset>,
     ns: Option<Rrset>,
     state: ServerZoneState,
+    /// Ленивый индекс denial-записей, ключ — версия снапшота зоны.
+    denial_index: Mutex<Option<Arc<DenialIndex>>>,
 }
 
 impl FileZoneView {
@@ -1157,6 +1159,7 @@ impl FileZoneView {
             soa,
             ns,
             state,
+            denial_index: Mutex::new(None),
         })
     }
 
@@ -1197,6 +1200,171 @@ impl FileZoneView {
             current = candidate.parent();
         }
         None
+    }
+
+    /// Открывает читатель текущего снапшота зоны (каталог + голова).
+    fn with_current_reader<T>(
+        &self,
+        f: impl FnOnce(&ZoneReader<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let Some(entry) = self.store.zone_entry(&self.origin)? else {
+            return Err(format!("zone {}: not found", self.origin));
+        };
+        self.store.with_reader(&entry, f)
+    }
+
+    /// Возвращает индекс denial-записей для версии снапшота.
+    ///
+    /// Индекс строится один раз на версию (обход ключей B+tree) и живёт до
+    /// смены версии/пересоздания view. При превышении лимита памяти возвращает
+    /// `None` — вызывающий использует линейный путь.
+    fn denial_index(&self, kind: DenialKind, reader: &ZoneReader<'_>) -> Option<Arc<DenialIndex>> {
+        let version = reader.version();
+        let mut guard = self
+            .denial_index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(index) = guard.as_ref()
+            && index.version == version
+            && index.kind == kind
+        {
+            return Some(Arc::clone(index));
+        }
+        let index = Arc::new(Self::build_denial_index(kind, reader)?);
+        *guard = Some(Arc::clone(&index));
+        Some(index)
+    }
+
+    fn build_denial_index(kind: DenialKind, reader: &ZoneReader<'_>) -> Option<DenialIndex> {
+        let version = reader.version();
+        let mut bytes = 0_usize;
+        let mut over_limit = false;
+        let data = match kind {
+            DenialKind::Nsec => {
+                let mut owners = Vec::new();
+                reader
+                    .for_each_owner(Rtype::NSEC.as_u16(), |owner| {
+                        if over_limit {
+                            return;
+                        }
+                        let Ok(name) = name_from_rle(owner) else {
+                            return;
+                        };
+                        bytes = bytes.saturating_add(size_of::<Name>() + name.as_wire().len() + 64);
+                        if bytes > MAX_DENIAL_INDEX_BYTES {
+                            over_limit = true;
+                            return;
+                        }
+                        owners.push(name);
+                    })
+                    .ok()?;
+                if over_limit {
+                    return None;
+                }
+                DenialIndexData::Nsec(owners)
+            }
+            DenialKind::Nsec3 => {
+                let mut hashes = Vec::new();
+                reader
+                    .for_each_owner(Rtype::NSEC3.as_u16(), |owner| {
+                        if over_limit {
+                            return;
+                        }
+                        let Some(label) = owner.first_label() else {
+                            return;
+                        };
+                        let Ok(hash) = pulse_dnssec::denial::base32hex::decode(label) else {
+                            return;
+                        };
+                        bytes = bytes.saturating_add(size_of::<Vec<u8>>() + hash.len() + 64);
+                        if bytes > MAX_DENIAL_INDEX_BYTES {
+                            over_limit = true;
+                            return;
+                        }
+                        hashes.push(hash);
+                    })
+                    .ok()?;
+                if over_limit {
+                    return None;
+                }
+                DenialIndexData::Nsec3(hashes)
+            }
+        };
+        Some(DenialIndex {
+            version,
+            kind,
+            data,
+        })
+    }
+
+    /// Fallback без индекса: `predecessor` по B+tree и проверка NSEC.
+    ///
+    /// Полезен для зон, не поместившихся в лимит индекса: спуск по дереву
+    /// вместо полного скана. Ограничен числом шагов (ENT/glue без NSEC).
+    fn nsec_cover_prev(&self, name: &Name) -> Option<Rrset> {
+        let mut before = name_to_rle(name).ok()?;
+        self.with_current_reader(|reader| {
+            for _ in 0..MAX_PREV_NSEC_STEPS {
+                let Some(previous) = reader.prev_name(Some(&before)).map_err(|e| e.to_string())?
+                else {
+                    return Ok(None);
+                };
+                let Ok(previous_name) = name_from_rle(&previous) else {
+                    return Ok(None);
+                };
+                if let Some(rrset) = read_stored_rrset(reader, &previous_name, Rtype::NSEC) {
+                    let Some(next) = rrset.rdatas().iter().find_map(|rdata| match rdata {
+                        Rdata::Nsec(nsec) => Some(nsec.next_domain()),
+                        _ => None,
+                    }) else {
+                        return Ok(None);
+                    };
+                    if nsec_covers(&previous_name, next, name) {
+                        return Ok(Some(rrset));
+                    }
+                }
+                before = previous;
+            }
+            Ok(None)
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Старый линейный поиск NSEC-покрытия (fallback без индекса).
+    fn nsec_cover_linear(&self, name: &Name) -> Option<Rrset> {
+        let records = self.store.nsec_records(&self.origin).ok()?;
+        records.into_iter().find(|rrset| {
+            let owner = rrset.owner();
+            let Some(next) = rrset.rdatas().iter().find_map(|rdata| match rdata {
+                Rdata::Nsec(nsec) => Some(nsec.next_domain()),
+                _ => None,
+            }) else {
+                return false;
+            };
+            nsec_covers(owner, next, name)
+        })
+    }
+
+    /// Старый линейный поиск NSEC3-покрытия (fallback без индекса).
+    fn nsec3_cover_linear(&self, hash: &[u8]) -> Option<Rrset> {
+        let records = self.store.nsec3_records(&self.origin).ok()?;
+        records.into_iter().find(|rrset| {
+            let owner = rrset.owner();
+            let Some(label) = owner.first_label() else {
+                return false;
+            };
+            let Ok(owner_hash) = pulse_dnssec::denial::base32hex::decode(label) else {
+                return false;
+            };
+            let Some(next) = rrset.rdatas().iter().find_map(|rdata| match rdata {
+                Rdata::Nsec3(data) => Some(data.next_hashed_owner()),
+                _ => None,
+            }) else {
+                return false;
+            };
+            nsec3_covers(&owner_hash, next, hash)
+        })
     }
 }
 
@@ -1285,20 +1453,48 @@ impl ZoneView for FileZoneView {
         if !name.is_subdomain_of(&self.origin) {
             return None;
         }
-        let _ = self.lookup_stored(&self.origin, Rtype::NSEC)?;
-        for rrset in self.store.nsec_records(&self.origin).ok()? {
-            let owner = rrset.owner();
+        let indexed = self.with_current_reader(|reader| {
+            let Some(index) = self.denial_index(DenialKind::Nsec, reader) else {
+                return Ok(IndexedCover::Unavailable);
+            };
+            let DenialIndexData::Nsec(owners) = &index.data else {
+                return Ok(IndexedCover::Unavailable);
+            };
+            let position = owners
+                .partition_point(|owner| owner.cmp_canonical(name) == std::cmp::Ordering::Less);
+            let candidate = if position == 0 {
+                owners.last()
+            } else {
+                owners.get(position - 1)
+            };
+            let Some(owner) = candidate else {
+                return Ok(IndexedCover::Miss);
+            };
+            if owner == name {
+                return Ok(IndexedCover::Miss);
+            }
+            let Some(rrset) = read_stored_rrset(reader, owner, Rtype::NSEC) else {
+                return Ok(IndexedCover::Unavailable);
+            };
             let Some(next) = rrset.rdatas().iter().find_map(|rdata| match rdata {
-                Rdata::Nsec(nsec) => Some(nsec.next_domain().clone()),
+                Rdata::Nsec(nsec) => Some(nsec.next_domain()),
                 _ => None,
             }) else {
-                continue;
+                return Ok(IndexedCover::Unavailable);
             };
-            if nsec_covers(owner, &next, name) {
-                return Some(rrset);
+            if nsec_covers(owner, next, name) {
+                Ok(IndexedCover::Hit(rrset))
+            } else {
+                Ok(IndexedCover::Unavailable)
             }
+        });
+        match indexed {
+            Ok(IndexedCover::Hit(rrset)) => Some(rrset),
+            Ok(IndexedCover::Miss) => None,
+            Ok(IndexedCover::Unavailable) | Err(_) => self
+                .nsec_cover_prev(name)
+                .or_else(|| self.nsec_cover_linear(name)),
         }
-        None
     }
 
     fn denial(&self) -> DenialKind {
@@ -1319,25 +1515,48 @@ impl ZoneView for FileZoneView {
     }
 
     fn nsec3_cover(&self, hash: &[u8]) -> Option<Rrset> {
-        for rrset in self.store.nsec3_records(&self.origin).ok()? {
-            let owner = rrset.owner();
-            let Some(label) = owner.first_label() else {
-                continue;
+        let indexed = self.with_current_reader(|reader| {
+            let Some(index) = self.denial_index(DenialKind::Nsec3, reader) else {
+                return Ok(IndexedCover::Unavailable);
             };
-            let Ok(owner_hash) = pulse_dnssec::denial::base32hex::decode(label) else {
-                continue;
+            let DenialIndexData::Nsec3(hashes) = &index.data else {
+                return Ok(IndexedCover::Unavailable);
+            };
+            let position = hashes.partition_point(|owner| owner.as_slice() < hash);
+            let candidate = if position == 0 {
+                hashes.last()
+            } else {
+                hashes.get(position - 1)
+            };
+            let Some(owner_hash) = candidate else {
+                return Ok(IndexedCover::Miss);
+            };
+            if owner_hash.as_slice() == hash {
+                return Ok(IndexedCover::Miss);
+            }
+            let Ok(owner) = pulse_dnssec::denial::nsec3_owner_name(&self.origin, owner_hash) else {
+                return Ok(IndexedCover::Unavailable);
+            };
+            let Some(rrset) = read_stored_rrset(reader, &owner, Rtype::NSEC3) else {
+                return Ok(IndexedCover::Unavailable);
             };
             let Some(next) = rrset.rdatas().iter().find_map(|rdata| match rdata {
                 Rdata::Nsec3(data) => Some(data.next_hashed_owner()),
                 _ => None,
             }) else {
-                continue;
+                return Ok(IndexedCover::Unavailable);
             };
-            if nsec3_covers(&owner_hash, next, hash) {
-                return Some(rrset);
+            if nsec3_covers(owner_hash, next, hash) {
+                Ok(IndexedCover::Hit(rrset))
+            } else {
+                Ok(IndexedCover::Unavailable)
             }
+        });
+        match indexed {
+            Ok(IndexedCover::Hit(rrset)) => Some(rrset),
+            Ok(IndexedCover::Miss) => None,
+            Ok(IndexedCover::Unavailable) | Err(_) => self.nsec3_cover_linear(hash),
         }
-        None
     }
 
     fn is_delegation(&self, name: &Name) -> bool {
@@ -1361,6 +1580,52 @@ impl ZoneView for FileZoneView {
     fn node_exists(&self, name: &Name) -> bool {
         name.is_subdomain_of(&self.origin) && self.node(name).is_some_and(|node| node.exists)
     }
+}
+
+/// Лимит памяти индекса denial-записей одной зоны.
+///
+/// Индекс хранит только владельцев NSEC (канонические имена) либо
+/// декодированные hashed-владельцы NSEC3, без RDATA. При превышении лимита
+/// зона обслуживается линейным fallback-путём.
+const MAX_DENIAL_INDEX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Сколько имён назад идти `predecessor`-fallback'ом, прежде чем сдаться
+/// линейному скану (защита от длинных цепочек ENT без NSEC).
+const MAX_PREV_NSEC_STEPS: usize = 64;
+
+/// Кэш denial-индекса зоны: согласован с версией снапшота B+tree.
+struct DenialIndex {
+    version: u64,
+    kind: DenialKind,
+    data: DenialIndexData,
+}
+
+enum DenialIndexData {
+    /// Владельцы NSEC в каноническом порядке.
+    Nsec(Vec<Name>),
+    /// Hashed-владельцы NSEC3 (сырые hash, возрастание).
+    Nsec3(Vec<Vec<u8>>),
+}
+
+/// Итог поиска по индексу: `Miss` — покрытия заведомо нет (exact owner),
+/// `Unavailable` — индекса нет/он несогласован, нужен линейный fallback.
+enum IndexedCover {
+    Hit(Rrset),
+    Miss,
+    Unavailable,
+}
+
+/// Читает один RRset владельца из того же снапшота, что и индекс.
+fn read_stored_rrset(reader: &ZoneReader<'_>, owner: &Name, rr_type: Rtype) -> Option<Rrset> {
+    let owner_rle = name_to_rle(owner).ok()?;
+    let record = reader.lookup(&owner_rle, rr_type.as_u16(), 0).ok()??;
+    let stored_owner = name_from_rle(&record.name).ok()?;
+    let view = StoredRrsetView {
+        ttl: record.ttl,
+        flags: record.flags,
+        rdata: record.rdata,
+    };
+    rrset_from_stored(&stored_owner, rr_type, &view).ok()
 }
 
 /// RFC 5155 §7.2: покрывает ли hash-интервал `(owner, next)` значение `hash`.
@@ -1475,4 +1740,249 @@ pub(crate) fn now_unix_ns() -> u64 {
 
 pub(crate) fn file_error(path: &Path, action: &str, error: &ParallelError) -> ZoneFileSourceError {
     ZoneFileSourceError::new(format!("zone file {}: {action}: {error}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulse_dns::{Nsec3Data, Nsec3ParamData, NsecData, TypeBitmap};
+
+    /// Сериализует тесты, создающие зоны: публикация головы использует
+    /// короткий spin (`HEAD_RETRIES`), и под параллельной нагрузкой он может
+    /// не успеть — это свойство store, не индекса.
+    static ZONE_TESTS: Mutex<()> = Mutex::new(());
+
+    fn name(text: &str) -> Name {
+        Name::parse(text).expect("test name")
+    }
+
+    fn ttl() -> Ttl {
+        Ttl::new(300).expect("ttl")
+    }
+
+    fn rrset(owner: &Name, rr_type: Rtype, rdatas: Vec<Rdata>) -> Rrset {
+        Rrset::new(owner.clone(), rr_type, Rclass::IN, ttl(), rdatas).expect("rrset")
+    }
+
+    fn base_data(origin: &Name) -> Vec<Rrset> {
+        vec![
+            rrset(
+                origin,
+                Rtype::SOA,
+                vec![Rdata::Soa(pulse_dns::SoaData::new(
+                    name("ns1.example.com"),
+                    name("hostmaster.example.com"),
+                    pulse_dns::Serial::new(1),
+                    3600,
+                    600,
+                    604_800,
+                    300,
+                ))],
+            ),
+            rrset(origin, Rtype::NS, vec![Rdata::Ns(name("ns1.example.com"))]),
+        ]
+    }
+
+    fn nsec_chain(origin: &Name, owners: &[Name]) -> Vec<Rrset> {
+        let bitmap = TypeBitmap::from_types([Rtype::A, Rtype::NS, Rtype::SOA, Rtype::NSEC]);
+        owners
+            .iter()
+            .enumerate()
+            .map(|(index, owner)| {
+                let next = owners
+                    .get(index + 1)
+                    .cloned()
+                    .unwrap_or_else(|| origin.clone());
+                rrset(
+                    owner,
+                    Rtype::NSEC,
+                    vec![Rdata::Nsec(
+                        NsecData::new(next, bitmap.clone()).expect("nsec"),
+                    )],
+                )
+            })
+            .collect()
+    }
+
+    fn nsec3_chain(origin: &Name, names: &[Name], salt: &[u8]) -> Vec<Rrset> {
+        let mut hashes: Vec<Vec<u8>> = names
+            .iter()
+            .map(|name| pulse_dnssec::rdata_util::nsec3_hash(name, salt, 0))
+            .collect();
+        hashes.sort();
+        let bitmap = TypeBitmap::from_types([Rtype::A, Rtype::NS]);
+        let mut records = vec![rrset(
+            origin,
+            Rtype::NSEC3PARAM,
+            vec![Rdata::Nsec3Param(
+                Nsec3ParamData::new(1, 0, 0, salt.to_vec()).expect("param"),
+            )],
+        )];
+        for (index, hash) in hashes.iter().enumerate() {
+            let next = hashes
+                .get(index + 1)
+                .cloned()
+                .unwrap_or_else(|| hashes[0].clone());
+            let owner = pulse_dnssec::denial::nsec3_owner_name(origin, hash).expect("owner");
+            records.push(rrset(
+                &owner,
+                Rtype::NSEC3,
+                vec![Rdata::Nsec3(
+                    Nsec3Data::new(1, 0, 0, salt.to_vec(), next, bitmap.clone()).expect("nsec3"),
+                )],
+            ));
+        }
+        records
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        store: Arc<ZoneStore>,
+        view: FileZoneView,
+    }
+
+    fn fixture(records: &[Rrset]) -> Fixture {
+        let origin = name("example.com");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("zones.v2");
+        let store = Arc::new(
+            ZoneStore::open_or_create(
+                &path,
+                16 * 1024 * 1024,
+                SyncModeV2::Memory,
+                CommitMode::PerZone,
+            )
+            .expect("store"),
+        );
+        store
+            .replace_zone(
+                &origin,
+                ZoneKind::Primary,
+                ttl(),
+                Denial::Nsec,
+                records,
+                &[],
+            )
+            .expect("write zone");
+        let entry = store
+            .zone_entry(&origin)
+            .expect("entry")
+            .expect("zone exists");
+        let view =
+            FileZoneView::new(Arc::clone(&store), &entry, ServerZoneState::Serving).expect("view");
+        Fixture {
+            _dir: dir,
+            store,
+            view,
+        }
+    }
+
+    #[test]
+    fn nsec_index_matches_linear_and_rebuilds_on_version_change() {
+        let _guard = ZONE_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let origin = name("example.com");
+        let mut owners = vec![
+            origin.clone(),
+            name("*.example.com"),
+            name("m.example.com"),
+            name("z.example.com"),
+        ];
+        owners.sort_by(Name::cmp_canonical);
+        let mut records = base_data(&origin);
+        records.extend(nsec_chain(&origin, &owners));
+        let fixture = fixture(&records);
+        let view = &fixture.view;
+
+        let mut targets: Vec<Name> = owners.clone();
+        for label in ["a", "b", "n", "za", "zzz"] {
+            targets.push(name(&format!("{label}.example.com")));
+        }
+        for target in &targets {
+            assert_eq!(
+                view.nsec_cover(target),
+                view.nsec_cover_linear(target),
+                "cover for {target}"
+            );
+            assert_eq!(
+                view.nsec_cover_prev(target),
+                view.nsec_cover_linear(target),
+                "predecessor fallback for {target}"
+            );
+        }
+
+        // Новая версия зоны: индекс должен перестроиться, а не отдать старый.
+        let mut next = vec![
+            origin.clone(),
+            name("*.example.com"),
+            name("a.example.com"),
+            name("m.example.com"),
+            name("z.example.com"),
+        ];
+        next.sort_by(Name::cmp_canonical);
+        let mut updated = base_data(&origin);
+        updated.extend(nsec_chain(&origin, &next));
+        fixture
+            .store
+            .replace_zone(
+                &origin,
+                ZoneKind::Primary,
+                ttl(),
+                Denial::Nsec,
+                &updated,
+                &[],
+            )
+            .expect("rewrite zone");
+        for target in &targets {
+            assert_eq!(
+                view.nsec_cover(target),
+                view.nsec_cover_linear(target),
+                "cover after version change for {target}"
+            );
+        }
+        // Новый владелец реально участвует в покрытии.
+        assert_eq!(
+            view.nsec_cover_linear(&name("b.example.com"))
+                .map(|r| r.owner().clone()),
+            Some(name("a.example.com"))
+        );
+        assert_eq!(
+            view.nsec_cover(&name("b.example.com"))
+                .map(|r| r.owner().clone()),
+            Some(name("a.example.com"))
+        );
+    }
+
+    #[test]
+    fn nsec3_index_matches_linear() {
+        let _guard = ZONE_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let origin = name("example.com");
+        let names = vec![
+            origin.clone(),
+            name("www.example.com"),
+            name("*.example.com"),
+            name("z.example.com"),
+            name("sub.example.com"),
+        ];
+        let salt = vec![0x10, 0x20];
+        let mut records = base_data(&origin);
+        records.extend(nsec3_chain(&origin, &names, &salt));
+        let fixture = fixture(&records);
+        let view = &fixture.view;
+
+        let mut targets: Vec<Vec<u8>> = names
+            .iter()
+            .map(|name| pulse_dnssec::rdata_util::nsec3_hash(name, &salt, 0))
+            .collect();
+        for byte in [0_u8, 1, 0x55, 0xAA, 0xFF] {
+            targets.push(vec![byte; 20]);
+        }
+        for target in &targets {
+            assert_eq!(
+                view.nsec3_cover(target),
+                view.nsec3_cover_linear(target),
+                "cover for {}",
+                pulse_dnssec::denial::base32hex::encode(target)
+            );
+        }
+    }
 }

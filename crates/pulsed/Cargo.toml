@@ -54,5 +54,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc
 name = "zone_writes"
 harness = false
 
+[[bench]]
+name = "negative"
+harness = false
+
 [lints]
 workspace = true

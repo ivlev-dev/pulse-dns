@@ -51,15 +51,10 @@ impl UdpService {
                 None => {}
             }
             let engine = admin.engine();
-            let Some(response) = dns::respond(request, Transport::Udp, &engine, &stats) else {
+            let Some(len) = dns::respond_into(request, Transport::Udp, &engine, &stats, out) else {
                 return Reply::Drop;
             };
-            if response.len() > out.len() {
-                stats.drop_response();
-                return Reply::Drop;
-            }
-            out[..response.len()].copy_from_slice(&response);
-            Reply::Send(response.len())
+            Reply::Send(len)
         };
         let server = UdpServer::bind_with(addr, handler, config)?;
         server.start()?;
