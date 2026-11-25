@@ -142,4 +142,7 @@ pub enum ServerError {
     /// Ошибка DNSCrypt-транспорта или загрузки ключей.
     #[error("DNSCrypt: {0}")]
     Dnscrypt(String),
+    /// Список CPU не пересекается с `sched_getaffinity`/cpuset.
+    #[error("CPU affinity error: {0}")]
+    Affinity(String),
 }

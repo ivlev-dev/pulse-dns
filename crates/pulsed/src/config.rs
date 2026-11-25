@@ -33,6 +33,7 @@ use std::str::FromStr;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use pulse_dns::Name;
+use pulse_runtime::affinity::{self, MAX_CPU};
 use pulse_transfer::TsigAlgorithm;
 use pulse_zonefile::SyncMode;
 use pulse_zonefile::parallel::SyncModeV2;
@@ -255,6 +256,96 @@ impl FromStr for Role {
             other => Err(format!("unknown role {other:?}; expected all, dns or api")),
         }
     }
+}
+
+/// Политика transparent huge pages для mmap-регионов и арен.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HugePagesSetting {
+    /// Best-effort `madvise(MADV_HUGEPAGE)`; ошибки не фатальны (по умолчанию).
+    #[default]
+    Auto,
+    /// Подсказка обязательна: без THP или при ошибке `madvise` — ошибка старта.
+    Always,
+    /// THP выключен (`MADV_NOHUGEPAGE` для арен).
+    Never,
+}
+
+impl HugePagesSetting {
+    /// Строковое представление для CLI/логов.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    /// Политика для RX-арены `pulse-runtime`.
+    #[must_use]
+    pub const fn runtime(self) -> pulse_runtime::HugePages {
+        match self {
+            Self::Auto => pulse_runtime::HugePages::Auto,
+            Self::Always => pulse_runtime::HugePages::Always,
+            Self::Never => pulse_runtime::HugePages::Never,
+        }
+    }
+
+    /// Политика для mmap-регионов `pulse-zonefile`.
+    #[must_use]
+    pub const fn zonefile(self) -> pulse_zonefile::HugePages {
+        match self {
+            Self::Auto => pulse_zonefile::HugePages::Auto,
+            Self::Always => pulse_zonefile::HugePages::Always,
+            Self::Never => pulse_zonefile::HugePages::Never,
+        }
+    }
+}
+
+impl fmt::Display for HugePagesSetting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for HugePagesSetting {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            "never" => Ok(Self::Never),
+            other => Err(format!(
+                "unknown huge pages policy {other:?}; expected auto, always or never"
+            )),
+        }
+    }
+}
+
+/// Список CPU в TOML/JSON: массив чисел или строка `"0,2,4-7"`.
+fn deserialize_cpu_list<'de, D>(deserializer: D) -> Result<Vec<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Spec {
+        List(Vec<usize>),
+        Text(String),
+    }
+
+    let cpus = match Spec::deserialize(deserializer)? {
+        Spec::List(list) => list,
+        Spec::Text(text) => affinity::parse_list(&text).map_err(serde::de::Error::custom)?,
+    };
+    if let Some(&cpu) = cpus.iter().find(|&&cpu| cpu >= MAX_CPU) {
+        return Err(serde::de::Error::custom(format!(
+            "CPU {cpu} is outside 0..{MAX_CPU}"
+        )));
+    }
+    Ok(cpus)
 }
 
 /// Параметры TCP-транспорта.
@@ -737,6 +828,27 @@ pub struct Config {
     /// Максимум одновременных API-соединений (по одному потоку на соединение).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_workers: Option<usize>,
+    /// CPU для DNS worker'ов (UDP/DNSCrypt), список `"0,2,4-7"` или массив.
+    ///
+    /// Пересекается с `sched_getaffinity`/cpuset; пустое пересечение — ошибка
+    /// старта. Не пересекается с `api_cpu_affinity`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_cpu_list"
+    )]
+    pub dns_cpu_affinity: Vec<usize>,
+    /// CPU для REST API: accept-поток и потоки соединений.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_cpu_list"
+    )]
+    pub api_cpu_affinity: Vec<usize>,
+    /// Политика huge pages для RX-арены DNS worker'ов и mmap-регионов
+    /// `pulse-zonefile` (v1 `FileMap`; v2 читает через page cache).
+    #[serde(default)]
+    pub huge_pages: HugePagesSetting,
     /// Rate limit REST API в запросах в секунду на токен.
     pub api_rate_limit_per_sec: u32,
     /// Интервал опроса новых версий зон ролью `dns`, мс (`0` — отключить).
@@ -825,6 +937,9 @@ impl Default for Config {
             workers: 0,
             dns_workers: None,
             api_workers: None,
+            dns_cpu_affinity: Vec::new(),
+            api_cpu_affinity: Vec::new(),
+            huge_pages: HugePagesSetting::Auto,
             api_rate_limit_per_sec: pulse_api::config::DEFAULT_RATE_LIMIT_PER_SEC,
             zone_poll_ms: 250,
             log_level: LogLevel::Info,
@@ -996,6 +1111,7 @@ impl Config {
                 "api_workers must be in 1..=65535, got {workers}"
             )));
         }
+        self.validate_cpu_affinity()?;
         if self.api_rate_limit_per_sec == 0 {
             return Err(ConfigError::Invalid(
                 "api_rate_limit_per_sec must be greater than zero".to_owned(),
@@ -1176,6 +1292,38 @@ impl Config {
     #[must_use]
     pub fn effective_dns_workers(&self) -> usize {
         self.dns_workers.unwrap_or(self.workers)
+    }
+
+    /// Проверяет списки CPU: границы, дубликаты и пересечение DNS/API.
+    fn validate_cpu_affinity(&self) -> Result<(), ConfigError> {
+        for (label, cpus) in [
+            ("dns_cpu_affinity", &self.dns_cpu_affinity),
+            ("api_cpu_affinity", &self.api_cpu_affinity),
+        ] {
+            let mut seen = std::collections::HashSet::with_capacity(cpus.len());
+            for &cpu in cpus {
+                if cpu >= MAX_CPU {
+                    return Err(ConfigError::Invalid(format!(
+                        "{label}: CPU {cpu} is outside 0..{MAX_CPU}"
+                    )));
+                }
+                if !seen.insert(cpu) {
+                    return Err(ConfigError::Invalid(format!(
+                        "{label}: duplicate CPU {cpu}"
+                    )));
+                }
+            }
+        }
+        if self
+            .dns_cpu_affinity
+            .iter()
+            .any(|cpu| self.api_cpu_affinity.contains(cpu))
+        {
+            return Err(ConfigError::Invalid(
+                "dns_cpu_affinity and api_cpu_affinity overlap".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Проверяет параметры DoT/DoH/DoQ.
@@ -1526,6 +1674,15 @@ impl Config {
         if let Some(workers) = overrides.api_workers {
             self.api_workers = Some(workers);
         }
+        if let Some(cpus) = &overrides.dns_cpu_affinity {
+            self.dns_cpu_affinity.clone_from(cpus);
+        }
+        if let Some(cpus) = &overrides.api_cpu_affinity {
+            self.api_cpu_affinity.clone_from(cpus);
+        }
+        if let Some(policy) = overrides.huge_pages {
+            self.huge_pages = policy;
+        }
         if let Some(poll_ms) = overrides.zone_poll_ms {
             self.zone_poll_ms = poll_ms;
         }
@@ -1592,6 +1749,12 @@ pub struct Overrides {
     pub dns_workers: Option<usize>,
     /// Новый лимит API-соединений (API worker'ов).
     pub api_workers: Option<usize>,
+    /// Новый список CPU для DNS worker'ов.
+    pub dns_cpu_affinity: Option<Vec<usize>>,
+    /// Новый список CPU для REST API.
+    pub api_cpu_affinity: Option<Vec<usize>>,
+    /// Новая политика huge pages.
+    pub huge_pages: Option<HugePagesSetting>,
     /// Новый интервал опроса зон ролью `dns`.
     pub zone_poll_ms: Option<u64>,
     /// Новый уровень логирования.
@@ -1714,6 +1877,9 @@ mod tests {
             role: None,
             dns_workers: None,
             api_workers: None,
+            dns_cpu_affinity: None,
+            api_cpu_affinity: None,
+            huge_pages: None,
             zone_poll_ms: None,
             log_level: Some(LogLevel::Debug),
             zonefile: None,
@@ -2336,6 +2502,9 @@ tick_secs = 300
             role: None,
             dns_workers: None,
             api_workers: None,
+            dns_cpu_affinity: Some(vec![2, 3]),
+            api_cpu_affinity: Some(vec![4]),
+            huge_pages: Some(HugePagesSetting::Never),
             zone_poll_ms: None,
             log_level: Some(LogLevel::Trace),
             zonefile: Some(PathBuf::from("cli.pulse")),
@@ -2530,5 +2699,59 @@ tick_secs = 300
         config.api_workers = Some(64);
         config.zone_poll_ms = 60_001;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn cpu_affinity_parses_from_array_and_string() {
+        let config = Config::from_toml_str(
+            r#"
+listen_udp = "127.0.0.1:0"
+dns_cpu_affinity = [0, 2]
+api_cpu_affinity = "4-5"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(config.dns_cpu_affinity, vec![0, 2]);
+        assert_eq!(config.api_cpu_affinity, vec![4, 5]);
+        assert_eq!(config.huge_pages, HugePagesSetting::Auto);
+        config.validate().expect("valid affinity");
+    }
+
+    #[test]
+    fn cpu_affinity_rejects_overlap_and_bad_cpus() {
+        let base = |dns: Vec<usize>, api: Vec<usize>| Config {
+            dns_cpu_affinity: dns,
+            api_cpu_affinity: api,
+            ..Config::default()
+        };
+        // Пересечение data-plane и control-plane — ошибка конфигурации.
+        let overlap = base(vec![0, 1], vec![1, 2]);
+        let error = overlap.validate().expect_err("overlap must be rejected");
+        assert!(error.to_string().contains("overlap"), "{error}");
+
+        // Дубликаты внутри одного списка и CPU вне маски отвергаются.
+        assert!(base(vec![1, 1], Vec::new()).validate().is_err());
+        assert!(base(vec![MAX_CPU], Vec::new()).validate().is_err());
+        // Непересекающиеся наборы валидны.
+        base(vec![0, 1], vec![2, 3]).validate().expect("disjoint");
+    }
+
+    #[test]
+    fn huge_pages_policy_roundtrips() {
+        let config = Config::from_toml_str(
+            r#"
+listen_udp = "127.0.0.1:0"
+huge_pages = "never"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(config.huge_pages, HugePagesSetting::Never);
+        let dumped = config.to_toml_string().expect("serialize");
+        assert!(dumped.contains("huge_pages = \"never\""), "{dumped}");
+        assert_eq!(
+            "always".parse::<HugePagesSetting>().unwrap(),
+            HugePagesSetting::Always
+        );
+        assert!("sometimes".parse::<HugePagesSetting>().is_err());
     }
 }

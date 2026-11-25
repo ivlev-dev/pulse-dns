@@ -20,10 +20,12 @@ impl UdpService {
     pub(crate) fn start(
         addr: SocketAddr,
         workers: usize,
+        cpu_affinity: &[usize],
         processor: Arc<Processor>,
     ) -> Result<Self, RuntimeError> {
         let config = RuntimeConfig::default()
             .with_workers(workers)
+            .with_cpu_affinity(cpu_affinity.to_vec())
             .with_rx_buffer_size(RX_BUFFER_SIZE)
             .with_tx(512, TX_SLOT_SIZE);
         let handler = move |request: &[u8], peer: SocketAddr, out: &mut [u8]| match processor

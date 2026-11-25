@@ -142,6 +142,7 @@ pub fn serve_with_journal<Z: ZoneAdmin>(
         write_timeout: config.write_timeout,
     };
     let max_connections = config.max_connections;
+    let cpu_affinity = Arc::new(config.cpu_affinity.clone());
     let store: Arc<dyn ZoneAdmin> = store;
     let api = Arc::new(Api::new(
         &config,
@@ -156,10 +157,22 @@ pub fn serve_with_journal<Z: ZoneAdmin>(
         let api = Arc::clone(&api);
         let shutdown = Arc::clone(&shutdown);
         let workers = Arc::clone(&workers);
+        let cpus = Arc::clone(&cpu_affinity);
         thread::Builder::new()
             .name("pulse-api-accept".to_owned())
             .spawn(move || {
-                accept_loop(listener, &api, &shutdown, &workers, limits, max_connections);
+                if let Some(&cpu) = cpus.first() {
+                    pin_current(cpu);
+                }
+                accept_loop(
+                    listener,
+                    &api,
+                    &shutdown,
+                    &workers,
+                    limits,
+                    max_connections,
+                    &cpus,
+                );
             })
             .map_err(ApiServerError::Thread)?
     };
@@ -178,8 +191,10 @@ fn accept_loop(
     workers: &Arc<Mutex<Vec<JoinHandle<()>>>>,
     limits: HttpLimits,
     max_connections: usize,
+    cpu_affinity: &Arc<Vec<usize>>,
 ) {
     let active = Arc::new(AtomicUsize::new(0));
+    let next_cpu = AtomicUsize::new(0);
     loop {
         if shutdown.load(Ordering::Acquire) {
             break;
@@ -196,9 +211,18 @@ fn accept_loop(
                 let _ = stream.set_nodelay(true);
                 let api = Arc::clone(api);
                 let worker_active = Arc::clone(&active);
+                let cpu = if cpu_affinity.is_empty() {
+                    None
+                } else {
+                    let index = next_cpu.fetch_add(1, Ordering::Relaxed);
+                    cpu_affinity.get(index % cpu_affinity.len()).copied()
+                };
                 let handle = match thread::Builder::new()
                     .name("pulse-api-conn".to_owned())
                     .spawn(move || {
+                        if let Some(cpu) = cpu {
+                            pin_current(cpu);
+                        }
                         let _guard = ActiveGuard(worker_active);
                         serve_connection(&mut stream, peer, &api, &limits);
                     }) {
@@ -222,6 +246,18 @@ fn accept_loop(
             }
         }
     }
+}
+
+/// Прибить текущий поток к `cpu`. Вызывается только из потоков API после
+/// `pulse_runtime::affinity::resolve`, поэтому ошибка не фатальна: поток
+/// продолжит работу на разрешённых CPU.
+fn pin_current(cpu: usize) {
+    if cpu >= rustix::thread::CpuSet::MAX_CPU {
+        return;
+    }
+    let mut set = rustix::thread::CpuSet::new();
+    set.set(cpu);
+    let _ = rustix::thread::sched_setaffinity(None, &set);
 }
 
 struct ActiveGuard(Arc<AtomicUsize>);
@@ -325,5 +361,77 @@ mod tests {
         let response = get(server.addr(), "/readyz").unwrap();
         assert!(response.starts_with("HTTP/1.1 503"));
         server.shutdown();
+    }
+
+    fn parse_cpu_list(text: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        for part in text.trim().split(',') {
+            match part.split_once('-') {
+                Some((start, end)) => {
+                    let start: usize = start.parse().expect("range start");
+                    let end: usize = end.parse().expect("range end");
+                    out.extend(start..=end);
+                }
+                None => out.push(part.parse().expect("cpu")),
+            }
+        }
+        out
+    }
+
+    /// Есть ли поток `name` с точной маской `expected` (в процессе живут и
+    /// другие тестовые API-серверы, поэтому проверяются все совпадения).
+    fn has_thread_with_mask(name: &str, expected: &[usize]) -> bool {
+        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+            return false;
+        };
+        for task in tasks.flatten() {
+            let Ok(status) = std::fs::read_to_string(task.path().join("status")) else {
+                continue;
+            };
+            let mut thread = String::new();
+            let mut mask = Vec::new();
+            for line in status.lines() {
+                if let Some(value) = line.strip_prefix("Name:") {
+                    value.trim().clone_into(&mut thread);
+                } else if let Some(value) = line.strip_prefix("Cpus_allowed_list:") {
+                    mask = parse_cpu_list(value);
+                }
+            }
+            if thread == name && mask == expected {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn accept_thread_follows_configured_cpu() {
+        let allowed = pulse_runtime_test_cpus();
+        let target = *allowed.last().expect("allowed CPUs");
+        let mut config = config();
+        config.cpu_affinity = vec![target];
+        let store = Arc::new(InMemoryZoneAdmin::new());
+        let server = serve(config, store).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // `/proc/<tid>/status` усекает comm до 15 символов ("pulse-api-accep").
+            if has_thread_with_mask("pulse-api-accep", &[target]) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "accept thread is not pinned");
+            thread::sleep(Duration::from_millis(10));
+        }
+        server.shutdown();
+    }
+
+    /// CPU, разрешённые процессу (для теста маски; без зависимости на pulse-runtime).
+    fn pulse_runtime_test_cpus() -> Vec<usize> {
+        let status = std::fs::read_to_string("/proc/self/status").expect("status");
+        for line in status.lines() {
+            if let Some(value) = line.strip_prefix("Cpus_allowed_list:") {
+                return parse_cpu_list(value);
+            }
+        }
+        panic!("Cpus_allowed_list is missing");
     }
 }

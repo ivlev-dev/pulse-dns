@@ -13,6 +13,7 @@ use pulse_api::auth::TokenConfig;
 use pulse_api::config::ApiConfig;
 use pulse_api::journal::{Journal, JournalConfig, JournalError};
 use pulse_api::server::{ApiServerError, RunningServer, serve_with_journal};
+use pulse_runtime::affinity;
 use pulse_server::StatsSnapshot as QueryStatsSnapshot;
 use thiserror::Error;
 
@@ -95,6 +96,20 @@ impl Server {
     pub fn start_with_api(config: &Config, api: Option<ApiOptions>) -> Result<Self, ServerError> {
         config.validate()?;
         let role = config.role;
+        // Пересечение с `sched_getaffinity`/cpuset проверяется до открытия
+        // zonefile и сокетов: пустое пересечение — ошибка старта, а не тихий
+        // запуск без пиннинга. `cpu_affinity` в конфиге уже не пересекается
+        // между DNS и API (см. `Config::validate_cpu_affinity`).
+        let dns_affinity = if role.serves_dns() {
+            resolve_affinity("dns_cpu_affinity", &config.dns_cpu_affinity)?
+        } else {
+            Vec::new()
+        };
+        let api_affinity = if role.serves_api() {
+            resolve_affinity("api_cpu_affinity", &config.api_cpu_affinity)?
+        } else {
+            Vec::new()
+        };
         if role == Role::Api && api.is_none() {
             return Err(ServerError::Store(
                 "role=api requires REST API options (--api-listen and --api-token)".to_owned(),
@@ -225,6 +240,7 @@ impl Server {
             Some(addr) if role.serves_dns() => Some(DnscryptService::start(
                 config,
                 addr,
+                &dns_affinity,
                 Arc::clone(&admin),
                 Arc::clone(&stats),
                 Arc::clone(&metrics),
@@ -235,6 +251,7 @@ impl Server {
             Some(addr) if role.serves_dns() => Some(DnscryptTcpService::start(
                 config,
                 addr,
+                &dns_affinity,
                 Arc::clone(&admin),
                 Arc::clone(&stats),
                 Arc::clone(&metrics),
@@ -248,7 +265,7 @@ impl Server {
                     addr,
                     config.tcp.max_connections,
                     config.tcp.idle_timeout(),
-                    Arc::clone(&admin),
+                    &admin,
                     Arc::clone(&stats),
                 )
                 .map_err(|source| ServerError::TcpStart { addr, source })?,
@@ -259,6 +276,8 @@ impl Server {
             Some(addr) if role.serves_dns() => Some(UdpService::start(
                 addr,
                 config.effective_dns_workers(),
+                &dns_affinity,
+                config.huge_pages.runtime(),
                 Arc::clone(&admin),
                 Arc::clone(&stats),
             )?),
@@ -282,6 +301,7 @@ impl Server {
                 if let Some(workers) = config.api_workers {
                     api_config.max_connections = workers;
                 }
+                api_config.cpu_affinity.clone_from(&api_affinity);
                 let metric_source = {
                     let metrics = Arc::clone(&metrics);
                     Arc::new(move || metrics.render())
@@ -765,4 +785,18 @@ pub enum ServerError {
     /// Ошибка write-ahead журнала или его recovery.
     #[error("journal error: {0}")]
     Journal(#[from] JournalError),
+    /// Список CPU не пересекается с `sched_getaffinity`/cpuset.
+    #[error("CPU affinity error: {0}")]
+    Affinity(String),
+}
+
+/// Проверить `cpu_affinity` из конфига против маски процесса.
+///
+/// Пустой список — пиннинга нет. Непустой пересекается с разрешёнными CPU;
+/// пустое пересечение — [`ServerError::Affinity`].
+fn resolve_affinity(name: &str, cpus: &[usize]) -> Result<Vec<usize>, ServerError> {
+    if cpus.is_empty() {
+        return Ok(Vec::new());
+    }
+    affinity::resolve(cpus).map_err(|error| ServerError::Affinity(format!("{name}: {error}")))
 }

@@ -60,6 +60,14 @@ impl Server {
     /// при ошибке защищённого транспорта, [`ServerError::MetricsStart`] при
     /// занятом адресе метрик.
     pub fn start(config: &Config) -> Result<Self, ServerError> {
+        // Пиннинг проверяется до bind: пустое пересечение с маской процесса —
+        // ошибка старта. Значение уже пересечено, чужие CPU не используются.
+        let cpu_affinity = if config.control_cpu_affinity.is_empty() {
+            Vec::new()
+        } else {
+            pulse_runtime::affinity::resolve(&config.control_cpu_affinity)
+                .map_err(|error| ServerError::Affinity(format!("control_cpu_affinity: {error}")))?
+        };
         let resolver = Resolver::new(config.resolver_config()?)?;
         let stats = Arc::new(Stats::new());
         let acl = config.build_acl()?;
@@ -94,6 +102,7 @@ impl Server {
             Some(addr) => Some(UdpService::start(
                 addr,
                 config.workers,
+                &cpu_affinity,
                 Arc::clone(&processor),
             )?),
             None => None,
@@ -180,7 +189,7 @@ impl Server {
                     token.expose().as_bytes().to_vec(),
                 );
                 Some(
-                    ControlService::start(addr, state)
+                    ControlService::start(addr, state, &cpu_affinity)
                         .map_err(|source| ServerError::ControlStart { addr, source })?,
                 )
             }

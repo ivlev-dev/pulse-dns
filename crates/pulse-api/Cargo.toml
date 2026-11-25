@@ -13,6 +13,7 @@ base64 = "0.22"
 pulse-dns = { path = "../pulse-dns" }
 pulse-dnssec = { path = "../pulse-dnssec" }
 pulse-master = { path = "../pulse-master" }
+rustix = { version = "1", features = ["thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

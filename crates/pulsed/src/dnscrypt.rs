@@ -448,6 +448,7 @@ impl DnscryptService {
     pub(crate) fn start(
         config: &Config,
         addr: SocketAddr,
+        cpu_affinity: &[usize],
         admin: Arc<SharedZoneAdmin>,
         stats: Arc<Stats>,
         metrics: Arc<TransportMetrics>,
@@ -479,7 +480,10 @@ impl DnscryptService {
         let server = UdpServer::bind_with(
             addr,
             handler,
-            RuntimeConfig::default().with_workers(config.workers),
+            RuntimeConfig::default()
+                .with_workers(config.workers)
+                .with_cpu_affinity(cpu_affinity.to_vec())
+                .with_huge_pages(config.huge_pages.runtime()),
         )?;
         server.start()?;
         Ok(Self {
@@ -567,6 +571,7 @@ impl DnscryptTcpService {
     pub(crate) fn start(
         config: &Config,
         addr: SocketAddr,
+        cpu_affinity: &[usize],
         admin: Arc<SharedZoneAdmin>,
         stats: Arc<Stats>,
         metrics: Arc<TransportMetrics>,
@@ -583,13 +588,18 @@ impl DnscryptTcpService {
         let idle_timeout = Duration::from_millis(config.dnscrypt_tcp_idle_timeout_ms);
         let max_connections = config.dnscrypt_tcp_max_connections;
         let max_frame = config.dnscrypt_tcp_max_frame;
+        let cpus = Arc::new(cpu_affinity.to_vec());
         let acceptor = {
             let shutdown = Arc::clone(&shutdown);
             let connections = Arc::clone(&connections);
             let active = Arc::clone(&active);
+            let cpus = Arc::clone(&cpus);
             thread::Builder::new()
                 .name("pulse-dnscrypt-tcp-accept".to_owned())
                 .spawn(move || {
+                    if let Some(&cpu) = cpus.first() {
+                        let _ = pulse_runtime::affinity::pin_current(cpu);
+                    }
                     let context = TcpAcceptContext {
                         max_connections,
                         max_frame,
@@ -599,7 +609,7 @@ impl DnscryptTcpService {
                         metrics,
                         dnscrypt,
                     };
-                    accept_loop(&listener, &context, &shutdown, &connections, &active);
+                    accept_loop(&listener, &context, &shutdown, &connections, &active, &cpus);
                 })
                 .map_err(DnscryptError::tcp)?
         };
@@ -708,10 +718,13 @@ fn accept_loop(
     shutdown: &Arc<AtomicBool>,
     connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
     active: &Arc<AtomicU64>,
+    cpu_affinity: &Arc<Vec<usize>>,
 ) {
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _peer)) => spawn_connection(stream, context, shutdown, connections, active),
+            Ok((stream, _peer)) => {
+                spawn_connection(stream, context, shutdown, connections, active, cpu_affinity);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(DNSCRYPT_TCP_ACCEPT_POLL);
             }
@@ -731,6 +744,7 @@ fn spawn_connection(
     shutdown: &Arc<AtomicBool>,
     connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
     active: &Arc<AtomicU64>,
+    cpu_affinity: &Arc<Vec<usize>>,
 ) {
     let active_now = usize::try_from(active.load(Ordering::Acquire)).unwrap_or(usize::MAX);
     if active_now >= context.max_connections {
@@ -761,9 +775,17 @@ fn spawn_connection(
     let shutdown = Arc::clone(shutdown);
     let idle_timeout = context.idle_timeout;
     let max_frame = context.max_frame;
+    let cpu = if cpu_affinity.is_empty() {
+        None
+    } else {
+        Some(cpu_affinity[usize::try_from(id).unwrap_or(0) % cpu_affinity.len()])
+    };
     let spawned = thread::Builder::new()
         .name(format!("pulse-dnscrypt-tcp-{id}"))
         .spawn(move || {
+            if let Some(cpu) = cpu {
+                let _ = pulse_runtime::affinity::pin_current(cpu);
+            }
             let _guard = guard;
             if let Err(error) = handle_tcp_connection(
                 stream,

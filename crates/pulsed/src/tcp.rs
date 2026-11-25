@@ -1,32 +1,37 @@
-//! TCP-транспорт: std listener, поток на соединение, length-prefixed framing.
+//! TCP-транспорт: неблокирующий event-loop, length-prefixed framing.
+//!
+//! Обычные DNS-запросы обслуживаются задачами общего tokio event-loop
+//! (`pulse_tls::net::TcpServer`): поток на соединение не создаётся, лимит
+//! соединений и idle-таймаут задаёт конфигурация. AXFR/IXFR остаются
+//! потоковыми: после разбора запроса сокет передаётся в `spawn_blocking`,
+//! потому что протокол трансфера пишет серию кадров через синхронный
+//! `Read + Write`. Такой поток ограничен таймаутами сокета и не занимает
+//! воркер event-loop.
 
-use std::collections::HashMap;
-use std::io::{self, Read, Write};
-use std::net::{Shutdown as SocketShutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::io;
+use std::net::{Shutdown as SocketShutdown, SocketAddr, TcpListener};
+use std::sync::Arc;
+use std::time::Duration;
 
+use pulse_dns::{DecodeLimits, Message, Opcode, Rtype};
 use pulse_server::Transport;
+use pulse_tls::net::{BufferPool, ConnectionHandler, ServerHooks, TcpServer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
+use tokio::time::timeout;
 
 use crate::stats::Stats;
 use crate::store::SharedZoneAdmin;
 use crate::{dns, logging};
 
-const ACCEPT_POLL: Duration = Duration::from_millis(20);
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
-
-static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
+const REQUEST_BUFFER_CHUNK: usize = 4096;
+const REQUEST_BUFFER_POOL: usize = 1024;
+const RESPONSE_POOL: usize = 256;
 
 /// Запущенный TCP-сервер.
 pub(crate) struct TcpService {
-    local_addr: SocketAddr,
-    shutdown: Arc<AtomicBool>,
+    tcp: TcpServer,
     stats: Arc<Stats>,
-    connections: Arc<Mutex<HashMap<u64, TcpStream>>>,
-    idle_timeout: Duration,
-    acceptor: Option<JoinHandle<()>>,
 }
 
 impl TcpService {
@@ -34,80 +39,86 @@ impl TcpService {
         addr: SocketAddr,
         max_connections: usize,
         idle_timeout: Duration,
-        admin: Arc<SharedZoneAdmin>,
+        admin: &Arc<SharedZoneAdmin>,
         stats: Arc<Stats>,
     ) -> io::Result<Self> {
+        let admin = Arc::clone(admin);
         let listener = TcpListener::bind(addr)?;
-        listener.set_nonblocking(true)?;
-        let local_addr = listener.local_addr()?;
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let connections = Arc::new(Mutex::new(HashMap::new()));
-        let acceptor = {
-            let shutdown = Arc::clone(&shutdown);
-            let connections = Arc::clone(&connections);
+        let requests = Arc::new(BufferPool::new(REQUEST_BUFFER_CHUNK, REQUEST_BUFFER_POOL));
+        let responses = Arc::new(BufferPool::new(pulse_dns::MAX_MESSAGE_LEN, RESPONSE_POOL));
+        let handler: ConnectionHandler = {
+            let admin = Arc::clone(&admin);
             let stats = Arc::clone(&stats);
-            thread::Builder::new()
-                .name("pulse-tcp-accept".to_owned())
-                .spawn(move || {
-                    accept_loop(
-                        &listener,
-                        max_connections,
-                        idle_timeout,
+            Arc::new(move |stream, peer, shutdown| {
+                let admin = Arc::clone(&admin);
+                let stats = Arc::clone(&stats);
+                let requests = Arc::clone(&requests);
+                let responses = Arc::clone(&responses);
+                Box::pin(async move {
+                    stats.tcp_connection_opened();
+                    let _guard = ConnectionGuard(Arc::clone(&stats));
+                    if let Err(error) = serve(
+                        stream,
+                        peer,
                         &admin,
                         &stats,
-                        &shutdown,
-                        &connections,
-                    );
-                })?
+                        shutdown,
+                        idle_timeout,
+                        &requests,
+                        &responses,
+                    )
+                    .await
+                    {
+                        stats.tcp_io_error();
+                        logging::debug(
+                            "tcp_connection",
+                            &format!("connection {peer} closed with error: {error}"),
+                        );
+                    }
+                })
+            })
         };
-        Ok(Self {
-            local_addr,
-            shutdown,
-            stats,
-            connections,
-            idle_timeout,
-            acceptor: Some(acceptor),
-        })
+        let hooks = ServerHooks::new(
+            Some({
+                let stats = Arc::clone(&stats);
+                Arc::new(move || stats.tcp_rejected())
+            }),
+            Some({
+                let stats = Arc::clone(&stats);
+                Arc::new(move || stats.tcp_accept_error())
+            }),
+        );
+        let shutdown_timeout = idle_timeout + Duration::from_millis(500);
+        let tcp = TcpServer::start(
+            "pulse-tcp",
+            listener,
+            max_connections,
+            shutdown_timeout,
+            hooks,
+            handler,
+        )?;
+        Ok(Self { tcp, stats })
     }
 
     pub(crate) fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        self.tcp.local_addr()
     }
 
     pub(crate) fn shutdown(&mut self) -> io::Result<()> {
-        self.shutdown.store(true, Ordering::Release);
-        if let Some(acceptor) = self.acceptor.take() {
-            acceptor
-                .join()
-                .map_err(|_| io::Error::other("tcp acceptor thread panicked"))?;
+        match self.tcp.shutdown() {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                logging::warn(
+                    "tcp_shutdown",
+                    &format!(
+                        "{} TCP connection(s) still active after graceful deadline",
+                        self.stats.tcp_active()
+                    ),
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
-        let streams: Vec<TcpStream> = {
-            let connections = self
-                .connections
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            connections
-                .values()
-                .filter_map(|stream| stream.try_clone().ok())
-                .collect()
-        };
-        for stream in streams {
-            let _ = stream.shutdown(SocketShutdown::Both);
-        }
-        let deadline = Instant::now() + self.idle_timeout + Duration::from_millis(500);
-        while self.stats.tcp_active() > 0 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
-        if self.stats.tcp_active() > 0 {
-            logging::warn(
-                "tcp_shutdown",
-                &format!(
-                    "{} TCP connection(s) still active after graceful deadline",
-                    self.stats.tcp_active()
-                ),
-            );
-        }
-        Ok(())
     }
 }
 
@@ -117,150 +128,60 @@ impl Drop for TcpService {
     }
 }
 
-fn accept_loop(
-    listener: &TcpListener,
-    max_connections: usize,
-    idle_timeout: Duration,
-    admin: &Arc<SharedZoneAdmin>,
-    stats: &Arc<Stats>,
-    shutdown: &Arc<AtomicBool>,
-    connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
-) {
-    while !shutdown.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, peer)) => spawn_connection(
-                stream,
-                peer,
-                max_connections,
-                idle_timeout,
-                admin,
-                stats,
-                shutdown,
-                connections,
-            ),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_POLL);
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => {
-                stats.tcp_accept_error();
-                logging::warn("tcp_accept", &format!("accept failed: {error}"));
-                thread::sleep(ACCEPT_ERROR_BACKOFF);
-            }
-        }
+struct ConnectionGuard(Arc<Stats>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.tcp_connection_closed();
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_connection(
-    stream: TcpStream,
+async fn serve(
+    mut stream: tokio::net::TcpStream,
     peer: SocketAddr,
-    max_connections: usize,
-    idle_timeout: Duration,
     admin: &Arc<SharedZoneAdmin>,
     stats: &Arc<Stats>,
-    shutdown: &Arc<AtomicBool>,
-    connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
-) {
-    let active = usize::try_from(stats.tcp_active()).unwrap_or(usize::MAX);
-    if active >= max_connections {
-        stats.tcp_rejected();
-        return;
-    }
-    stats.tcp_connection_opened();
-    let id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
-    let guard = ConnectionGuard {
-        id,
-        connections: Arc::clone(connections),
-        stats: Arc::clone(stats),
-    };
-    if let Ok(tracked) = stream.try_clone() {
-        guard
-            .connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, tracked);
-    }
-    let admin = Arc::clone(admin);
-    let stats = Arc::clone(stats);
-    let shutdown = Arc::clone(shutdown);
-    let spawned = thread::Builder::new()
-        .name(format!("pulse-tcp-{id}"))
-        .spawn(move || {
-            let _guard = guard;
-            if let Err(error) =
-                handle_connection(stream, peer, &admin, &stats, &shutdown, idle_timeout)
-            {
-                stats.tcp_io_error();
-                logging::debug(
-                    "tcp_connection",
-                    &format!("connection {id} closed with error: {error}"),
-                );
-            }
-        });
-    if let Err(error) = spawned {
-        logging::warn(
-            "tcp_spawn",
-            &format!("cannot spawn connection thread: {error}"),
-        );
-    }
-}
-
-struct ConnectionGuard {
-    id: u64,
-    connections: Arc<Mutex<HashMap<u64, TcpStream>>>,
-    stats: Arc<Stats>,
-}
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.id);
-        self.stats.tcp_connection_closed();
-    }
-}
-
-fn handle_connection(
-    mut stream: TcpStream,
-    peer: SocketAddr,
-    admin: &SharedZoneAdmin,
-    stats: &Stats,
-    shutdown: &AtomicBool,
+    mut shutdown: watch::Receiver<bool>,
     idle_timeout: Duration,
+    requests: &Arc<BufferPool>,
+    responses: &Arc<BufferPool>,
 ) -> io::Result<()> {
-    stream.set_read_timeout(Some(idle_timeout))?;
-    stream.set_write_timeout(Some(idle_timeout))?;
     stream.set_nodelay(true)?;
-    // Переиспользуемые буферы на соединение: запрос и ответ не аллоцируются
-    // на каждый кадр.
-    let mut request = Vec::new();
-    let mut response = vec![0_u8; pulse_dns::MAX_MESSAGE_LEN];
     loop {
-        if shutdown.load(Ordering::Acquire) {
+        if *shutdown.borrow() {
             return Ok(());
         }
-        let Some(length) = read_prefix(&mut stream)? else {
+        let prefix = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return Ok(()),
+            prefix = read_prefix(&mut stream, idle_timeout) => prefix?,
+        };
+        let Some(length) = prefix else {
             return Ok(());
         };
         if length == 0 {
             return Ok(());
         }
-        request.clear();
-        request.resize(usize::from(length), 0);
-        if !read_exact_idle(&mut stream, &mut request)? {
-            return Ok(());
+        let mut request_buffer = requests.acquire();
+        let buffer = request_buffer.prepare(usize::from(length));
+        match timeout(idle_timeout, stream.read_exact(buffer)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Ok(()),
         }
+        let request = request_buffer.take_vec(usize::from(length));
+
         let now = crate::transfer::now_unix();
         match admin.transfer().handle_notify_in(&request, peer.ip(), now) {
             Some(crate::transfer::NotifyAction::Reply(response)) => {
-                write_frame(&mut stream, &response)?;
+                write_frame(&mut stream, &response, idle_timeout).await?;
                 stats.response();
                 continue;
             }
             Some(crate::transfer::NotifyAction::Accepted { zone, response, .. }) => {
-                write_frame(&mut stream, &response)?;
+                write_frame(&mut stream, &response, idle_timeout).await?;
                 stats.response();
                 admin.wake_secondary(&zone, std::time::Instant::now());
                 continue;
@@ -268,69 +189,101 @@ fn handle_connection(
             Some(crate::transfer::NotifyAction::Ignore) => return Ok(()),
             None => {}
         }
-        if let Some(result) =
-            admin
-                .transfer()
-                .handle_transfer(&mut stream, &request, peer.ip(), now)
-        {
-            stats.tcp_query();
-            match result {
-                Ok(()) => stats.response(),
-                Err(error) => {
-                    stats.tcp_io_error();
-                    logging::debug(
-                        "tcp_transfer",
-                        &format!("transfer from {} failed: {error}", peer.ip()),
-                    );
-                }
-            }
-            continue;
+
+        if is_transfer_request(&request) {
+            let stream = stream.into_std()?;
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(idle_timeout))?;
+            stream.set_write_timeout(Some(idle_timeout))?;
+            let admin = Arc::clone(admin);
+            let stats = Arc::clone(stats);
+            let outcome = tokio::task::spawn_blocking(move || {
+                let mut stream = stream;
+                stats.tcp_query();
+                let result = match admin.transfer().handle_transfer(
+                    &mut stream,
+                    &request,
+                    peer.ip(),
+                    crate::transfer::now_unix(),
+                ) {
+                    Some(Ok(())) => {
+                        stats.response();
+                        Ok(())
+                    }
+                    Some(Err(error)) => {
+                        stats.tcp_io_error();
+                        logging::debug(
+                            "tcp_transfer",
+                            &format!("transfer from {} failed: {error}", peer.ip()),
+                        );
+                        Err(io::Error::other(error.to_string()))
+                    }
+                    None => Ok(()),
+                };
+                let _ = stream.shutdown(SocketShutdown::Both);
+                result
+            })
+            .await;
+            return outcome.map_err(io::Error::other)?;
         }
+
         let engine = admin.engine();
-        let Some(len) = dns::respond_into(&request, Transport::Tcp, &engine, stats, &mut response)
-        else {
-            continue;
-        };
-        let Some(frame) = response.get(..len) else {
-            continue;
-        };
-        write_frame(&mut stream, frame)?;
+        {
+            let mut response_buffer = responses.acquire();
+            let buffer = response_buffer.prepare(pulse_dns::MAX_MESSAGE_LEN);
+            let Some(len) = dns::respond_into(&request, Transport::Tcp, &engine, stats, buffer)
+            else {
+                continue;
+            };
+            let Some(frame) = buffer.get(..len) else {
+                continue;
+            };
+            write_frame(&mut stream, frame, idle_timeout).await?;
+        }
     }
 }
 
-fn write_frame(stream: &mut TcpStream, response: &[u8]) -> io::Result<()> {
+fn is_transfer_request(raw: &[u8]) -> bool {
+    let Ok(message) = Message::decode(raw, &DecodeLimits::default()) else {
+        return false;
+    };
+    message.opcode() == Opcode::QUERY
+        && message
+            .questions()
+            .first()
+            .is_some_and(|question| matches!(question.qtype(), Rtype::AXFR | Rtype::IXFR))
+}
+
+async fn write_frame(
+    stream: &mut tokio::net::TcpStream,
+    response: &[u8],
+    deadline: Duration,
+) -> io::Result<()> {
     let length = u16::try_from(response.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response exceeds 65535 bytes"))?;
-    stream.write_all(&length.to_be_bytes())?;
-    stream.write_all(response)?;
-    stream.flush()
+    let write = async {
+        stream.write_all(&length.to_be_bytes()).await?;
+        stream.write_all(response).await?;
+        stream.flush().await
+    };
+    match timeout(deadline, write).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "TCP write timed out",
+        )),
+    }
 }
 
-fn read_prefix(stream: &mut TcpStream) -> io::Result<Option<u16>> {
+async fn read_prefix(
+    stream: &mut tokio::net::TcpStream,
+    idle_timeout: Duration,
+) -> io::Result<Option<u16>> {
     let mut prefix = [0_u8; 2];
-    if !read_exact_idle(stream, &mut prefix)? {
-        return Ok(None);
+    match timeout(idle_timeout, stream.read_exact(&mut prefix)).await {
+        Ok(Ok(_)) => Ok(Some(u16::from_be_bytes(prefix))),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Ok(None),
     }
-    Ok(Some(u16::from_be_bytes(prefix)))
-}
-
-fn read_exact_idle(stream: &mut TcpStream, buffer: &mut [u8]) -> io::Result<bool> {
-    let mut filled = 0;
-    while filled < buffer.len() {
-        match stream.read(&mut buffer[filled..]) {
-            Ok(0) => return Ok(false),
-            Ok(read) => filled += read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if is_timeout(&error) => return Ok(false),
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(true)
-}
-
-fn is_timeout(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
 }

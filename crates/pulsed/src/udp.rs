@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use pulse_runtime::{BackendKind, Reply, RuntimeConfig, ServerStats, UdpServer};
+use pulse_runtime::{BackendKind, HugePages, Reply, RuntimeConfig, ServerStats, UdpServer};
 use pulse_server::Transport;
 
 use crate::dns;
@@ -19,10 +19,19 @@ impl UdpService {
     pub(crate) fn start(
         addr: SocketAddr,
         workers: usize,
+        cpu_affinity: &[usize],
+        huge_pages: HugePages,
         admin: Arc<SharedZoneAdmin>,
         stats: Arc<Stats>,
     ) -> Result<Self, pulse_runtime::RuntimeError> {
-        let config = RuntimeConfig::default().with_workers(workers);
+        // Непустой список уже пересечён с маской процесса в `Server::start`;
+        // `with_cpu_affinity` включает пиннинг worker'ов (`pin_to_cpu` не нужен).
+        // CPU раздаются по кругу `cpu[index % len]`, лишние ядра просто не
+        // используются при малом числе worker'ов.
+        let config = RuntimeConfig::default()
+            .with_workers(workers)
+            .with_cpu_affinity(cpu_affinity.to_vec())
+            .with_huge_pages(huge_pages);
         let handler = move |request: &[u8], peer: SocketAddr, out: &mut [u8]| -> Reply {
             match admin
                 .transfer()

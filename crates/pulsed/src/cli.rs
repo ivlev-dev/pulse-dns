@@ -11,7 +11,9 @@ use pulse_dns::Name;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::config::{CommitMode, Config, DnssecKeyRole, Durability, LogLevel, Overrides, Role};
+use crate::config::{
+    CommitMode, Config, DnssecKeyRole, Durability, HugePagesSetting, LogLevel, Overrides, Role,
+};
 use crate::dnscrypt::{GenCertOptions, generate_certificate};
 use crate::logging;
 use crate::server::{ApiOptions, Server, ServerError};
@@ -60,6 +62,9 @@ pub(crate) fn run() -> ExitCode {
         role: matches.get_one::<Role>("role").copied(),
         dns_workers: matches.get_one::<usize>("dns-workers").copied(),
         api_workers: matches.get_one::<usize>("api-workers").copied(),
+        dns_cpu_affinity: matches.get_one::<Vec<usize>>("dns-cpu-affinity").cloned(),
+        api_cpu_affinity: matches.get_one::<Vec<usize>>("api-cpu-affinity").cloned(),
+        huge_pages: matches.get_one::<HugePagesSetting>("huge-pages").copied(),
         zone_poll_ms: matches.get_one::<u64>("zone-poll-ms").copied(),
         log_level: matches.get_one::<LogLevel>("log-level").copied(),
         zonefile: matches.get_one::<PathBuf>("data").cloned(),
@@ -830,6 +835,7 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
         ServerError::Config(_)
         | ServerError::Store(_)
         | ServerError::Dnssec(_)
+        | ServerError::Affinity(_)
         | ServerError::Journal(_) => ExitCode::from(2),
         ServerError::Api(error) => match error {
             ApiServerError::Config(_) => ExitCode::from(2),
@@ -845,6 +851,12 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
         | ServerError::Tls(_)
         | ServerError::Dnscrypt(_) => ExitCode::from(1),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+/// Разобрать список CPU для clap (`"0,2,4-7"`).
+fn parse_cpu_list(value: &str) -> Result<Vec<usize>, String> {
+    pulse_runtime::affinity::parse_list(value)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -998,6 +1010,27 @@ fn command() -> Command {
                 .value_name("N")
                 .value_parser(value_parser!(usize))
                 .help("Maximum concurrent REST connections (one worker thread each)"),
+        )
+        .arg(
+            Arg::new("dns-cpu-affinity")
+                .long("dns-cpu-affinity")
+                .value_name("LIST")
+                .value_parser(parse_cpu_list)
+                .help("Pin DNS workers to CPUs: \"0,2,4-7\" (intersected with the process mask)"),
+        )
+        .arg(
+            Arg::new("api-cpu-affinity")
+                .long("api-cpu-affinity")
+                .value_name("LIST")
+                .value_parser(parse_cpu_list)
+                .help("Pin REST API threads to CPUs: \"2,3\" (must not overlap dns list)"),
+        )
+        .arg(
+            Arg::new("huge-pages")
+                .long("huge-pages")
+                .value_name("POLICY")
+                .value_parser(value_parser!(HugePagesSetting))
+                .help("Transparent huge pages for mmap/arenas: auto (default), always or never"),
         )
         .arg(
             Arg::new("zone-poll-ms")
@@ -1349,5 +1382,34 @@ mod tests {
         assert!(tsig_keys(&matches(&["--tsig-key", "xfr-key.test.:c2VjcmV0"])).is_err());
         assert!(tsig_keys(&matches(&["--tsig-key", ".:hmac-sha256:c2VjcmV0"])).is_err());
         assert!(tsig_keys(&matches(&["--tsig-key", "xfr-key.test.:hmac-sha256:"])).is_err());
+    }
+
+    #[test]
+    fn affinity_and_huge_pages_flags_parse() {
+        let matches = matches(&[
+            "--dns-cpu-affinity",
+            "0,2-3",
+            "--api-cpu-affinity",
+            "4",
+            "--huge-pages",
+            "never",
+        ]);
+        assert_eq!(
+            matches.get_one::<Vec<usize>>("dns-cpu-affinity"),
+            Some(&vec![0, 2, 3])
+        );
+        assert_eq!(
+            matches.get_one::<Vec<usize>>("api-cpu-affinity"),
+            Some(&vec![4])
+        );
+        assert_eq!(
+            matches.get_one::<HugePagesSetting>("huge-pages"),
+            Some(&HugePagesSetting::Never)
+        );
+        assert!(
+            command()
+                .try_get_matches_from(["pulsed", "--dns-cpu-affinity", "5-2"])
+                .is_err()
+        );
     }
 }

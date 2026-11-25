@@ -4,6 +4,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use pulse_dns::{
@@ -234,4 +235,88 @@ fn shutdown_releases_listeners() {
         recv_from(&socket, &mut buffer).is_err(),
         "UDP socket must be closed"
     );
+}
+
+#[test]
+fn tcp_slowloris_does_not_block_active_query() {
+    let (_zone, mut config) = test_config();
+    config.tcp.idle_timeout_ms = 200;
+    let mut server = Server::start(&config).expect("start server");
+    let address = server.tcp_addr().expect("tcp enabled");
+
+    let mut slow = TcpStream::connect(address).expect("slow connect");
+    slow.write_all(&[0_u8]).expect("partial prefix");
+
+    let started = Instant::now();
+    let mut active = TcpStream::connect(address).expect("active connect");
+    active
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    write_frame(&mut active, &query("www.example.com.", Rtype::A));
+    let response = read_frame(&mut active);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "slowloris blocked active query for {:?}",
+        started.elapsed()
+    );
+
+    slow.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("slow timeout");
+    let mut byte = [0_u8; 1];
+    loop {
+        match slow.read(&mut byte) {
+            Ok(0) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                break;
+            }
+            other => panic!("slowloris connection must be closed, got {other:?}"),
+        }
+    }
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn tcp_connection_limit_rejects_excess_and_reuses_slot() {
+    let (_zone, mut config) = test_config();
+    config.tcp.max_connections = 1;
+    let mut server = Server::start(&config).expect("start server");
+    let address = server.tcp_addr().expect("tcp enabled");
+
+    let mut first = TcpStream::connect(address).expect("first");
+    write_frame(&mut first, &query("www.example.com.", Rtype::A));
+    assert_eq!(read_frame(&mut first).rcode(), Rcode::NOERROR);
+
+    let mut excess = TcpStream::connect(address).expect("excess connect");
+    excess
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("excess timeout");
+    let mut byte = [0_u8; 1];
+    assert!(
+        matches!(excess.read(&mut byte), Ok(0) | Err(_)),
+        "connection above the limit must be closed"
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while server.stats().tcp_rejected == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(server.stats().tcp_rejected >= 1);
+
+    drop(first);
+    thread::sleep(Duration::from_millis(200));
+    let mut reused = TcpStream::connect(address).expect("reused slot");
+    reused
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    write_frame(&mut reused, &query("www.example.com.", Rtype::A));
+    assert_eq!(read_frame(&mut reused).rcode(), Rcode::NOERROR);
+    server.shutdown().expect("shutdown");
 }

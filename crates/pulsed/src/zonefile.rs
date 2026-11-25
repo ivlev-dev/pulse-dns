@@ -1911,8 +1911,10 @@ impl FileZoneSnapshot<'_, '_> {
 
 /// Заимствованный поиск RRset по точному ключу `(owner, type, subtype)`.
 ///
-/// `OVERFLOW`-payload и ошибки чтения дают [`RefLookup::Unsupported`]:
-/// вызывающий обязан уступить полному пути, чтобы не потерять записи.
+/// Inline-payload и `OVERFLOW`-цепочка, умещающаяся в одной странице, отдаются
+/// без копии. Цепочка из нескольких страниц и ошибки чтения дают
+/// [`RefLookup::Unsupported`]: вызывающий обязан уступить полному пути, чтобы
+/// не потерять записи.
 fn stored_lookup_ref<'s: 'b, 'b>(
     reader: &'s ZoneReader<'_>,
     name: NameRef<'b>,
@@ -1924,7 +1926,12 @@ fn stored_lookup_ref<'s: 'b, 'b>(
     };
     match reader.lookup_ref(&owner, rr_type.as_u16(), subtype) {
         Ok(Some(stored)) => {
-            if stored.value.kind != ValueKind::Inline {
+            let overflow = stored.value.kind == ValueKind::Overflow;
+            if overflow && stored.payload.is_empty() {
+                // Несколько overflow-страниц: непрерывного среза без копии нет.
+                return RefLookup::Unsupported;
+            }
+            if stored.value.kind != ValueKind::Inline && !overflow {
                 return RefLookup::Unsupported;
             }
             RefLookup::Found(ServerRrsetRef::from_wire(
@@ -2024,6 +2031,11 @@ impl ServerZoneSnapshot for FileZoneSnapshot<'_, '_> {
         if !name.is_subdomain_of_name(&self.view.origin) {
             return LookupOutcomeRef::ZoneNotFound;
         }
+        // v2 хранит RRSIG по подтипу (`type covered`); запрос `QTYPE = RRSIG`
+        // требует слияния всех подтипов — это делает полный путь.
+        if rtype == Rtype::RRSIG {
+            return LookupOutcomeRef::Unsupported;
+        }
 
         if let Some(cut) = self.delegation_of_ref(name) {
             if cut.as_wire() != name.as_wire() {
@@ -2043,15 +2055,26 @@ impl ServerZoneSnapshot for FileZoneSnapshot<'_, '_> {
             };
         }
 
-        if let Some(rrset) = self.stored_ref(name, rtype) {
-            return LookupOutcomeRef::Answer(rrset);
+        match stored_lookup_ref(self.reader, name, rtype, 0) {
+            RefLookup::Found(rrset) => return LookupOutcomeRef::Answer(rrset),
+            RefLookup::Unsupported => return LookupOutcomeRef::Unsupported,
+            RefLookup::Absent => {}
         }
-        if rtype != Rtype::CNAME
-            && let Some(cname) = self.stored_ref(name, Rtype::CNAME)
-            && let Some(pulse_server::RdataRef::Wire { bytes, .. }) = cname.first_record()
-            && let Ok(target) = NameRef::from_wire(bytes)
-        {
-            return LookupOutcomeRef::Cname(cname, target);
+        if rtype != Rtype::CNAME {
+            match stored_lookup_ref(self.reader, name, Rtype::CNAME, 0) {
+                RefLookup::Found(cname) => {
+                    let Some(pulse_server::RdataRef::Wire { bytes, .. }) = cname.first_record()
+                    else {
+                        return LookupOutcomeRef::Unsupported;
+                    };
+                    let Ok(target) = NameRef::from_wire(bytes) else {
+                        return LookupOutcomeRef::Unsupported;
+                    };
+                    return LookupOutcomeRef::Cname(cname, target);
+                }
+                RefLookup::Unsupported => return LookupOutcomeRef::Unsupported,
+                RefLookup::Absent => {}
+            }
         }
         if self.node_exists_ref(name) {
             LookupOutcomeRef::NoData

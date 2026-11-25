@@ -529,3 +529,92 @@ fn malformed_query_never_panics_the_server() {
         Rcode::NOERROR
     );
 }
+
+#[test]
+fn tcp_slowloris_does_not_block_active_query() {
+    let upstream = MockUpstream::start(|request| {
+        Some(positive_response(
+            request,
+            record_for(request, [192, 0, 2, 11]),
+        ))
+    });
+    let mut config = base_config(upstream.address());
+    config.tcp.idle_timeout_ms = 200;
+    let mut server = Server::start(&config).unwrap();
+    let addr = server.tcp_addr().unwrap();
+
+    let mut slow = TcpStream::connect(addr).expect("slow connect");
+    slow.write_all(&[0_u8]).expect("partial prefix");
+
+    let started = std::time::Instant::now();
+    let reply = tcp_query_retry(addr, &make_query("slow.test", Rtype::A, None), "slowloris");
+    assert_eq!(reply.rcode(), Rcode::NOERROR);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "slowloris blocked active query for {:?}",
+        started.elapsed()
+    );
+
+    slow.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("slow timeout");
+    let mut byte = [0_u8; 1];
+    loop {
+        match slow.read(&mut byte) {
+            Ok(0) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                break;
+            }
+            other => panic!("slowloris connection must be closed, got {other:?}"),
+        }
+    }
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn tcp_connection_limit_rejects_excess_and_reuses_slot() {
+    let upstream = MockUpstream::start(|request| {
+        Some(positive_response(
+            request,
+            record_for(request, [192, 0, 2, 12]),
+        ))
+    });
+    let mut config = base_config(upstream.address());
+    config.tcp.max_connections = 1;
+    let mut server = Server::start(&config).unwrap();
+    let addr = server.tcp_addr().unwrap();
+
+    let first = TcpStream::connect(addr).expect("first");
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while server.stats().tcp_connections == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut excess = TcpStream::connect(addr).expect("excess connect");
+    excess
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("excess timeout");
+    let mut byte = [0_u8; 1];
+    assert!(
+        matches!(excess.read(&mut byte), Ok(0) | Err(_)),
+        "connection above the limit must be closed"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while server.stats().tcp_rejected == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(server.stats().tcp_rejected >= 1);
+
+    drop(first);
+    std::thread::sleep(Duration::from_millis(200));
+    let reply = tcp_query_retry(addr, &make_query("slot.test", Rtype::A, None), "slot reuse");
+    assert_eq!(reply.rcode(), Rcode::NOERROR);
+    server.shutdown().unwrap();
+}

@@ -370,7 +370,11 @@ pub(crate) struct ControlService {
 }
 
 impl ControlService {
-    pub(crate) fn start(addr: SocketAddr, state: Arc<ControlState>) -> io::Result<Self> {
+    pub(crate) fn start(
+        addr: SocketAddr,
+        state: Arc<ControlState>,
+        cpu_affinity: &[usize],
+    ) -> io::Result<Self> {
         if !addr.ip().is_loopback() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -384,14 +388,21 @@ impl ControlService {
         let active = Arc::new(AtomicUsize::new(0));
         let workers = Arc::new(Mutex::new(Vec::new()));
         let setting = state.config.control;
+        let cpus = Arc::new(cpu_affinity.to_vec());
         let accept = {
             let state = Arc::clone(&state);
             let shutdown = Arc::clone(&shutdown);
             let active = Arc::clone(&active);
             let workers = Arc::clone(&workers);
+            let cpus = Arc::clone(&cpus);
             thread::Builder::new()
                 .name("pulseresolved-control".to_owned())
-                .spawn(move || accept_loop(&listener, &state, shutdown, &active, &workers))?
+                .spawn(move || {
+                    if let Some(&cpu) = cpus.first() {
+                        pin_current(cpu);
+                    }
+                    accept_loop(&listener, &state, shutdown, &active, &workers, &cpus);
+                })?
         };
         Ok(Self {
             addr,
@@ -444,7 +455,9 @@ fn accept_loop(
     shutdown: Arc<AtomicBool>,
     active: &Arc<AtomicUsize>,
     workers: &Arc<Mutex<Vec<JoinHandle<()>>>>,
+    cpu_affinity: &Arc<Vec<usize>>,
 ) {
+    let next_cpu = AtomicUsize::new(0);
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, peer)) => {
@@ -457,9 +470,18 @@ fn accept_loop(
                 let state = Arc::clone(state);
                 let guard = ActiveGuard(Arc::clone(active));
                 let stop = Arc::clone(&shutdown);
+                let cpu = if cpu_affinity.is_empty() {
+                    None
+                } else {
+                    let index = next_cpu.fetch_add(1, Ordering::Relaxed);
+                    Some(cpu_affinity[index % cpu_affinity.len()])
+                };
                 let spawned = thread::Builder::new()
                     .name("pulseresolved-control-http".to_owned())
                     .spawn(move || {
+                        if let Some(cpu) = cpu {
+                            pin_current(cpu);
+                        }
                         let _guard = guard;
                         let _ = serve_connection(stream, peer, &state, &stop);
                     });
@@ -476,6 +498,11 @@ fn accept_loop(
             Err(_) => thread::sleep(ACCEPT_POLL),
         }
     }
+}
+
+/// Прибить текущий поток к `cpu` (список уже пересечён с маской процесса).
+fn pin_current(cpu: usize) {
+    let _ = pulse_runtime::affinity::pin_current(cpu);
 }
 
 struct ActiveGuard(Arc<AtomicUsize>);

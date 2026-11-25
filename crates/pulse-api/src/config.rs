@@ -80,6 +80,12 @@ pub struct ApiConfig {
     pub idempotency_capacity: usize,
     /// Максимум одновременных соединений.
     pub max_connections: usize,
+    /// CPU для accept-потока и потоков соединений (по кругу).
+    ///
+    /// Список уже пересечён с `sched_getaffinity`/cpuset вызывающей стороной
+    /// (`pulse_runtime::affinity::resolve`); пусто — пиннинга нет. Ошибка
+    /// `sched_setaffinity` в отдельном соединении не фатальна.
+    pub cpu_affinity: Vec<usize>,
 }
 
 impl ApiConfig {
@@ -97,6 +103,7 @@ impl ApiConfig {
             idempotency_ttl: DEFAULT_IDEMPOTENCY_TTL,
             idempotency_capacity: DEFAULT_IDEMPOTENCY_CAPACITY,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            cpu_affinity: Vec::new(),
         }
     }
 

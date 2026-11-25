@@ -151,6 +151,118 @@ fn udp_allocations_over_v2_zone_by_class() {
                 &RrsetData::new(60, 0, vec![cname]).expect("cname"),
             )
             .expect("alias write");
+        for (owner, target) in [
+            ("loop1.example.test", "loop2.example.test."),
+            ("loop2.example.test", "loop1.example.test."),
+        ] {
+            writer
+                .upsert_rrset(
+                    &NameRle::from_ascii(owner).expect("loop owner"),
+                    Rtype::CNAME.as_u16(),
+                    0,
+                    &RrsetData::new(
+                        120,
+                        0,
+                        vec![
+                            Rdata::Cname(Name::parse(target).expect("loop target"))
+                                .to_canonical_wire(),
+                        ],
+                    )
+                    .expect("loop cname"),
+                )
+                .expect("loop write");
+        }
+        let dname_owner = NameRle::from_ascii("dname.example.test").expect("dname owner");
+        let dname_ext = NameRle::from_ascii("dname-ext.example.test").expect("dname ext");
+        let dname_a = NameRle::from_ascii("a.example.test").expect("dname a");
+        let dname_b = NameRle::from_ascii("b.example.test").expect("dname b");
+        let cname_to_dname =
+            NameRle::from_ascii("cname-to-dname.example.test").expect("cname to dname");
+        let wc = NameRle::from_ascii("*.wc.example.test").expect("wildcard cname");
+        let big_single = NameRle::from_ascii("big1.example.test").expect("single overflow");
+        let big_multi = NameRle::from_ascii("big2.example.test").expect("multi overflow");
+        let dname_wire = |target: &str| {
+            Rdata::Dname(Name::parse(target).expect("dname target")).to_canonical_wire()
+        };
+        for (owner, target) in [
+            (&dname_owner, "dname-target.example.test."),
+            (&dname_ext, "target.outside.test."),
+            (&dname_a, "b.example.test."),
+            (&dname_b, "a.example.test."),
+        ] {
+            writer
+                .upsert_rrset(
+                    owner,
+                    Rtype::DNAME.as_u16(),
+                    0,
+                    &RrsetData::new(300, 0, vec![dname_wire(target)]).expect("dname"),
+                )
+                .expect("dname write");
+        }
+        writer
+            .upsert_rrset(
+                &NameRle::from_ascii("host.dname-target.example.test").expect("dname target owner"),
+                Rtype::A.as_u16(),
+                0,
+                &RrsetData::new(
+                    300,
+                    0,
+                    vec![Rdata::A("192.0.2.60".parse().expect("ipv4")).to_canonical_wire()],
+                )
+                .expect("dname target a"),
+            )
+            .expect("dname target write");
+        writer
+            .upsert_rrset(
+                &cname_to_dname,
+                Rtype::CNAME.as_u16(),
+                0,
+                &RrsetData::new(
+                    120,
+                    0,
+                    vec![
+                        Rdata::Cname(Name::parse("host.dname.example.test.").expect("target"))
+                            .to_canonical_wire(),
+                    ],
+                )
+                .expect("cname to dname"),
+            )
+            .expect("cname to dname write");
+        writer
+            .upsert_rrset(
+                &wc,
+                Rtype::CNAME.as_u16(),
+                0,
+                &RrsetData::new(
+                    120,
+                    0,
+                    vec![
+                        Rdata::Cname(Name::parse("alias.example.test.").expect("target"))
+                            .to_canonical_wire(),
+                    ],
+                )
+                .expect("wildcard cname"),
+            )
+            .expect("wildcard cname write");
+        let txt_rrset = |count: usize| {
+            let payload = "x".repeat(150);
+            let records = (0..count)
+                .map(|index| {
+                    Rdata::Txt(
+                        pulse_dns::TxtData::new([format!("{index:04}-{payload}").into_bytes()])
+                            .expect("txt"),
+                    )
+                    .to_canonical_wire()
+                })
+                .collect::<Vec<_>>();
+            RrsetData::new(300, 0, records).expect("txt rrset")
+        };
+        writer
+            .upsert_rrset(&big_single, Rtype::TXT.as_u16(), 0, &txt_rrset(6))
+            .expect("single overflow write");
+        writer
+            .upsert_rrset(&big_multi, Rtype::TXT.as_u16(), 0, &txt_rrset(40))
+            .expect("multi overflow write");
         writer
             .upsert_rrset(
                 &wildcard,
@@ -364,6 +476,42 @@ fn udp_allocations_over_v2_zone_by_class() {
             Rcode::NXDOMAIN,
             0,
         ),
+        (
+            "DNAME",
+            query("host.dname.example.test.", Rtype::A, false),
+            Rcode::NOERROR,
+            3,
+        ),
+        (
+            "DNAME-outside",
+            query("host.dname-ext.example.test.", Rtype::A, false),
+            Rcode::NOERROR,
+            2,
+        ),
+        (
+            "DNAME-via-cname",
+            query("cname-to-dname.example.test.", Rtype::A, false),
+            Rcode::NOERROR,
+            4,
+        ),
+        (
+            "CNAME-loop",
+            query("loop1.example.test.", Rtype::A, false),
+            Rcode::SERVFAIL,
+            0,
+        ),
+        (
+            "DNAME-loop",
+            query("x.a.example.test.", Rtype::A, false),
+            Rcode::SERVFAIL,
+            0,
+        ),
+        (
+            "wildcard-CNAME-chain",
+            query("x.wc.example.test.", Rtype::A, false),
+            Rcode::NOERROR,
+            3,
+        ),
     ];
 
     for (label, bytes, rcode, answers) in &classes {
@@ -404,5 +552,79 @@ fn udp_allocations_over_v2_zone_by_class() {
             "{label}: bytes/op {bytes_per_op:.1} exceeds 512"
         );
     }
+    // `QTYPE = RRSIG` в v2 требует слияния подтипов `type covered` — это
+    // документированный fallback полного пути.
+    let sig_bytes = query("www.example.test.", Rtype::RRSIG, false);
+    for _ in 0..10 {
+        socket.send_to(&sig_bytes, address).expect("send");
+        let len = recv(&socket, &mut buffer);
+        let response =
+            Message::decode(&buffer[..len], &pulse_dns::DecodeLimits::default()).expect("decode");
+        assert_eq!(response.rcode(), Rcode::NOERROR, "RRSIG: rcode");
+        assert_eq!(response.answers().len(), 2, "RRSIG: merged subtypes");
+    }
+
+    // Overflow-payload: одна страница кодируется из refs, несколько страниц —
+    // безопасный fallback полного пути.
+    for (label, bytes, single) in [
+        (
+            "overflow-single",
+            query("big1.example.test.", Rtype::TXT, true),
+            true,
+        ),
+        (
+            "overflow-multi",
+            query("big2.example.test.", Rtype::TXT, true),
+            false,
+        ),
+    ] {
+        for _ in 0..100 {
+            socket.send_to(&bytes, address).expect("send");
+            recv(&socket, &mut buffer);
+        }
+        socket.send_to(&bytes, address).expect("send");
+        let len = recv(&socket, &mut buffer);
+        let response =
+            Message::decode(&buffer[..len], &pulse_dns::DecodeLimits::default()).expect("decode");
+        assert_eq!(response.rcode(), Rcode::NOERROR, "{label}: rcode");
+        assert!(!response.answers().is_empty(), "{label}: answers");
+        if single {
+            assert_eq!(
+                response.answers().len(),
+                6,
+                "{label}: full single-page rrset"
+            );
+            assert!(!response.flags().tc(), "{label}: must fit EDNS 1232");
+        } else {
+            assert!(
+                response.flags().tc(),
+                "{label}: multi-page rrset must truncate"
+            );
+        }
+
+        let ops = 200_u64;
+        ALLOCS.store(0, Ordering::Relaxed);
+        COUNTING.store(true, Ordering::Relaxed);
+        for _ in 0..ops {
+            socket.send_to(&bytes, address).expect("send");
+            recv(&socket, &mut buffer);
+        }
+        COUNTING.store(false, Ordering::Relaxed);
+        let allocations = ALLOCS.load(Ordering::Relaxed);
+        let per_op = allocations as f64 / ops as f64;
+        println!("udp-e2e v2 {label}: {per_op:.4} allocs/op");
+        if single {
+            assert!(
+                allocations <= 2,
+                "{label}: single-page overflow must be zero-copy (got {allocations})"
+            );
+        } else {
+            assert!(
+                allocations > 0,
+                "{label}: multi-page overflow uses the documented fallback"
+            );
+        }
+    }
+
     server.shutdown().expect("shutdown");
 }

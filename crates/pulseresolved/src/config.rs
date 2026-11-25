@@ -21,6 +21,7 @@ use pulse_resolver::{
     ForwardConfig, IterativeConfig, Mode, Override, ResolverConfig, TimeoutConfig, UpstreamConfig,
     UpstreamPoolConfig,
 };
+use pulse_runtime::affinity::MAX_CPU;
 use pulse_tls::{Acl, RateLimitConfig as TlsRateLimitConfig, RateLimiter};
 use serde::de::{self, Deserializer};
 use serde::ser::SerializeMap;
@@ -1065,6 +1066,16 @@ pub struct Config {
     /// Число UDP worker'ов (`0` — по доступному параллелизму).
     #[serde(default)]
     pub workers: usize,
+    /// CPU для worker'ов резолвера (UDP/TCP/control), `"0,2,4-7"` или массив.
+    ///
+    /// Пересекается с `sched_getaffinity`/cpuset; пустое пересечение — ошибка
+    /// старта, чужие CPU не используются.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_cpu_list"
+    )]
+    pub control_cpu_affinity: Vec<usize>,
     /// Режим резолюции.
     #[serde(default)]
     pub mode: ModeSetting,
@@ -1142,6 +1153,7 @@ impl Default for Config {
             control_token: None,
             control: ControlSetting::default(),
             workers: 0,
+            control_cpu_affinity: Vec::new(),
             mode: ModeSetting::default(),
             forwarders: Vec::new(),
             upstreams: Vec::new(),
@@ -1245,6 +1257,30 @@ impl Config {
     ///
     /// [`ConfigError::Invalid`], если не задан ни один транспорт, параметры
     /// выходят за допустимые пределы или overrides некорректны.
+    fn validate_control_cpu_affinity(&self) -> Result<(), ConfigError> {
+        let mut seen = Vec::with_capacity(self.control_cpu_affinity.len());
+        for &cpu in &self.control_cpu_affinity {
+            if cpu >= MAX_CPU {
+                return Err(ConfigError::invalid(format!(
+                    "control_cpu_affinity: CPU {cpu} is outside 0..{MAX_CPU}"
+                )));
+            }
+            if seen.contains(&cpu) {
+                return Err(ConfigError::invalid(format!(
+                    "control_cpu_affinity: duplicate CPU {cpu}"
+                )));
+            }
+            seen.push(cpu);
+        }
+        Ok(())
+    }
+
+    /// Проверяет локальные ограничения конфигурации.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`], если не задан ни один транспорт, параметры
+    /// выходят за допустимые пределы или overrides некорректны.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !self.has_any_transport() {
             return Err(ConfigError::invalid(
@@ -1302,6 +1338,7 @@ impl Config {
                 self.workers
             )));
         }
+        self.validate_control_cpu_affinity()?;
         if self.ns_port == 0 {
             return Err(ConfigError::invalid("ns_port must be non-zero"));
         }
@@ -1685,6 +1722,9 @@ impl Config {
         if let Some(workers) = overrides.workers {
             self.workers = workers;
         }
+        if let Some(cpus) = &overrides.control_cpu_affinity {
+            self.control_cpu_affinity.clone_from(cpus);
+        }
         if !overrides.forwarders.is_empty() {
             self.mode = ModeSetting::Forward;
             self.forwarders.clone_from(&overrides.forwarders);
@@ -1759,6 +1799,8 @@ pub struct Overrides {
     pub metrics_listen: Option<SocketAddr>,
     /// Новое число UDP worker'ов.
     pub workers: Option<usize>,
+    /// Новый список CPU для worker'ов резолвера.
+    pub control_cpu_affinity: Option<Vec<usize>>,
     /// Новые forwarder-ы (включают forward-режим).
     pub forwarders: Vec<SocketAddr>,
     /// Дополнительные смешанные upstream (включают forward-режим).
@@ -1775,6 +1817,32 @@ pub struct Overrides {
     pub no_dnssec: bool,
     /// Новый уровень логирования.
     pub log_level: Option<LogLevel>,
+}
+
+/// Список CPU в TOML/JSON: массив чисел или строка `"0,2,4-7"`.
+fn deserialize_cpu_list<'de, D>(deserializer: D) -> Result<Vec<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Spec {
+        List(Vec<usize>),
+        Text(String),
+    }
+
+    let cpus = match Spec::deserialize(deserializer)? {
+        Spec::List(list) => list,
+        Spec::Text(text) => {
+            pulse_runtime::affinity::parse_list(&text).map_err(serde::de::Error::custom)?
+        }
+    };
+    if let Some(&cpu) = cpus.iter().find(|&&cpu| cpu >= MAX_CPU) {
+        return Err(serde::de::Error::custom(format!(
+            "CPU {cpu} is outside 0..{MAX_CPU}"
+        )));
+    }
+    Ok(cpus)
 }
 
 fn default_true() -> bool {
@@ -2540,5 +2608,62 @@ total_ms = 2000
         assert_eq!(config.forwarders.len(), 1);
         assert_eq!(config.blocklist.paths.len(), 2);
         assert!(!config.dnssec_validate);
+    }
+
+    #[test]
+    fn control_cpu_affinity_parses_and_validates() {
+        let text = r#"
+listen_udp = "127.0.0.1:0"
+forwarders = ["1.1.1.1:53"]
+control_cpu_affinity = "0,2-3"
+"#;
+        let config = Config::from_toml_str(text).expect("parse");
+        assert_eq!(config.control_cpu_affinity, vec![0, 2, 3]);
+        config.validate().expect("valid affinity");
+
+        let array = Config::from_toml_str(
+            r#"
+listen_udp = "127.0.0.1:0"
+control_cpu_affinity = [4, 5]
+"#,
+        )
+        .expect("parse array");
+        assert_eq!(array.control_cpu_affinity, vec![4, 5]);
+
+        // Дубликаты и CPU вне маски отвергаются.
+        let duplicate = Config {
+            listen_udp: Some("127.0.0.1:0".parse().unwrap()),
+            forwarders: vec!["1.1.1.1:53".parse().unwrap()],
+            control_cpu_affinity: vec![1, 1],
+            ..Config::default()
+        };
+        assert!(duplicate.validate().is_err());
+        let outside = Config {
+            listen_udp: Some("127.0.0.1:0".parse().unwrap()),
+            forwarders: vec!["1.1.1.1:53".parse().unwrap()],
+            control_cpu_affinity: vec![MAX_CPU],
+            ..Config::default()
+        };
+        assert!(outside.validate().is_err());
+        // Ошибка разбора диапазона видна на этапе конфигурации.
+        assert!(
+            Config::from_toml_str(
+                r#"
+listen_udp = "127.0.0.1:0"
+control_cpu_affinity = "5-2"
+"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn control_cpu_affinity_override_applies() {
+        let mut config = Config::from_toml_str(r#"listen_udp = "127.0.0.1:0""#).expect("parse");
+        config.apply_overrides(&Overrides {
+            control_cpu_affinity: Some(vec![1, 3]),
+            ..Overrides::default()
+        });
+        assert_eq!(config.control_cpu_affinity, vec![1, 3]);
     }
 }

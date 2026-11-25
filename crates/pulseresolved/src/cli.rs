@@ -194,6 +194,9 @@ fn overrides(matches: &ArgMatches) -> Overrides {
         tls_key: matches.get_one::<PathBuf>("tls-key").cloned(),
         metrics_listen: matches.get_one::<SocketAddr>("metrics-listen").copied(),
         workers: matches.get_one::<usize>("workers").copied(),
+        control_cpu_affinity: matches
+            .get_one::<Vec<usize>>("control-cpu-affinity")
+            .cloned(),
         forwarders: matches
             .get_many::<SocketAddr>("forward")
             .map(|values| values.copied().collect())
@@ -216,7 +219,9 @@ fn overrides(matches: &ArgMatches) -> Overrides {
 
 fn server_exit_code(error: &ServerError) -> ExitCode {
     match error {
-        ServerError::Config(_) | ServerError::Resolver(_) => ExitCode::from(2),
+        ServerError::Config(_) | ServerError::Resolver(_) | ServerError::Affinity(_) => {
+            ExitCode::from(2)
+        }
         ServerError::Udp(_)
         | ServerError::TcpStart { .. }
         | ServerError::Tcp(_)
@@ -242,6 +247,11 @@ fn parse_forwarder(value: &str) -> Result<SocketAddr, String> {
         return Ok(SocketAddr::new(ip, 53));
     }
     Err(format!("expected an IP address or IP:port, got {value:?}"))
+}
+
+/// Разобрать список CPU для clap (`"0,2,4-7"`).
+fn parse_cpu_list(value: &str) -> Result<Vec<usize>, String> {
+    pulse_runtime::affinity::parse_list(value)
 }
 
 fn command() -> Command {
@@ -357,6 +367,13 @@ fn command() -> Command {
                 .help("Override the number of UDP workers (0 = available parallelism)"),
         )
         .arg(
+            Arg::new("control-cpu-affinity")
+                .long("control-cpu-affinity")
+                .value_name("LIST")
+                .value_parser(parse_cpu_list)
+                .help("Pin resolver workers to CPUs: \"0,2,4-7\" (intersected with the process mask)"),
+        )
+        .arg(
             Arg::new("log-level")
                 .long("log-level")
                 .value_name("LEVEL")
@@ -440,6 +457,15 @@ mod tests {
         assert_eq!(overrides.blocklists.len(), 2);
         assert!(overrides.no_dnssec);
         assert_eq!(overrides.workers, Some(2));
+    }
+
+    #[test]
+    fn cli_parses_control_cpu_affinity() {
+        let matches = command()
+            .try_get_matches_from(["pulseresolved", "--control-cpu-affinity", "0,2-3"])
+            .unwrap();
+        let overrides = overrides(&matches);
+        assert_eq!(overrides.control_cpu_affinity, Some(vec![0, 2, 3]));
     }
 
     #[test]
