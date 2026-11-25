@@ -83,14 +83,32 @@ upstream по UDP, TCP, DoT и DoH/1.1 (пул keep-alive, backoff). Остат�
   отдельный `tls_allow_from`), token bucket вместо RRL на TLS/QUIC,
   hot-reload TLS-пары по SIGHUP, метрики
   `dot_*`/`doh_*`/`doh_http2_*`/`doq_*`/`dnscrypt_*`.
+- TCP/DoT/DoH/plain TCP на tokio event-loop: ~11 КБ/соединение, 10k idle-соединений
+  (было 59–67 КБ); qps −8–10%, p99 без изменений.
+- Multi-process каталог/reclaim: create/delete/meta из любого процесса;
+  `high_water` стабилизируется (3636→5428 после 10k циклов); 8 процессов — 13.4k zone-commit/s;
+  в multi отключены Page/node-кеши, `freeze()` process-local, fsck repair — quiescent.
+- Zero-copy fallback: DNAME/циклы/wildcard-CNAME/single-page overflow — 0 allocs;
+  multi-page overflow — fallback.
+- Изолированный стенд: server/client на разных SMT-ядрах, 14 сценариев, perf stat +
+  плоские флеймграфы; отчёт [`docs/bench/isolated.md`](docs/bench/isolated.md).
 - CI/hardening: `fuzz/` (cargo-fuzz, nightly) — 5 таргетов, seed-корпус,
   job `fuzz-smoke` на push в main; Miri на `pulse-dns`/`pulse-master`
   (nightly, continue-on-error); `cargo deny check`.
 
-**Остаточные ограничения (см. `STATUS.md`):** каталог (`create/delete zone`,
-meta) — один писатель в multi-process; durable-пулы в multi не
-переиспользуются (bump-only, рекламация в quiescent/repair); `freeze()`
-локальный. DoH3/DoQ — серверные транспорты; upstream-клиенты резолвера
+**Остаточные ограничения (см. `STATUS.md`):** каталог/durable commit сериализованы; каталог (`create/delete zone`,
+meta) — любой процесс под catalog lease + commit-lock; durable-пулы в multi
+переиспользуются под lease зоны при `drop_txn < min(D_z, MP всех процессов,
+freeze)`, `high_water` стабилизируется (3636→5428 после 10k циклов); в multi
+отключены Page/node-кеши; `freeze()` process-local; fsck repair — quiescent.
+8 процессов — 13.4k zone-commit/s. Водарк-баг `WatermarkRegression` при DELETE
+исправлен (20/20 ролей).
+TCP/DoT/DoH/plain TCP — tokio event-loop: 10k idle-соединений, ~11 КБ/соединение
+(было 59–67 КБ), qps −8–10%, p99 без изменений.
+THP на ext4 file-backed — no-op, на RX-арене удваивает RSS без выигрыша
+(auto best-effort; file-backed ограничен shmem/tmpfs).
+perf call-graph (dwarf) запрещён paranoid=2; только плоский cycles:u.
+DoH3/DoQ — серверные транспорты; upstream-клиенты резолвера
 остаются HTTP/1.1/DoT (h2/h3 upstream нет). Jobs/audit в памяти (TTL 24 ч /
 ring 4096), import только `text/plain`. DNSCrypt-сертификат без hot-reload;
 0-RTT выключен; нет HSM/PKCS#11. Один статический control-токен у резолвера;
@@ -98,10 +116,15 @@ ring 4096), import только `text/plain`. DNSCrypt-сертификат бе
 REST — MVP-подмножество спецификации; API доступен только на loopback (без
 TLS). DNS Cookies и полноценный RRL авторитетного сервера (`pulsed`) нет; у
 резолвера RRL есть. 0x20 echo нет. Loom в CI нет (Miri — continue-on-error).
-RRset warm wide ~1.36–1.45 µs при 1M (цель 500 нс не достигнута). Signed/DO/ANY/referral — zero-copy; DNAME/циклы/oversized/wildcard-CNAME —
-fallback. Bulk требует
-отсортированный вход; `Memory` incremental не реклеймит (bulk рекомендуется).
-Замеры на loopback + SMT (8 vCPU общие), абсолютные qps занижены. REST под 8 UDP
+RRset warm 842 нс при 1M (было 1.57 µs); cold 27.7–41.4 µs (было 83.6); 0 allocs;
+zone index ~113–122 нс; e2e A p50 46.8 µs.
+Signed/DO/ANY/referral/DNAME/циклы/oversized/wildcard-CNAME/single-page overflow —
+zero-copy (0 allocs); fallback остаётся для multi-page `OVERFLOW`.
+Bulk требует отсортированный вход; `Memory` incremental не реклеймит (bulk рекомендуется).
+Изолированный стенд: server/client на разных SMT-ядрах, 14 сценариев, perf stat + плоские
+флеймграфы; отчёт [`docs/bench/isolated.md`](docs/bench/isolated.md). Хост шумный, цифры — нижняя оценка.
+Замеры на loopback + SMT (8 vCPU общие), абсолютные qps занижены. REST split: ~381 PUT/s
+p50 22 мс против 62/118 мс; DNS 85–93k qps. REST под 8 UDP
 workers по-прежнему делит CPU с DNS в режиме `all`; для разделения есть роли
 `--role dns` и `--role api` на одном v2-файле (см.
 [`docs/process-roles.md`](docs/process-roles.md)). HTTP/3 используется только
@@ -177,6 +200,13 @@ PULSED_API_TOKEN='...' \
 `api` владеет журналом и восстанавливает его при рестарте. Второй `all` на
 занятом файле получает `Busy`. Подробности и ограничения —
 [`docs/process-roles.md`](docs/process-roles.md).
+
+Ядра можно разделить явно: `dns_cpu_affinity = "0-3"` и
+`api_cpu_affinity = [4, 5]` (пересечение с cpuset проверяется на старте,
+общие CPU у ролей запрещены). Политика THP для mmap/арен — `huge_pages =
+"auto"` (по умолчанию, best-effort). Рекомендации по NUMA, измерениям
+`dTLB`/RSS и ограничениям file-backed THP — в
+[`docs/ops/numa-affinity.md`](docs/ops/numa-affinity.md).
 
 Проверка UDP/TCP:
 
@@ -376,7 +406,7 @@ curl -sS -X PUT "$API/api/v1/zones/dynamic.test." \
 cargo test --workspace
 ```
 
-Полный набор workspace-тестов (1478 тестов, включая doctests) проходит. Также проходят
+Полный набор workspace-тестов (1558 тестов, включая doctests) проходит. Также проходят
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` и
 rustdoc без warnings.
 
@@ -401,12 +431,13 @@ cargo deny check
 | NSEC/NSEC3 NXDOMAIN p99 (100k signed) | 367 мс → 0.71 мс |
 | Signed NXDOMAIN (NSEC3/NSEC) | p99 307 µs / 343 µs (было 38–47 мс) |
 | NSEC/NSEC3 in-memory (1M) | p99 18 µs (цель <2 мс) |
-| Zero-copy ответ (allocs/query) | 52 → 0–0.01 (udp-e2e); 0 аллокаций на ответ (unsigned/signed/referral/ANY/EDNS) |
+| Zero-copy ответ (allocs/query) | 52 → 0–0.01 (udp-e2e); 0 аллокаций на ответ (unsigned/signed/referral/ANY/EDNS); fallback: DNAME/циклы/wildcard-CNAME/single-page overflow — 0 allocs; multi-page overflow — fallback |
 | v2 чтение 1M RRset (RssAnon) | 6.3 МБ (−41%); soak 600 с без роста |
 | Сервер на 1M RRset (RSS) | ~36 МБ |
 | PageCache | 1024 страницы (~4 MiB образов) |
 | Zone snapshot | 87–92 нс |
-| RRset warm wide (1M) | ~1.36–1.45 µs (−20%); warm lookup 0 аллокаций |
+| RRset warm (1M) | 842 нс (было 1.57 µs); cold 27.7–41.4 µs (было 83.6); 0 allocs; zone index ~113–122 нс |
+| e2e A p50 | 46.8 µs (Key::rebuild убран) |
 | Bulk-load 1M RRset | 2.5–2.8 с (было 26 мин), пик RSS 91–103 МБ, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с |
 | io_uring RSS (1/4/8 workers) | 4.7/10.2/17.5 МБ (было 12.7/40.6/104.9) |
 | io_uring p99 (8 workers) | 650 → 440 µs; SQPOLL медленнее (выкл), registered files вкл |
@@ -423,28 +454,35 @@ cargo deny check
 | Per-zone commit (4 потока, B1, tmpfs) | 49 000 zone-commit/s |
 | Group commit (fsync на группу) | 2 fsync/группу; ускорение 2.4× (btrfs), 3.36× (эмуляция fsync 2 мс) |
 | PageCache warm single-page | 418 нс; полный lookup ~1.06 µs |
-| DoT (qps) | ~10.4k |
+| DoT (qps, одно keep-alive соединение) | ~10.4k |
+| DoT async, 64 активных + 100/1k/10k idle | 48.4k/49.5k/49.0k qps, p99 2.73/2.84/3.15 мс |
+| DoT/TCP/DoH idle RSS (event-loop) | ~11 KiB/соединение (было 59–67 KiB); 10k соединений |
 | DoH HTTP/2 (DNS/s) | ~8.2k |
 | DoH HTTP/3 (qps) | ~13.6–14.9k |
 | DoQ (qps) | ~5.25k |
-| Межпроцессная запись v2 | 4 процесса × 4 зоны без потерь; 10k коммитов в 2 процессах без пересечений; ~20k zone-commit/s |
-| Роли `dns`+`api` (8 DNS + 8 REST, 8 vCPU) | DNS 85–93k qps (p99 0.53–0.66 ms), REST 359–361 PUT/s (p99 29–30 ms); `all`: 98–106k qps (p99 0.36–0.41 ms), 381–385 PUT/s (p99 27–28 ms) |
+| Межпроцессная запись v2 | 4 процесса × 4 зоны без потерь; 10k коммитов в 2 процессах без пересечений; create 1.9k/1.3k/0.6k зон/с (2/4/8 процессов); commit ~11–14k zone-commit/s; 8 процессов — 13.4k zone-commit/s; `high_water` стабилизируется (3636→5428 после 10k циклов); 100k insert/delete: `high_water` 50→98 / 56→152 / 68→260 |
+| Роли `dns`+`api` (8 DNS + 8 REST, 8 vCPU) | DNS 85–93k qps (p99 0.53–0.66 ms), REST 359–361 PUT/s (p99 29–30 ms); `all`: 98–106k qps (p99 0.36–0.41 ms), 381–385 PUT/s (p99 27–28 ms); REST split ~381 PUT/s p50 22 мс (против 62/118 мс) |
 
 ## Ограничения и roadmap
 
 - Зоны хранятся в одном бинарном mmap-файле (`--data`); JSON-зон нет. v2:
   параллельная запись по зонам внутри одного процесса и межпроцессная запись
   (ADR 0007: sidecar-координатор, CAS-курсор, `fcntl` per-zone leases +
-  fencing, общая reader table, `LOCK_SH`); каталог (`create/delete zone`, meta) —
-  один писатель; durable-пулы в multi не переиспользуются (bump-only);
-  `freeze()` локальный; offline `pulsed fsck --data <file> [--repair]` проверяет
+  fencing, общая reader table, `LOCK_SH`); каталог (`create/delete zone`, meta)
+  может менять любой процесс (catalog lease); durable-пулы переиспользуются под
+  lease зоны, `high_water` стабилизируется; `freeze()` пока локальный; offline
+  `pulsed fsck --data <file> [--repair]` проверяет
   граф/пулы/утечки и изолирует повреждённые зоны; `map_size` задаётся при
   создании (по умолчанию 4 GiB); до 4096 зон, страницы 4096 байт.
-- DoT/DoH/1.1 работают синхронно (поток на соединение), DoH/2 — h2, DoH/3 и
-  DoQ — QUIC (quinn); DoH/3 только серверный, без WebTransport/server push/
-  datagrams и 0-RTT; DNSCrypt UDP усекает большие ответы с `TC`, DNSCrypt TCP
-  отдаёт их без усечения; DNSCrypt TXT-запись публикуется вручную; DNSCrypt
-  сертификат без hot-reload.
+- DoT/DoH/1.1 и plain TCP DNS не создают поток на соединение: соединения —
+  задачи общего tokio event-loop (`pulse_tls::net::TcpServer`) с лимитом
+  соединений, idle/request-таймаутами, backpressure и graceful shutdown.
+  DoH/2 — h2, DoH/3 и DoQ — QUIC (quinn); DoH/3 только серверный, без
+  WebTransport/server push/datagrams и 0-RTT; DNSCrypt UDP усекает большие
+  ответы с `TC`, DNSCrypt TCP отдаёт их без усечения; DNSCrypt TXT-запись
+  публикуется вручную; DNSCrypt сертификат без hot-reload.
+  AXFR/IXFR-out остаётся потоковым: после разбора запроса сокет уходит в
+  `spawn_blocking`, потому что трансфер пишет серию кадров синхронно.
 - REST — MVP-подмножество спецификации (jobs/transfers/audit/serial/keys
   реализованы); API доступен только на loopback (без TLS).
 - DNSSEC: NSEC и NSEC3 (SHA-1, Opt-Out включается `nsec3_opt_out`),

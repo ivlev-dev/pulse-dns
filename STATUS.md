@@ -19,7 +19,7 @@
 
 ## Проверки (зелёные)
 
-- `cargo test --workspace --all-features` — **1478 тестов**, 0 failures.
+- `cargo test --workspace --all-features` — **1558 тестов**, 0 failures.
 - `cargo fmt --check`.
 - `cargo clippy --workspace --all-targets -D warnings`.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
@@ -49,14 +49,23 @@
 
 - **Zero-copy ответ**: `respond_ref_into` покрывает A/AAAA/MX/TXT/SRV/CNAME/NS/SVCB/HTTPS,
   NXDOMAIN/NODATA, wildcard (unsigned), EDNS без DO; `udp-e2e` allocs/query с 52 → 0–0.01.
-  **0 аллокаций** на ответ (unsigned/signed/referral/ANY/EDNS); DNAME/циклы/oversized/wildcard-CNAME — fallback.
+  **0 аллокаций** на ответ (unsigned/signed/referral/ANY/EDNS); DNAME (синтез `CNAME` в стековом буфере),
+  циклы `CNAME`/`DNAME` (`SERVFAIL`), wildcard-CNAME-цепочки, `YXDOMAIN` и oversized RRset из refs —
+  zero-copy.
 - **NSEC/NSEC3 индексы**: NXDOMAIN p99 на 100k signed с 367 мс → 0.71 мс; 1M in-memory p99 18 µs (цель <2 мс).
   Signed NXDOMAIN: NSEC3 p99 307 µs (было 38–47 мс), NSEC p99 343 µs.
 - **Bulk-load**: 1M RRset за 2.5–2.8 с (было 26 мин), пик RSS 91–103 МБ, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с.
 - **Память**: v2 чтение 1M RRset RssAnon 6.3 МБ (−41%, было ~9.6), soak 600 с без роста; сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов); кеш резолвера 113.8 B/entry на 1M.
-- **Чтение**: zone snapshot 87–92 нс, RRset warm wide ~1.36–1.45 µs (−20%), order-key memcmp; warm lookup 0 аллокаций.
+- **Чтение**: zone snapshot 87–92 нс; RRset warm 1M **842 нс** (было 1.57 µs), cold 1M 27.7–41.4 µs (было 83.6), 0 allocs; zone index ~113–122 нс; order-key memcmp; warm lookup 0 аллокаций; e2e A p50 **46.8 µs**. `Key::rebuild` убран.
 - **io_uring**: RSS 4.7/10.2/17.5 МБ на 1/4/8 workers (было 12.7/40.6/104.9); p99 8 workers 650→440 µs; SQPOLL на этом ядре медленнее (выкл), registered files вкл.
-- **Каталог 1000 зон**: исправлено зависание (выделенный lease-шард каталога); 1000 зон за 83 мс, 4096 за 651 мс.
+- **Каталог 1000 зон**: исправлено зависание (выделенный lease-шард каталога); 1000 зон за 83 мс, 4096 за 651 мс. В multi каталог пишут все процессы под catalog lease (4 × 250 зон), `zone_seq` переиспользуется через общую очередь sidecar.
+- **Affinity/THP**: маски DNS/API/control проверены; THP на ext4 file-backed — no-op, на RX-арене удваляет RSS без выигрыша (auto best-effort).
+- **TCP/DoT/DoH/plain TCP**: переведены на tokio event-loop; 10k idle-соединений, ~11 КБ/соединение (было 59–67 КБ), qps −8–10%, p99 без изменений.
+- **Multi-process каталог и reclaim**: create/delete/meta из любого процесса; `high_water` стабилизируется (3636→5428 после 10k циклов); 8 процессов — 13.4k zone-commit/s.
+- **Водарк-баг** `WatermarkRegression` при DELETE исправлен (порядок bucket-цепочек + DP по головам), 20/20 ролей.
+- **Zero-copy fallback**: DNAME/циклы/wildcard-CNAME/single-page overflow — 0 allocs; multi-page overflow — fallback.
+- **REST split**: ~381 PUT/s p50 22 мс против 62/118 мс; DNS 85–93k qps.
+- **Изолированный стенд**: server/client на разных SMT-ядрах, 14 сценариев, perf stat + плоские флеймграфы; отчёт `docs/bench/isolated.md`. Хост шумный, цифры — нижняя оценка.
 - **Тесты**: утечка дочерних процессов закрыта RAII-guard; 15× pulsed lib без флейков.
 
 ## Проверено руками
@@ -125,7 +134,12 @@
   читатель другого процесса видит согласованные версии; kill -9 писателя
   очищает lease/reader, чужие зоны целы; kill -9 в середине коммита → `DP`
   не убывает, зона на `V−1`/`V`; 10 000 коммитов в 2 процессах без
-  пересечений страниц; single-process без регрессий.
+  пересечений страниц; каталог пишут все процессы без внешнего flock
+  (4 × 250 = 1000 зон; update/delete/gc/recreate без потерь); 100k
+  insert/delete в 2/4/8 процессах: `high_water` 50→98 / 56→152 / 68→260;
+  high_water стабилизируется (3636→5428 после 10k циклов); 8 процессов — 13.4k zone-commit/s.
+  Водарк-баг `WatermarkRegression` при DELETE исправлен (порядок bucket-цепочек + DP по головам), 20/20 ролей.
+  single-process без регрессий.
 - Производительность (loopback, окно 1, 4 клиента; хост нагружен, числа консервативные):
   A p50 68 µs, p99 141 µs; mix p50 68 µs, p99 604 µs, ~44k qps на 4 клиентах;
   10k open-loop mix p99 777 µs (было 2361); NXDOMAIN 10k qps p50 757 µs, p99 1.56 мс,
@@ -135,17 +149,21 @@
   Zero-copy: allocs/query 52 → 0–0.01 (udp-e2e); 0 аллокаций на ответ (unsigned/signed/referral/ANY/EDNS).
   Память: v2 чтение 1M RRset RssAnon 6.3 МБ (−41%); soak 600 с без роста;
   сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов); кеш резолвера 113.8 B/entry на 1M.
-  Чтение: zone snapshot 87–92 нс; RRset warm wide ~1.36–1.45 µs (−20%); order-key memcmp; warm lookup 0 аллокаций.
+  Чтение: zone snapshot 87–92 нс; RRset warm 1M 842 нс (было 1.57 µs), cold 1M 27.7–41.4 µs (было 83.6), 0 allocs; zone index ~113–122 нс; order-key memcmp; warm lookup 0 аллокаций.
   io_uring: RSS 4.7/10.2/17.5 МБ на 1/4/8 workers (было 12.7/40.6/104.9); p99 8 workers 650→440 µs;
   SQPOLL медленнее (выкл), registered files вкл.
   Bulk-load: 1M RRset 2.5–2.8 с (было 26 мин), пик RSS 91–103 МБ, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с.
-  Каталог: 1000 зон за 83 мс, 4096 за 651 мс (исправлен self-deadlock на 256-й зоне).
+  Каталог: 1000 зон за 83 мс, 4096 за 651 мс (исправлен self-deadlock на 256-й зоне). Multi-process: create/delete/meta из любого процесса; high_water стабилизируется (3636→5428 после 10k циклов); 8 процессов — 13.4k zone-commit/s; в multi отключены Page/node-кеши, freeze process-local, fsck repair — quiescent.
   Резолвер: библиотека cache hit p50 0.396 µs, p99 0.572 µs, 0 allocs, ~2.3M qps/поток (было 6–7.6 µs);
   pulseresolved hot path p50 578 нс, p99 750 нс, 0 allocs; 200k qps без таймаутов (было захлёбывался на 150k).
+  REST split: ~381 PUT/s p50 22 мс против 62/118 мс; DNS 85–93k qps.
   Старые замеры (loopback, хост нагружен): UDP echo 220 117 qps (4w/4c, окно 16); epoll 230 352 qps;
   окно 1 — 89 036 qps, p50 35 µs, p99 182 µs; zone lookup 156–268 нс; insert ~10 000/s;
   alloc reserve ~50M/s; per-zone commit 49k zone-commit/s; group commit 2 fsync/группу (2.4×/3.36×);
   PageCache 418 нс warm single-page; полный lookup ~1.06 µs; DoT ~10.4k; DoH h2 ~8.2k; DoH3 ~13.6–14.9k; DoQ ~5.25k.
+  TCP/DoT/DoH/plain TCP — tokio event-loop: 10k idle-соединений, ~11 КБ/соединение (было 59–67 КБ), qps −8–10%, p99 без изменений; 10k соединений там, где thread-per-conn упирался в лимиты.
+  DoT async (64 активных + 100/1k/10k idle): 48.4k/49.5k/49.0k qps, p99 2.73/2.84/3.15 мс; серверный RSS idle ~11 KiB/conn (10k соединений, 115 MiB);
+  baseline thread-per-conn: 52.5k/54.5k qps при 100/1k, но 59–67 KiB/conn.
 - Fuzz/CI: `fuzz/` (cargo-fuzz, nightly) — 5 таргетов (`dns_wire`,
   `master_zone`, `zonefile_v2_open`, `transfer_tsig`, `dnscrypt_packet`),
   seed-корпус; CI job `fuzz-smoke` на push в main; Miri на
@@ -154,9 +172,10 @@
 
 ## Остаточные ограничения (честно)
 
-- Multi-process: каталог (`create/delete zone`, meta) — один писатель; durable-пулы
-  в multi не переиспользуются (bump-only, рекламация в quiescent/repair);
-  `freeze()` локальный.
+- Multi-process: каталог/durable commit сериализованы; каталог (`create/delete zone`, meta) может менять любой процесс
+  (catalog lease + commit-lock); durable-пулы переиспользуются под lease зоны при
+  `drop_txn < min(D_z, MP всех процессов, freeze)`, `high_water` стабилизируется (3636→5428 после 10k циклов);
+  в multi отключены Page/node-кеши; `freeze()` process-local; fsck repair — quiescent.
 - DoH3/DoQ — серверные; upstream-клиенты у резолвера остаются HTTP/1.1/DoT
   (h2/h3 upstream нет).
 - Jobs/audit в памяти (TTL 24 ч / ring 4096), import только `text/plain`.
@@ -166,18 +185,25 @@
   автоматически.
 - REST — MVP-подмножество спецификации (хотя доведён по jobs/transfers/audit);
   API доступен только на loopback (без TLS).
-- RRset warm wide ~1.36–1.45 µs при 1M (−20%); цель 500 нс не достигнута.
-- Signed/DO/ANY/referral теперь zero-copy; DNAME/циклы/oversized/wildcard-CNAME — fallback.
+- RRset warm 842 нс при 1M (было 1.57 µs); цель 500 нс не достигнута.
+- Signed/DO/ANY/referral/DNAME/циклы/wildcard-CNAME/oversized — zero-copy; fallback только для multi-page `OVERFLOW`.
 - Bulk-load требует отсортированный вход; `Memory` incremental не реклеймит (bulk рекомендуется).
 - В режиме `all` REST под 8 UDP workers делит CPU с DNS; для разделения есть роли `--role dns|api` на одном v2-файле (multi-process, ADR 0007), см. `docs/process-roles.md`.
 - Замеры на loopback + SMT: клиент и сервер делят 8 vCPU, абсолютные qps занижены.
-- perf record заблокирован (paranoid=2), flamegraph не снят.
+- perf record заблокирован (paranoid=2), flamegraph не снят; call-graph (dwarf) запрещён, только плоский cycles:u.
+- TCP event-loop даёт −8–10% qps против thread-per-conn при меньшей памяти.
+- THP file-backed ограничен shmem/tmpfs; на RX-арене удваивает RSS без выигрыша (auto best-effort).
+- Изолированный стенд: server/client на разных SMT-ядрах, 14 сценариев, perf stat + плоские флеймграфы; отчёт `docs/bench/isolated.md`. Хост шумный, цифры — нижняя оценка.
 - Loom отсутствует (fuzz и Miri есть); Miri — continue-on-error.
 - File-fatal порча требует ручного разбора (repair её не «чинит»).
 - io_uring работает на уровне L3 только при поддержке `IORING_FEAT_NODROP`,
   иначе L2; epoll даёт сопоставимый qps.
 - DNS Cookies нет; 0x20 echo нет; полноценный RRL авторитетного сервера
   (`pulsed`) нет.
+- THP file-backed ограничен shmem/tmpfs (ext4 file-backed — no-op; на RX-арене удваивает RSS без выигрыша).
+- perf call-graph (dwarf) запрещён paranoid=2; только плоский cycles:u.
+- TCP event-loop даёт −8–10% qps против thread-per-conn при меньшей памяти.
+- Loopback/SMT/шумный хост; для SLA — отдельный стенд.
 
 ## Как проверить за 5 минут
 
@@ -204,16 +230,20 @@ dig @127.0.0.1 -p 5353 example.com. A +norecurse
 
 ## Риски и известные дефекты
 
-- RRset warm wide ~1.36–1.45 µs при 1M (−20%); цель 500 нс не достигнута.
-- Signed/DO/ANY/referral теперь zero-copy; DNAME/циклы/oversized/wildcard-CNAME — fallback.
+- RRset warm 842 нс при 1M (было 1.57 µs); цель 500 нс не достигнута.
+- Signed/DO/ANY/referral/DNAME/циклы/wildcard-CNAME/oversized — zero-copy; fallback только для multi-page `OVERFLOW`.
 - Bulk требует отсортированный вход; `Memory` incremental не реклеймит (bulk рекомендуется).
 - В режиме `all` REST под 8 UDP workers делит CPU с DNS; для разделения есть роли `--role dns|api` на одном v2-файле (multi-process, ADR 0007), см. `docs/process-roles.md`.
 - Замеры на loopback + SMT: клиент и сервер делят 8 vCPU, абсолютные qps занижены.
-- perf record заблокирован (paranoid=2), flamegraph не снят.
+- perf record заблокирован (paranoid=2), flamegraph не снят; call-graph (dwarf) запрещён, только плоский cycles:u.
+- TCP event-loop даёт −8–10% qps против thread-per-conn при меньшей памяти.
+- THP file-backed ограничен shmem/tmpfs; на RX-арене удваивает RSS без выигрыша (auto best-effort).
+- Изолированный стенд: server/client на разных SMT-ядрах, 14 сценариев, perf stat + плоские флеймграфы; отчёт `docs/bench/isolated.md`. Хост шумный, цифры — нижняя оценка.
 - API доступен только на loopback, TLS отсутствует.
 - Storage: параллельная запись по зонам внутри одного процесса (v2) и
-  межпроцессная (v2, ADR 0007); каталог — один writer, durable-пулы bump-only
-  в multi, `freeze()` локальный.
+  межпроцессная (v2, ADR 0007); каталог — multi-writer под lease, durable-пулы
+  рекламируются под lease, `freeze()` локальный, page-кеш в multi отключён.
+- Водарк-баг `WatermarkRegression` при DELETE исправлен (порядок bucket-цепочек + DP по головам), 20/20 ролей.
 - v2: до 4096 зон, страницы 4096; offline `pulsed fsck [--repair]` есть,
   file-fatal порча требует ручного разбора.
 - Числа производительности сняты на loopback при загруженном хосте —

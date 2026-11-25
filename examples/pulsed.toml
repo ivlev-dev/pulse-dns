@@ -4,6 +4,13 @@ listen_udp = "127.0.0.1:5353"
 listen_tcp = "127.0.0.1:5353"
 workers = 2
 log_level = "info"
+# CPU-affinity: data-plane (UDP/DNSCrypt) и control-plane (REST) не должны
+# делить ядра. Списки пересекаются с cgroup cpuset; пустое пересечение — ошибка
+# старта. Пусто (по умолчанию) — без пиннинга. См. docs/ops/numa-affinity.md.
+# dns_cpu_affinity = "0-3"
+# api_cpu_affinity = [4, 5]
+# Transparent huge pages для RX-арены и mmap зон: auto | always | never.
+huge_pages = "auto"
 zonefile = "/tmp/pulse-dns.zonefile"
 durability = "flush"
 map_size = 268435456

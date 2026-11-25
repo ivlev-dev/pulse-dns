@@ -15,3 +15,7 @@ durability = "flush"
 map_size = 268435456
 
 # API-настройки здесь не нужны: роль `dns` их игнорирует.
+
+# CPU для DNS worker'ов (пересекается с cgroup cpuset; пусто — без пиннинга).
+# dns_cpu_affinity = "0-3"
+# huge_pages = "auto"
