@@ -32,7 +32,7 @@ pub struct QuerySet {
 impl QuerySet {
     /// Собирает рабочий набор из `working_set` пакетов.
     ///
-    /// Имена: `r{record}.z{zone}.bench.test.` (тип записи циклится A/AAAA/MX/TXT)
+    /// Имена: `r{record:07}.z{zone}.bench.test.` (тип записи циклится A/AAAA/MX/TXT)
     /// и `nx{n}.z{zone}.bench.test.` для NXDOMAIN. `rrsets_per_zone`
     /// соответствует числу RRset, сгенерированных [`crate::storegen`].
     ///
@@ -68,7 +68,7 @@ impl QuerySet {
                 let per_type = u64::from(rrsets) / 4;
                 let record = rng.below(per_type.max(1)) * 4 + type_index;
                 let record = record.min(u64::from(rrsets) - 1);
-                let name = format!("r{record}.z{zone}.bench.test.");
+                let name = format!("r{record:07}.z{zone}.bench.test.");
                 build_packet(class, &name, qtype)?
             };
             by_class[class.index()].push(packet);

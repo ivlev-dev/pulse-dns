@@ -23,7 +23,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use pulse_api::ZoneKind;
-use pulse_dns::{DecodeLimits, EncodeOptions, Message, Name, Opcode, Rcode, Record, Rtype, Serial};
+use pulse_dns::{
+    DecodeLimits, EncodeOptions, Flags, Message, Name, Opcode, Rcode, Record, Rtype, Serial,
+};
 use pulse_transfer::{
     AxfrServer, IxfrServer, NotifyIgnoreReason, NotifyOutcome, NotifyPolicy, NotifyRequest,
     NotifyServer, TransferConfig, TransferError, TransferLimits, TsigError, TsigErrorCode, TsigKey,
@@ -470,6 +472,16 @@ impl TransferState {
         source: IpAddr,
         now: u64,
     ) -> Option<NotifyAction> {
+        // Горячий UDP-путь вызывает этот метод для каждого запроса. Полный
+        // декодер здесь аллоцировал бы на обычный QUERY, поэтому opcode
+        // проверяется по заголовку до разбора.
+        if raw.len() < 12 {
+            return None;
+        }
+        let flags = u16::from_be_bytes([*raw.get(2)?, *raw.get(3)?]);
+        if Flags::from_bits(flags).opcode() != Opcode::NOTIFY {
+            return None;
+        }
         let message = Message::decode(raw, &DecodeLimits::default()).ok()?;
         if message.opcode() != Opcode::NOTIFY {
             return None;

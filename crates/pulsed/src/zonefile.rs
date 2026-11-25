@@ -20,14 +20,18 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pulse_api::{Denial, ZoneFileMetrics, ZoneKind};
-use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype, Ttl};
-use pulse_server::{DenialKind, LookupOutcome, ZoneState as ServerZoneState, ZoneView};
+use pulse_dns::{Name, NameRef, Rclass, Rdata, Rrset, Rtype, Ttl};
+use pulse_server::{
+    DenialKind, LookupOutcome, LookupOutcomeRef, RrsetRef as ServerRrsetRef,
+    ZoneSnapshot as ServerZoneSnapshot, ZoneState as ServerZoneState, ZoneView,
+};
 use pulse_transfer::ZoneSnapshot;
 use pulse_zonefile::RrsetView as StoredRrsetView;
 use pulse_zonefile::key::NameRle;
+use pulse_zonefile::node::ValueKind;
 use pulse_zonefile::parallel::{
-    CommitOutcome, GroupCommitter, OpenConfigV2, ParallelError, ParallelStore, ParallelZone,
-    ParallelZones, RootState, RrsetData, RrsetRecord, StoreConfig, SyncModeV2,
+    BulkRrset, CommitOutcome, GroupCommitter, OpenConfigV2, ParallelError, ParallelStore,
+    ParallelZone, ParallelZones, RootState, RrsetData, RrsetRecord, StoreConfig, SyncModeV2,
     ZONE_KIND_FLAG_FORWARD, ZONE_KIND_FLAG_SECONDARY, ZoneCreateMeta, ZoneMetaV2, ZoneReader,
 };
 use pulse_zonefile::tree::NodeInfo;
@@ -552,24 +556,13 @@ impl ZoneStore {
                 Some(Rdata::Soa(soa)) => Some(soa.serial.as_u32()),
                 _ => None,
             });
+        let records = bulk_records(rrsets)?;
         let mut writer = self.open_writer(origin)?;
-        let existing = writer
-            .records()
-            .map_err(|error| self.error("read zone", &error))?;
-        let mut owners = Vec::new();
-        for record in &existing {
-            if !owners.contains(&record.name) {
-                owners.push(record.name);
-            }
-        }
-        for owner in owners {
-            writer
-                .delete_name(&owner)
-                .map_err(|error| self.error("clear zone", &error))?;
-        }
-        for rrset in rrsets {
-            write_rrset(&mut writer, rrset)?;
-        }
+        // Полная замена дерева одной bulk-транзакцией: старые страницы уходят
+        // в drop-группу того же коммита, COW на каждый RRset не выполняется.
+        writer
+            .bulk_load(records)
+            .map_err(|error| self.error("bulk load", &error))?;
         let mut written: Vec<NameRle> = rrsets
             .iter()
             .filter_map(|r| name_to_rle(r.owner()).ok())
@@ -756,6 +749,38 @@ impl ZoneStore {
         entry: &ZoneEntry,
         f: impl FnOnce(&ZoneReader<'_>) -> Result<T, String>,
     ) -> Result<T, String> {
+        self.with_reader_parts(entry.apex, entry.zone_seq, f)
+    }
+
+    /// Читает зону по origin без клонирования записи каталога.
+    ///
+    /// Горячий путь ответа: `CatalogEntry` содержит `Name`, клонирование
+    /// которого аллоцировало бы на каждый запрос.
+    pub(crate) fn with_reader_for<T>(
+        &self,
+        origin: &Name,
+        f: impl FnOnce(&ZoneReader<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let Some((apex, zone_seq)) = self.zone_position(origin) else {
+            return Err(format!("zone {origin}: not found"));
+        };
+        self.with_reader_parts(apex, zone_seq, f)
+    }
+
+    fn zone_position(&self, origin: &Name) -> Option<(NameRle, u32)> {
+        let cache = self.catalog.lock().unwrap_or_else(PoisonError::into_inner);
+        cache
+            .entries
+            .get(origin)
+            .map(|entry| (entry.apex, entry.zone_seq))
+    }
+
+    fn with_reader_parts<T>(
+        &self,
+        apex: NameRle,
+        zone_seq: u32,
+        f: impl FnOnce(&ZoneReader<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
         self.stats.pin();
         // Слоты читателей ограничены (1024). Под пиком параллельных запросов
         // слот освобождается за микросекунды — короткий retry вместо отказа.
@@ -772,7 +797,7 @@ impl ZoneStore {
         };
         let mut attempt = 0_u32;
         loop {
-            match ZoneReader::open(&self.store, &reader, entry.apex, entry.zone_seq) {
+            match ZoneReader::open(&self.store, &reader, apex, zone_seq) {
                 Ok(zone) => return f(&zone),
                 Err(ParallelError::ReaderContended) if attempt < READ_RETRIES => {
                     attempt = attempt.saturating_add(1);
@@ -1075,6 +1100,57 @@ fn group_records(origin: &Name, records: Vec<RrsetRecord>) -> Result<Vec<Rrset>,
                 .map_err(|error| format!("zone {origin}: {owner} {rr_type}: {error}"))?,
         );
     }
+    Ok(out)
+}
+
+/// Готовит отсортированный вход bulk-загрузки из набора `RRset`.
+///
+/// `RRSIG` раскладывается по `subtype` (type covered), как в
+/// [`write_rrset`]; порядок — канонический (owner, type, subtype), как требует
+/// [`pulse_zonefile::parallel::ParallelZone::bulk_load`].
+fn bulk_records(rrsets: &[Rrset]) -> Result<Vec<BulkRrset>, String> {
+    let mut out = Vec::with_capacity(rrsets.len());
+    for rrset in rrsets {
+        let owner = name_to_rle(rrset.owner()).map_err(|error| error.to_string())?;
+        let ttl = rrset.ttl().as_u32();
+        let rr_type = rrset.rr_type().as_u16();
+        let mut groups: BTreeMap<u16, Vec<Vec<u8>>> = BTreeMap::new();
+        for rdata in rrset.rdatas() {
+            let subtype = if rrset.rr_type() == Rtype::RRSIG {
+                match rdata {
+                    Rdata::Rrsig(signature) => signature.type_covered().as_u16(),
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            groups
+                .entry(subtype)
+                .or_default()
+                .push(rdata.to_canonical_wire());
+        }
+        for (subtype, rdata) in groups {
+            let data = RrsetData::new(ttl, 0, rdata).map_err(|error| {
+                format!(
+                    "cannot encode RRset {} {}: {error}",
+                    rrset.owner(),
+                    rrset.rr_type()
+                )
+            })?;
+            out.push(BulkRrset {
+                name: owner,
+                rr_type,
+                subtype,
+                data,
+            });
+        }
+    }
+    out.sort_by(|left, right| {
+        pulse_zonefile::key::name_cmp(left.name.as_rle(), right.name.as_rle())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.rr_type.cmp(&right.rr_type))
+            .then_with(|| left.subtype.cmp(&right.subtype))
+    });
     Ok(out)
 }
 
@@ -1580,6 +1656,163 @@ impl ZoneView for FileZoneView {
     fn node_exists(&self, name: &Name) -> bool {
         name.is_subdomain_of(&self.origin) && self.node(name).is_some_and(|node| node.exists)
     }
+
+    fn with_snapshot(&self, f: &mut dyn FnMut(&dyn ServerZoneSnapshot)) -> bool {
+        if self.state != ServerZoneState::Serving {
+            return false;
+        }
+        self.store
+            .with_reader_for(&self.origin, |reader| {
+                let snapshot = FileZoneSnapshot { view: self, reader };
+                f(&snapshot);
+                Ok(())
+            })
+            .is_ok()
+    }
+}
+
+/// Заимствованный снимок v2-зоны: один `ZoneReader` на ответ.
+struct FileZoneSnapshot<'a, 'z> {
+    view: &'a FileZoneView,
+    reader: &'a ZoneReader<'z>,
+}
+
+impl FileZoneSnapshot<'_, '_> {
+    fn stored_ref<'a>(&'a self, name: NameRef<'a>, rr_type: Rtype) -> Option<ServerRrsetRef<'a>> {
+        let owner = NameRle::from_wire(name.as_wire()).ok()?;
+        let stored = self
+            .reader
+            .lookup_ref(&owner, rr_type.as_u16(), 0)
+            .ok()
+            .flatten()?;
+        if stored.value.kind != ValueKind::Inline {
+            return None;
+        }
+        Some(ServerRrsetRef::from_wire(
+            name,
+            rr_type,
+            Rclass::IN,
+            Ttl::from_wire(stored.ttl),
+            stored.payload,
+        ))
+    }
+
+    fn delegation_of_ref<'a>(&self, name: NameRef<'a>) -> Option<NameRef<'a>> {
+        let origin = self.view.origin.as_wire();
+        let mut current = Some(name);
+        while let Some(candidate) = current {
+            if candidate.as_wire() == origin {
+                return None;
+            }
+            if !candidate.is_subdomain_of_name(&self.view.origin) {
+                return None;
+            }
+            if self.is_delegation_ref(candidate) {
+                return Some(candidate);
+            }
+            current = candidate.parent();
+        }
+        None
+    }
+}
+
+impl ServerZoneSnapshot for FileZoneSnapshot<'_, '_> {
+    fn origin_ref(&self) -> NameRef<'_> {
+        NameRef::from_name(&self.view.origin)
+    }
+
+    fn class_ref(&self) -> Rclass {
+        Rclass::IN
+    }
+
+    fn lookup_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> LookupOutcomeRef<'a> {
+        if !name.is_subdomain_of_name(&self.view.origin) {
+            return LookupOutcomeRef::ZoneNotFound;
+        }
+
+        if let Some(cut) = self.delegation_of_ref(name) {
+            if cut.as_wire() != name.as_wire() {
+                return LookupOutcomeRef::Referral;
+            }
+            if rtype == Rtype::DS {
+                return match self.stored_ref(cut, Rtype::DS) {
+                    Some(ds) => LookupOutcomeRef::Answer(ds),
+                    None => LookupOutcomeRef::NoData,
+                };
+            }
+            let ns = self.stored_ref(cut, Rtype::NS);
+            let ds = self.stored_ref(cut, Rtype::DS);
+            return match ns {
+                Some(ns) => LookupOutcomeRef::Delegation { ns, ds },
+                None => LookupOutcomeRef::Referral,
+            };
+        }
+
+        if let Some(rrset) = self.stored_ref(name, rtype) {
+            return LookupOutcomeRef::Answer(rrset);
+        }
+        if rtype != Rtype::CNAME
+            && let Some(cname) = self.stored_ref(name, Rtype::CNAME)
+            && let Some(pulse_server::RdataRef::Wire { bytes, .. }) = cname.first_record()
+            && let Ok(target) = NameRef::from_wire(bytes)
+        {
+            return LookupOutcomeRef::Cname(cname, target);
+        }
+        if self.node_exists_ref(name) {
+            LookupOutcomeRef::NoData
+        } else {
+            LookupOutcomeRef::NxDomain
+        }
+    }
+
+    fn soa_ref(&self) -> Option<ServerRrsetRef<'_>> {
+        self.view.soa.as_ref().map(ServerRrsetRef::from_owned)
+    }
+
+    fn ns_ref(&self) -> Option<ServerRrsetRef<'_>> {
+        self.view.ns.as_ref().map(ServerRrsetRef::from_owned)
+    }
+
+    fn records_ref<'a>(&'a self, name: NameRef<'a>) -> Vec<ServerRrsetRef<'a>> {
+        // Полный обход типов без материализации в v2-API не предусмотрен;
+        // горячий путь использует `lookup_ref`.
+        let _ = name;
+        Vec::new()
+    }
+
+    fn lookup_all_ref<'a>(&'a self, name: NameRef<'a>, rtype: Rtype) -> Vec<ServerRrsetRef<'a>> {
+        if rtype == Rtype::RRSIG {
+            return Vec::new();
+        }
+        self.stored_ref(name, rtype).into_iter().collect()
+    }
+
+    fn glue_ref<'a>(&'a self, name: NameRef<'a>) -> Vec<ServerRrsetRef<'a>> {
+        if !name.is_subdomain_of_name(&self.view.origin) {
+            return Vec::new();
+        }
+        [Rtype::A, Rtype::AAAA]
+            .into_iter()
+            .filter_map(|rtype| self.stored_ref(name, rtype))
+            .collect()
+    }
+
+    fn node_exists_ref(&self, name: NameRef<'_>) -> bool {
+        if !name.is_subdomain_of_name(&self.view.origin) {
+            return false;
+        }
+        NameRle::from_wire(name.as_wire())
+            .ok()
+            .and_then(|owner| self.reader.node(&owner).ok())
+            .is_some_and(|node| node.exists)
+    }
+
+    fn is_delegation_ref(&self, name: NameRef<'_>) -> bool {
+        if name.as_wire() == self.view.origin.as_wire() {
+            return false;
+        }
+        self.stored_ref(name, Rtype::NS).is_some() && self.stored_ref(name, Rtype::SOA).is_none()
+    }
 }
 
 /// Лимит памяти индекса denial-записей одной зоны.
@@ -1875,6 +2108,38 @@ mod tests {
             store,
             view,
         }
+    }
+
+    #[test]
+    fn snapshot_lookup_ref_matches_owned_lookup() {
+        let _guard = ZONE_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let origin = name("example.com");
+        let www = name("www.example.com");
+        let mut records = base_data(&origin);
+        records.push(rrset(
+            &www,
+            Rtype::A,
+            vec![Rdata::A("192.0.2.1".parse().expect("ipv4"))],
+        ));
+        let fixture = fixture(&records);
+        let mut answer = 0;
+        let mut nxdomain = 0;
+        assert!(fixture.view.with_snapshot(&mut |snapshot| {
+            match snapshot.lookup_ref(NameRef::from_name(&www), Rtype::A) {
+                LookupOutcomeRef::Answer(rrset) => {
+                    assert_eq!(rrset.rr_type(), Rtype::A);
+                    assert_eq!(rrset.len(), 1);
+                    answer += 1;
+                }
+                other => panic!("expected answer, got {other:?}"),
+            }
+            match snapshot.lookup_ref(NameRef::from_name(&name("missing.example.com")), Rtype::A) {
+                LookupOutcomeRef::NxDomain => nxdomain += 1,
+                other => panic!("expected NXDOMAIN, got {other:?}"),
+            }
+        }));
+        assert_eq!(answer, 1);
+        assert_eq!(nxdomain, 1);
     }
 
     #[test]

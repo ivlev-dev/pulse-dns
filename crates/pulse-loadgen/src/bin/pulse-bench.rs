@@ -895,7 +895,7 @@ fn wait_ready(server: &RunningServer, _workers: usize) -> Result<(), String> {
     let query = Message::query(
         0x1234,
         Question::new(
-            Name::parse("r0.z0.bench.test.").map_err(|error| error.to_string())?,
+            Name::parse("r0000000.z0.bench.test.").map_err(|error| error.to_string())?,
             Rtype::A,
             Rclass::IN,
         ),

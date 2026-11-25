@@ -8,7 +8,9 @@
 use std::cell::RefCell;
 
 use pulse_dns::DecodeLimits;
-use pulse_dns::{EncodeOptions, EncodeScratch, Encoder, Flags, HeaderCounts, Message, Rcode};
+use pulse_dns::{
+    EncodeOptions, EncodeScratch, Encoder, Flags, HeaderCounts, Message, MessageRef, Rcode,
+};
 use pulse_server::{QueryEngine, Scratch, Transport};
 
 use crate::stats::Stats;
@@ -33,6 +35,23 @@ pub(crate) fn respond_into(
     if request.len() < 12 {
         stats.decode_error();
         return None;
+    }
+    // Горячий путь: простой запрос разбирается без аллокаций, ответ
+    // кодируется из заимствованных RRset прямо в TX-слот. Любой не-горячий
+    // случай уходит в полный декодер ниже без изменения поведения.
+    if let Some(parsed) = MessageRef::decode_simple(request) {
+        let fast = SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            engine.respond_ref_into(&parsed, transport, out, &mut scratch)
+        });
+        if let Some(len) = fast {
+            match transport {
+                Transport::Udp => stats.udp_query(),
+                Transport::Tcp => stats.tcp_query(),
+            }
+            stats.response();
+            return Some(len);
+        }
     }
     let Ok(message) = Message::decode(request, &DecodeLimits::default()) else {
         stats.decode_error();
@@ -175,6 +194,17 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        zone.insert(
+            pulse_dns::Rrset::new(
+                Name::parse("www.example.com.").unwrap(),
+                Rtype::A,
+                Rclass::IN,
+                Ttl::new(300).unwrap(),
+                [pulse_dns::Rdata::A("192.0.2.1".parse().unwrap())],
+            )
+            .unwrap(),
+        )
+        .unwrap();
         QueryEngine::new(vec![Arc::new(zone)])
     }
 
@@ -202,6 +232,25 @@ mod tests {
         let query = Message::query(
             9,
             Question::new(Name::parse("example.com.").unwrap(), Rtype::SOA, Rclass::IN),
+        );
+        let bytes = query.encode(&EncodeOptions::compressed()).unwrap();
+        let owned = respond(&bytes, Transport::Udp, &engine, &stats).unwrap();
+        let mut out = [0_u8; 4096];
+        let len = respond_into(&bytes, Transport::Udp, &engine, &stats, &mut out).unwrap();
+        assert_eq!(&out[..len], owned.as_slice());
+    }
+
+    #[test]
+    fn zero_copy_a_matches_owned_path() {
+        let stats = Stats::new();
+        let engine = engine();
+        let query = Message::query(
+            11,
+            Question::new(
+                Name::parse("www.example.com.").unwrap(),
+                Rtype::A,
+                Rclass::IN,
+            ),
         );
         let bytes = query.encode(&EncodeOptions::compressed()).unwrap();
         let owned = respond(&bytes, Transport::Udp, &engine, &stats).unwrap();

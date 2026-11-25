@@ -70,7 +70,7 @@ fn main() -> Result<(), String> {
     let message = Message::query(
         0x1234,
         Question::new(
-            Name::parse("r0.z0.bench.test.").expect("name"),
+            Name::parse("r0000000.z0.bench.test.").expect("name"),
             Rtype::A,
             Rclass::IN,
         ),
@@ -86,7 +86,7 @@ fn main() -> Result<(), String> {
     let encoded = Message::query(
         0x1234,
         Question::new(
-            Name::parse("r0.z0.bench.test.").expect("name"),
+            Name::parse("r0000000.z0.bench.test.").expect("name"),
             Rtype::A,
             Rclass::IN,
         ),
@@ -108,7 +108,8 @@ fn main() -> Result<(), String> {
             .map_err(|error| format!("zone: {error}"))?;
         let names: Vec<NameRle> = (0..args.rrsets.max(4) / 4)
             .map(|index| {
-                NameRle::from_ascii(&format!("r{}.z0.bench.test.", index * 4)).expect("record name")
+                NameRle::from_ascii(&format!("r{:07}.z0.bench.test.", index * 4))
+                    .expect("record name")
             })
             .collect();
         let mut index = 0_usize;
@@ -147,7 +148,7 @@ fn main() -> Result<(), String> {
     let query = Message::query(
         0x1234,
         Question::new(
-            Name::parse("r0.z0.bench.test.").expect("name"),
+            Name::parse("r0000000.z0.bench.test.").expect("name"),
             Rtype::A,
             Rclass::IN,
         ),

@@ -13,7 +13,7 @@ use std::time::Instant;
 use pulse_dns::{Name, Rdata, SoaData, TxtData};
 use pulse_zonefile::key::NameRle;
 use pulse_zonefile::parallel::{
-    ParallelStore, ParallelZones, RrsetData, StoreConfig, SyncModeV2, ZoneCreateMeta,
+    BulkRrset, ParallelStore, ParallelZones, RrsetData, StoreConfig, SyncModeV2, ZoneCreateMeta,
 };
 
 /// Параметры генерации.
@@ -184,28 +184,67 @@ pub fn generate(spec: &GenSpec) -> Result<GenReport, String> {
         let mut writer = catalog
             .writer(&apex)
             .map_err(|error| format!("writer {origin_text}: {error}"))?;
-        if !spec.resume {
-            write_apex(&mut writer, &origin_text)?;
-        }
-        let start = if zone == 0 { resume_start } else { 0 };
-        let batch = 8_192_u32;
-        let mut inserted = 0_u32;
-        for index in start..spec.rrsets_per_zone {
-            let record = record_name(index, zone);
-            let name =
-                NameRle::from_ascii(&record).map_err(|error| format!("record name: {error}"))?;
-            let (rr_type, data) = record_rdata(index, &origin_text);
-            writer
-                .upsert_rrset(&name, rr_type, 0, &data)
-                .map_err(|error| format!("upsert {record}: {error}"))?;
-            inserted = inserted.saturating_add(1);
-            if (index + 1) % batch == 0 {
+        if spec.resume {
+            let start = if zone == 0 { resume_start } else { 0 };
+            let batch = 8_192_u32;
+            let mut inserted = 0_u32;
+            for index in start..spec.rrsets_per_zone {
+                let record = record_name(index, zone);
+                let name = NameRle::from_ascii(&record)
+                    .map_err(|error| format!("record name: {error}"))?;
+                let (rr_type, data) = record_rdata(index, &origin_text);
+                writer
+                    .upsert_rrset(&name, rr_type, 0, &data)
+                    .map_err(|error| format!("upsert {record}: {error}"))?;
+                inserted = inserted.saturating_add(1);
+                if (index + 1) % batch == 0 {
+                    writer
+                        .commit_with(spec.sync_mode)
+                        .map_err(|error| format!("commit {origin_text} at {index}: {error}"))?;
+                }
+            }
+            if inserted > 0 {
                 writer
                     .commit_with(spec.sync_mode)
-                    .map_err(|error| format!("commit {origin_text} at {index}: {error}"))?;
+                    .map_err(|error| format!("commit {origin_text}: {error}"))?;
             }
-        }
-        if inserted > 0 {
+        } else {
+            // Один поток записей в каноническом порядке: apex/glue, затем
+            // `r0000000…` (фиксированная ширина => лексикографический порядок
+            // совпадает с каноническим). Bulk пишет каждую страницу один раз.
+            let head = apex_records(&origin_text)?;
+            let mut index = 0_u32;
+            let name_error = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+            let error_sink = std::rc::Rc::clone(&name_error);
+            let generated_origin = origin_text.clone();
+            let generated = std::iter::from_fn(move || {
+                if index >= spec.rrsets_per_zone || error_sink.borrow().is_some() {
+                    return None;
+                }
+                let current = index;
+                index = index.saturating_add(1);
+                let name = record_name(current, zone);
+                let name = match NameRle::from_ascii(&name) {
+                    Ok(name) => name,
+                    Err(error) => {
+                        *error_sink.borrow_mut() = Some(format!("record name: {error}"));
+                        return None;
+                    }
+                };
+                let (rr_type, data) = record_rdata(current, &generated_origin);
+                Some(BulkRrset {
+                    name,
+                    rr_type,
+                    subtype: 0,
+                    data,
+                })
+            });
+            writer
+                .bulk_load(head.into_iter().chain(generated))
+                .map_err(|error| format!("bulk load {origin_text}: {error}"))?;
+            if let Some(error) = name_error.borrow_mut().take() {
+                return Err(error);
+            }
             writer
                 .commit_with(spec.sync_mode)
                 .map_err(|error| format!("commit {origin_text}: {error}"))?;
@@ -229,10 +268,8 @@ pub fn generate(spec: &GenSpec) -> Result<GenReport, String> {
     })
 }
 
-fn write_apex(
-    writer: &mut pulse_zonefile::parallel::ParallelZone<'_>,
-    origin_text: &str,
-) -> Result<(), String> {
+/// Канонический префикс зоны: apex `SOA`/`NS` и glue `ns1`.
+fn apex_records(origin_text: &str) -> Result<Vec<BulkRrset>, String> {
     let apex = NameRle::from_ascii(origin_text).map_err(|error| format!("apex: {error}"))?;
     let soa = Rdata::Soa(SoaData::new(
         Name::parse(&format!("ns1.{origin_text}"))
@@ -247,25 +284,35 @@ fn write_apex(
     ));
     let soa_data = RrsetData::from_slices(60, 0, &[&soa.to_canonical_wire()])
         .map_err(|error| format!("soa rrset: {error}"))?;
-    writer
-        .upsert_rrset(&apex, pulse_dns::Rtype::SOA.as_u16(), 0, &soa_data)
-        .map_err(|error| format!("upsert soa: {error}"))?;
     let ns = Rdata::Ns(
         Name::parse(&format!("ns1.{origin_text}")).map_err(|error| format!("ns: {error}"))?,
     );
     let ns_data = RrsetData::from_slices(60, 0, &[&ns.to_canonical_wire()])
         .map_err(|error| format!("ns rrset: {error}"))?;
-    writer
-        .upsert_rrset(&apex, pulse_dns::Rtype::NS.as_u16(), 0, &ns_data)
-        .map_err(|error| format!("upsert ns: {error}"))?;
     let ns_name = NameRle::from_ascii(&format!("ns1.{origin_text}"))
         .map_err(|error| format!("ns name: {error}"))?;
     let glue = RrsetData::from_slices(60, 0, &[&[127, 0, 0, 1]])
         .map_err(|error| format!("glue: {error}"))?;
-    writer
-        .upsert_rrset(&ns_name, pulse_dns::Rtype::A.as_u16(), 0, &glue)
-        .map_err(|error| format!("upsert glue: {error}"))?;
-    Ok(())
+    Ok(vec![
+        BulkRrset {
+            name: apex,
+            rr_type: pulse_dns::Rtype::NS.as_u16(),
+            subtype: 0,
+            data: ns_data,
+        },
+        BulkRrset {
+            name: apex,
+            rr_type: pulse_dns::Rtype::SOA.as_u16(),
+            subtype: 0,
+            data: soa_data,
+        },
+        BulkRrset {
+            name: ns_name,
+            rr_type: pulse_dns::Rtype::A.as_u16(),
+            subtype: 0,
+            data: glue,
+        },
+    ])
 }
 
 fn record_rdata(index: u32, origin_text: &str) -> (u16, RrsetData) {
@@ -320,10 +367,10 @@ pub fn origin(zone: u32) -> String {
     format!("z{zone}.bench.test.")
 }
 
-/// Имя RRset.
+/// Имя RRset (фиксированная ширина: лексикографический порядок = канонический).
 #[must_use]
 pub fn record_name(index: u32, zone: u32) -> String {
-    format!("r{index}.z{zone}.bench.test.")
+    format!("r{index:07}.z{zone}.bench.test.")
 }
 
 /// Apex A (для запросов к origin, при необходимости).
