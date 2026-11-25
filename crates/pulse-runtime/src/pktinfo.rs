@@ -91,7 +91,6 @@ impl DstInfo {
     /// Записать control message в буфер слота; вернуть длину для
     /// `msg_controllen` (0 — control не нужен).
     pub(crate) fn write(self, buf: &mut [u8; CMSG_BUF_LEN]) -> usize {
-        buf.fill(0);
         let (level, kind, data_len) = match self {
             Self::None => return 0,
             Self::V4 { .. } => (libc::IPPROTO_IP, libc::IP_PKTINFO, CMSG_SIZE_V4),

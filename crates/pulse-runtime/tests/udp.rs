@@ -605,6 +605,69 @@ fn ipv6_loopback_echo() {
 }
 
 #[test]
+fn optional_kernel_features_degrade_without_breaking_echo() {
+    let cfg = RuntimeConfig::default()
+        .with_workers(1)
+        .with_rx_buffer_size(512)
+        .with_tx(32, 1024)
+        .with_rx_buffers(std::num::NonZeroU16::new(64).unwrap())
+        .with_cqe_batch(32)
+        .with_thread_stack(128 * 1024)
+        .with_busy_poll(50)
+        .with_prefer_busy_poll(true)
+        .with_register_files(false)
+        .with_coop_taskrun(false);
+    let server = UdpServer::bind_with("127.0.0.1:0".parse().unwrap(), echo, cfg).unwrap();
+    // busy-poll/COOP не обязаны быть доступны (EPERM/EINVAL) — bind не падает.
+    assert!(!server.capabilities().registered_files);
+    server.start().unwrap();
+    let socket = client(server.local_addr());
+    socket.send(b"degrade").unwrap();
+    assert_eq!(
+        recv_until(&socket, Instant::now() + DEADLINE).expect("reply"),
+        b"degrade"
+    );
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn sqpoll_request_degrades_gracefully() {
+    let cfg = RuntimeConfig::default()
+        .with_workers(1)
+        .with_sqpoll(Some(1000))
+        .with_sqpoll_cpu(None);
+    let server = UdpServer::bind_with("127.0.0.1:0".parse().unwrap(), echo, cfg).unwrap();
+    let caps = server.capabilities();
+    server.start().unwrap();
+    let socket = client(server.local_addr());
+    socket.send(b"sqpoll").unwrap();
+    assert_eq!(
+        recv_until(&socket, Instant::now() + DEADLINE).expect("reply"),
+        b"sqpoll"
+    );
+    // Флаг в capabilities отражает фактическое состояние: без прав SQPOLL
+    // просто выключен, а echo продолжает работать.
+    assert!(matches!(caps.backend, BackendKind::IoUring { .. }));
+    if !caps.sqpoll {
+        eprintln!("sqpoll unavailable in this environment; degradation path exercised");
+    }
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn cpu_affinity_outside_process_set_is_rejected_on_start() {
+    let cfg = RuntimeConfig::default()
+        .with_workers(1)
+        .with_cpu_affinity(vec![usize::MAX - 1]);
+    let server = UdpServer::bind_with("127.0.0.1:0".parse().unwrap(), echo, cfg).unwrap();
+    let error = server.start().expect_err("foreign CPU must be rejected");
+    assert!(
+        error.to_string().contains("cpu_affinity"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn wait_before_start_is_rejected() {
     let server = UdpServer::bind("127.0.0.1:0".parse().unwrap(), echo, 1).unwrap();
     assert!(matches!(server.wait(), Err(RuntimeError::NotStarted)));

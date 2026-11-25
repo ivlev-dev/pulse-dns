@@ -110,6 +110,9 @@ macro_rules! counter_add {
     };
 }
 
+// Без epoll-фолбэка атомарные инкременты не нужны: io_uring публикует
+// локальную дельту через `publish`; методы остаются для epoll-бэкенда.
+#[cfg_attr(not(feature = "epoll-fallback"), allow(dead_code))]
 impl WorkerCounters {
     pub(crate) fn snapshot(&self) -> WorkerStats {
         WorkerStats {
@@ -137,9 +140,33 @@ impl WorkerCounters {
     counter!(send_error, send_errors);
     counter!(oversize, oversize_received);
     counter!(response_dropped, responses_dropped);
-    counter!(pressure, tx_pressure);
-    counter!(starve, pbuf_starve);
     counter!(handler_panic, handler_panics);
-    counter!(stale, stale_completions);
-    counter!(cq_overflow, cq_overflow_total);
+
+    /// Опубликовать локально накопленную дельту worker'а.
+    ///
+    /// Горячий путь io_uring пишет в `WorkerStats` без атомиков, а сюда
+    /// приходит один раз за проход completion-loop.
+    pub(crate) fn publish(&self, delta: &WorkerStats) {
+        // Ошибки/дропы обычно нулевые: не трогаем их cache line зря.
+        macro_rules! publish_field {
+            ($field:ident) => {
+                if delta.$field != 0 {
+                    self.$field.fetch_add(delta.$field, Ordering::Relaxed);
+                }
+            };
+        }
+        publish_field!(packets_received);
+        publish_field!(bytes_received);
+        publish_field!(packets_sent);
+        publish_field!(bytes_sent);
+        publish_field!(recv_errors);
+        publish_field!(send_errors);
+        publish_field!(oversize_received);
+        publish_field!(responses_dropped);
+        publish_field!(tx_pressure);
+        publish_field!(pbuf_starve);
+        publish_field!(handler_panics);
+        publish_field!(stale_completions);
+        publish_field!(cq_overflow_total);
+    }
 }

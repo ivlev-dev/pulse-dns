@@ -23,7 +23,7 @@ use crate::handler::{Handler, Reply};
 use crate::panic_hook;
 use crate::pktinfo::{CMSG_BUF_LEN, DstInfo};
 use crate::socket::sockaddr_from_bytes;
-use crate::stats::WorkerCounters;
+use crate::stats::{WorkerCounters, WorkerStats};
 
 const OP_RECV: u8 = 1;
 const OP_SEND: u8 = 2;
@@ -42,7 +42,56 @@ const SOCKADDR_STORAGE_LEN: usize = 128;
 /// Резерв под control message (`IP_PKTINFO`/`IPV6_PKTINFO`) в provided-буфере.
 const RECVMSG_CTRL_LEN: usize = CMSG_BUF_LEN;
 
-const MAX_CQE_BATCH: usize = 256;
+/// Выравнивание арены и шага буфера: соседние provided-буферы не делят
+/// cache line (ядро пишет в них параллельно с чтением worker'а).
+const ARENA_ALIGN: usize = 64;
+
+/// Индекс fd в `IORING_REGISTER_FILES`: сокет, затем `eventfd`.
+const FIXED_SOCKET: u32 = 0;
+const FIXED_WAKE: u32 = 1;
+
+/// Ссылка на fd для SQE: обычный или зарегистрированный.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FdRef {
+    Raw(RawFd),
+    Fixed(u32),
+}
+
+impl FdRef {
+    fn poll_read(self, user_data: u64) -> squeue::Entry {
+        let entry = match self {
+            Self::Raw(fd) => opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as u32).build(),
+            Self::Fixed(index) => {
+                opcode::PollAdd::new(types::Fixed(index), libc::POLLIN as u32).build()
+            }
+        };
+        entry.user_data(user_data)
+    }
+
+    fn recv_msg(self, hdr: *mut libc::msghdr, user_data: u64) -> squeue::Entry {
+        let entry = match self {
+            Self::Raw(fd) => opcode::RecvMsg::new(types::Fd(fd), hdr).build(),
+            Self::Fixed(index) => opcode::RecvMsg::new(types::Fixed(index), hdr).build(),
+        };
+        entry.user_data(user_data)
+    }
+
+    fn recv_msg_multi(self, hdr: *const libc::msghdr, bgid: u16, user_data: u64) -> squeue::Entry {
+        let entry = match self {
+            Self::Raw(fd) => opcode::RecvMsgMulti::new(types::Fd(fd), hdr, bgid).build(),
+            Self::Fixed(index) => opcode::RecvMsgMulti::new(types::Fixed(index), hdr, bgid).build(),
+        };
+        entry.user_data(user_data)
+    }
+
+    fn send_msg(self, hdr: *const libc::msghdr, user_data: u64) -> squeue::Entry {
+        let entry = match self {
+            Self::Raw(fd) => opcode::SendMsg::new(types::Fd(fd), hdr).build(),
+            Self::Fixed(index) => opcode::SendMsg::new(types::Fixed(index), hdr).build(),
+        };
+        entry.user_data(user_data)
+    }
+}
 
 /// Тег `user_data`: op (8) | slot (16) | generation (32).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,16 +190,14 @@ impl RxSlot {
         slot
     }
 
-    fn arm(&mut self, fd: RawFd, slot: u16) -> squeue::Entry {
+    fn arm(&mut self, fd: FdRef, slot: u16) -> squeue::Entry {
         self.generation = self.generation.wrapping_add(1);
         self.in_flight = true;
         self.hdr.msg_namelen = SOCKADDR_STORAGE_LEN as libc::socklen_t;
         self.hdr.msg_controllen = RECVMSG_CTRL_LEN;
         self.hdr.msg_flags = 0;
         self.iov.iov_len = self.buf.len();
-        opcode::RecvMsg::new(types::Fd(fd), &raw mut self.hdr)
-            .build()
-            .user_data(make_tag(OP_RECV, slot, self.generation))
+        fd.recv_msg(&raw mut self.hdr, make_tag(OP_RECV, slot, self.generation))
     }
 
     fn peer(&self) -> Option<SocketAddr> {
@@ -307,7 +354,7 @@ impl TxPool {
         len: usize,
         peer: SocketAddr,
         dst: DstInfo,
-        fd: RawFd,
+        fd: FdRef,
     ) -> Option<squeue::Entry> {
         let index = usize::from(slot);
         let tx_slot = self.slots.get_mut(index)?;
@@ -323,11 +370,10 @@ impl TxPool {
         tx_slot.hdr.msg_namelen = name_len as libc::socklen_t;
         tx_slot.hdr.msg_controllen = dst.write(&mut tx_slot.control);
         self.in_flight += 1;
-        Some(
-            opcode::SendMsg::new(types::Fd(fd), &raw const tx_slot.hdr)
-                .build()
-                .user_data(make_tag(OP_SEND, slot, tx_slot.generation)),
-        )
+        Some(fd.send_msg(
+            &raw const tx_slot.hdr,
+            make_tag(OP_SEND, slot, tx_slot.generation),
+        ))
     }
 
     /// Завершить отправку; `false` — CQE устарел либо слот не в полёте.
@@ -363,6 +409,72 @@ impl RxState {
     }
 }
 
+/// Арена provided-буферов: общий `Vec`, выровненное начало и выровненный шаг.
+///
+/// Начало арены выравнивается на [`ARENA_ALIGN`] переполнением аллокации;
+/// указатель не перемещается, пока жив `Vec`.
+struct RxArena {
+    mem: Vec<u8>,
+    offset: usize,
+    stride: usize,
+    buffers: u16,
+}
+
+impl RxArena {
+    fn empty() -> Self {
+        Self {
+            mem: Vec::new(),
+            offset: 0,
+            stride: 0,
+            buffers: 0,
+        }
+    }
+
+    fn new(buffers: u16, stride: usize) -> io::Result<Self> {
+        // Нечётное число cache line в шаге: иначе при степени двойки буферы
+        // ложатся в ограниченный набор cache set'ов и конфликтуют в L1/L2.
+        let mut stride = align_up(stride, ARENA_ALIGN);
+        if (stride / ARENA_ALIGN).is_multiple_of(2) {
+            stride += ARENA_ALIGN;
+        }
+        let payload = stride
+            .checked_mul(usize::from(buffers))
+            .and_then(|value| value.checked_add(ARENA_ALIGN))
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let mem = vec![0_u8; payload];
+        let base = mem.as_ptr() as usize;
+        let offset = align_up(base, ARENA_ALIGN) - base;
+        Ok(Self {
+            mem,
+            offset,
+            stride,
+            buffers,
+        })
+    }
+
+    fn stride(&self) -> usize {
+        self.stride
+    }
+
+    fn buffers(&self) -> u16 {
+        self.buffers
+    }
+
+    fn addr(&self, bid: u16) -> u64 {
+        let start = self.offset + usize::from(bid) * self.stride;
+        self.mem.as_ptr().wrapping_add(start) as u64
+    }
+
+    fn slice(&self, bid: u16) -> &[u8] {
+        let start = self.offset + usize::from(bid) * self.stride;
+        &self.mem[start..start + self.stride]
+    }
+}
+
+const fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
 /// Состояние worker'а и его главный цикл.
 pub(crate) struct UringWorker {
     // Поля объявлены так, что ring уничтожается первым: к этому моменту все
@@ -370,18 +482,19 @@ pub(crate) struct UringWorker {
     ring: IoUring,
     /// Владеет fd сокета; ring использует только номер.
     _socket: OwnedFd,
-    fd: RawFd,
+    fd_target: FdRef,
+    wake_target: FdRef,
     cfg: Arc<RuntimeConfig>,
     handler: Arc<dyn Handler>,
     counters: Arc<WorkerCounters>,
+    /// Локальная дельта счётчиков: публикуется раз за проход, не на пакет.
+    stats: WorkerStats,
     stop: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
     wake: OwnedFd,
     mode: Mode,
     pbuf: Option<ProvidedBufRing>,
-    arena: Vec<u8>,
-    arena_stride: usize,
-    arena_buffers: u16,
+    arena: RxArena,
     rx_hdr: Box<MultishotHdr>,
     // Box фиксирует адрес слота: `msghdr`/`iovec` ссылаются на поля слота.
     #[allow(clippy::vec_box)]
@@ -389,6 +502,7 @@ pub(crate) struct UringWorker {
     rx: RxState,
     tx: TxPool,
     sq_ops: Vec<squeue::Entry>,
+    cq_batch: Vec<(u64, i32, u32)>,
     closed: bool,
     fatal: Option<io::Error>,
 }
@@ -403,27 +517,43 @@ impl UringWorker {
         stop: Arc<AtomicBool>,
         abort: Arc<AtomicBool>,
         wake: OwnedFd,
+        sqpoll_cpu: Option<usize>,
     ) -> Result<Self, RuntimeError> {
         let fd = socket.as_raw_fd();
-        let (ring, _fast_flags) = build_ring(&cfg).map_err(|source| RuntimeError::IoUring {
+        let setup = build_ring(&cfg, sqpoll_cpu).map_err(|source| RuntimeError::IoUring {
             context: "io_uring_setup (worker)",
             source,
         })?;
+        if cfg.sqpoll_idle.is_some() && !setup.sqpoll {
+            eprintln!("pulse-runtime: warning: worker io_uring_setup fell back without SQPOLL");
+        }
+        let ring = setup.ring;
+
+        // Регистрация файлов убирает indirection fd→file на каждом SQE.
+        // Недоступность деградирует к обычному `Fd`, не ломая worker.
+        let (fd_target, wake_target) = if cfg.register_files {
+            let fds = [socket.as_raw_fd(), wake.as_raw_fd()];
+            if ring.submitter().register_files(&fds).is_ok() {
+                (FdRef::Fixed(FIXED_SOCKET), FdRef::Fixed(FIXED_WAKE))
+            } else {
+                (FdRef::Raw(fd), FdRef::Raw(wake.as_raw_fd()))
+            }
+        } else {
+            (FdRef::Raw(fd), FdRef::Raw(wake.as_raw_fd()))
+        };
 
         let prefer_multishot = cfg.rx_mode != RxMode::RecvBatch;
         let forced_multishot = cfg.rx_mode == RxMode::Multishot;
 
         let mut pbuf = None;
-        let mut arena = Vec::new();
-        let mut arena_stride = 0;
+        let mut arena = RxArena::empty();
         let mut mode = Mode::Batch;
 
         if prefer_multishot {
             match Self::setup_provided_buffers(&ring, &cfg) {
-                Ok((ring_buf, buf, stride)) => {
+                Ok((ring_buf, rx_arena)) => {
                     pbuf = Some(ring_buf);
-                    arena = buf;
-                    arena_stride = stride;
+                    arena = rx_arena;
                     mode = Mode::Multishot;
                 }
                 Err(source) if forced_multishot => {
@@ -446,32 +576,29 @@ impl UringWorker {
         } else {
             Vec::new()
         };
-        let arena_buffers = if mode == Mode::Multishot {
-            cfg.rx_buffers
-        } else {
-            0
-        };
+        let arena_buffers = arena.buffers();
 
         let mut worker = Self {
             ring,
             _socket: socket,
-            fd,
+            fd_target,
+            wake_target,
             handler,
             counters,
+            stats: WorkerStats::default(),
             stop,
             abort,
             wake,
             mode,
             pbuf,
             arena,
-            arena_stride,
-            arena_buffers,
             rx_hdr: MultishotHdr::new(),
             rx_slots,
             rx: RxState::new(arena_buffers),
             tx: TxPool::new(&cfg),
+            sq_ops: Vec::with_capacity(cfg.cqe_batch.saturating_mul(2) + 8),
+            cq_batch: vec![(0, 0, 0); cfg.cqe_batch],
             cfg,
-            sq_ops: Vec::with_capacity(MAX_CQE_BATCH * 2 + 8),
             closed: false,
             fatal: None,
         };
@@ -484,40 +611,35 @@ impl UringWorker {
     fn setup_provided_buffers(
         ring: &IoUring,
         cfg: &RuntimeConfig,
-    ) -> io::Result<(ProvidedBufRing, Vec<u8>, usize)> {
+    ) -> io::Result<(ProvidedBufRing, RxArena)> {
         let stride = cfg
             .rx_buffer_size
             .checked_add(RECVMSG_OUT_LEN + SOCKADDR_STORAGE_LEN + RECVMSG_CTRL_LEN)
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let total = stride
-            .checked_mul(usize::from(cfg.rx_buffers))
-            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let arena = RxArena::new(cfg.rx_buffers, stride)?;
         let ring_buf = ProvidedBufRing::new(cfg.rx_buffers, BGID_RX)?;
         // SAFETY: ring_buf не перемещается (живёт в worker до shutdown, где
         // снимается регистрация) и переживает io_uring.
         unsafe { ring_buf.register(&ring.submitter())? };
-        Ok((ring_buf, vec![0_u8; total], stride))
+        Ok((ring_buf, arena))
     }
 
     fn fill_provided_buffers(&mut self) {
-        let (Some(pbuf), mode) = (self.pbuf.as_mut(), self.mode) else {
-            return;
-        };
-        if mode != Mode::Multishot {
+        if self.mode != Mode::Multishot {
             return;
         }
-        let base = self.arena.as_ptr() as u64;
-        let stride = self.arena_stride;
-        for index in 0..self.arena_buffers {
-            let addr = base + u64::from(index) * stride as u64;
-            pbuf.push(index, addr, stride as u32);
+        let stride = self.arena.stride();
+        let buffers = self.arena.buffers();
+        let Some(pbuf) = self.pbuf.as_mut() else {
+            return;
+        };
+        for index in 0..buffers {
+            pbuf.push(index, self.arena.addr(index), stride as u32);
         }
     }
 
     fn arm_wake(&mut self) {
-        let entry = opcode::PollAdd::new(types::Fd(self.wake.as_raw_fd()), libc::POLLIN as u32)
-            .build()
-            .user_data(make_tag(OP_WAKE, 0, 0));
+        let entry = self.wake_target.poll_read(make_tag(OP_WAKE, 0, 0));
         self.sq_ops.push(entry);
     }
 
@@ -549,9 +671,11 @@ impl UringWorker {
             }
 
             self.drain_completions();
+            self.flush_stats();
             let overflow = self.ring.completion().overflow();
             if overflow > 0 {
-                self.counters.cq_overflow();
+                self.stats.cq_overflow_total += 1;
+                self.flush_stats();
                 return Err(RuntimeError::IoUring {
                     context: "completion queue overflow",
                     source: io::Error::other(format!(
@@ -570,21 +694,28 @@ impl UringWorker {
     }
 
     fn drain_completions(&mut self) {
-        let mut batch = [(0_u64, 0_i32, 0_u32); MAX_CQE_BATCH];
         let mut count = 0;
         {
+            let limit = self.cq_batch.len();
             let mut cq = self.ring.completion();
-            while count < MAX_CQE_BATCH {
+            while count < limit {
                 let Some(cqe) = cq.next() else {
                     break;
                 };
-                batch[count] = (cqe.user_data(), cqe.result(), cqe.flags());
+                self.cq_batch[count] = (cqe.user_data(), cqe.result(), cqe.flags());
                 count += 1;
             }
         }
-        for &(user_data, result, flags) in &batch[..count] {
+        for index in 0..count {
+            let (user_data, result, flags) = self.cq_batch[index];
             self.dispatch(user_data, result, flags);
         }
+    }
+
+    /// Опубликовать локальные счётчики (раз за проход, не на пакет).
+    fn flush_stats(&mut self) {
+        self.counters.publish(&self.stats);
+        self.stats = WorkerStats::default();
     }
 
     fn flush_submissions(&mut self) -> Result<(), RuntimeError> {
@@ -625,7 +756,7 @@ impl UringWorker {
                 self.on_recv_multishot(tag, result, flags);
             }
             OP_RECV => self.on_recv_batch(tag, result),
-            _ => self.counters.stale(),
+            _ => self.stats.stale_completions += 1,
         }
     }
 
@@ -639,14 +770,14 @@ impl UringWorker {
 
     fn on_send(&mut self, tag: Tag, result: i32) {
         if !self.tx.complete(tag.slot, tag.generation) {
-            self.counters.stale();
+            self.stats.stale_completions += 1;
             return;
         }
         if result >= 0 {
-            self.counters.add_sent(1);
-            self.counters.add_bytes_sent(result as u64);
+            self.stats.packets_sent += 1;
+            self.stats.bytes_sent += result as u64;
         } else {
-            self.counters.send_error();
+            self.stats.send_errors += 1;
         }
         self.maybe_flush_held();
     }
@@ -656,12 +787,13 @@ impl UringWorker {
         if !more {
             self.rx.armed = false;
         }
+        let arena_buffers = self.arena.buffers();
         if tag.generation != self.rx.generation {
-            self.counters.stale();
+            self.stats.stale_completions += 1;
             // Буфер, выданный под этот CQE, всё равно нужно вернуть в кольцо.
             if result >= 0
                 && let Some(bid) = cqueue::buffer_select(flags)
-                && bid < self.arena_buffers
+                && bid < arena_buffers
             {
                 if let Some(pbuf) = self.pbuf.as_mut() {
                     pbuf.take_one_available();
@@ -676,19 +808,18 @@ impl UringWorker {
         }
 
         let Some(bid) = cqueue::buffer_select(flags) else {
-            self.counters.recv_error();
+            self.stats.recv_errors += 1;
             return;
         };
-        if bid >= self.arena_buffers {
-            self.counters.recv_error();
+        if bid >= arena_buffers {
+            self.stats.recv_errors += 1;
             return;
         }
         if let Some(pbuf) = self.pbuf.as_mut() {
             pbuf.take_one_available();
         }
 
-        let start = usize::from(bid) * self.arena_stride;
-        let buffer = &self.arena[start..start + self.arena_stride];
+        let buffer = self.arena.slice(bid);
         let parsed = RecvMsgOut::parse(buffer, &self.rx_hdr.hdr);
         match parsed {
             Ok(msg) => {
@@ -702,14 +833,14 @@ impl UringWorker {
                         truncated,
                         &*self.handler,
                         &mut self.tx,
-                        &self.counters,
+                        &mut self.stats,
                         &mut self.sq_ops,
-                        self.fd,
+                        self.fd_target,
                     ),
-                    None => self.counters.recv_error(),
+                    None => self.stats.recv_errors += 1,
                 }
             }
-            Err(()) => self.counters.recv_error(),
+            Err(()) => self.stats.recv_errors += 1,
         }
         self.return_buffer(bid);
     }
@@ -717,11 +848,11 @@ impl UringWorker {
     fn on_recv_batch(&mut self, tag: Tag, result: i32) {
         let index = usize::from(tag.slot);
         let Some(slot) = self.rx_slots.get_mut(index) else {
-            self.counters.stale();
+            self.stats.stale_completions += 1;
             return;
         };
         if !slot.in_flight || slot.generation != tag.generation {
-            self.counters.stale();
+            self.stats.stale_completions += 1;
             return;
         }
         slot.in_flight = false;
@@ -734,7 +865,7 @@ impl UringWorker {
         let len = usize::try_from(result).unwrap_or(0).min(slot.buf.len());
         let truncated = (slot.hdr.msg_flags & libc::MSG_TRUNC) != 0;
         let Some(peer) = slot.peer() else {
-            self.counters.recv_error();
+            self.stats.recv_errors += 1;
             return;
         };
         let dst = slot.dst_info();
@@ -745,19 +876,19 @@ impl UringWorker {
             truncated,
             &*self.handler,
             &mut self.tx,
-            &self.counters,
+            &mut self.stats,
             &mut self.sq_ops,
-            self.fd,
+            self.fd_target,
         );
     }
 
     /// Учесть ошибку приёма; невосстановимую — запомнить и завершить worker.
     fn record_recv_error(&mut self, errno: i32) {
         match errno {
-            libc::ENOBUFS => self.counters.starve(),
+            libc::ENOBUFS => self.stats.pbuf_starve += 1,
             libc::ECANCELED | libc::EAGAIN | libc::EINTR => {}
             _ => {
-                self.counters.recv_error();
+                self.stats.recv_errors += 1;
                 if self.fatal.is_none() {
                     self.fatal = Some(io::Error::from_raw_os_error(errno));
                 }
@@ -768,7 +899,7 @@ impl UringWorker {
     /// Вернуть provided-буфер ядру либо удержать его (backpressure).
     fn return_buffer(&mut self, bid: u16) {
         if self.tx.free_count() < self.tx.low {
-            self.counters.pressure();
+            self.stats.tx_pressure += 1;
             self.rx.held.push(bid);
         } else {
             self.release_buffer(bid);
@@ -776,11 +907,11 @@ impl UringWorker {
     }
 
     fn release_buffer(&mut self, bid: u16) {
-        let (Some(pbuf), stride) = (self.pbuf.as_mut(), self.arena_stride) else {
+        let stride = self.arena.stride();
+        let Some(pbuf) = self.pbuf.as_mut() else {
             return;
         };
-        let addr = self.arena.as_ptr() as u64 + u64::from(bid) * stride as u64;
-        pbuf.push(bid, addr, stride as u32);
+        pbuf.push(bid, self.arena.addr(bid), stride as u32);
     }
 
     fn maybe_flush_held(&mut self) {
@@ -807,10 +938,11 @@ impl UringWorker {
                 let available = self.pbuf.as_ref().map_or(0, ProvidedBufRing::available);
                 if !self.rx.armed && available > 0 && self.tx.free_count() > 0 {
                     self.rx.generation = self.rx.generation.wrapping_add(1);
-                    let entry =
-                        opcode::RecvMsgMulti::new(types::Fd(self.fd), self.rx_hdr.ptr(), BGID_RX)
-                            .build()
-                            .user_data(make_tag(OP_RECV, 0, self.rx.generation));
+                    let entry = self.fd_target.recv_msg_multi(
+                        self.rx_hdr.ptr(),
+                        BGID_RX,
+                        make_tag(OP_RECV, 0, self.rx.generation),
+                    );
                     self.sq_ops.push(entry);
                     self.rx.armed = true;
                 }
@@ -834,7 +966,7 @@ impl UringWorker {
                         continue;
                     }
                     let slot_index = u16::try_from(index).unwrap_or(u16::MAX);
-                    let entry = slot.arm(self.fd, slot_index);
+                    let entry = slot.arm(self.fd_target, slot_index);
                     self.sq_ops.push(entry);
                     self.rx.inflight += 1;
                     wanted -= 1;
@@ -848,6 +980,7 @@ impl UringWorker {
             return Ok(());
         }
         self.closed = true;
+        self.flush_stats();
         let deadline = Instant::now() + self.cfg.shutdown_timeout;
 
         // 1. Досылаем всё, что уже лежит в SQ: отмена должна покрывать весь
@@ -950,7 +1083,7 @@ impl UringWorker {
     /// при недренированном CQ/ошибке unregister: утечка — осознанная цена
     /// безопасности, процесс всё равно завершается.
     fn leak_buffers(&mut self) {
-        std::mem::forget(std::mem::take(&mut self.arena));
+        std::mem::forget(std::mem::replace(&mut self.arena, RxArena::empty()));
         if let Some(pbuf) = self.pbuf.take() {
             std::mem::forget(pbuf);
         }
@@ -1007,30 +1140,30 @@ fn respond(
     truncated: bool,
     handler: &dyn Handler,
     tx: &mut TxPool,
-    counters: &WorkerCounters,
+    stats: &mut WorkerStats,
     sq_ops: &mut Vec<squeue::Entry>,
-    fd: RawFd,
+    fd: FdRef,
 ) {
-    counters.add_received(1);
-    counters.add_bytes_received(payload.len() as u64);
+    stats.packets_received += 1;
+    stats.bytes_received += payload.len() as u64;
     if truncated {
-        counters.oversize();
+        stats.oversize_received += 1;
         return;
     }
 
     let Some(slot) = tx.alloc() else {
-        counters.response_dropped();
+        stats.responses_dropped += 1;
         return;
     };
     let capacity = tx.slot_capacity();
     let Some(out) = tx.out(slot) else {
-        counters.response_dropped();
+        stats.responses_dropped += 1;
         tx.release(slot);
         return;
     };
     let reply = panic_hook::catch(|| handler.handle(payload, peer, out));
     let Ok(reply) = reply else {
-        counters.handler_panic();
+        stats.handler_panics += 1;
         tx.release(slot);
         return;
     };
@@ -1039,7 +1172,7 @@ fn respond(
         Reply::Send(len) => len,
         Reply::Owned(bytes) => {
             if !tx.copy_owned(slot, &bytes) {
-                counters.response_dropped();
+                stats.responses_dropped += 1;
                 tx.release(slot);
                 return;
             }
@@ -1054,7 +1187,7 @@ fn respond(
     // Обработчик не может отправить больше, чем ему дали: иначе ушёл бы
     // хвост прошлого ответа. Обрезать нельзя — это чужие байты.
     if len > capacity {
-        counters.response_dropped();
+        stats.responses_dropped += 1;
         tx.release(slot);
         return;
     }
@@ -1062,7 +1195,7 @@ fn respond(
     if let Some(entry) = tx.send_entry(slot, len, peer, dst, fd) {
         sq_ops.push(entry);
     } else {
-        counters.response_dropped();
+        stats.responses_dropped += 1;
         tx.release(slot);
     }
 }
@@ -1070,6 +1203,25 @@ fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arena_stride_is_aligned_and_cache_spread() {
+        for raw in [
+            512 + RECVMSG_OUT_LEN + SOCKADDR_STORAGE_LEN + RECVMSG_CTRL_LEN,
+            2256,
+        ] {
+            let arena = RxArena::new(64, raw).unwrap();
+            let stride = arena.stride();
+            assert_eq!(stride % ARENA_ALIGN, 0);
+            // Нечётное число линий — нет алиасинга на степень двойки.
+            assert!(!(stride / ARENA_ALIGN).is_multiple_of(2), "stride={stride}");
+            let first = arena.addr(0);
+            let second = arena.addr(1);
+            assert_eq!(first % ARENA_ALIGN as u64, 0);
+            assert_eq!(second - first, stride as u64);
+            assert_eq!(arena.slice(0).len(), stride);
+        }
+    }
 
     #[test]
     fn tag_roundtrip() {

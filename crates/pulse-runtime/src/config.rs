@@ -61,16 +61,21 @@ pub struct Capabilities {
     pub multishot_recv: bool,
     /// Доступны provided buffers (`IORING_REGISTER_PBUF_RING`).
     pub provided_buffers: bool,
-    /// Приняты флаги `SINGLE_ISSUER | DEFER_TASKRUN`.
+    /// Приняты `IORING_SETUP_SINGLE_ISSUER | DEFER_TASKRUN`.
     pub defer_taskrun: bool,
-    /// Принят `IORING_SETUP_SQPOLL`.
+    /// Принят `IORING_SETUP_COOP_TASKRUN` (не будить задачу из kernel task_work).
+    pub coop_taskrun: bool,
+    /// Принят `IORING_SETUP_SQPOLL` (фактически, а не запрошен).
     pub sqpoll: bool,
+    /// Сокет и `eventfd` зарегистрированы (`IORING_REGISTER_FILES`).
+    pub registered_files: bool,
     /// Ядро поддерживает `IORING_FEAT_NODROP` (переполнение CQ не теряет CQE).
     pub nodrop: bool,
 }
 
 /// Настройки `Runtime`.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RuntimeConfig {
     /// Число worker-потоков (ring-per-worker). `0` — по числу доступных ядер.
     pub workers: usize,
@@ -94,10 +99,36 @@ pub struct RuntimeConfig {
     pub socket_send_buffer: usize,
     /// Глубина батча приёма для L1-режима и максимум CQE за проход.
     pub batch_size: usize,
+    /// Максимум CQE, разбираемых за один проход без возврата в `submit`.
+    pub cqe_batch: usize,
+    /// Размер стека worker-потока, байт (`0` — размер по умолчанию ОС/`std`).
+    pub thread_stack_size: usize,
     /// Прибить worker'ов к ядрам (`sched_setaffinity`); ошибки игнорируются.
     pub pin_to_cpu: bool,
-    /// Включить `IORING_SETUP_SQPOLL` с указанным idle-таймаутом (нужны привилегии).
+    /// Явный список CPU для worker'ов (`sched_getaffinity`/cpuset учитываются);
+    /// пусто — все разрешённые процессу CPU.
+    pub cpu_affinity: Vec<usize>,
+    /// Включить `IORING_SETUP_SQPOLL` с указанным idle-таймаутом.
+    ///
+    /// При отсутствии прав ядро вернёт ошибку; рантайм продолжит без SQPOLL
+    /// (`Capabilities::sqpoll = false`).
     pub sqpoll_idle: Option<u32>,
+    /// CPU для kernel-потока SQPOLL (`IORING_SETUP_SQ_AFF`); `None` — выбрать
+    /// автоматически из разрешённых CPU.
+    pub sqpoll_cpu: Option<usize>,
+    /// `SO_BUSY_POLL`, микросекунды (`None`/`0` — выключено).
+    pub busy_poll_us: Option<u16>,
+    /// `SO_PREFER_BUSY_POLL` (обычно требует `CAP_NET_ADMIN`; ошибки игнорируются).
+    pub prefer_busy_poll: bool,
+    /// `SO_BUSY_POLL_BUDGET` — бюджет NAPI-опроса.
+    pub busy_poll_budget: Option<u16>,
+    /// Регистрировать сокет и `eventfd` в ring (`IORING_REGISTER_FILES`).
+    pub register_files: bool,
+    /// Пытаться включить `IORING_SETUP_COOP_TASKRUN` (опция, мягкая деградация).
+    ///
+    /// По умолчанию выключен: на современных ядрах с `DEFER_TASKRUN` выигрыш
+    /// не измерен, а поведение доставки CQE меняется.
+    pub coop_taskrun: bool,
     /// Режим приёма.
     pub rx_mode: RxMode,
     /// Таймаут graceful shutdown на worker, после которого операция отменяется.
@@ -113,13 +144,22 @@ impl Default for RuntimeConfig {
             cq_entries: 4096,
             rx_buffer_size: 2048,
             rx_buffers: 1024,
-            tx_slots: 512,
+            tx_slots: 256,
             tx_slot_size: 4096,
             socket_recv_buffer: 4 * 1024 * 1024,
             socket_send_buffer: 4 * 1024 * 1024,
             batch_size: 64,
+            cqe_batch: 256,
+            thread_stack_size: 512 * 1024,
             pin_to_cpu: false,
+            cpu_affinity: Vec::new(),
             sqpoll_idle: None,
+            sqpoll_cpu: None,
+            busy_poll_us: None,
+            prefer_busy_poll: false,
+            busy_poll_budget: None,
+            register_files: true,
+            coop_taskrun: false,
             rx_mode: RxMode::Auto,
             shutdown_timeout: Duration::from_secs(2),
         }
@@ -178,6 +218,20 @@ impl RuntimeConfig {
         self
     }
 
+    /// Задать максимум CQE за проход.
+    #[must_use]
+    pub fn with_cqe_batch(mut self, batch: usize) -> Self {
+        self.cqe_batch = batch;
+        self
+    }
+
+    /// Задать размер стека worker-потока (`0` — по умолчанию ОС).
+    #[must_use]
+    pub fn with_thread_stack(mut self, bytes: usize) -> Self {
+        self.thread_stack_size = bytes;
+        self
+    }
+
     /// Включить/выключить привязку к ядрам.
     #[must_use]
     pub fn with_cpu_pinning(mut self, pin: bool) -> Self {
@@ -185,10 +239,59 @@ impl RuntimeConfig {
         self
     }
 
+    /// Ограничить worker'ов указанными CPU (в пересечении с `sched_getaffinity`).
+    #[must_use]
+    pub fn with_cpu_affinity(mut self, cpus: Vec<usize>) -> Self {
+        self.cpu_affinity = cpus;
+        self
+    }
+
     /// Включить SQPOLL с указанным idle-таймаутом.
     #[must_use]
     pub fn with_sqpoll(mut self, idle_ms: Option<u32>) -> Self {
         self.sqpoll_idle = idle_ms;
+        self
+    }
+
+    /// Задать CPU для SQPOLL-потока (`None` — авто).
+    #[must_use]
+    pub fn with_sqpoll_cpu(mut self, cpu: Option<usize>) -> Self {
+        self.sqpoll_cpu = cpu;
+        self
+    }
+
+    /// Включить `SO_BUSY_POLL` на указанное число микросекунд (`0` — выключить).
+    #[must_use]
+    pub fn with_busy_poll(mut self, microseconds: u16) -> Self {
+        self.busy_poll_us = (microseconds > 0).then_some(microseconds);
+        self
+    }
+
+    /// Включить/выключить `SO_PREFER_BUSY_POLL`.
+    #[must_use]
+    pub fn with_prefer_busy_poll(mut self, prefer: bool) -> Self {
+        self.prefer_busy_poll = prefer;
+        self
+    }
+
+    /// Задать `SO_BUSY_POLL_BUDGET`.
+    #[must_use]
+    pub fn with_busy_poll_budget(mut self, budget: u16) -> Self {
+        self.busy_poll_budget = (budget > 0).then_some(budget);
+        self
+    }
+
+    /// Включить/выключить `IORING_REGISTER_FILES` для сокета и `eventfd`.
+    #[must_use]
+    pub fn with_register_files(mut self, register: bool) -> Self {
+        self.register_files = register;
+        self
+    }
+
+    /// Включить/выключить попытку `IORING_SETUP_COOP_TASKRUN`.
+    #[must_use]
+    pub fn with_coop_taskrun(mut self, coop: bool) -> Self {
+        self.coop_taskrun = coop;
         self
     }
 
@@ -224,6 +327,14 @@ impl RuntimeConfig {
         }
         if self.batch_size > self.sq_entries as usize {
             return Err("batch_size must not exceed sq_entries".into());
+        }
+        if self.cqe_batch == 0 || self.cqe_batch > self.cq_entries as usize {
+            return Err("cqe_batch must be in 1..=cq_entries".into());
+        }
+        // 0 — оставить размер стека по умолчанию; иначе нужен запас на
+        // обработчик и код io_uring (меньше 64 КиБ небезопасно).
+        if self.thread_stack_size != 0 && self.thread_stack_size < 64 * 1024 {
+            return Err("thread_stack_size must be 0 or >= 64 KiB".into());
         }
         if self.shutdown_timeout.is_zero() {
             return Err("shutdown_timeout must be > 0".into());
@@ -295,10 +406,58 @@ mod tests {
                 cq_entries: 1024,
                 ..RuntimeConfig::default()
             },
+            RuntimeConfig {
+                cqe_batch: 0,
+                ..RuntimeConfig::default()
+            },
+            RuntimeConfig {
+                cqe_batch: 8192,
+                ..RuntimeConfig::default()
+            },
+            RuntimeConfig {
+                thread_stack_size: 32 * 1024,
+                ..RuntimeConfig::default()
+            },
         ];
         for config in bad {
             assert!(config.validate().is_err(), "config must be rejected");
         }
+    }
+
+    #[test]
+    fn tuning_builders_apply() {
+        let cfg = RuntimeConfig::default()
+            .with_cqe_batch(512)
+            .with_thread_stack(256 * 1024)
+            .with_cpu_affinity(vec![0, 2])
+            .with_sqpoll(Some(1000))
+            .with_sqpoll_cpu(Some(2))
+            .with_busy_poll(50)
+            .with_prefer_busy_poll(true)
+            .with_busy_poll_budget(64)
+            .with_register_files(false)
+            .with_coop_taskrun(false);
+        assert_eq!(cfg.cqe_batch, 512);
+        assert_eq!(cfg.thread_stack_size, 256 * 1024);
+        assert_eq!(cfg.cpu_affinity, vec![0, 2]);
+        assert_eq!(cfg.sqpoll_idle, Some(1000));
+        assert_eq!(cfg.sqpoll_cpu, Some(2));
+        assert_eq!(cfg.busy_poll_us, Some(50));
+        assert!(cfg.prefer_busy_poll);
+        assert_eq!(cfg.busy_poll_budget, Some(64));
+        assert!(!cfg.register_files);
+        assert!(!cfg.coop_taskrun);
+        assert!(cfg.validate().is_ok());
+        // 0 выключает busy-poll/budget.
+        let cfg = cfg.with_busy_poll(0).with_busy_poll_budget(0);
+        assert_eq!(cfg.busy_poll_us, None);
+        assert_eq!(cfg.busy_poll_budget, None);
+    }
+
+    #[test]
+    fn zero_stack_size_keeps_os_default() {
+        let cfg = RuntimeConfig::default().with_thread_stack(0);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

@@ -10,6 +10,8 @@
 //!   один SQE на worker, буферы выдаются кольцом. При отказе регистрации —
 //!   автоматический L1-фолбэк на батч одиночных `RECVMSG`.
 //! - **Батчевый `sendmsg`**. Ответ пишется в TX-слот, SQE уходит в общий submit.
+//! - **`IORING_REGISTER_FILES`** для сокета и `eventfd` (по умолчанию; при
+//!   отказе — обычный `Fd`), опциональный `IORING_SETUP_COOP_TASKRUN`.
 //! - **Backpressure.** При нехватке TX-слотов provided-буферы не возвращаются
 //!   ядру; приём останавливается, пока слоты не освободятся.
 //! - **`MSG_TRUNC`.** Датаграмма больше RX-буфера принимается, считается в
@@ -25,6 +27,9 @@
 //! - **Без tokio и без async.** Синхронный обработчик, completion loop.
 //! - **epoll-фолбэк** (feature `epoll-fallback`): `recvmmsg`/`sendmmsg`,
 //!   `EPOLLET`, ретрай `EINTR` и частичной отправки.
+//! - **Тюнинг без изменения API**: размеры ring/CQE-батча, число provided
+//!   буферов и TX-слотов, стек worker'а (по умолчанию 512 КиБ), CPU-affinity
+//!   поверх `sched_getaffinity`, `SO_BUSY_POLL` и опциональный SQPOLL.
 //!
 //! `SO_REUSEPORT` — не изоляция: другой процесс того же uid может привязаться
 //! к тому же порту и получать часть трафика.
@@ -105,8 +110,10 @@
 //! Реализованы L1–L3 для UDP (spec §4.2), §6.1 (provided buffers), §7
 //! (multishot recv), §8 (батчи и backpressure), §9.3 (отмена), §10.1–10.2
 //! (сокеты, `SO_REUSEPORT`, `IP_PKTINFO`, приём, `MSG_TRUNC`), §15 (счётчики).
-//! Не входят в MVP: TCP, таймеры домена, `SEND_ZC`, `IORING_REGISTER_FILES`,
-//! `SO_BUSY_POLL`, SQPOLL по умолчанию, dual-stack `IPV6_V6ONLY=0`.
+//! Не входят в MVP: TCP, таймеры домена, `SEND_ZC`, dual-stack
+//! `IPV6_V6ONLY=0`. SQPOLL и `SO_BUSY_POLL` реализованы как опции и по
+//! умолчанию выключены (SQPOLL требует отдельного ядра/прав, busy-poll жжёт
+//! CPU и на loopback не даёт выигрыша).
 
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]

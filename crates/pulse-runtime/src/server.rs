@@ -150,16 +150,15 @@ impl Runtime {
         }
         let cfg = &self.inner.cfg;
         let workers = cfg.resolved_workers();
-        let first = socket::bind_udp(addr, cfg.socket_recv_buffer, cfg.socket_send_buffer)
-            .map_err(|source| RuntimeError::Socket { addr, source })?;
+        let first =
+            socket::bind_udp(addr, cfg).map_err(|source| RuntimeError::Socket { addr, source })?;
         let local_addr =
             socket::local_addr(&first).map_err(|source| RuntimeError::Socket { addr, source })?;
 
         let mut sockets = Vec::with_capacity(workers);
         sockets.push(Some(first));
         for _ in 1..workers {
-            let fd = socket::bind_udp(local_addr, cfg.socket_recv_buffer, cfg.socket_send_buffer)
-                .map_err(|source| RuntimeError::Socket {
+            let fd = socket::bind_udp(local_addr, cfg).map_err(|source| RuntimeError::Socket {
                 addr: local_addr,
                 source,
             })?;
@@ -438,11 +437,18 @@ impl ServerCore {
         }
 
         let caps = runtime.caps;
-        let cfg = Arc::new(runtime.cfg.clone());
+        let mut config = runtime.cfg.clone();
+        // Если проба не подтвердила SQPOLL, не тратим попытки на каждом
+        // worker'е: деградация уже зафиксирована в capabilities().
+        if !caps.sqpoll {
+            config.sqpoll_idle = None;
+        }
+        let cfg = Arc::new(config);
         let stop = Arc::clone(&self.stop);
         let abort = self.hub.flag();
         let hub = Arc::clone(&self.hub);
-        let allowed = socket::allowed_cpus();
+        let allowed = socket::worker_cpus(&cfg.cpu_affinity)
+            .map_err(|source| RuntimeError::Config(format!("cpu_affinity: {source}")))?;
         let (sender, results) = mpsc::channel();
 
         let mut handles = Vec::with_capacity(self.workers);
@@ -459,44 +465,49 @@ impl ServerCore {
             let handler = Arc::clone(&self.handler);
             let counters = Arc::clone(&self.counters[index]);
             let wake = Arc::clone(&self.wake[index]);
-            let cpu = if allowed.is_empty() {
-                index
-            } else {
-                allowed[index % allowed.len()]
-            };
+            let cpu =
+                (self.workers > 0 && !allowed.is_empty()).then(|| allowed[index % allowed.len()]);
+            let sqpoll_cpu = cfg.sqpoll_idle.and_then(|_| {
+                socket::select_sqpoll_cpu(&allowed, cfg.sqpoll_cpu, index, self.workers, cpu)
+            });
             let stop = Arc::clone(&stop);
             let abort = Arc::clone(&abort);
             let hub = Arc::clone(&hub);
             let cfg = Arc::clone(&cfg);
             let sender = sender.clone();
-            let result = thread::Builder::new()
-                .name(format!("pulse-udp-{index}"))
-                .spawn(move || {
-                    if cfg.pin_to_cpu {
-                        let _ = socket::pin_current_thread(cpu);
-                    }
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_worker(
-                            index,
-                            socket,
-                            &cfg,
-                            handler,
-                            counters,
-                            Arc::clone(&stop),
-                            Arc::clone(&abort),
-                            wake,
-                            caps,
-                        )
-                    }))
-                    .unwrap_or(Err(RuntimeError::WorkerPanicked { worker: index }));
-                    if outcome.is_err() {
-                        // Будим и останавливаем всех: иначе run()/join зависнет
-                        // на живых соседях.
-                        stop.store(true, Ordering::Release);
-                        hub.abort();
-                    }
-                    let _ = sender.send((index, outcome));
-                });
+            let mut builder = thread::Builder::new().name(format!("pulse-udp-{index}"));
+            if cfg.thread_stack_size > 0 {
+                builder = builder.stack_size(cfg.thread_stack_size);
+            }
+            let result = builder.spawn(move || {
+                if cfg.pin_to_cpu
+                    && let Some(cpu) = cpu
+                {
+                    let _ = socket::pin_current_thread(cpu);
+                }
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_worker(
+                        index,
+                        socket,
+                        &cfg,
+                        handler,
+                        counters,
+                        Arc::clone(&stop),
+                        Arc::clone(&abort),
+                        wake,
+                        caps,
+                        sqpoll_cpu,
+                    )
+                }))
+                .unwrap_or(Err(RuntimeError::WorkerPanicked { worker: index }));
+                if outcome.is_err() {
+                    // Будим и останавливаем всех: иначе run()/join зависнет
+                    // на живых соседях.
+                    stop.store(true, Ordering::Release);
+                    hub.abort();
+                }
+                let _ = sender.send((index, outcome));
+            });
             match result {
                 Ok(handle) => handles.push(handle),
                 Err(source) => {
@@ -597,6 +608,7 @@ fn run_worker(
     abort: Arc<AtomicBool>,
     wake: Arc<OwnedFd>,
     caps: Capabilities,
+    sqpoll_cpu: Option<usize>,
 ) -> WorkerOutcome {
     match caps.backend {
         BackendKind::IoUring { .. } => {
@@ -609,12 +621,14 @@ fn run_worker(
                 stop,
                 abort,
                 wake_owned,
+                sqpoll_cpu,
             )?
             .run()
         }
         BackendKind::Epoll => {
             #[cfg(feature = "epoll-fallback")]
             {
+                let _ = sqpoll_cpu;
                 crate::backend::epoll::run_worker(
                     socket,
                     Arc::clone(cfg),
@@ -627,7 +641,7 @@ fn run_worker(
             }
             #[cfg(not(feature = "epoll-fallback"))]
             {
-                let _ = (socket, handler, counters, stop, abort, wake);
+                let _ = (socket, handler, counters, stop, abort, wake, sqpoll_cpu);
                 Err(RuntimeError::EpollUnsupported)
             }
         }
@@ -675,7 +689,9 @@ fn epoll_capabilities() -> Result<Capabilities, RuntimeError> {
             multishot_recv: false,
             provided_buffers: false,
             defer_taskrun: false,
+            coop_taskrun: false,
             sqpoll: false,
+            registered_files: false,
             nodrop: false,
         })
     }

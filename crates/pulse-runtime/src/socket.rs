@@ -8,6 +8,8 @@ use rustix::net::addr::{SocketAddrArg, SocketAddrStorage};
 use rustix::net::sockopt;
 use rustix::net::{AddressFamily, SocketType, ipproto};
 
+use crate::config::RuntimeConfig;
+
 /// Создать неблокирующий UDP-сокет с `SO_REUSEPORT`, привязанный к `addr`.
 ///
 /// Несколько сокетов с одинаковым адресом образуют reuseport-группу; ядро
@@ -19,11 +21,7 @@ use rustix::net::{AddressFamily, SocketType, ipproto};
 /// `SO_REUSEPORT` разрешает другому процессу того же uid (и с той же группой)
 /// занять тот же порт и перехватывать часть трафика — это осознанное свойство
 /// механизма, а не изоляция.
-pub(crate) fn bind_udp(
-    addr: SocketAddr,
-    recv_buffer: usize,
-    send_buffer: usize,
-) -> io::Result<OwnedFd> {
+pub(crate) fn bind_udp(addr: SocketAddr, cfg: &RuntimeConfig) -> io::Result<OwnedFd> {
     let family = match addr {
         SocketAddr::V4(_) => AddressFamily::INET,
         SocketAddr::V6(_) => AddressFamily::INET6,
@@ -32,33 +30,80 @@ pub(crate) fn bind_udp(
 
     sockopt::set_socket_reuseport(&fd, true).map_err(io_err)?;
     // Размеры буферов — оптимизация: ядро вправе урезать значение по sysctl.
-    sockopt::set_socket_recv_buffer_size(&fd, recv_buffer).map_err(io_err)?;
-    sockopt::set_socket_send_buffer_size(&fd, send_buffer).map_err(io_err)?;
+    sockopt::set_socket_recv_buffer_size(&fd, cfg.socket_recv_buffer).map_err(io_err)?;
+    sockopt::set_socket_send_buffer_size(&fd, cfg.socket_send_buffer).map_err(io_err)?;
     if let SocketAddr::V6(_) = addr {
         // Не полагаемся на dual-stack: у каждого семейства своя reuseport-группа.
         sockopt::set_ipv6_v6only(&fd, true).map_err(io_err)?;
     }
     enable_pktinfo(&fd, family)?;
+    configure_busy_poll(&fd, cfg);
     rustix::io::ioctl_fionbio(&fd, true).map_err(io_err)?;
     rustix::net::bind(&fd, &addr).map_err(io_err)?;
 
     // Ядро вправе урезать SO_RCVBUF/SO_SNDBUF по sysctl (и удваивает значение).
     // Предупреждаем, если фактический буфер меньше запрошенного.
     if let Ok(actual) = sockopt::socket_recv_buffer_size(&fd)
-        && actual < recv_buffer
+        && actual < cfg.socket_recv_buffer
     {
         eprintln!(
-            "pulse-runtime: warning: SO_RCVBUF={actual} < requested {recv_buffer}              (check net.core.rmem_max)"
+            "pulse-runtime: warning: SO_RCVBUF={actual} < requested {}              (check net.core.rmem_max)",
+            cfg.socket_recv_buffer
         );
     }
     if let Ok(actual) = sockopt::socket_send_buffer_size(&fd)
-        && actual < send_buffer
+        && actual < cfg.socket_send_buffer
     {
         eprintln!(
-            "pulse-runtime: warning: SO_SNDBUF={actual} < requested {send_buffer}              (check net.core.wmem_max)"
+            "pulse-runtime: warning: SO_SNDBUF={actual} < requested {}              (check net.core.wmem_max)",
+            cfg.socket_send_buffer
         );
     }
     Ok(fd)
+}
+
+/// `SO_BUSY_POLL`/`SO_PREFER_BUSY_POLL`/`SO_BUSY_POLL_BUDGET`.
+///
+/// Это оптимизация латентности, а не корректности: недоступность (EPERM для
+/// `SO_PREFER_BUSY_POLL`, отсутствие опции в ядре) не должна ломать bind.
+fn configure_busy_poll(fd: &OwnedFd, cfg: &RuntimeConfig) {
+    let Some(microseconds) = cfg.busy_poll_us.filter(|value| *value > 0) else {
+        return;
+    };
+    set_int_sockopt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_BUSY_POLL,
+        i32::from(microseconds),
+    );
+    if let Some(budget) = cfg.busy_poll_budget {
+        set_int_sockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL_BUDGET,
+            i32::from(budget),
+        );
+    }
+    if cfg.prefer_busy_poll {
+        set_int_sockopt(fd, libc::SOL_SOCKET, libc::SO_PREFER_BUSY_POLL, 1);
+    }
+}
+
+fn set_int_sockopt(fd: &OwnedFd, level: libc::c_int, name: libc::c_int, value: i32) {
+    // SAFETY: `fd` валиден, `value` — инициализированный c_int нужного размера.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            level,
+            name,
+            (&raw const value).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    // Ошибки (EPERM/ENOPROTOOPT) игнорируются: busy-poll — необязательная
+    // оптимизация. Отдельное предупреждение не печатаем, чтобы не шуметь на
+    // каждом worker'е.
+    let _ = rc;
 }
 
 fn enable_pktinfo(fd: &OwnedFd, family: AddressFamily) -> io::Result<()> {
@@ -161,6 +206,63 @@ pub(crate) fn allowed_cpus() -> Vec<usize> {
         .collect()
 }
 
+/// CPU-список для worker'ов: пересечение `sched_getaffinity`/cpuset и
+/// явного `cpu_affinity`.
+///
+/// Пустой явный список — все разрешённые CPU. Если явный список не пересекается
+/// с разрешёнными, возвращается `EINVAL`: пинить на чужие CPU нельзя.
+pub(crate) fn worker_cpus(explicit: &[usize]) -> io::Result<Vec<usize>> {
+    let allowed = allowed_cpus();
+    if explicit.is_empty() {
+        return Ok(allowed);
+    }
+    if allowed.is_empty() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    select_cpus(&allowed, explicit).map_err(|()| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// Чистый выбор CPU: пересечение разрешённых и явных.
+pub(crate) fn select_cpus(allowed: &[usize], explicit: &[usize]) -> Result<Vec<usize>, ()> {
+    if explicit.is_empty() {
+        return Ok(allowed.to_vec());
+    }
+    let filtered: Vec<usize> = allowed
+        .iter()
+        .copied()
+        .filter(|cpu| explicit.contains(cpu))
+        .collect();
+    if filtered.is_empty() {
+        Err(())
+    } else {
+        Ok(filtered)
+    }
+}
+
+/// Выбрать CPU для kernel-потока SQPOLL (`IORING_SETUP_SQ_AFF`).
+///
+/// Явно заданный CPU используется только если он разрешён процессу. Иначе,
+/// при наличии свободных CPU, SQPOLL-поток уводится на отдельное ядро; если
+/// свободных нет — делит ядро с worker'ом.
+pub(crate) fn select_sqpoll_cpu(
+    allowed: &[usize],
+    configured: Option<usize>,
+    worker_index: usize,
+    workers: usize,
+    worker_cpu: Option<usize>,
+) -> Option<usize> {
+    if let Some(cpu) = configured {
+        return (allowed.is_empty() || allowed.contains(&cpu)).then_some(cpu);
+    }
+    if allowed.is_empty() {
+        return None;
+    }
+    if allowed.len() > workers {
+        return Some(allowed[(worker_index + workers) % allowed.len()]);
+    }
+    worker_cpu.or_else(|| Some(allowed[worker_index % allowed.len()]))
+}
+
 /// Прибить текущий поток к ядру `cpu`. Ошибки не критичны (например, EPERM в cgroup).
 pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
     if cpu >= rustix::thread::CpuSet::MAX_CPU {
@@ -206,5 +308,27 @@ mod tests {
         assert_eq!(sockaddr_from_bytes(&[]), None);
         assert_eq!(sockaddr_from_bytes(&[0xff, 0xff]), None);
         assert_eq!(sockaddr_from_bytes(&[2, 0, 0]), None);
+    }
+
+    #[test]
+    fn cpu_selection_respects_affinity() {
+        assert_eq!(select_cpus(&[0, 1, 2, 3], &[]).unwrap(), vec![0, 1, 2, 3]);
+        // Явный CPU вне разрешённого множества не пинится.
+        assert_eq!(select_cpus(&[0, 1, 2, 3], &[2, 7]).unwrap(), vec![2]);
+        assert_eq!(select_cpus(&[0, 1], &[5]), Err(()));
+        assert_eq!(select_cpus(&[], &[]).unwrap(), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn sqpoll_cpu_avoids_worker_core_when_possible() {
+        let allowed = [0, 1, 2, 3];
+        // 2 worker'а, 4 CPU: SQPOLL уходит на отдельные ядра.
+        assert_eq!(select_sqpoll_cpu(&allowed, None, 0, 2, Some(0)), Some(2));
+        assert_eq!(select_sqpoll_cpu(&allowed, None, 1, 2, Some(1)), Some(3));
+        // CPU не разрешён — без SQ_AFF.
+        assert_eq!(select_sqpoll_cpu(&allowed, Some(9), 0, 2, Some(0)), None);
+        // Свободных CPU нет — делим с worker'ом.
+        assert_eq!(select_sqpoll_cpu(&[0, 1], None, 0, 2, Some(1)), Some(1));
+        assert_eq!(select_sqpoll_cpu(&[], Some(2), 0, 1, None), Some(2));
     }
 }

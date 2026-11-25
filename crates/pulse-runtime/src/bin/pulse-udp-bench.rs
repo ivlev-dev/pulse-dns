@@ -14,6 +14,7 @@
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::similar_names,
+    clippy::struct_excessive_bools,
     clippy::too_many_lines
 )]
 
@@ -37,7 +38,18 @@ struct Args {
     payload: usize,
     window: usize,
     rx_buffer: usize,
+    rx_buffers: Option<u16>,
+    tx_slots: usize,
+    cqe_batch: usize,
+    stack_kb: usize,
     backend: BackendPreference,
+    pin: bool,
+    sqpoll: Option<u32>,
+    sqpoll_cpu: Option<usize>,
+    register_files: bool,
+    coop: bool,
+    busy_poll: Option<u16>,
+    prefer_busy_poll: bool,
 }
 
 impl Default for Args {
@@ -51,7 +63,18 @@ impl Default for Args {
             payload: 64,
             window: 1,
             rx_buffer: 4096,
+            rx_buffers: None,
+            tx_slots: 256,
+            cqe_batch: 256,
+            stack_kb: 512,
             backend: BackendPreference::Auto,
+            pin: false,
+            sqpoll: None,
+            sqpoll_cpu: None,
+            register_files: true,
+            coop: false,
+            busy_poll: None,
+            prefer_busy_poll: false,
         }
     }
 }
@@ -97,6 +120,32 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Option<Args>, St
             "--payload" => args.payload = parse_usize(&value()?, &flag)?.max(9),
             "--window" => args.window = parse_usize(&value()?, &flag)?.max(1),
             "--rx-buffer" => args.rx_buffer = parse_usize(&value()?, &flag)?.max(512),
+            "--rx-buffers" => {
+                args.rx_buffers = Some(
+                    u16::try_from(parse_usize(&value()?, &flag)?)
+                        .map_err(|_| "rx-buffers out of range".to_string())?,
+                );
+            }
+            "--tx-slots" => args.tx_slots = parse_usize(&value()?, &flag)?.max(8),
+            "--cqe-batch" => args.cqe_batch = parse_usize(&value()?, &flag)?.max(1),
+            "--stack-kb" => args.stack_kb = parse_usize(&value()?, &flag)?,
+            "--pin" => args.pin = true,
+            "--sqpoll" => {
+                args.sqpoll = Some(
+                    u32::try_from(parse_usize(&value()?, &flag)?)
+                        .map_err(|_| "sqpoll idle out of range".to_string())?,
+                );
+            }
+            "--sqpoll-cpu" => args.sqpoll_cpu = Some(parse_usize(&value()?, &flag)?),
+            "--no-register-files" => args.register_files = false,
+            "--coop" => args.coop = true,
+            "--busy-poll" => {
+                args.busy_poll = Some(
+                    u16::try_from(parse_usize(&value()?, &flag)?)
+                        .map_err(|_| "busy-poll out of range".to_string())?,
+                );
+            }
+            "--prefer-busy-poll" => args.prefer_busy_poll = true,
             "--backend" => {
                 args.backend = match value()?.as_str() {
                     "auto" => BackendPreference::Auto,
@@ -137,6 +186,17 @@ fn print_usage() {
          --payload N     размер запроса в байтах (по умолчанию 64)\n\
          --window N      запросов в полёте на клиента (по умолчанию 1)\n\
          --rx-buffer N   RX-буфер сервера в байтах (по умолчанию 4096)\n\
+         --rx-buffers N  число provided-буферов на worker (по умолчанию 1024)\n\
+         --tx-slots N    TX-слотов на worker (по умолчанию 256)\n\
+         --cqe-batch N   максимум CQE за проход (по умолчанию 256)\n\
+         --stack-kb N    стек worker-потока в КиБ (по умолчанию 512, 0 — ОС)\n\
+         --pin           прибить worker'ов к разрешённым CPU\n\
+         --sqpoll MS     включить SQPOLL с idle-таймаутом\n\
+         --sqpoll-cpu N  CPU для SQ_AFF (по умолчанию авто)\n\
+         --no-register-files  не регистрировать fd (IORING_REGISTER_FILES)\n\
+         --coop          попытаться включить COOP_TASKRUN\n\
+         --busy-poll US  SO_BUSY_POLL в микросекундах\n\
+         --prefer-busy-poll   SO_PREFER_BUSY_POLL\n\
          --backend KIND  auto | uring | epoll (epoll требует feature epoll-fallback)"
     );
 }
@@ -146,14 +206,29 @@ fn run(args: Args) -> Result<(), String> {
         .with_workers(args.workers)
         .with_backend(args.backend)
         .with_rx_buffer_size(args.rx_buffer)
-        .with_tx(args.workers * 256, 4096.max(args.rx_buffer + 512))
-        .with_socket_buffers(8 * 1024 * 1024, 8 * 1024 * 1024);
+        .with_tx(args.tx_slots, 4096.max(args.rx_buffer + 512))
+        .with_socket_buffers(8 * 1024 * 1024, 8 * 1024 * 1024)
+        .with_cqe_batch(args.cqe_batch)
+        .with_thread_stack(args.stack_kb * 1024)
+        .with_cpu_pinning(args.pin)
+        .with_register_files(args.register_files)
+        .with_coop_taskrun(args.coop)
+        .with_sqpoll(args.sqpoll)
+        .with_sqpoll_cpu(args.sqpoll_cpu);
+    if let Some(buffers) = args.rx_buffers {
+        config.rx_buffers = buffers;
+    }
+    if let Some(microseconds) = args.busy_poll {
+        config = config.with_busy_poll(microseconds);
+    }
+    config = config.with_prefer_busy_poll(args.prefer_busy_poll);
     // Инвариант CQ: rx_buffers + tx_slots + 2 <= cq_entries.
     let needed = usize::from(config.rx_buffers) + config.tx_slots + 2;
     if needed > config.cq_entries as usize {
         config.cq_entries = (needed.next_power_of_two()).try_into().unwrap_or(u32::MAX);
     }
 
+    let tuning = (config.rx_buffers, config.tx_slots, config.cqe_batch);
     let server = UdpServer::bind_with(
         "127.0.0.1:0".parse().expect("static address"),
         move |request: &[u8], _peer: SocketAddr, out: &mut [u8]| {
@@ -174,12 +249,19 @@ fn run(args: Args) -> Result<(), String> {
     println!("pulse-udp-bench");
     println!("  backend      : {}", caps.backend);
     println!(
-        "  workers      : {} (multishot={}, provided_buffers={}, defer_taskrun={}, nodrop={})",
+        "  workers      : {} (multishot={}, provided_buffers={}, defer={}, coop={}, sqpoll={}, fixed_files={}, nodrop={})",
         server.workers(),
         caps.multishot_recv,
         caps.provided_buffers,
         caps.defer_taskrun,
+        caps.coop_taskrun,
+        caps.sqpoll,
+        caps.registered_files,
         caps.nodrop
+    );
+    println!(
+        "  tuning       : rx_buf={}B, rx_buffers={}, tx_slots={}, cqe_batch={}, stack={}KiB, pin={}, busy_poll={:?}",
+        args.rx_buffer, tuning.0, tuning.1, tuning.2, args.stack_kb, args.pin, args.busy_poll
     );
     println!(
         "  clients      : {} (window {}, {} B payload)",
@@ -248,10 +330,60 @@ fn run(args: Args) -> Result<(), String> {
         "  shutdown     : {:.1} ms",
         shutdown_time.as_secs_f64() * 1000.0
     );
+    let (user, sys) = process_cpu();
+    println!("  process cpu  : user {user:.2} s, sys {sys:.2} s");
+    println!(
+        "  peak rss/vm  : {} / {} KiB",
+        process_peak_rss_kib(),
+        process_peak_vm_kib()
+    );
     if total_corrupt > 0 {
         return Err(format!("{total_corrupt} corrupted response(s)"));
     }
     Ok(())
+}
+
+/// CPU-время процесса (все потоки) из `/proc/self/stat` в секундах.
+///
+/// Linux `USER_HZ` для `x86_64` зафиксирован ABI и равен 100.
+fn process_cpu() -> (f64, f64) {
+    const USER_HZ: f64 = 100.0;
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return (0.0, 0.0);
+    };
+    let Some(rest) = stat.rfind(')').map(|end| &stat[end + 1..]) else {
+        return (0.0, 0.0);
+    };
+    let ticks: Vec<u64> = rest
+        .split_whitespace()
+        .skip(11)
+        .take(2)
+        .filter_map(|value| value.parse().ok())
+        .collect();
+    if ticks.len() < 2 {
+        return (0.0, 0.0);
+    }
+    (ticks[0] as f64 / USER_HZ, ticks[1] as f64 / USER_HZ)
+}
+
+fn process_peak_rss_kib() -> u64 {
+    process_status_kib("VmHWM:")
+}
+
+fn process_peak_vm_kib() -> u64 {
+    process_status_kib("VmPeak:")
+}
+
+fn process_status_kib(field: &str) -> u64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(field))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 struct RunResult {
