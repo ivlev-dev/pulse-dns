@@ -63,11 +63,21 @@ impl Node {
     }
 
     fn contains(&self, name: &Name) -> bool {
-        let labels: Vec<&[u8]> = name.labels().collect();
+        // Метки складываются в стековый массив: поиск на горячем пути не
+        // аллоцирует даже при глубоких именах.
+        let mut labels = [&[][..]; pulse_dns::MAX_LABELS];
+        let mut count = 0_usize;
+        for label in name.labels() {
+            let Some(slot) = labels.get_mut(count) else {
+                break;
+            };
+            *slot = label;
+            count = count.saturating_add(1);
+        }
         let mut node = self;
         // Идём от корневой метки к левой. На каждом шаге проверяем, не
         // покрывает ли уже пройденный узел все оставшиеся метки.
-        for label in labels.iter().rev() {
+        for label in labels.get(..count).unwrap_or(&[]).iter().rev() {
             if node.terminal || node.wildcard {
                 return true;
             }
@@ -190,6 +200,9 @@ impl Blocklist {
     /// Заблокировано ли имя.
     #[must_use]
     pub fn is_blocked(&self, name: &Name) -> bool {
+        if self.stats.blocked == 0 && self.stats.allowed == 0 {
+            return false;
+        }
         self.block.contains(name) && !self.allow.contains(name)
     }
 

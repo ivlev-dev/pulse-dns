@@ -1512,6 +1512,7 @@ name = "pulse-resolver"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "dhat",
  "getrandom 0.4.3",
  "proptest",
  "pulse-dns",

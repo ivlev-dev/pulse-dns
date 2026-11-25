@@ -297,6 +297,36 @@ fn corrupt_signature_is_servfail() {
 }
 
 #[test]
+fn validation_cache_avoids_repeated_chain_and_signature_checks() {
+    let zone = signed_zone(false);
+    let anchor = anchor_for(&zone);
+    let server = MockServer::spawn(handler(zone));
+    let resolver = Resolver::new(config(server.address(), anchor)).unwrap();
+    let name = Name::parse("example.test").unwrap();
+
+    let first = resolver.resolve_qname(&name, Rtype::A);
+    assert!(first.flags().ad());
+    assert!(resolver.stats().dnssec_validation_misses >= 1);
+
+    // Убираем сам ответ и его RRSIG, но оставляем DNSKEY зоны: следующая
+    // резолюция обязана снова прийти от upstream, а валидация должна
+    // воспользоваться кешем цепочки и подписи.
+    resolver.cache().purge_matching(Some(&name), Some(Rtype::A));
+    resolver
+        .cache()
+        .purge_matching(Some(&name), Some(Rtype::RRSIG));
+    let hits_before = resolver.stats().dnssec_validation_hits;
+    let second = resolver.resolve_qname(&name, Rtype::A);
+    assert_eq!(second.rcode(), Rcode::NOERROR);
+    assert!(second.flags().ad());
+    let stats = resolver.stats();
+    assert!(
+        stats.dnssec_validation_hits > hits_before,
+        "validation cache must be reused: {stats:?}"
+    );
+}
+
+#[test]
 fn unsigned_zone_is_insecure_passthrough() {
     let handler: RawHandler = Arc::new(|request, _tcp| {
         let mut reply = response(request, Rcode::NOERROR);

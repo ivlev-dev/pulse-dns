@@ -14,8 +14,14 @@
 //!   DNS-over-HTTPS/1.1), round-robin, health-счётчиками, cooldown и
 //!   failover по порядку; DoT/DoH проверяют сертификат (webpki-roots или
 //!   явный CA) и держат keep-alive-соединение на upstream.
-//! - **Кеш**: шардированные `RwLock`-шарды, собственная LRU, TTL-декремент,
-//!   negative caching RFC 2308, лимиты записей/памяти, метрики.
+//! - **Кеш**: шардированные `RwLock`-шарды с открытой адресацией, ключ по
+//!   wire-байтам `(qname, qtype, qclass)`, компактные wire-записи, TTL как
+//!   absolute deadline, approximate-LRU, negative caching RFC 2308, лимиты
+//!   записей/памяти, метрики. [`Resolver::resolve_into`] кодирует попадание
+//!   в caller-буфер без аллокаций и построения [`pulse_dns::Message`].
+//! - **DNSSEC-кеш**: результат проверки цепочки (`zone` + отпечаток DNSKEY)
+//!   и пары RRset+RRSIG переиспользуется между запросами; смена DNSKEY/DS
+//!   или trust anchors инвалидирует доказательства.
 //! - **Blocklist**: домены/hosts/`@@allow`/`*.wildcard`, суффиксное дерево,
 //!   NXDOMAIN или null-address по выбору, атомарная перезагрузка.
 //! - **Overrides**: A/AAAA/CNAME, приоритет выше blocklist и upstream.

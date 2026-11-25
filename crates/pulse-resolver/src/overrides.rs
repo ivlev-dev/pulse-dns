@@ -4,7 +4,7 @@
 //! `A`, `AAAA` и `CNAME`; `CNAME`-цепочка разрешается внутри самих
 //! overrides и не ходит в сеть.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use pulse_dns::{Name, Rclass, Rdata, Record, Rtype, Ttl};
 
@@ -114,16 +114,25 @@ impl Overrides {
     }
 
     /// Ищет ответ, NODATA или промах.
+    ///
+    /// Промах не аллоцирует: обход идёт по wire-суффиксам имени, а
+    /// `HashMap` ищется по заимствованному `&[u8]`.
     #[must_use]
     pub fn lookup(&self, name: &Name, qtype: Rtype) -> OverrideOutcome {
-        let mut current = name.clone();
+        if self.exact.is_empty() && self.wildcard.is_empty() {
+            return OverrideOutcome::Miss;
+        }
+        let mut current = name.as_wire();
         let mut answer = Vec::new();
-        let mut visited = HashSet::new();
-        for _ in 0..16 {
-            if !visited.insert(current.clone()) {
+        let mut visited = [&[][..]; 16];
+        for step in 0..16 {
+            if visited.get(..step).unwrap_or(&[]).contains(&current) {
                 return OverrideOutcome::Answer(answer);
             }
-            let Some(entry) = self.find(&current) else {
+            if let Some(slot) = visited.get_mut(step) {
+                *slot = current;
+            }
+            let Some(entry) = self.find(current) else {
                 return if answer.is_empty() {
                     OverrideOutcome::Miss
                 } else {
@@ -135,7 +144,9 @@ impl Overrides {
                 .iter()
                 .find(|rdata| rdata.rr_type() == Rtype::CNAME)
             {
-                if let Some(record) = build_record(&current, entry.ttl, cname) {
+                if let Ok(owner) = Name::from_wire(current)
+                    && let Some(record) = build_record(&owner, entry.ttl, cname)
+                {
                     answer.push(record);
                 }
                 if qtype == Rtype::CNAME {
@@ -144,14 +155,17 @@ impl Overrides {
                 let Rdata::Cname(target) = cname else {
                     return OverrideOutcome::Answer(answer);
                 };
-                current = target.clone();
+                current = target.as_wire();
                 continue;
             }
+            let Ok(owner) = Name::from_wire(current) else {
+                return OverrideOutcome::Answer(answer);
+            };
             let matching: Vec<Record> = entry
                 .data
                 .iter()
                 .filter(|rdata| rdata.rr_type() == qtype)
-                .filter_map(|rdata| build_record(&current, entry.ttl, rdata))
+                .filter_map(|rdata| build_record(&owner, entry.ttl, rdata))
                 .collect();
             if matching.is_empty() {
                 return if answer.is_empty() {
@@ -166,16 +180,23 @@ impl Overrides {
         OverrideOutcome::Answer(answer)
     }
 
-    fn find(&self, name: &Name) -> Option<&Entry> {
-        if let Some(entry) = self.exact.get(name) {
+    fn find(&self, wire: &[u8]) -> Option<&Entry> {
+        if let Some(entry) = self.exact.get(wire) {
             return Some(entry);
         }
-        let mut ancestor = name.parent()?;
+        let mut position = 0_usize;
         loop {
-            if let Some(entry) = self.wildcard.get(&ancestor) {
+            let length = *wire.get(position)?;
+            if length == 0 {
+                return None;
+            }
+            position = position
+                .checked_add(1)
+                .and_then(|value| value.checked_add(usize::from(length)))?;
+            let suffix = wire.get(position..)?;
+            if let Some(entry) = self.wildcard.get(suffix) {
                 return Some(entry);
             }
-            ancestor = ancestor.parent()?;
         }
     }
 

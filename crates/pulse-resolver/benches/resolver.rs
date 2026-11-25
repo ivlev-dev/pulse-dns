@@ -70,6 +70,15 @@ fn cache_hit(criterion: &mut Criterion) {
             black_box(reply);
         });
     });
+    let mut out = [0_u8; 512];
+    group.bench_function("hit_into", |bencher| {
+        bencher.iter(|| {
+            let length = resolver
+                .resolve_into(black_box(&query), &mut out)
+                .expect("encode");
+            black_box(length);
+        });
+    });
     group.finish();
     assert!(
         resolver.stats().cache.hits > 0,

@@ -12,10 +12,15 @@
 //!   отдельный проход по DS-цепочке.
 //! - NSEC3 opt-out учитывается denial-функциями, но EDE-опции не
 //!   генерируются.
-//! - Кеш не хранит результат валидации отдельно от RRset: secure-флаг
-//!   пишется вместе с записью.
+//! - Результат валидации кешируется отдельно от RRset: проверенная цепочка
+//!   (`zone` + отпечаток DNSKEY RRset) и пара RRset+RRSIG. Смена DNSKEY
+//!   RRset или trust anchors инвалидирует доказательства, а смена DS
+//!   приводит к новому набору ключей; сам RRset по-прежнему хранит
+//!   secure-флаг вместе с записью.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pulse_dns::{DsData, Name, Rcode, Rdata, Record, Rrset, RrsigData, Rtype};
@@ -49,6 +54,160 @@ pub(crate) struct ValidationOutcome {
     pub(crate) validated: HashSet<(Name, Rtype)>,
 }
 
+#[derive(Debug)]
+struct CachedKeyset {
+    keys: ValidatedDnskeySet,
+    fingerprint: Box<[u8]>,
+    expires: u32,
+}
+
+/// Кеш результатов DNSSEC-валидации.
+///
+/// Хранит два вида доказательств:
+///
+/// - **цепочка**: валидированный `DNSKEY`-набор зоны вместе с отпечатком
+///   самого RRset. На следующем запросе достаточно сравнить отпечаток
+///   свежего DNSKEY RRset — криптография DS → DNSKEY не повторяется;
+/// - **подпись**: факт успешной проверки конкретного RRset конкретными
+///   RRSIG под конкретным набором ключей. Ключ кеша — точные wire-байты
+///   RRset, RRSIG и отпечатка keyset, поэтому смена DS/ключей или подписи
+///   автоматически промахивается.
+///
+/// Обе таблицы ограничены по числу записей; при переполнении вытесняется
+/// произвольная запись (`O(1)`), а не выполняется полный перебор.
+#[derive(Debug)]
+pub(crate) struct ValidationCache {
+    keys: RwLock<HashMap<Box<[u8]>, CachedKeyset>>,
+    signatures: RwLock<HashMap<Box<[u8]>, u32>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    limit: usize,
+}
+
+impl ValidationCache {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            keys: RwLock::new(HashMap::new()),
+            signatures: RwLock::new(HashMap::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            limit: limit.max(16),
+        }
+    }
+
+    /// Есть ли для зоны неистёкший кандидат keyset-кеша.
+    fn has_keys(&self, zone: &Name, now: u32) -> bool {
+        let Ok(guard) = self.keys.read() else {
+            return false;
+        };
+        guard
+            .get(zone.as_wire())
+            .is_some_and(|entry| entry.expires > now)
+    }
+
+    /// Возвращает валидированный набор, если отпечаток DNSKEY RRset совпал.
+    fn lookup_keys(&self, zone: &Name, fingerprint: &[u8], now: u32) -> Option<ValidatedDnskeySet> {
+        let Ok(mut guard) = self.keys.write() else {
+            return None;
+        };
+        let Some(entry) = guard.get(zone.as_wire()) else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        if entry.expires <= now || entry.fingerprint.as_ref() != fingerprint {
+            guard.remove(zone.as_wire());
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let keys = entry.keys.clone();
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(keys)
+    }
+
+    fn store_keys(
+        &self,
+        zone: &Name,
+        fingerprint: Box<[u8]>,
+        keys: ValidatedDnskeySet,
+        expires: u32,
+    ) {
+        if expires == 0 {
+            return;
+        }
+        let Ok(mut guard) = self.keys.write() else {
+            return;
+        };
+        if guard.len() >= self.limit
+            && !guard.contains_key(zone.as_wire())
+            && let Some(victim) = guard.keys().next().cloned()
+        {
+            guard.remove(&victim);
+        }
+        guard.insert(
+            zone.as_wire().into(),
+            CachedKeyset {
+                keys,
+                fingerprint,
+                expires,
+            },
+        );
+    }
+
+    fn invalidate_keys(&self, zone: &Name) {
+        if let Ok(mut guard) = self.keys.write() {
+            guard.remove(zone.as_wire());
+        }
+    }
+
+    /// Проверяет, что эта пара RRset+RRSIG уже успешно валидирована.
+    fn signature_valid(&self, key: &[u8], now: u32) -> bool {
+        let Ok(guard) = self.signatures.read() else {
+            return false;
+        };
+        let valid = guard.get(key).is_some_and(|expires| *expires > now);
+        if valid {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        valid
+    }
+
+    fn store_signature(&self, key: Box<[u8]>, expires: u32) {
+        if expires == 0 {
+            return;
+        }
+        let Ok(mut guard) = self.signatures.write() else {
+            return;
+        };
+        if guard.len() >= self.limit
+            && !guard.contains_key(key.as_ref())
+            && let Some(victim) = guard.keys().next().cloned()
+        {
+            guard.remove(&victim);
+        }
+        guard.insert(key, expires);
+    }
+
+    /// Полностью сбрасывает кеш (например, при смене trust anchors).
+    pub(crate) fn clear(&self) {
+        if let Ok(mut guard) = self.keys.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.signatures.write() {
+            guard.clear();
+        }
+    }
+
+    /// `(hits, misses)` для метрик.
+    pub(crate) fn snapshot(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
+    }
+}
+
 pub(crate) fn validate(
     resolver: &Resolver,
     qname: &Name,
@@ -63,6 +222,7 @@ pub(crate) fn validate(
         now,
         verify_options: VerifyOptions::new(now),
         memo: HashMap::new(),
+        keyset_fingerprints: HashMap::new(),
         raw_cache: HashMap::new(),
         visiting: HashSet::new(),
         verifications: 0,
@@ -80,6 +240,7 @@ struct Validator<'a> {
     now: u32,
     verify_options: VerifyOptions,
     memo: HashMap<Name, Option<ValidatedDnskeySet>>,
+    keyset_fingerprints: HashMap<Name, Box<[u8]>>,
     raw_cache: HashMap<(Name, Rtype), Resolution>,
     visiting: HashSet<Name>,
     verifications: usize,
@@ -239,12 +400,31 @@ impl Validator<'_> {
         if signatures.len() > config.max_rrsigs_per_rrset {
             return Err(bogus("too many RRSIG records"));
         }
+        let fingerprint = self
+            .keyset_fingerprints
+            .get(keys.zone())
+            .map_or_else(Vec::new, |fingerprint| fingerprint.to_vec());
+        let cache_key = signature_cache_key(rrset, signatures, &fingerprint);
+        if self
+            .resolver
+            .inner
+            .validation
+            .signature_valid(&cache_key, self.now)
+        {
+            return Ok(());
+        }
         self.verifications = self.verifications.saturating_add(signatures.len().max(1));
         if self.verifications > config.max_verifications {
             return Err(bogus("verification budget exhausted"));
         }
         keys.verify_rrset(rrset, signatures, &self.verify_options)
-            .map_err(|error| bogus(error.to_string()))
+            .map_err(|error| bogus(error.to_string()))?;
+        let expires = signature_expiry(rrset.ttl().as_u32(), signatures, self.now);
+        self.resolver
+            .inner
+            .validation
+            .store_signature(cache_key.into_boxed_slice(), expires);
+        Ok(())
     }
 
     fn keys_for(&mut self, zone: &Name) -> Result<Option<ValidatedDnskeySet>, ResolverError> {
@@ -263,6 +443,11 @@ impl Validator<'_> {
     }
 
     fn compute_keys(&mut self, zone: &Name) -> Result<Option<ValidatedDnskeySet>, ResolverError> {
+        if self.resolver.inner.validation.has_keys(zone, self.now)
+            && let Some(keys) = self.try_cached_keys(zone)?
+        {
+            return Ok(Some(keys));
+        }
         let anchors = self.anchors_for(zone);
         let ds_set = if let Some(anchors) = anchors {
             anchors
@@ -349,7 +534,48 @@ impl Validator<'_> {
         if let Some(provider) = &self.resolver.inner.config.trust_anchor_provider {
             provider.observe_validated_dnskey(zone, &rrset, self.now);
         }
+        let fingerprint = keyset_fingerprint(&rrset);
+        let expires = keyset_expiry(&key_resolution, &signatures, self.now);
+        self.resolver.inner.validation.store_keys(
+            zone,
+            fingerprint.clone().into_boxed_slice(),
+            validated.clone(),
+            expires,
+        );
+        self.keyset_fingerprints
+            .insert(zone.clone(), fingerprint.into_boxed_slice());
         Ok(Some(validated))
+    }
+
+    /// Проверяет кеш цепочки по свежему DNSKEY RRset.
+    fn try_cached_keys(
+        &mut self,
+        zone: &Name,
+    ) -> Result<Option<ValidatedDnskeySet>, ResolverError> {
+        let key_resolution = self.raw_lookup(zone, Rtype::DNSKEY)?;
+        let Some(key_group) = group_rrsets(&key_resolution.answers)
+            .into_iter()
+            .find(|group| group.owner == *zone && group.rr_type == Rtype::DNSKEY)
+        else {
+            self.resolver.inner.validation.invalidate_keys(zone);
+            return Ok(None);
+        };
+        let Some(rrset) = key_group.to_rrset() else {
+            self.resolver.inner.validation.invalidate_keys(zone);
+            return Ok(None);
+        };
+        let fingerprint = keyset_fingerprint(&rrset);
+        let Some(keys) = self
+            .resolver
+            .inner
+            .validation
+            .lookup_keys(zone, &fingerprint, self.now)
+        else {
+            return Ok(None);
+        };
+        self.keyset_fingerprints
+            .insert(zone.clone(), fingerprint.into_boxed_slice());
+        Ok(Some(keys))
     }
 
     fn anchors_for(&self, zone: &Name) -> Option<Vec<DsData>> {
@@ -438,6 +664,63 @@ impl Validator<'_> {
     }
 }
 
+fn keyset_fingerprint(rrset: &Rrset) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(rrset.owner().as_wire());
+    out.extend_from_slice(&rrset.rr_type().as_u16().to_be_bytes());
+    for rdata in rrset.rdatas() {
+        let bytes = rdata.to_canonical_wire();
+        out.extend_from_slice(&u16::try_from(bytes.len()).unwrap_or(u16::MAX).to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
+fn signature_cache_key(
+    rrset: &Rrset,
+    signatures: &[RrsigData],
+    keyset_fingerprint: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(keyset_fingerprint.len().saturating_add(256));
+    out.extend_from_slice(keyset_fingerprint);
+    out.extend_from_slice(rrset.owner().as_wire());
+    out.extend_from_slice(&rrset.rr_type().as_u16().to_be_bytes());
+    for rdata in rrset.rdatas() {
+        let bytes = rdata.to_canonical_wire();
+        out.extend_from_slice(&u16::try_from(bytes.len()).unwrap_or(u16::MAX).to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    for signature in signatures {
+        let bytes = Rdata::Rrsig(signature.clone()).to_canonical_wire();
+        out.extend_from_slice(&u16::try_from(bytes.len()).unwrap_or(u16::MAX).to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
+fn keyset_expiry(resolution: &Resolution, signatures: &[RrsigData], now: u32) -> u32 {
+    let ttl = resolution
+        .answers
+        .iter()
+        .filter(|record| record.rr_type() == Rtype::DNSKEY)
+        .map(|record| record.ttl().as_u32())
+        .min()
+        .unwrap_or(0);
+    let mut expires = now.saturating_add(ttl.min(86_400));
+    for signature in signatures {
+        expires = expires.min(signature.signature_expiration());
+    }
+    if expires <= now { 0 } else { expires }
+}
+
+fn signature_expiry(rrset_ttl: u32, signatures: &[RrsigData], now: u32) -> u32 {
+    let mut expires = now.saturating_add(rrset_ttl.min(86_400));
+    for signature in signatures {
+        expires = expires.min(signature.signature_expiration());
+    }
+    if expires <= now { 0 } else { expires }
+}
+
 fn insecure() -> ValidationOutcome {
     ValidationOutcome {
         state: Security::Insecure,
@@ -457,4 +740,88 @@ fn unix_now() -> u32 {
         .map_or(0, |duration| {
             u32::try_from(duration.as_secs()).unwrap_or(u32::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use pulse_dns::{Rclass, Ttl};
+    use pulse_dnssec::{
+        Algorithm, DsPolicy, PrivateKey, SignOptions, VerifyOptions, ds_from_dnskey, sign_rrset,
+        validate_dnskey_rrset,
+    };
+
+    use super::*;
+
+    fn validated_keyset(now: u32) -> (Name, ValidatedDnskeySet, Rrset) {
+        let zone = Name::parse("example.test").unwrap();
+        let key = PrivateKey::generate(Algorithm::ED25519).unwrap();
+        let dnskey = key.dnskey(257).unwrap();
+        let rrset = Rrset::new(
+            zone.clone(),
+            Rtype::DNSKEY,
+            Rclass::IN,
+            Ttl::new(300).unwrap(),
+            [Rdata::Dnskey(dnskey.clone())],
+        )
+        .unwrap();
+        let signature = sign_rrset(
+            &key,
+            &rrset,
+            &SignOptions::new(zone.clone(), now, 3600).with_dnskey_flags(257),
+        )
+        .unwrap();
+        let ds = ds_from_dnskey(&zone, &dnskey, 2, DsPolicy::strict()).unwrap();
+        let validated = validate_dnskey_rrset(
+            &zone,
+            &rrset,
+            std::slice::from_ref(&signature),
+            std::slice::from_ref(&ds),
+            &VerifyOptions::new(now),
+            DsPolicy::strict(),
+        )
+        .unwrap();
+        (zone, validated, rrset)
+    }
+
+    #[test]
+    fn keyset_cache_hits_and_invalidates_on_fingerprint_change() {
+        let now = unix_now();
+        let (zone, keys, rrset) = validated_keyset(now);
+        let cache = ValidationCache::new(16);
+        let fingerprint = keyset_fingerprint(&rrset);
+        cache.store_keys(
+            &zone,
+            fingerprint.clone().into_boxed_slice(),
+            keys,
+            now + 300,
+        );
+        assert!(cache.has_keys(&zone, now));
+        assert!(cache.lookup_keys(&zone, &fingerprint, now).is_some());
+        assert!(!cache.has_keys(&zone, now.saturating_add(301)));
+
+        cache.store_keys(
+            &zone,
+            fingerprint.clone().into_boxed_slice(),
+            {
+                let (_, keys, _) = validated_keyset(now);
+                keys
+            },
+            now + 300,
+        );
+        assert!(cache.lookup_keys(&zone, b"different", now).is_none());
+        assert!(!cache.has_keys(&zone, now));
+    }
+
+    #[test]
+    fn signature_cache_expires() {
+        let now = unix_now();
+        let cache = ValidationCache::new(16);
+        cache.store_signature(b"sig-key".as_slice().into(), now.saturating_add(10));
+        assert!(cache.signature_valid(b"sig-key", now));
+        assert!(!cache.signature_valid(b"sig-key", now.saturating_add(11)));
+        assert!(!cache.signature_valid(b"missing", now));
+        let (hits, misses) = cache.snapshot();
+        assert_eq!(hits, 1);
+        assert!(misses >= 2);
+    }
 }

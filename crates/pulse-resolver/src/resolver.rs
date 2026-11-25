@@ -12,14 +12,17 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use pulse_dns::{DecodeLimits, Edns, Message, Name, Question, Rclass, Rcode, Record, Rtype, Ttl};
+use pulse_dns::{
+    DecodeLimits, Edns, EncodeError, EncodeOptions, EncodeScratch, Encoder, Flags, HeaderCounts,
+    Message, Name, Question, Rclass, Rcode, Record, Rtype, Ttl,
+};
 use pulse_tls::client::{DohClient, DotClient};
 use pulse_tls::{PoolConfig, PoolStats};
 
 use crate::blocklist::{Blocklist, BlocklistStats};
-use crate::cache::{Cache, CacheSnapshot};
+use crate::cache::{Cache, CacheSnapshot, SecurityState, wire_rrs};
 use crate::config::{BlockResponse, Mode, ResolverConfig, TrustAnchorConfig, UpstreamConfig};
-use crate::dnssec::{self, Security};
+use crate::dnssec::{self, Security, ValidationCache};
 use crate::error::ResolverError;
 use crate::forward;
 use crate::iterative;
@@ -207,6 +210,10 @@ pub struct StatsSnapshot {
     pub dnssec_insecure: u64,
     /// BOGUS-ответов.
     pub dnssec_bogus: u64,
+    /// Попадания в кеш результатов DNSSEC-валидации (цепочка и подписи).
+    pub dnssec_validation_hits: u64,
+    /// Промахи кеша результатов DNSSEC-валидации.
+    pub dnssec_validation_misses: u64,
     /// Статистика кеша.
     pub cache: CacheSnapshot,
     /// Статистика транспорта.
@@ -233,6 +240,7 @@ pub struct UpstreamStatus {
 pub(crate) struct Inner {
     pub(crate) config: ResolverConfig,
     pub(crate) cache: Cache,
+    pub(crate) validation: ValidationCache,
     pub(crate) blocklist: RwLock<Arc<Blocklist>>,
     pub(crate) static_anchors: RwLock<Arc<Vec<TrustAnchorConfig>>>,
     pub(crate) overrides: Overrides,
@@ -310,12 +318,14 @@ impl Resolver {
         }));
         let upstream_counters = upstream.counters();
         let cache = Cache::new(config.cache);
+        let validation = ValidationCache::new(config.cache.max_entries.saturating_div(4).max(64));
         let static_anchors = Arc::new(config.dnssec.anchors.clone());
 
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 cache,
+                validation,
                 blocklist: RwLock::new(Arc::new(blocklist)),
                 static_anchors: RwLock::new(static_anchors),
                 overrides,
@@ -353,6 +363,33 @@ impl Resolver {
         }
     }
 
+    /// Разрешает запрос и кодирует ответ прямо в `out`.
+    ///
+    /// На попадании в кеш ответ кодируется из компактных wire-записей кеша
+    /// без построения [`Message`] и без копирования RRset: горячий путь не
+    /// аллоцирует. На промахе выполняется обычная резолюция, после чего
+    /// готовый ответ кодируется в тот же буфер.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::BufferTooSmall`], если `out` меньше ответа; прочие
+    /// ошибки кодирования при некорректных данных.
+    pub fn resolve_into(&self, request: &Message, out: &mut [u8]) -> Result<usize, EncodeError> {
+        self.inner.counters.queries.fetch_add(1, Ordering::Relaxed);
+        if let Some(result) = self.try_cache_into(request, out) {
+            return result;
+        }
+        let context = self.effective_context(&ResolveContext::new());
+        let response = match self.resolve_inner(request, &context) {
+            Ok(response) => response,
+            Err(error) => {
+                self.inner.counters.servfail.fetch_add(1, Ordering::Relaxed);
+                error_response(request, error.rcode())
+            }
+        };
+        response.encode_into(out)
+    }
+
     /// Удобная резолюция одиночного вопроса.
     #[must_use]
     pub fn resolve_qname(&self, qname: &Name, qtype: Rtype) -> Message {
@@ -376,6 +413,7 @@ impl Resolver {
             forwarder.pool_stats(&mut pool);
         }
         upstream.pool = pool;
+        let (validation_hits, validation_misses) = self.inner.validation.snapshot();
         StatsSnapshot {
             queries: self.inner.counters.queries.load(Ordering::Relaxed),
             servfail: self.inner.counters.servfail.load(Ordering::Relaxed),
@@ -384,6 +422,8 @@ impl Resolver {
             dnssec_secure: self.inner.counters.dnssec_secure.load(Ordering::Relaxed),
             dnssec_insecure: self.inner.counters.dnssec_insecure.load(Ordering::Relaxed),
             dnssec_bogus: self.inner.counters.dnssec_bogus.load(Ordering::Relaxed),
+            dnssec_validation_hits: validation_hits,
+            dnssec_validation_misses: validation_misses,
             cache: self.inner.cache.snapshot(),
             upstream,
         }
@@ -485,6 +525,7 @@ impl Resolver {
         if let Ok(mut guard) = self.inner.static_anchors.write() {
             *guard = Arc::new(anchors);
         }
+        self.inner.validation.clear();
         count
     }
 
@@ -529,7 +570,7 @@ impl Resolver {
         if question.qclass() != Rclass::IN && question.qclass() != Rclass::ANY {
             return Ok(simple_response(request, Rcode::REFUSED));
         }
-        let qname = question.qname().clone();
+        let qname = question.qname();
         let qtype = question.qtype();
         if let Some(edns) = request.edns()
             && edns.version() != 0
@@ -544,7 +585,7 @@ impl Resolver {
         }
         check_context(context)?;
 
-        match self.inner.overrides.lookup(&qname, qtype) {
+        match self.inner.overrides.lookup(qname, qtype) {
             OverrideOutcome::Answer(records) => {
                 self.inner
                     .counters
@@ -562,7 +603,7 @@ impl Resolver {
             OverrideOutcome::Miss => {}
         }
 
-        if self.is_blocked(&qname) {
+        if self.is_blocked(qname) {
             self.inner.counters.blocked.fetch_add(1, Ordering::Relaxed);
             return Ok(blocked_response(
                 request,
@@ -575,7 +616,7 @@ impl Resolver {
         if let Some(hit) = self
             .inner
             .cache
-            .lookup_answer(&qname, qtype, !validation_enabled)
+            .lookup_answer(qname, qtype, !validation_enabled)
         {
             return Ok(answer_response(
                 request,
@@ -586,7 +627,7 @@ impl Resolver {
         if let Some(hit) = self
             .inner
             .cache
-            .lookup_negative(&qname, qtype, !validation_enabled)
+            .lookup_negative(qname, qtype, !validation_enabled)
         {
             return Ok(negative_response(
                 request,
@@ -598,12 +639,12 @@ impl Resolver {
 
         let dnssec_ok = validation_enabled || request_do(request);
         let resolution = match &self.inner.config.mode {
-            Mode::Forward(_) => forward::resolve(self, &qname, qtype, dnssec_ok, context)?,
-            Mode::Iterative(_) => iterative::resolve(self, &qname, qtype, dnssec_ok, context)?,
+            Mode::Forward(_) => forward::resolve(self, qname, qtype, dnssec_ok, context)?,
+            Mode::Iterative(_) => iterative::resolve(self, qname, qtype, dnssec_ok, context)?,
         };
 
         let (security, validated) = if validation_enabled {
-            let outcome = match dnssec::validate(self, &qname, qtype, &resolution, context) {
+            let outcome = match dnssec::validate(self, qname, qtype, &resolution, context) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     if matches!(error, ResolverError::Bogus { .. }) {
@@ -639,7 +680,7 @@ impl Resolver {
             if let Some(ttl) = negative_ttl(&resolution.authority) {
                 let secure = cache_security(security);
                 self.inner.cache.insert_negative(
-                    &qname,
+                    qname,
                     qtype,
                     resolution.rcode,
                     &resolution.authority,
@@ -734,6 +775,139 @@ impl Resolver {
 
         let ad = validation_enabled && security == Security::Secure;
         Ok(resolution_response(request, &resolution, ad))
+    }
+
+    /// Пытается собрать ответ из кеша прямо в `out`.
+    ///
+    /// `None` означает, что запрос нужно обслужить обычным путём (override,
+    /// blocklist, CNAME-цепочка, промах или нестандартный запрос).
+    fn try_cache_into(
+        &self,
+        request: &Message,
+        out: &mut [u8],
+    ) -> Option<Result<usize, EncodeError>> {
+        if request.flags().opcode() != pulse_dns::Opcode::QUERY {
+            return None;
+        }
+        if request.questions().len() != 1 {
+            return None;
+        }
+        let question = request.questions().first()?;
+        let qclass = question.qclass();
+        if qclass != Rclass::IN && qclass != Rclass::ANY {
+            return None;
+        }
+        if let Some(edns) = request.edns()
+            && edns.version() != 0
+        {
+            return None;
+        }
+        let qtype = question.qtype();
+        if matches!(
+            qtype,
+            Rtype::AXFR | Rtype::IXFR | Rtype::OPT | Rtype::TKEY | Rtype::TSIG | Rtype::ANY
+        ) {
+            return None;
+        }
+        let qname = question.qname();
+        if !matches!(
+            self.inner.overrides.lookup(qname, qtype),
+            OverrideOutcome::Miss
+        ) {
+            return None;
+        }
+        if self.is_blocked(qname) {
+            return None;
+        }
+
+        let validation_enabled = self.inner.config.dnssec.enabled;
+        let accept_unvalidated = !validation_enabled;
+        let cache = &self.inner.cache;
+        let hit = if let Some(hit) = cache.lookup(qname, qtype, Rclass::IN, accept_unvalidated) {
+            hit
+        } else {
+            let fallback = cache.lookup(qname, Rtype::ANY, Rclass::IN, accept_unvalidated)?;
+            if !fallback.negative() {
+                drop(fallback);
+                return None;
+            }
+            fallback
+        };
+        let negative = hit.negative();
+        let rcode = hit.rcode();
+        let secure = hit.secure() == SecurityState::Secure;
+        let remaining = hit.remaining();
+
+        let mut scratch = EncodeScratch::new();
+        let mut encoder = Encoder::new(out, EncodeOptions::compressed(), &mut scratch);
+        if let Err(error) = encoder.begin_message(request.id()) {
+            return Some(Err(error));
+        }
+        if let Err(error) = encoder.write_question(question) {
+            return Some(Err(error));
+        }
+        let stored = usize::from(hit.records());
+        let mut answers = if negative { 0 } else { stored };
+        let authority = if negative { stored } else { 0 };
+        for rr in wire_rrs(hit.rrset()) {
+            if let Err(error) = encoder.write_rr_raw(
+                rr.owner,
+                rr.rr_type,
+                rr.class,
+                Ttl::from_wire(remaining),
+                rr.rdata,
+            ) {
+                return Some(Err(error));
+            }
+        }
+        drop(hit);
+
+        if !negative
+            && qtype != Rtype::RRSIG
+            && cache.may_have_signatures()
+            && let Some(signatures) =
+                cache.peek(qname, Rtype::RRSIG, Rclass::IN, accept_unvalidated)
+        {
+            for rr in wire_rrs(signatures.rrset()) {
+                if let Err(error) = encoder.write_rr_raw(
+                    rr.owner,
+                    rr.rr_type,
+                    rr.class,
+                    Ttl::from_wire(signatures.remaining()),
+                    rr.rdata,
+                ) {
+                    return Some(Err(error));
+                }
+                answers = answers.saturating_add(1);
+            }
+        }
+
+        let edns = request.edns().map(|edns| {
+            Edns::new(
+                edns.udp_payload_size()
+                    .clamp(512, pulse_dns::EDNS_DEFAULT_PAYLOAD),
+            )
+            .with_dnssec_ok(edns.dnssec_ok())
+        });
+        if let Some(edns) = &edns
+            && let Err(error) = encoder.write_edns(edns)
+        {
+            return Some(Err(error));
+        }
+        let flags = Flags::new()
+            .with_qr(true)
+            .with_rd(request.flags().rd())
+            .with_cd(request.flags().cd())
+            .with_ra(true)
+            .with_ad(validation_enabled && secure && !request.flags().cd())
+            .with_rcode_bits(rcode.header_bits());
+        let counts = HeaderCounts {
+            question: 1,
+            answer: u16::try_from(answers).unwrap_or(u16::MAX),
+            authority: u16::try_from(authority).unwrap_or(u16::MAX),
+            additional: u16::from(edns.is_some()),
+        };
+        Some(encoder.finish(flags, counts))
     }
 
     fn is_blocked(&self, qname: &Name) -> bool {
