@@ -18,6 +18,7 @@ use crate::consts::{
 use crate::errors::{CorruptDetail, CorruptKind, ZoneFileError};
 use crate::lock::WriterLock;
 use crate::map::{FileMap, ReaderRegion};
+use crate::mem::HugePages;
 use crate::meta::Meta;
 use crate::readers::{self, ProcProcessProbe, ReaderTable};
 use crate::recovery;
@@ -75,6 +76,8 @@ pub struct OpenConfig {
     /// Разрешить старт, если в режиме `Memory` (`NoSync`) выбрана meta новее
     /// `durable_txn` (meta могла пережить данные).
     pub allow_unsynced_memory_recovery: bool,
+    /// Политика huge pages для отображения данных (`auto` — best-effort).
+    pub huge_pages: HugePages,
 }
 
 impl Default for OpenConfig {
@@ -86,6 +89,7 @@ impl Default for OpenConfig {
             strict: true,
             allow_rollback_to_initial: false,
             allow_unsynced_memory_recovery: false,
+            huge_pages: HugePages::Auto,
         }
     }
 }
@@ -199,7 +203,7 @@ fn create_impl(
 
     let identity = identity_of(&file)?;
     verify_identity(&file, &identity, superblock.map_size())?;
-    let map = FileMap::map_read(&file, superblock.map_size())?;
+    let map = FileMap::map_read(&file, superblock.map_size(), cfg.huge_pages)?;
 
     let superblock_a = superblock.encode();
     let superblock_b = superblock.as_copy_b().encode();
@@ -324,7 +328,7 @@ pub(crate) fn open(
     };
 
     verify_identity(&file, &identity, file_size)?;
-    let map = FileMap::map_read(&file, file_size)?;
+    let map = FileMap::map_read(&file, file_size, cfg.huge_pages)?;
 
     verify_identity(&file, &identity, file_size)?;
     let region = ReaderRegion::map(

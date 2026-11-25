@@ -61,7 +61,12 @@ use crate::parallel::geometry::Geometry;
 /// Магия sidecar-файла координатора.
 pub(crate) const COORD_MAGIC: [u8; 8] = *b"PULSCD01";
 /// Версия раскладки sidecar.
-pub(crate) const COORD_VERSION: u16 = 1;
+///
+/// v2 добавила очередь свободных `zone_seq` (`free_seqs`), которой
+/// пользуется каталог при повторном создании зон (ADR 0007 §7.1). Это не
+/// формат данных: sidecar пересоздаётся при старте, а live-процессы старой
+/// версии получают `Busy`, а не читают чужую раскладку.
+pub(crate) const COORD_VERSION: u16 = 2;
 /// Суффикс sidecar-файла.
 pub(crate) const COORD_FILE_SUFFIX: &str = ".pulsecoord";
 
@@ -82,6 +87,10 @@ const SC_OFF_DURABLE_TXN: usize = PAGE + 192;
 const SC_OFF_PUBLISHED: usize = PAGE + 256;
 const SC_OFF_GENERATION: usize = PAGE + 320;
 const SC_OFF_ALIVE_HINT: usize = PAGE + 384;
+/// Очередь переиспользуемых `zone_seq` (каталог): голова/хвост/флаг.
+const SC_OFF_FREE_ZONE_HEAD: usize = PAGE + 448;
+const SC_OFF_FREE_ZONE_TAIL: usize = PAGE + 512;
+const SC_OFF_FREE_ZONE_READY: usize = PAGE + 576;
 const ARRAYS_OFF: usize = 2 * PAGE;
 
 /// Размер слота lease: `generation | state | pid | starttime`.
@@ -242,6 +251,8 @@ pub(crate) struct SharedCoord {
     zone_seq_off: usize,
     durable_off: usize,
     readers_off: usize,
+    /// Массив переиспользуемых `zone_seq` (`max_zones` × `u32`).
+    free_seqs_off: usize,
     /// Держим `LOCK_SH` на `LOCK_OFF_ALIVE` всё время жизни.
     alive_lock: Option<RangeLock>,
 }
@@ -327,6 +338,7 @@ impl SharedCoord {
             zone_seq_off: layout.zone_seq_off,
             durable_off: layout.durable_off,
             readers_off: layout.readers_off,
+            free_seqs_off: layout.free_seqs_off,
             alive_lock: None,
         };
 
@@ -401,6 +413,79 @@ impl SharedCoord {
     #[must_use]
     pub(crate) fn alive_hint(&self) -> &AtomicU64 {
         self.atomic_u64(SC_OFF_ALIVE_HINT)
+    }
+
+    // --- очередь переиспользуемых zone_seq (каталог, ADR 0007 §7.1) ---
+
+    fn free_zone_head(&self) -> &AtomicU64 {
+        self.atomic_u64(SC_OFF_FREE_ZONE_HEAD)
+    }
+
+    fn free_zone_tail(&self) -> &AtomicU64 {
+        self.atomic_u64(SC_OFF_FREE_ZONE_TAIL)
+    }
+
+    fn free_zone_ready_atomic(&self) -> &AtomicU64 {
+        self.atomic_u64(SC_OFF_FREE_ZONE_READY)
+    }
+
+    fn free_zone_slot(&self, index: u64) -> &AtomicU32 {
+        let modulus = u64::from(self.max_zones.max(1));
+        let slot = index % modulus;
+        self.atomic_u32(self.free_seqs_off + usize::try_from(slot).unwrap_or(0) * 4)
+    }
+
+    /// Очередь свободных слотов уже восстановлена из durable tombstone'ов.
+    #[must_use]
+    pub(crate) fn free_zone_ready(&self) -> bool {
+        self.free_zone_ready_atomic().load(Ordering::Acquire) != 0
+    }
+
+    /// Помечает очередь свободных слотов восстановленной.
+    pub(crate) fn mark_free_zone_ready(&self) {
+        self.free_zone_ready_atomic().store(1, Ordering::Release);
+    }
+
+    /// Кладёт `zone_seq` в очередь переиспользования.
+    ///
+    /// Вызывается только держателем lease каталога. `false` — очередь полна.
+    pub(crate) fn push_free_zone_seq(&self, zone: u32) -> bool {
+        if zone == 0 || zone >= self.max_zones {
+            return false;
+        }
+        let head = self.free_zone_head().load(Ordering::Acquire);
+        let tail = self.free_zone_tail().load(Ordering::Acquire);
+        if tail.saturating_sub(head) >= u64::from(self.max_zones) {
+            return false;
+        }
+        self.free_zone_slot(tail).store(zone, Ordering::Release);
+        self.free_zone_tail()
+            .store(tail.saturating_add(1), Ordering::Release);
+        true
+    }
+
+    /// Забирает `zone_seq` из очереди (держатель lease каталога).
+    #[must_use]
+    pub(crate) fn pop_free_zone_seq(&self) -> Option<u32> {
+        let head = self.free_zone_head().load(Ordering::Acquire);
+        let tail = self.free_zone_tail().load(Ordering::Acquire);
+        if head == tail {
+            return None;
+        }
+        let zone = self.free_zone_slot(head).load(Ordering::Acquire);
+        self.free_zone_head()
+            .store(head.saturating_add(1), Ordering::Release);
+        (zone != 0).then_some(zone)
+    }
+
+    /// Сбрасывает очередь свободных слотов (только при отсутствии живых).
+    fn reset_free_zone_queue(&self) {
+        self.free_zone_head().store(0, Ordering::SeqCst);
+        self.free_zone_tail().store(0, Ordering::SeqCst);
+        self.free_zone_ready_atomic().store(0, Ordering::SeqCst);
+        for index in 0..u64::from(self.max_zones) {
+            self.free_zone_slot(index).store(0, Ordering::SeqCst);
+        }
     }
 
     /// `D_z` зоны (durable version), 0 — неизвестно.
@@ -940,6 +1025,7 @@ impl SharedCoord {
                     .store(0, Ordering::SeqCst);
             }
         }
+        self.reset_free_zone_queue();
     }
 
     fn raise_watermarks(&self, init: &CoordInit) {
@@ -1028,6 +1114,7 @@ struct Layout {
     zone_seq_off: usize,
     durable_off: usize,
     readers_off: usize,
+    free_seqs_off: usize,
     len: u64,
 }
 
@@ -1056,18 +1143,21 @@ impl Layout {
                 .checked_add(max_zones * 8)
                 .ok_or(ParallelError::InvalidArgument { field: "max_zones" })?,
         );
-        let len =
-            readers_off
-                .checked_add(slots * RS_SIZE)
-                .ok_or(ParallelError::InvalidArgument {
-                    field: "reader_slots",
-                })?;
+        let free_seqs_off = align64(readers_off.checked_add(slots * RS_SIZE).ok_or(
+            ParallelError::InvalidArgument {
+                field: "reader_slots",
+            },
+        )?);
+        let len = free_seqs_off
+            .checked_add(max_zones * 4)
+            .ok_or(ParallelError::InvalidArgument { field: "max_zones" })?;
         let len = align64(len);
         Ok(Self {
             leases_off,
             zone_seq_off,
             durable_off,
             readers_off,
+            free_seqs_off,
             len: u64::try_from(len).map_err(|_| ParallelError::InvalidArgument {
                 field: "coord_size",
             })?,

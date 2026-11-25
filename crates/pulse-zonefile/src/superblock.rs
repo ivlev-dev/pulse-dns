@@ -19,6 +19,7 @@ use crate::consts::{
     SUPERBLOCK_RECORD_SIZE, SYNC_MODE_FIELD_VERSION,
 };
 use crate::errors::{CorruptDetail, CorruptKind, Version, ZoneFileError};
+use crate::mem::HugePages;
 use crate::wire;
 
 /// Дескриптор секции файла (32 байта в wire-форме).
@@ -174,6 +175,8 @@ pub struct CreateConfig {
     pub feature_flags_optional: u64,
     /// Режим durability; влияет на recovery (§13.7).
     pub sync_mode: SyncMode,
+    /// Политика huge pages для отображения данных (не входит в формат файла).
+    pub huge_pages: HugePages,
 }
 
 impl Default for CreateConfig {
@@ -184,6 +187,7 @@ impl Default for CreateConfig {
             feature_flags_required: KNOWN_REQUIRED_FLAGS,
             feature_flags_optional: 0,
             sync_mode: SyncMode::Sync,
+            huge_pages: HugePages::Auto,
         }
     }
 }

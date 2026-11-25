@@ -70,6 +70,7 @@ mod hash;
 pub mod key;
 mod lock;
 mod map;
+pub mod mem;
 pub mod meta;
 pub mod node;
 pub mod overflow;
@@ -88,6 +89,7 @@ mod zonefile;
 
 pub use errors::{CorruptDetail, CorruptKind, InvariantId, Version, ZoneFileError};
 pub use freelist::{Bucket, Freelist};
+pub use mem::{HugePages, ThpStatus};
 pub use meta::Meta;
 pub use page::PageHeader;
 pub use pager::{LockMode, OpenConfig};

@@ -6,7 +6,9 @@
 **фазу B1** — B+tree поверх `ParallelStore`, per-zone commit и read snapshots.
 **Фаза B2b** — group commit (батчинг зон, ровно два `fdatasync` на группу),
 `Flush`/`Memory` и липкий `Sync`, tombstone-GC каталога, sweep утечек и
-offline `fsck --repair`.
+offline `fsck --repair`. **M3 (ADR 0007)** — sidecar-координатор, per-zone
+lease/fencing, общая reader table, multi-writer каталог и межпроцессная
+рекламация durable-пулов.
 v1-модули, их публичный API и поведение не изменены: v2 — отдельные типы
 [`ParallelStore`], [`ParallelZones`], [`ParallelZone`], [`ZoneReader`] и
 отдельный файловый формат 2.0.
@@ -294,10 +296,14 @@ cargo test -p pulse-zonefile --test v2_group    # B2b: group commit, fsync/гр�
 cargo test -p pulse-zonefile --test v2_group -- --ignored --nocapture # нативный wall-clock замер
 cargo test -p pulse-zonefile --test v2_durability # B2b: Flush/Memory/sticky/sync, kill -9, torn
 cargo test -p pulse-zonefile --test v2_catalog_gc # B2b: tombstone-GC + recreate
+cargo test -p pulse-zonefile --test v2_multiprocess # M3: shared allocator/lease/reader, 1000 зон
+cargo test -p pulse-zonefile --test v2_multiprocess_reclaim # M3: 4×insert/delete, kill -9, reader
+cargo test -p pulse-zonefile --test v2_multiprocess_reclaim -- --ignored --nocapture # 10k insert+delete
 cargo test -p pulse-zonefile --test v2_leak     # B2b: leak sweep/repair/MAX_LEAK_RATIO
 cargo test -p pulse-zonefile --test v2_group_crash # B2b: kill -9 групп (random + точки)
 cargo test -p pulse-zonefile --test v2_group_prop  # B2b: proptest монотонности/выбора
 cargo bench -p pulse-zonefile --bench v2        # reserve/publish/pin/select
+cargo bench -p pulse-zonefile --bench v2_multiprocess_reclaim # create/commit/reclaim
 cargo bench -p pulse-zonefile --bench v2_zones  # B1: commit ops/s 1/4/8 потоков, read ns
 cargo bench -p pulse-zonefile --bench v2_cache  # B2a: lookup ns, commit+GC, high_water
 cargo bench -p pulse-zonefile --bench v2_group  # B2b: group vs per-zone, fsync/группу, p50/p99
@@ -364,9 +370,11 @@ let _snap = store.zone_snapshot(&reader, 1)?; // seqlock + пин
 - Только `page_size = 4096`; v2-файл с другим размером отвергается.
 - Single-process (по умолчанию): txn-курсор и пины — в памяти процесса; второй
   writer файла → `Busy`. M3 включается `multi_process: true` (ADR 0007).
-- В multi рекламация durable-пулов — bump-only (PW-L13): drop'ы остаются
-  reachable-free до quiescent-окна; каталог-мутации должен выполнять один
-  процесс (M3-L1).
+- В multi рекламация durable-пулов идёт под lease зоны с гейтом
+  `drop_txn < min(D_z, MP всех процессов, freeze)`; append-only + COW-компакция.
+  Каталог могут менять все процессы (catalog lease + commit-lock), readers
+  обновляются `refresh()`. Page/node-кеш в multi отключён (M3-L10);
+  `fsck --repair` и `[DP, cursor)` после `kill -9` — офлайн (M3-L11).
 - `publish_root` (низкоуровневый API фазы A) всегда выполняет два `fdatasync`;
   группировка — `commit_group`/`GroupCommitter` (B2b).
 - `publish_root` принимает `version` от вызывающего и проверяет монотонность

@@ -324,7 +324,14 @@ mod tests {
             .open(&path)
             .unwrap();
         file.set_len(u64::from(PAGE_SIZE_DEFAULT) * 16).unwrap();
-        let map = Arc::new(FileMap::map_read(&file, u64::from(PAGE_SIZE_DEFAULT) * 16).unwrap());
+        let map = Arc::new(
+            FileMap::map_read(
+                &file,
+                u64::from(PAGE_SIZE_DEFAULT) * 16,
+                crate::mem::HugePages::Never,
+            )
+            .unwrap(),
+        );
         let mut pages = TxnPages::new(map, PAGE_SIZE_DEFAULT, 16, 1, 16, 0, 0, 0, 0, 0).unwrap();
         assert!(matches!(
             pages.alloc_page(),
@@ -357,7 +364,14 @@ mod tests {
             file.write_all_at(&image, u64::from(page) * u64::from(PAGE_SIZE_DEFAULT))
                 .unwrap();
         }
-        let map = Arc::new(FileMap::map_read(&file, u64::from(PAGE_SIZE_DEFAULT) * 16).unwrap());
+        let map = Arc::new(
+            FileMap::map_read(
+                &file,
+                u64::from(PAGE_SIZE_DEFAULT) * 16,
+                crate::mem::HugePages::Never,
+            )
+            .unwrap(),
+        );
         let mut pages = TxnPages::new(map, PAGE_SIZE_DEFAULT, 16, 2, 16, 0, 14, 14, 1, 1).unwrap();
         assert!(matches!(
             pages.alloc_page(),

@@ -293,6 +293,19 @@ impl<'a> OverflowRrset<'a> {
         self.segments.get(..self.segment_count).unwrap_or(&[])
     }
 
+    /// Весь байтовый поток цепочки, если он лежит в одной странице.
+    ///
+    /// Возвращает `None`, когда цепочка занимает несколько страниц: такой
+    /// `RRset` нельзя отдать как непрерывный срез без материализации.
+    #[must_use]
+    pub fn contiguous(&self) -> Option<&'a [u8]> {
+        if self.segment_count == 1 {
+            self.segments.first().copied()
+        } else {
+            None
+        }
+    }
+
     fn validate_records(&self) -> Result<(), ZoneFileError> {
         let segments = self.segment_slice();
         let mut cursor = StreamCursor::new(segments);
@@ -691,6 +704,24 @@ mod tests {
         let mut store = MemoryStore::new(4096).unwrap();
         put_page(&mut store, 1, 2, 0, &[1, 2, 3]);
         assert!(OverflowRrset::decode(&store, 2, 1, 100, 1).is_err());
+    }
+
+    #[test]
+    fn contiguous_stream_only_for_single_page() {
+        let small = payload(&[&[1_u8; 16], &[2_u8; 32]]);
+        let mut store = MemoryStore::new(4096).unwrap();
+        let first = write_chain(&mut store, 2, &small).unwrap();
+        let rrset = OverflowRrset::decode(&store, 2, first, 48, 2).unwrap();
+        assert_eq!(rrset.contiguous(), Some(small.as_slice()));
+
+        let large = payload(&[&[3_u8; 6000]]);
+        let mut store = MemoryStore::new(4096).unwrap();
+        let first = write_chain(&mut store, 2, &large).unwrap();
+        let rrset = OverflowRrset::decode(&store, 2, first, 6000, 1).unwrap();
+        assert!(
+            rrset.contiguous().is_none(),
+            "multi-page chain is not contiguous"
+        );
     }
 
     #[test]

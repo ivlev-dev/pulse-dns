@@ -12,7 +12,7 @@ authors.workspace = true
 crc32c = "0.6"
 libc = "0.2"
 memmap2 = "0.9"
-rustix = { version = "1", features = ["fs", "process", "time"] }
+rustix = { version = "1", features = ["fs", "param", "process", "time"] }
 thiserror = "2"
 
 [dev-dependencies]
@@ -54,6 +54,10 @@ harness = false
 
 [[bench]]
 name = "v2_multiprocess"
+harness = false
+
+[[bench]]
+name = "v2_multiprocess_reclaim"
 harness = false
 
 [[bench]]

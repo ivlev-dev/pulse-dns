@@ -17,9 +17,10 @@
 | 5 | **Fencing** — слот `(pid, starttime, generation)` в координаторе + `writer_pid`/`epoch_hint` в `ALLOC_RECORD`; `version` монотонен | зомби-процесс/потеря lease не могут опубликовать корень |
 | 6 | Reader table v2 — общие слоты 128 Б в разделяемой памяти, `(pid, starttime, зона, версия)`, seqlock | `MP(z)`/`RV_z` учитывают чужие пины; мёртвые слоты санитизируются по `pid+starttime` |
 | 7 | Публикация/чтение — per-zone seqlock `zone_write_seq` + барьеры | читатель видит либо согласованную старую, либо новую версию; torn-запись не ломает старую |
-| 8 | Рекламация в multi — **bump-only** + append-only bucket-цепочка | нет двойной выдачи между процессами; цена — файл растёт до quiescent-момента (PW-L12/новая L13) |
+| 8 | Рекламация в multi — **гейт `drop_txn < min(D_z, MP всех процессов, freeze)`**; append-only bucket + COW-компакция под lease зоны | страницы переиспользуются между процессами без двойной выдачи; `high_water` стабилизируется |
 | 9 | API: `StoreConfig.multi_process` / `OpenConfigV2.multi_process`, по умолчанию `false` | одиночный процесс идёт по пути M1 без регрессий |
-| 10 | `fsck --repair`/`donation` в multi — только при отсутствии живых процессов (`try_maintenance`) | maintenance не гоняется с писателями |
+| 10 | `fsck --repair` в multi — только при отсутствии живых процессов (`try_maintenance`) | maintenance не гоняется с писателями |
+| 11 | Каталог мутирует **любой процесс** под `lease(0)` + commit-lock; свободные `zone_seq` — общая очередь в sidecar | нет потери обновлений; readers делают `refresh()` (polling) |
 
 ## 1. Контекст
 
@@ -158,18 +159,78 @@ Torn-запись одной копии: `RootEntry::decode` отвергает 
 
 ## 7. Рекламация и GC в multi-режиме
 
-**Почему не переиспользуются durable-пулы.** `FreeChain` — кэш в памяти процесса. После того как зону писал процесс A, кэш процесса B устарел; выдача из него дала бы двойную аллокацию. Поэтому в multi:
+### 7.1. Правило выдачи
 
-1. **Bump-only**: `take_pool_page`/`allocate_from_pool` не выдают страницы из durable bucket'ов (только `immediate` — «никогда не опубликованные», локальные и безопасные).
-2. **Append-only bucket**: drop-группы коммита пишутся одной новой страницей (`next = старый free_head`), без COW-перестройки всей цепочки. `FreeChain::load` понимает оба порядка (`drop_txn` возрастает после COW-пересборки и убывает в append-режиме) и нормализует цепочку в память по возрастанию.
-3. **Chain-GC не переносит страницы в пул**: chain-страницы достижимы из durable-головы и учитываются `fsck`; перенос не дал бы рекламации.
-4. Кэш зоны инвалидируется при **взятии** lease (а не на each commit): под lease зону пишет только этот процесс, поэтому внутри lease кэш авторитетен.
+Durable-пул зоны — это цепочка bucket-групп `drop_txn` в `RootEntry.free_head`.
+Страница выдаётся, только если
 
-`MP(z)`/`RV_z` учитывают общие пины (`effective_mp = min(local MP, shared oldest_pin)`); `RV_z = min(D_z−1, MP, freeze)`. `oldest_pin` игнорирует и CAS-очищает слоты мёртвых `(pid, starttime)`.
+```text
+is_reclaimable = drop_txn >= 2
+              && drop_txn <  D_z                 # durable-версия зоны
+              && drop_txn <= RV_z
+              && drop_txn <  current_version     # не переиспользовать в своём коммите
+RV_z = min(D_z - 1, MP(z), freeze)
+```
 
-**Каталог в single-process.** Каталог получает коммит на каждое создание/удаление зоны, поэтому его bucket-цепочка длиннее, чем у зон. Пока reclaimable-страниц нет (`Memory`/`D_z = 0`), каталог пишет пул append-only: COW-перестройка всей цепочки на каждом коммите давала O(n²) (на 1000 зон — десятки минут). Как только появляется переиспользуемая страница (`take_pool_page` пометил пул `dirty`) или групп становится ≥ 64, COW-путь **сливает все группы в одну** и пересобирает её: reclaim работает, а append-хвост не копится. Инвариант «страница ровно в одной группе» сохраняется: `push_group` отвергает дубли, а `merge` добавляет и страницы групп, и их содержимое.
+`MP(z)` — минимум по **всем** живым пинам: локальной reader table и общей
+sidecar-таблице (`oldest_pin`). Мёртвые слоты санитизируются по `(pid,
+starttime)`. `D_z` и reader table живут в sidecar; поэтому гейт одинаков для
+всех процессов. `freeze` пока локальный (M3-L4).
 
-**Ограничение PW-L13.** В multi-режиме durable-пул не выдаётся: после долгой нагрузки файл растёт (drop'ы остаются reachable-free, не утечка). Рекламация возобновляется в quiescent-окне (все процессы завершены → `repair_leaks`/`donation`/обычный single-process коммит) либо в будущем v2.1 (per-zone lease + перечитывание пула под ним). `NoSpace` в multi — ожидаемое поведение при исчерпании `page_count_max`.
+Корректность: страница, освобождённая в `V`, жива в версиях `≤ V−1`; условие
+`V ≤ min(D_z−1, MP)` означает, что ни durable-откат, ни живой читатель её уже
+не увидят. `V < current_version` не даёт сослаться на неё в том же коммите.
+
+### 7.2. Протокол под lease зоны
+
+1. Взятие lease зоны **сбрасывает** локальный кэш пула (`loaded = false`):
+   durable-цепочка перечитывается из головы, записанной другим процессом.
+2. `take_pool_page` может выдать страницу из `immediate` (никогда не
+   публиковалась) или из eligible-группы; во втором случае ставится
+   `dirty = true`.
+3. Коммит с `dirty` идёт **COW-путём**: цепочка пересобирается в новые
+   bucket-страницы, старые bucket'ы и `drops` попадают в группу
+   `drop_txn = V`. Выданные страницы удалены из групп, поэтому двойной выдачи
+   нет. Если групп ≥ `MULTI_COMPACT_BUCKETS` (64), COW сливает их в одну
+   (drop_txn текущего коммита) — страховка от роста цепочки.
+4. Обычный коммит без `dirty` использует **append-only**: новая группа
+   `drop_txn = V` пишется одной/несколькими страницами и ссылается на старый
+   head. Это O(1) и не даёт O(n²) на серии освобождений.
+5. `install_group` выполняется только после `fdatasync` фазы 1; отменённый
+   коммит оставляет недостижимую утечку, но не «половину» группы.
+6. `gc_pass` может вернуть chain-страницы в пул: он берёт актуальные пины
+   (локальные + shared) под `EpochGuard` и добавляет страницы в группу
+   `drop_txn = head.version`; повторный проход идемпотентен.
+
+### 7.3. Donation
+
+`donate()` удаляет eligible-страницы из `free_head` зоны отдельным durable
+коммитом и переносит их в donation-пул **процесса**. Выдача из donation
+гейтится глобальным `DT` (`donated_at < DT`): к этому моменту группа
+`donated_at` уже прошла фазу 2 (commit-lock сериализует группы), поэтому
+откат не вернёт страницу в старую цепочку. Donation остаётся process-local;
+межпроцессная передача — через обычный bucket-пул/quiescent `repair`.
+
+### 7.4. Кэш страниц в multi
+
+`PageCacheV2` и node-cache **отключены** в multi-режиме: номер страницы может
+быть переиспользован другим процессом, а общей генерации страницы в sidecar
+нет. Чтение идёт `pread` + CRC. Single-process путь сохраняет кэш без
+регрессий; инвалидация «при взятии lease» остаётся правилом для будущей
+общей генерации (v2.1).
+
+### 7.5. Каталог
+
+Каталог использует тот же пул (зона `0`), но коммитит чаще. В single-process
+он остаётся на append-only, пока нет eligible-страниц/64 групп, затем идёт
+COW с merge. В multi — append-only с COW-компакцией по общему правилу §7.1;
+каталог-мутации сериализуются lease'ом каталога (см. §8).
+
+### 7.6. Quiescent-окно
+
+Живая рекламация покрывает нормальный churn. `[DP, cursor)` после `kill -9`
+(выделено, но не опубликовано) и structural `fsck --repair` по-прежнему
+возвращаются только в quiescent-окне (`try_maintenance`, живых процессов нет).
 
 ## 8. Модель конкурентности и lock-порядок
 
@@ -196,7 +257,7 @@ L6  shard-мьютекс пула                    # под L2/L4; не бер
 
 Правила: L1→L2 (lease), L3→L4 (окно коммита), L5 берётся до L3 и никогда внутри L4; пул (`L6`) не берётся при удержании L3/L4 и не берёт lease. `lease_guard` берёт L1→L2→L6 (инвалидация кэша). `prepare_reclaim_multi` держит L6 и не берёт L1–L4.
 
-**Каталог.** Мутация каталога (`create_zone`/`delete_zone`/`set_zone_meta`) берёт только `lease(0)` (шард 0). Lease зоны к этому моменту уже отпущен (`create_zone` коммитит зону и делает `drop(zone)` до правки каталога), поэтому вложенного захвата «lease зоны → lease каталога» нет. Обратного порядка (каталог → зона) в коде нет: каталог-операции не открывают writer'ы зон.
+**Каталог.** Любой процесс может мутировать каталог: операция берёт `lease(0)` (шард 0) и под ним **перечитывает каталог** из durable-головы. Это исключает потерю обновления: две параллельные `create_zone`/`set_zone_meta`/`gc_catalog` выполняются последовательно, вторая видит запись первой. `create_zone` держит lease каталога на время создания зоны (lease зоны + commit), затем отпускает lease зоны и публикует запись каталога. Порядок «каталог → зона» единственный; обратного нет. `ParallelZones::open` также берёт lease каталога на время обхода дерева — readers в другом процессе не видят переиспользованную страницу каталога. Долгоживущий снимок обновляется `refresh()` (polling по версии головы). `zone_seq`: в multi — общая очередь durable-tombstone'ов в sidecar (`free_seqs`), пополняется `gc_catalog`; при открытии очередь восстанавливается однократным сканом. Конкурентная выдача невозможна: и очередь, и запись каталога под одним lease.
 
 **Deadlock-анализ.**
 
@@ -228,15 +289,15 @@ L6  shard-мьютекс пула                    # под L2/L4; не бер
 
 | ID | Ограничение |
 |---|---|
-| M3-L1 | **Каталог** (`create_zone`/`delete_zone`/`set_zone_meta`) — один writer: каталог-зона `0` под lease. В multi каталог-мутации должен выполнять один процесс (или переоткрывать `ParallelZones` после взятия lease); иначе возможна потеря обновления каталога. Запись **разных зон** при стабильном каталоге параллельна |
 | M3-L2 | Durable-фаза (2 `fdatasync`) сериализована глобальным commit-lock — потолок throughput остаётся «fsync одного inode» (ADR-0005 §4.5) |
 | M3-L3 | `sync()` — глобальный барьер (как PW-L9) |
 | M3-L4 | `freeze()` реален только в процессе-владельце: `freeze_epoch` локален, а GC другого процесса его не видит. Для кросс-процессного среза — quiesce/`try_maintenance` |
-| M3-L5 | Reclamation (bucket/donation/`repair_leaks`) — только bump-only до quiescent-окна (PW-L13) |
 | M3-L6 | `read_only`-читатель в multi открывает sidecar RW (нужен для пинов); данные файла — `PROT_READ`/`RDONLY` |
 | M3-L7 | Linux (`F_OFD_SETLK`, `/proc/<pid>/stat`); на не-Linux — `F_SETLK` fallback с classic-семантикой закрытия fd (документировано) |
 | M3-L8 | `max_zones`/`reader_slots` фиксированы геометрией; sidecar растёт с ними (32+8+8 Б/зона + 128 Б/слот) |
 | M3-L9 | Single-process писатель держит `LOCK_EX` на lock-файле, multi-процессы — `LOCK_SH`; смешанный режим (`single-writer` + `multi-reader`) невозможен (`Busy`), потому что single-writer не участвует в per-zone seqlock |
+| M3-L10 | В multi отключены `PageCacheV2`/node-cache: общая генерация страницы отсутствует, номер может переиспользоваться другим процессом. Single-process кэш не затронут |
+| M3-L11 | `fsck --repair` и возврат `[DP, cursor)` после `kill -9` — только в quiescent-окне; живая рекламация не чинит структурные утечки |
 
 ## 11. API и совместимость
 
@@ -248,6 +309,13 @@ OpenConfigV2 { multi_process: true, .. }         // open (writer/reader)
 // читатель
 let reader = store.reader()?;                    // регистрирует общий слот
 let snap = store.zone_snapshot(&reader, zone)?;  // seqlock-протокол
+
+// каталог (любой процесс)
+let mut catalog = ParallelZones::open(&store)?;   // краткий lease(0)
+catalog.create_zone(&origin, meta)?;              // lease(0) + commit-lock
+catalog.set_zone_meta(&origin, meta)?;
+catalog.refresh()?;                               // polling для долгоживущего снимка
+catalog.entry_count();                            // дешёвый счётчик без чтения голов
 
 // писатель
 let mut zone = ParallelZone::open(&store, origin, zone_seq)?; // lease до Drop
@@ -272,5 +340,11 @@ zone.commit()?;                                   // commit-lock внутри
 | C-11.6 | 10 000 alloc/commit в 2 процессах: нет пересечений страниц | `ten_thousand_commits_in_two_processes_do_not_overlap_pages` |
 | C-11.7 | Чтение/durability single-process без регрессий | весь `cargo test -p pulse-zonefile` |
 | C-11.8 | `unsafe` локализован (mmap/atomics/fcntl) с SAFETY | `src/parallel/coord.rs` (`#![allow(unsafe_code)]`) |
+| C-11.9 | Каталог: 4 процесса без внешнего flock создают 1000 зон; update/delete/gc/recreate не теряют записи | `tests/v2_multiprocess.rs::four_processes_create_1000_zones_without_external_lock`, `four_processes_update_delete_recreate_catalog_consistently` |
+| C-11.10 | 4 процесса insert/delete 10k: `high_water` ограничен, нет пересечений/утечек | `tests/v2_multiprocess_reclaim.rs` (regular + `--ignored` 10k) |
+| C-11.11 | `kill -9` писателя и crash после фазы 1: рекламация и `fsck` корректны | `kill9_writer_then_reclaim_is_consistent`, `crash_after_phase1_then_reclaim_is_safe` |
+| C-11.12 | Читатель другого процесса с пином не видит переиспользованную страницу | `reader_in_other_process_does_not_see_reused_pages` |
 
-**Остаточные риски.** (R1) Сериализация durable-фазы — потолок throughput (не регресс, а свойство одного inode). (R2) При append-only bucket цепочка растёт O(коммитов); `FreeChain::load` линейна при открытии — кэш инвалидируется только при смене lease. (R3) `zone_write_seq` исключает ложную публикацию, но не даёт wait-free чтения: под непрерывной записью одной зоны читатель может получить `ReaderContended` (retryable). (R4) Каталог требует одного писателя (M3-L1). (R5) На не-Linux fencing/lease деградируют до classic `fcntl` (задокументировано).
+**Bench (2026-11-25, release, локальный tmpfs/overlay, 8 vCPU, `benches/v2_multiprocess_reclaim.rs`).** Create 100→400 зон: 1869/1267/624 зон/с (2/4/8 процессов). Commit 2 зоны/процесс: 11.7k/10.8k/13.4k zone-commit/s. Reclaim 100 000 коммитов (insert+delete): `high_water` 50→98, 56→152, 68→260 для 2/4/8 процессов; commit 0.073/0.050/0.051 мс. Числа — ориентир, не SLA: диск/планировщик влияют.
+
+**Остаточные риски.** (R1) Сериализация durable-фазы — потолок throughput (не регресс, а свойство одного inode). (R2) Append-only хвост растёт O(коммитов) между COW-компакциями; `FreeChain::load` линейна при открытии. (R3) `zone_write_seq` исключает ложную публикацию, но не даёт wait-free чтения: под непрерывной записью одной зоны читатель может получить `ReaderContended` (retryable). (R4) Каталог-мутации сериализованы глобально: throughput `create_zone` ограничен двумя fsync на зону и перечитыванием каталога под lease (O(размера каталога)); это не блокирует запись разных зон. (R5) На не-Linux fencing/lease деградируют до classic `fcntl` (задокументировано). (R6) В multi нет кэша страниц (M3-L10), поэтому чтение дороже single-process.

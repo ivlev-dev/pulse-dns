@@ -93,7 +93,10 @@ pub fn rle_len(bytes: &[u8]) -> Result<usize, ZoneFileError> {
     }
 }
 
-fn validate_name_rle(bytes: &[u8], require_lowercase: bool) -> Result<(), ZoneFileError> {
+pub(crate) fn validate_name_rle(
+    bytes: &[u8],
+    require_lowercase: bool,
+) -> Result<(), ZoneFileError> {
     let name_len = rle_len(bytes)?;
     if name_len != bytes.len() {
         return Err(corrupt_name(CorruptDetail::BadNameEncoding));
@@ -640,18 +643,40 @@ pub(crate) fn compare_raw_to_key_len(
     candidate_name_len: usize,
     target: &Key,
 ) -> Ordering {
+    compare_raw_keys(
+        candidate,
+        candidate_name_len,
+        target.as_bytes(),
+        usize::from(target.name_len),
+    )
+}
+
+/// Сравнивает два уже провалидированных RLE-имени без повторной проверки.
+pub(crate) fn name_cmp_validated(left: &[u8], right: &[u8]) -> Ordering {
+    cmp_rle(left, right)
+}
+
+/// Сравнивает два провалидированных ключа, заданных байтами и длиной имени.
+///
+/// Не копирует ключи и не валидирует RLE повторно: обе стороны уже прошли
+/// проверку страницы/входа. Порядок совпадает с [`compare_keys`].
+pub(crate) fn compare_raw_keys(
+    left: &[u8],
+    left_name_len: usize,
+    right: &[u8],
+    right_name_len: usize,
+) -> Ordering {
     let name_order = cmp_rle(
-        candidate.get(..candidate_name_len).unwrap_or(&[]),
-        target.owner_bytes(),
+        left.get(..left_name_len).unwrap_or(&[]),
+        right.get(..right_name_len).unwrap_or(&[]),
     );
     if name_order != Ordering::Equal {
         return name_order;
     }
     for index in 0..3_usize {
-        let left = wire::read_u16(candidate, candidate_name_len + index * 2).unwrap_or(0);
-        let right = wire::read_u16(target.as_bytes(), usize::from(target.name_len) + index * 2)
-            .unwrap_or(0);
-        match left.cmp(&right) {
+        let left_value = wire::read_u16(left, left_name_len + index * 2).unwrap_or(0);
+        let right_value = wire::read_u16(right, right_name_len + index * 2).unwrap_or(0);
+        match left_value.cmp(&right_value) {
             Ordering::Equal => {}
             other => return other,
         }
@@ -659,8 +684,17 @@ pub(crate) fn compare_raw_to_key_len(
     Ordering::Equal
 }
 
+/// Имя из провалидированных байтов ключа без материализации [`Key`].
+pub(crate) fn owner_from_raw(bytes: &[u8], name_len: usize) -> Option<NameRle> {
+    NameRle::from_validated(bytes.get(..name_len)?)
+}
+
 /// Длина байтово-сравнимого префикса ключа ([`OrderKey`]).
-pub(crate) const ORDER_KEY_BYTES: usize = 16;
+///
+/// 32 байта покрывают имя до ~12 байт RLE (`com.` + `example.`) вместе с
+/// хвостом `type/class/subtype`. Для более длинных имён хвост префикса
+/// сравнивается полностью ([`compare_raw_keys`]).
+pub(crate) const ORDER_KEY_BYTES: usize = 32;
 
 /// Байтово-сравнимый префикс ключа для `memcmp`-поиска.
 ///
@@ -743,7 +777,22 @@ impl OrderKey {
     /// Порядок префиксов (`memcmp`).
     #[must_use]
     pub(crate) fn cmp(&self, other: &Self) -> Ordering {
-        self.bytes.cmp(&other.bytes)
+        let left = be_u64::<0>(&self.bytes);
+        let right = be_u64::<0>(&other.bytes);
+        if left != right {
+            return left.cmp(&right);
+        }
+        let left = be_u64::<8>(&self.bytes);
+        let right = be_u64::<8>(&other.bytes);
+        if left != right {
+            return left.cmp(&right);
+        }
+        let left = be_u64::<16>(&self.bytes);
+        let right = be_u64::<16>(&other.bytes);
+        if left != right {
+            return left.cmp(&right);
+        }
+        be_u64::<24>(&self.bytes).cmp(&be_u64::<24>(&other.bytes))
     }
 }
 
@@ -752,6 +801,19 @@ fn push_order_byte(out: &mut [u8; ORDER_KEY_BYTES], written: &mut usize, byte: u
         *slot = byte;
         *written += 1;
     }
+}
+
+fn be_u64<const OFFSET: usize>(bytes: &[u8; ORDER_KEY_BYTES]) -> u64 {
+    u64::from_be_bytes([
+        bytes.get(OFFSET).copied().unwrap_or(0),
+        bytes.get(OFFSET + 1).copied().unwrap_or(0),
+        bytes.get(OFFSET + 2).copied().unwrap_or(0),
+        bytes.get(OFFSET + 3).copied().unwrap_or(0),
+        bytes.get(OFFSET + 4).copied().unwrap_or(0),
+        bytes.get(OFFSET + 5).copied().unwrap_or(0),
+        bytes.get(OFFSET + 6).copied().unwrap_or(0),
+        bytes.get(OFFSET + 7).copied().unwrap_or(0),
+    ])
 }
 
 /// Сравнивает два уже валидированных ключа без повторной RLE-проверки.
@@ -885,56 +947,6 @@ impl Key {
         })
     }
 
-    /// Восстанавливает ключ из общего префикса и суффикса (фронт-кодирование).
-    ///
-    /// # Errors
-    ///
-    /// `Corrupt(BadName)` / `Corrupt(Bounds)` — невалидный результат.
-    #[allow(dead_code)]
-    pub(crate) fn rebuild(
-        prev: &Self,
-        shared_len: usize,
-        suffix: &[u8],
-    ) -> Result<Self, ZoneFileError> {
-        if shared_len > prev.len() {
-            return Err(corrupt_key_bounds());
-        }
-        let total = shared_len
-            .checked_add(suffix.len())
-            .filter(|&total| total <= KEY_MAX)
-            .ok_or_else(corrupt_key_bounds)?;
-        let mut buf = [0_u8; KEY_MAX];
-        let prefix = prev.buf.get(..shared_len).ok_or_else(corrupt_key_bounds)?;
-        buf.get_mut(..shared_len)
-            .ok_or_else(corrupt_key_bounds)?
-            .copy_from_slice(prefix);
-        buf.get_mut(shared_len..total)
-            .ok_or_else(corrupt_key_bounds)?
-            .copy_from_slice(suffix);
-        let name_len = rle_len(buf.get(..total).ok_or_else(corrupt_key_bounds)?)?;
-        if name_len + KEY_TAIL_SIZE != total {
-            return Err(corrupt_key_bounds());
-        }
-        validate_name_rle(buf.get(..name_len).ok_or_else(corrupt_key_bounds)?, true)?;
-        Ok(Self {
-            buf,
-            len: u16::try_from(total).map_err(|_| corrupt_key_bounds())?,
-            name_len: u16::try_from(name_len).map_err(|_| corrupt_key_bounds())?,
-        })
-    }
-
-    /// Пустой ключ-заглушка для восстановления первого item'а страницы.
-    ///
-    /// У него нулевая длина, поэтому [`Key::rebuild`] с `shared_len = 0`
-    /// игнорирует его содержимое. Публично не используется.
-    pub(crate) const fn placeholder() -> Self {
-        Self {
-            buf: [0_u8; KEY_MAX],
-            len: 0,
-            name_len: 0,
-        }
-    }
-
     /// Создаёт ключ из уже провалидированных байтов без повторной проверки.
     pub(crate) fn from_validated(bytes: &[u8]) -> Option<Self> {
         if bytes.len() > KEY_MAX {
@@ -951,6 +963,17 @@ impl Key {
             len: u16::try_from(bytes.len()).ok()?,
             name_len: u16::try_from(name_len).ok()?,
         })
+    }
+
+    /// Пустой ключ-заглушка для «первого ключа нет» в пути записи.
+    ///
+    /// Нулевая длина: сравнения с ним в горячем поиске не используются.
+    pub(crate) const fn placeholder() -> Self {
+        Self {
+            buf: [0_u8; KEY_MAX],
+            len: 0,
+            name_len: 0,
+        }
     }
 
     /// Длина ключа в байтах.
@@ -1188,6 +1211,44 @@ impl fmt::Debug for ChildrenProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn random_name() -> impl Strategy<Value = NameRle> {
+        let label = prop::collection::vec(
+            prop::sample::select(vec![0x00_u8, 0x01, 0x2A, 0x41, 0x5F, 0x61, 0x7A, 0xFF]),
+            1..=6,
+        );
+        prop::collection::vec(label, 1..=4).prop_map(|labels| {
+            let mut bytes = Vec::new();
+            for label in &labels {
+                bytes.push(u8::try_from(label.len()).unwrap());
+                bytes.extend_from_slice(label);
+            }
+            bytes.push(0);
+            NameRle::normalize(&bytes).unwrap()
+        })
+    }
+
+    fn random_key() -> impl Strategy<Value = Key> {
+        (random_name(), any::<u16>(), any::<u16>(), any::<u16>()).prop_map(
+            |(name, rr_type, class, subtype)| Key::new(&name, rr_type, class, subtype).unwrap(),
+        )
+    }
+
+    proptest! {
+        /// Если префиксы различаются, их порядок обязан совпадать с полным
+        /// компаратором; при длинных именах допустимо равенство префиксов,
+        /// но не инверсия.
+        #[test]
+        fn order_key_is_monotone_against_full_comparator(
+            left in random_key(),
+            right in random_key(),
+        ) {
+            let full = compare_validated(&left, &right);
+            let prefix = OrderKey::of_key(&left).cmp(&OrderKey::of_key(&right));
+            prop_assert!(prefix == Ordering::Equal || prefix == full);
+        }
+    }
 
     #[test]
     fn rejects_long_and_empty_names() {

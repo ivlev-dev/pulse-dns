@@ -420,7 +420,7 @@ mod tests {
             .open(&path)
             .unwrap();
         file.set_len(100 * 4096).unwrap();
-        let map = FileMap::map_read(&file, 100 * 4096).unwrap();
+        let map = FileMap::map_read(&file, 100 * 4096, crate::mem::HugePages::Never).unwrap();
         // Пишем два bucket'а: 20 -> 21, free_txn 2 и 3.
         let first = encode_bucket(20, 4096, 3, 21, 2, &[40, 41]).unwrap();
         let second = encode_bucket(21, 4096, 3, 0, 3, &[42]).unwrap();

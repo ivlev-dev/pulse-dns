@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use proptest::prelude::*;
 
 use pulse_zonefile::ZoneFileError;
+use pulse_zonefile::cache::PageCache;
 use pulse_zonefile::key::{CLASS_IN, NameRle, T_NODE, name_cmp};
 use pulse_zonefile::node::{
     DecodedBranch, DecodedLeaf, LeafItem, LeafValue, RR_FLAG_APEX, RR_FLAG_CHILDREN_MAY_EXIST,
@@ -462,6 +463,71 @@ fn prev_name_crosses_leaf_pages() {
     // Начало и конец последовательности — реальные владельцы зоны.
     assert_eq!(backward.last(), Some(&name("example.com")));
     assert_eq!(backward.first(), Some(&name("h0599.example.com")));
+}
+
+#[test]
+fn cached_walk_matches_uncached_across_pages() {
+    let mut store = store(4096);
+    let mut tree = zone();
+    for index in 0..600_u32 {
+        let owner = name(&format!("h{index:04}.example.com"));
+        insert_a(&mut tree, &mut store, &owner, 1);
+    }
+    let cache = PageCache::new(4096);
+
+    let mut uncached_forward = Vec::new();
+    let mut after = None;
+    while let Some(owner) = tree.next_name(&store, TXN, after.as_ref()).unwrap() {
+        uncached_forward.push(owner);
+        after = Some(owner);
+    }
+    let mut cached_forward = Vec::new();
+    let mut after = None;
+    while let Some(owner) = tree
+        .next_name_cached(&store, &cache, TXN, after.as_ref())
+        .unwrap()
+    {
+        cached_forward.push(owner);
+        after = Some(owner);
+    }
+    assert_eq!(uncached_forward, cached_forward);
+
+    let mut cached_backward = Vec::new();
+    let mut before = None;
+    while let Some(owner) = tree
+        .prev_name_cached(&store, &cache, TXN, before.as_ref())
+        .unwrap()
+    {
+        cached_backward.push(owner);
+        before = Some(owner);
+    }
+    cached_forward.reverse();
+    assert_eq!(cached_forward, cached_backward);
+
+    // Цель между владельцами: границы и `has_children` совпадают с
+    // некэшированным путём.
+    let between = name("h0300x.example.com");
+    assert_eq!(
+        tree.next_name_cached(&store, &cache, TXN, Some(&between))
+            .unwrap(),
+        tree.next_name(&store, TXN, Some(&between)).unwrap()
+    );
+    assert_eq!(
+        tree.prev_name_cached(&store, &cache, TXN, Some(&between))
+            .unwrap(),
+        tree.prev_name(&store, TXN, Some(&between)).unwrap()
+    );
+    for owner in uncached_forward.iter().step_by(37) {
+        assert_eq!(
+            tree.node_cached(&store, &cache, TXN, owner).unwrap(),
+            tree.node(&store, TXN, owner).unwrap()
+        );
+        assert_eq!(
+            tree.has_children_cached(&store, &cache, TXN, owner)
+                .unwrap(),
+            tree.has_children(&store, TXN, owner).unwrap()
+        );
+    }
 }
 
 #[test]

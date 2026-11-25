@@ -1,11 +1,13 @@
-//! Отображения `mmap`. Единственный модуль крейта, содержащий `unsafe`.
+//! Отображения `mmap`.
 //!
 //! Здесь находятся:
 //! - read-only отображение всего файла (`PROT_READ`, `MAP_SHARED`);
 //! - единственное writable-отображение региона reader table
 //!   (`PROT_READ|PROT_WRITE`, `MAP_SHARED`).
 //!
-//! Остальные модули работают с этими отображениями через безопасный API.
+//! `unsafe` в крейте локализован в этом модуле, [`crate::parallel::coord`]
+//! (общая память координатора) и [`crate::mem`] (`madvise`); каждый блок
+//! снабжён SAFETY-комментарием.
 
 #![allow(unsafe_code)]
 
@@ -19,6 +21,7 @@ use crate::consts::{
     SLOT_OFF_ACTIVE, SLOT_OFF_FLAGS, SLOT_OFF_HEARTBEAT, SLOT_OFF_OWNER,
 };
 use crate::errors::ZoneFileError;
+use crate::mem::{self, HugePages};
 
 fn map_error(size: u64, error: &std::io::Error) -> ZoneFileError {
     ZoneFileError::MapAllocFailed {
@@ -36,7 +39,15 @@ pub(crate) struct FileMap {
 
 impl FileMap {
     /// Отображает весь файл `[0, size)` как `PROT_READ | MAP_SHARED`.
-    pub(crate) fn map_read(file: &File, size: u64) -> Result<Self, ZoneFileError> {
+    ///
+    /// После отображения применяется политика [`HugePages`]: для `auto`/`never`
+    /// подсказка не фатальна, для `always` ошибка `madvise`/выключенный THP
+    /// возвращаются как `MapAllocFailed`.
+    pub(crate) fn map_read(
+        file: &File,
+        size: u64,
+        huge_pages: HugePages,
+    ) -> Result<Self, ZoneFileError> {
         let len = usize::try_from(size).map_err(|_| ZoneFileError::MapAllocFailed {
             size,
             errno: 0,
@@ -47,6 +58,17 @@ impl FileMap {
         // owned by the same `ZoneFile`). No writable alias is created here.
         let mmap = unsafe { MmapOptions::new().len(len).map(file) }
             .map_err(|error| map_error(size, &error))?;
+        // Данные зоны читаются точечно из этого отображения: THP снижает
+        // dTLB-misses на горячем пути чтения. На ext4/xfs вызов — no-op.
+        let ptr = std::ptr::NonNull::new(mmap.as_ptr().cast_mut()).ok_or(
+            ZoneFileError::MapAllocFailed {
+                size,
+                errno: 0,
+                hint: "mmap returned a null pointer",
+            },
+        )?;
+        mem::advise(ptr, mmap.len(), huge_pages)
+            .map_err(|error| mem::advise_error(size, &error))?;
         Ok(Self { mmap })
     }
 

@@ -20,8 +20,8 @@ use crate::consts::{
 };
 use crate::errors::{CorruptDetail, CorruptKind, InvariantId, ZoneFileError};
 use crate::key::{
-    CLASS_IN, ChildrenProbe, Key, LABELS_MAX, NameRle, T_NODE, T_RRSIG, T_ZONE_ENTRY,
-    compare_validated, name_cmp,
+    CLASS_IN, KEY_MAX, Key, LABELS_MAX, NameRle, OrderKey, T_NODE, T_RRSIG, T_ZONE_ENTRY,
+    compare_validated, name_cmp_validated,
 };
 use crate::node::{
     self, BranchItem, BranchNode, DecodedBranch, DecodedLeaf, DecodedValue, EncodeContext,
@@ -335,6 +335,7 @@ impl BTree {
         cache: &PageCache,
         txn: u64,
         target: &Key,
+        order: &OrderKey,
     ) -> Result<Option<NodeRef<'a>>, ZoneFileError> {
         if self.root == 0 {
             return Ok(None);
@@ -352,7 +353,7 @@ impl BTree {
             if branch.level() != node_level {
                 return Err(bounds(Some(page_no), CorruptDetail::PageType));
             }
-            let index = branch.predecessor(target)?.unwrap_or(0);
+            let index = branch.predecessor_with_order(target, order)?.unwrap_or(0);
             page_no = branch.child(index)?;
             node_level -= 1;
         }
@@ -371,23 +372,96 @@ impl BTree {
         txn: u64,
         target: &Key,
     ) -> Result<Option<StoredEntry<'a>>, ZoneFileError> {
-        let Some(leaf) = self.find_leaf_cached(io, cache, txn, target)? else {
+        if self.root == 0 {
+            return Ok(None);
+        }
+        if self.level == 1 {
+            let leaf = cache.leaf(io, self.root, txn)?;
+            let (position, captured, equal) = leaf.lower_bound_capture_match(target)?;
+            if position >= leaf.len() || !equal {
+                return Ok(None);
+            }
+            let Some(key) = captured else {
+                return Ok(None);
+            };
+            return Ok(Some(StoredEntry {
+                key,
+                value: leaf.value(position)?,
+            }));
+        }
+        let order = OrderKey::of_key(target);
+        let Some(leaf) = self.find_leaf_cached(io, cache, txn, target, &order)? else {
             return Ok(None);
         };
-        let (position, captured) = leaf.lower_bound_capture(target)?;
-        if position >= leaf.len() {
+        let (position, captured, equal) =
+            leaf.lower_bound_capture_match_with_order(target, &order)?;
+        if position >= leaf.len() || !equal {
             return Ok(None);
         }
         let Some(key) = captured else {
             return Ok(None);
         };
-        if compare_validated(&key, target) != Ordering::Equal {
-            return Ok(None);
-        }
         Ok(Some(StoredEntry {
             key,
             value: leaf.value(position)?,
         }))
+    }
+
+    /// Первое имя строго после `after` (`None` — первое) через `PageCache`.
+    ///
+    /// Ключи промежуточных узлов не материализуются: спуск идёт по
+    /// `OrderKey`, имя собирается только для найденного item'а.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево; ошибки [`PageIo`].
+    pub fn next_name_cached<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        cache: &PageCache,
+        txn: u64,
+        after: Option<&NameRle>,
+    ) -> Result<Option<NameRle>, ZoneFileError> {
+        if self.root == 0 {
+            return Ok(None);
+        }
+        let level = self
+            .level
+            .checked_sub(1)
+            .ok_or_else(|| bounds(None, CorruptDetail::DepthExceeded))?;
+        let Some(after) = after else {
+            return first_owner_in(io, cache, txn, self.root, level);
+        };
+        let target = Key::new(after, u16::MAX, u16::MAX, u16::MAX)?;
+        let order = OrderKey::of_key(&target);
+        next_owner_in(io, cache, txn, self.root, level, &target, &order)
+    }
+
+    /// Последнее имя строго до `before` (`None` — последнее) через `PageCache`.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево; ошибки [`PageIo`].
+    pub fn prev_name_cached<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        cache: &PageCache,
+        txn: u64,
+        before: Option<&NameRle>,
+    ) -> Result<Option<NameRle>, ZoneFileError> {
+        if self.root == 0 {
+            return Ok(None);
+        }
+        let level = self
+            .level
+            .checked_sub(1)
+            .ok_or_else(|| bounds(None, CorruptDetail::DepthExceeded))?;
+        let Some(before) = before else {
+            return last_owner_in(io, cache, txn, self.root, level);
+        };
+        let target = Key::new(before, T_NODE, 0, 0)?;
+        let order = OrderKey::of_key(&target);
+        prev_owner_in(io, cache, txn, self.root, level, &target, &order)
     }
 
     /// Вставка или замена ключа с COW-путём до корня.
@@ -678,6 +752,130 @@ struct Inserted {
     split: Option<(Key, u32)>,
     is_new: bool,
     old: Option<ItemValue>,
+}
+
+fn first_owner_in<P: PageIo + ?Sized>(
+    io: &P,
+    cache: &PageCache,
+    txn: u64,
+    page_no: u32,
+    level: u16,
+) -> Result<Option<NameRle>, ZoneFileError> {
+    if level == 0 {
+        let leaf = cache.leaf(io, page_no, txn)?;
+        if leaf.is_empty() {
+            return Ok(None);
+        }
+        return leaf.owner_at(0).map(Some);
+    }
+    let branch = cache.branch(io, page_no, txn, level)?;
+    for index in 0..branch.len() {
+        if let Some(owner) = first_owner_in(io, cache, txn, branch.child(index)?, level - 1)? {
+            return Ok(Some(owner));
+        }
+    }
+    Ok(None)
+}
+
+fn last_owner_in<P: PageIo + ?Sized>(
+    io: &P,
+    cache: &PageCache,
+    txn: u64,
+    page_no: u32,
+    level: u16,
+) -> Result<Option<NameRle>, ZoneFileError> {
+    if level == 0 {
+        let leaf = cache.leaf(io, page_no, txn)?;
+        let Some(index) = leaf.len().checked_sub(1) else {
+            return Ok(None);
+        };
+        return leaf.owner_at(index).map(Some);
+    }
+    let branch = cache.branch(io, page_no, txn, level)?;
+    for index in (0..branch.len()).rev() {
+        if let Some(owner) = last_owner_in(io, cache, txn, branch.child(index)?, level - 1)? {
+            return Ok(Some(owner));
+        }
+    }
+    Ok(None)
+}
+
+fn next_owner_in<P: PageIo + ?Sized>(
+    io: &P,
+    cache: &PageCache,
+    txn: u64,
+    page_no: u32,
+    level: u16,
+    target: &Key,
+    order: &OrderKey,
+) -> Result<Option<NameRle>, ZoneFileError> {
+    if level == 0 {
+        let leaf = cache.leaf(io, page_no, txn)?;
+        let index = leaf.upper_bound_with_order(target, order)?;
+        if index < leaf.len() {
+            return leaf.owner_at(index).map(Some);
+        }
+        return Ok(None);
+    }
+    let branch = cache.branch(io, page_no, txn, level)?;
+    let index = branch.predecessor_with_order(target, order)?.unwrap_or(0);
+    if let Some(owner) = next_owner_in(
+        io,
+        cache,
+        txn,
+        branch.child(index)?,
+        level - 1,
+        target,
+        order,
+    )? {
+        return Ok(Some(owner));
+    }
+    for next in index + 1..branch.len() {
+        if let Some(owner) = first_owner_in(io, cache, txn, branch.child(next)?, level - 1)? {
+            return Ok(Some(owner));
+        }
+    }
+    Ok(None)
+}
+
+fn prev_owner_in<P: PageIo + ?Sized>(
+    io: &P,
+    cache: &PageCache,
+    txn: u64,
+    page_no: u32,
+    level: u16,
+    target: &Key,
+    order: &OrderKey,
+) -> Result<Option<NameRle>, ZoneFileError> {
+    if level == 0 {
+        let leaf = cache.leaf(io, page_no, txn)?;
+        let index = leaf.lower_bound_with_order(target, order)?;
+        if index == 0 {
+            return Ok(None);
+        }
+        return leaf.owner_at(index - 1).map(Some);
+    }
+    let branch = cache.branch(io, page_no, txn, level)?;
+    let Some(index) = branch.predecessor_with_order(target, order)? else {
+        return Ok(None);
+    };
+    if let Some(owner) = prev_owner_in(
+        io,
+        cache,
+        txn,
+        branch.child(index)?,
+        level - 1,
+        target,
+        order,
+    )? {
+        return Ok(Some(owner));
+    }
+    for previous in (0..index).rev() {
+        if let Some(owner) = last_owner_in(io, cache, txn, branch.child(previous)?, level - 1)? {
+            return Ok(Some(owner));
+        }
+    }
+    Ok(None)
 }
 
 fn write_leaf_page<P: PageIo + ?Sized>(
@@ -1560,6 +1758,22 @@ impl<'a, P: PageIo + ?Sized> Cursor<'a, P> {
     where
         F: FnMut(&Key) -> Result<Ordering, ZoneFileError>,
     {
+        self.seek_raw_by(move |bytes, _name_len| {
+            let key =
+                Key::from_validated(bytes).ok_or_else(|| bounds(None, CorruptDetail::KeyOrder))?;
+            compare(&key)
+        })
+    }
+
+    /// Позиционируется по сырым байтам ключа (без материализации [`Key`]).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённая страница; ошибка компаратора.
+    pub fn seek_raw_by<F>(&mut self, mut compare: F) -> Result<bool, ZoneFileError>
+    where
+        F: FnMut(&[u8], usize) -> Result<Ordering, ZoneFileError>,
+    {
         self.path.clear();
         self.leaf = None;
         self.index = 0;
@@ -1576,7 +1790,7 @@ impl<'a, P: PageIo + ?Sized> Cursor<'a, P> {
             let page = self.io.read_page(page_no)?;
             if node_level == 0 {
                 let leaf = DecodedLeaf::decode(page, page_no, self.txn, page_size)?;
-                let position = leaf.lower_bound_by(&mut compare)?;
+                let position = leaf.lower_bound_raw_by(&mut compare)?;
                 let exhausted = position >= leaf.len();
                 self.leaf = Some(leaf);
                 self.index = position;
@@ -1589,7 +1803,7 @@ impl<'a, P: PageIo + ?Sized> Cursor<'a, P> {
             if branch.level() != node_level {
                 return Err(bounds(Some(page_no), CorruptDetail::PageType));
             }
-            let index = branch.predecessor_by(&mut compare)?.unwrap_or(0);
+            let index = branch.predecessor_raw_by(&mut compare)?.unwrap_or(0);
             self.path.push((page_no, index, node_level));
             page_no = branch.child(index)?;
             node_level -= 1;
@@ -1609,18 +1823,40 @@ impl<'a, P: PageIo + ?Sized> Cursor<'a, P> {
     where
         F: FnMut(&Key) -> Result<Ordering, ZoneFileError>,
     {
-        // `seek_by` встаёт на первый ключ `>= target`. Ключи одного владельца
-        // могут пересекать границу листа, поэтому шагаем назад до первого
-        // ключа, который компаратор действительно считает меньшим.
-        let _ = self.seek_by(&mut compare)?;
+        self.seek_prev_raw_by(move |bytes, _name_len| {
+            let key =
+                Key::from_validated(bytes).ok_or_else(|| bounds(None, CorruptDetail::KeyOrder))?;
+            compare(&key)
+        })
+    }
+
+    /// `seek_prev_by` по сырым байтам ключа (без материализации [`Key`]).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённая страница; ошибка компаратора.
+    pub fn seek_prev_raw_by<F>(&mut self, mut compare: F) -> Result<bool, ZoneFileError>
+    where
+        F: FnMut(&[u8], usize) -> Result<Ordering, ZoneFileError>,
+    {
+        // `seek_raw_by` встаёт на первый ключ `>= target`. Ключи одного
+        // владельца могут пересекать границу листа, поэтому шагаем назад до
+        // первого ключа, который компаратор действительно считает меньшим.
+        let _ = self.seek_raw_by(&mut compare)?;
+        let mut buffer = [0_u8; KEY_MAX];
         loop {
             if !self.retreat()? {
                 return Ok(false);
             }
-            let Some(key) = self.key()? else {
+            let Some(leaf) = &self.leaf else {
                 return Ok(false);
             };
-            if compare(&key)? == Ordering::Less {
+            if self.index >= leaf.len() {
+                continue;
+            }
+            let len = leaf.key_raw(self.index, &mut buffer)?;
+            let name_len = leaf.name_len_at(self.index)?;
+            if compare(buffer.get(..len).unwrap_or(&[]), name_len)? == Ordering::Less {
                 return Ok(true);
             }
         }
@@ -1755,6 +1991,18 @@ impl<'a, P: PageIo + ?Sized> Cursor<'a, P> {
     pub fn key(&self) -> Result<Option<Key>, ZoneFileError> {
         match &self.leaf {
             Some(leaf) if self.index < leaf.len() => leaf.key(self.index).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// Имя текущего ключа (без материализации [`Key`]).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — страница повреждена (недостижимо после `decode`).
+    pub fn owner(&self) -> Result<Option<NameRle>, ZoneFileError> {
+        match &self.leaf {
+            Some(leaf) if self.index < leaf.len() => leaf.owner_at(self.index).map(Some),
             _ => Ok(None),
         }
     }
@@ -2096,6 +2344,25 @@ impl ZoneTree {
         }
     }
 
+    fn node_flags_cached<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        cache: &PageCache,
+        txn: u64,
+        name: &NameRle,
+    ) -> Result<Option<u16>, ZoneFileError> {
+        let key = Key::new(name, T_NODE, 0, 0)?;
+        match self.tree.lookup_cached(io, cache, txn, &key)? {
+            None => Ok(None),
+            Some(entry) => match entry.value {
+                DecodedValue::Rrset { value, .. } if value.kind == ValueKind::Node => {
+                    Ok(Some(value.flags))
+                }
+                _ => Err(tree_order(None, CorruptDetail::KeyOrder)),
+            },
+        }
+    }
+
     /// Точный поиск `RRset` `(name, type, subtype)`.
     ///
     /// # Errors
@@ -2187,13 +2454,8 @@ impl ZoneTree {
         if self.tree.is_empty() {
             return Ok(false);
         }
-        let probe = ChildrenProbe::new(name);
-        let mut cursor = self.tree.cursor(io, txn);
-        if !cursor.seek_by(|key| probe.compare_key(key))? {
-            return Ok(false);
-        }
-        match cursor.key()? {
-            Some(key) => probe.matches(&key),
+        match self.next_name(io, txn, Some(name))? {
+            Some(next) => Ok(is_descendant(&next, name)),
             None => Ok(false),
         }
     }
@@ -2228,6 +2490,88 @@ impl ZoneTree {
         })
     }
 
+    /// Предикат `has_children` через `PageCache`.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево; ошибки [`PageIo`].
+    pub fn has_children_cached<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        cache: &PageCache,
+        txn: u64,
+        name: &NameRle,
+    ) -> Result<bool, ZoneFileError> {
+        if self.tree.is_empty() {
+            return Ok(false);
+        }
+        match self.tree.next_name_cached(io, cache, txn, Some(name))? {
+            Some(next) => Ok(is_descendant(&next, name)),
+            None => Ok(false),
+        }
+    }
+
+    /// Состояние имени через `PageCache` (горячий негативный путь).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево; ошибки [`PageIo`].
+    pub fn node_cached<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        cache: &PageCache,
+        txn: u64,
+        name: &NameRle,
+    ) -> Result<NodeInfo, ZoneFileError> {
+        let flags = self.node_flags_cached(io, cache, txn, name)?;
+        let is_apex = name == &self.apex || flags.is_some_and(|flags| flags & RR_FLAG_APEX != 0);
+        let has_children = match flags {
+            Some(flags) => flags & RR_FLAG_CHILDREN_MAY_EXIST != 0,
+            None => self.has_children_cached(io, cache, txn, name)?,
+        };
+        Ok(NodeInfo {
+            name: *name,
+            exists: flags.is_some(),
+            is_apex,
+            is_empty_non_terminal: flags
+                .is_some_and(|flags| flags & RR_FLAG_EMPTY_NON_TERMINAL != 0),
+            is_zone_cut: flags
+                .is_some_and(|flags| flags & (RR_FLAG_DELEGATION | RR_FLAG_SECURE_DELEGATION) != 0),
+            has_children,
+            flags: flags.unwrap_or(0),
+        })
+    }
+
+    /// Следующее имя через `PageCache` (без материализации промежуточных ключей).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево; ошибки [`PageIo`].
+    pub fn next_name_cached<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        cache: &PageCache,
+        txn: u64,
+        after: Option<&NameRle>,
+    ) -> Result<Option<NameRle>, ZoneFileError> {
+        self.tree.next_name_cached(io, cache, txn, after)
+    }
+
+    /// Предыдущее имя через `PageCache` (без материализации промежуточных ключей).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt` — повреждённое дерево; ошибки [`PageIo`].
+    pub fn prev_name_cached<P: PageIo + ?Sized>(
+        &self,
+        io: &P,
+        cache: &PageCache,
+        txn: u64,
+        before: Option<&NameRle>,
+    ) -> Result<Option<NameRle>, ZoneFileError> {
+        self.tree.prev_name_cached(io, cache, txn, before)
+    }
+
     /// Следующее имя в каноническом порядке после `after` (`None` — первое).
     ///
     /// # Errors
@@ -2241,9 +2585,11 @@ impl ZoneTree {
     ) -> Result<Option<NameRle>, ZoneFileError> {
         let mut cursor = self.tree.cursor(io, txn);
         let found = match after {
-            Some(after) => cursor.seek_by(|key| {
-                let owner = key.owner()?;
-                name_cmp(owner.as_rle(), after.as_rle())
+            Some(after) => cursor.seek_raw_by(|bytes, name_len| {
+                Ok(name_cmp_validated(
+                    bytes.get(..name_len).unwrap_or(&[]),
+                    after.as_rle(),
+                ))
             })?,
             None => cursor.seek_first()?,
         };
@@ -2251,12 +2597,13 @@ impl ZoneTree {
             return Ok(None);
         }
         loop {
-            let Some(key) = cursor.key()? else {
+            let Some(owner) = cursor.owner()? else {
                 return Ok(None);
             };
-            let owner = key.owner()?;
             let greater = match after {
-                Some(after) => name_cmp(owner.as_rle(), after.as_rle())? == Ordering::Greater,
+                Some(after) => {
+                    name_cmp_validated(owner.as_rle(), after.as_rle()) == Ordering::Greater
+                }
                 None => true,
             };
             if greater {
@@ -2284,19 +2631,18 @@ impl ZoneTree {
     ) -> Result<Option<NameRle>, ZoneFileError> {
         let mut cursor = self.tree.cursor(io, txn);
         let found = match before {
-            Some(before) => cursor.seek_prev_by(|key| {
-                let owner = key.owner()?;
-                name_cmp(owner.as_rle(), before.as_rle())
+            Some(before) => cursor.seek_prev_raw_by(|bytes, name_len| {
+                Ok(name_cmp_validated(
+                    bytes.get(..name_len).unwrap_or(&[]),
+                    before.as_rle(),
+                ))
             })?,
             None => cursor.seek_last()?,
         };
         if !found {
             return Ok(None);
         }
-        let Some(key) = cursor.key()? else {
-            return Ok(None);
-        };
-        Ok(Some(key.owner()?))
+        cursor.owner()
     }
 
     /// Обходит владельцев ключей заданного типа в каноническом порядке.

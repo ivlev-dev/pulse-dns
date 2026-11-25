@@ -456,6 +456,11 @@ const CATALOG_LEASE_SHARD: usize = 0;
 /// Число шардов, доступных зонам: все, кроме каталога.
 const ZONE_LEASE_SHARDS: usize = LEASE_SHARDS - 1;
 const FREE_POOL_SHARDS: usize = 256;
+/// Порог числа bucket-групп зоны, после которого multi-COW сливает их в одну
+/// (страховка от роста цепочки при отстающих `MP`/`D_z`).
+const MULTI_COMPACT_BUCKETS: usize = 64;
+/// Сколько ждать catalog-lease в multi (другая мутация каталога).
+const CATALOG_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// Порог числа bucket-групп каталога, после которого append-цепочка
 /// сливается в одну группу (компакция с переиспользованием страниц).
 const CATALOG_COMPACT_GROUPS: usize = 64;
@@ -594,7 +599,11 @@ impl ParallelStore {
         let pins = PinTable::new(geometry.reader_slots().min(READER_SLOTS_V2))?;
         let gc = GcState::new(geometry.max_zones())?;
         let leases = allocate_leases()?;
-        let (raw_cache, node_cache) = make_caches(page_cache_entries);
+        // В multi-режиме номер страницы может быть переиспользован другим
+        // процессом; локальный кеш образа страницы без общей генерации
+        // невалидируем. Кеш включён только в single-process.
+        let (raw_cache, node_cache) =
+            make_caches(if multi_process { 0 } else { page_cache_entries });
         let dp = u64::from(geometry.page_data_first());
         let init = CoordInit {
             durable_pages: dp,
@@ -739,7 +748,11 @@ impl ParallelStore {
         let pins = PinTable::new(geometry.reader_slots().min(READER_SLOTS_V2))?;
         let gc = GcState::new(geometry.max_zones())?;
         let leases = allocate_leases()?;
-        let (raw_cache, node_cache) = make_caches(config.page_cache_entries);
+        let (raw_cache, node_cache) = make_caches(if config.multi_process {
+            0
+        } else {
+            config.page_cache_entries
+        });
         let durable_version_list = recovered
             .heads
             .iter()
@@ -1255,11 +1268,9 @@ impl ParallelStore {
                 self.stats.reclaimed_pages.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(page));
             }
-            // Межпроцессный режим — bump-only: общий per-zone пул не
-            // кэшируется между процессами (иначе возможна двойная выдача).
-            if self.is_multi() {
-                return Ok(None);
-            }
+            // Под lease зоны цепочка перечитана из durable-головы, а другие
+            // процессы не могут её менять; гейт `is_reclaimable` учитывает
+            // `D_z`, общие пины всех процессов (`MP`) и freeze.
             if let Some(page) = entry.chain.take_eligible(durable, rv, current_version) {
                 entry.dirty = true;
                 self.stats.reclaimed_pages.fetch_add(1, Ordering::Relaxed);
@@ -1286,13 +1297,10 @@ impl ParallelStore {
             entry.loaded = true;
         }
         while u32::try_from(pages.len()).unwrap_or(u32::MAX) < max_pages {
-            let page = entry.immediate.pop().or_else(|| {
-                if self.is_multi() {
-                    None
-                } else {
-                    entry.chain.take_eligible(durable, rv, current_version)
-                }
-            });
+            let page = entry
+                .immediate
+                .pop()
+                .or_else(|| entry.chain.take_eligible(durable, rv, current_version));
             match page {
                 Some(page) => pages.push(page),
                 None => break,
@@ -1371,7 +1379,14 @@ impl ParallelStore {
                 && *zone != 0
                 && self.geometry.zone_slot(*zone).is_ok()
             {
-                let _lease = self.lease_guard(*zone)?;
+                // В multi зона может быть под чужим lease: GC просто пропускает
+                // её до следующего прохода (не ошибка вызывающего).
+                let lease = match self.lease_guard(*zone) {
+                    Ok(lease) => lease,
+                    Err(ParallelError::ZoneBusy { .. }) => continue,
+                    Err(error) => return Err(error),
+                };
+                let _lease = lease;
                 self.reclaim_chain_pages(*zone)?;
             }
         }
@@ -1389,23 +1404,25 @@ impl ParallelStore {
         if head.prev_record == 0 {
             return Ok(0);
         }
-        // Межпроцессный режим не переиспользует страницы пула, а chain-страницы
-        // достижимы из durable-головы (их видит `fsck`), поэтому перенос в
-        // bucket не даёт ни рекламации, ни уменьшения утечек.
-        if self.is_multi() {
-            return Ok(0);
-        }
         let guard_ref = self
             .zone_guard
             .get(zone as usize)
             .ok_or(ParallelError::InvalidArgument { field: "zone_seq" })?;
         let floor = {
             let _guard = EpochGuard::enter(guard_ref);
+            // Читаем актуальные пины под guard'ом: кэш `gc.mp` мог отстать, а
+            // межпроцессные пины читаются из общей reader table.
+            let local = self.pins.oldest_reader(zone).unwrap_or(NO_VERSION);
+            let foreign = self
+                .shared
+                .as_ref()
+                .and_then(|coord| coord.oldest_pin(zone))
+                .unwrap_or(NO_VERSION);
             let freeze = self.gc.freeze_epoch();
             if freeze == 0 {
-                self.effective_mp(zone)
+                local.min(foreign)
             } else {
-                self.effective_mp(zone).min(freeze)
+                local.min(foreign).min(freeze)
             }
         };
         let ring = Ring::new(&self.file, &self.geometry);
@@ -1439,6 +1456,17 @@ impl ParallelStore {
             if !entry.loaded {
                 entry.chain = self.load_zone_chain(zone)?;
                 entry.loaded = true;
+            }
+            // Повторный GC до коммита: страница уже в пуле (chain может
+            // одновременно быть в bucket'е — §4.4). Не добавляем дубль.
+            let mut existing = HashSet::new();
+            for bucket in entry.chain.buckets() {
+                existing.insert(bucket.page);
+                existing.extend(bucket.pages.iter().copied());
+            }
+            collected.retain(|page| !existing.contains(page));
+            if collected.is_empty() {
+                return Ok(0);
             }
             entry
                 .chain
@@ -1489,15 +1517,24 @@ impl ParallelStore {
         // Снимок голов ДО fsync: всё, что записано к этому моменту, попадёт в
         // fdatasync; более новые публикации останутся неdurable (консервативно).
         let mut durable_heads = Vec::new();
+        let mut head_page_limit = 0_u64;
         for (index, block) in self.heads.iter().enumerate() {
             if let HeadRead::Stable { entry, .. } = block.load()
                 && let Ok(zone) = u32::try_from(index)
             {
+                head_page_limit = head_page_limit.max(u64::from(entry.page_limit_at_commit));
                 durable_heads.push((zone, entry.version));
             }
         }
         let mut durable = lock_unpoison(&self.alloc_durable);
-        let page_limit = durable.page_limit.max(self.allocator.cursor());
+        // Инвариант §3.4: `DP >= max(page_limit_at_commit всех валидных голов,
+        // cursor)`. Головы `Flush`/`Memory` другого процесса могли поднять
+        // `page_limit_at_commit` выше нашего курсора — `Sync` обязан их догнать,
+        // иначе рекламация сможет выдать страницу из-под опубликованной головы.
+        let page_limit = durable
+            .page_limit
+            .max(self.allocator.cursor())
+            .max(head_page_limit);
         let txn_limit = durable.txn_limit.max(self.published_txn());
         let seq = durable.seq.saturating_add(1);
         self.write_alloc_record(seq, page_limit, txn_limit)?;
@@ -2258,6 +2295,20 @@ impl ParallelStore {
         self.fire(CrashPoint::AfterHeadPublish);
     }
 
+    /// Нужен ли multi-режиму COW-пересбор цепочки в этом коммите.
+    ///
+    /// `dirty` означает, что `take_pool_page` уже выдернул страницу из
+    /// durable-группы: append-путь не смог бы убрать её из старого bucket'а.
+    fn multi_pool_needs_cow(&self, zone: u32) -> Result<bool, ParallelError> {
+        let mut shard = lock_unpoison(self.pool_shard(zone));
+        let entry = shard.zones.entry(zone).or_default();
+        if !entry.loaded {
+            entry.chain = self.load_zone_chain(zone)?;
+            entry.loaded = true;
+        }
+        Ok(entry.dirty || entry.chain.buckets().len() >= MULTI_COMPACT_BUCKETS)
+    }
+
     /// Готовит bucket-образы, `free_head` и (при необходимости) chain-страницу.
     ///
     /// Все страницы выдаются из staging-копии пула или bump-курсора; durable
@@ -2273,6 +2324,12 @@ impl ParallelStore {
         max_allocated: &mut u64,
     ) -> Result<ReclaimPrep, ParallelError> {
         if self.is_multi() {
+            // Append-only — быстрый путь. COW включается, когда писатель уже
+            // выдернул страницы из durable-пула (`dirty`) или цепочка групп
+            // выросла настолько, что её пора слить.
+            if self.multi_pool_needs_cow(zone)? {
+                return self.prepare_reclaim_cow(zone, version, drops, needs_chain, max_allocated);
+            }
             return self.prepare_reclaim_multi(zone, version, drops, needs_chain, max_allocated);
         }
         // Каталог получает коммит на каждое создание/удаление зоны. Пока
@@ -2285,6 +2342,20 @@ impl ParallelStore {
         if zone == 0 && self.catalog_append_allowed() {
             return self.prepare_reclaim_multi(zone, version, drops, needs_chain, max_allocated);
         }
+        self.prepare_reclaim_cow(zone, version, drops, needs_chain, max_allocated)
+    }
+
+    /// Пересобирает durable bucket-цепочку COW-путём (single-process и
+    /// периодическая компакция multi).
+    #[allow(clippy::too_many_lines)]
+    fn prepare_reclaim_cow(
+        &self,
+        zone: u32,
+        version: u64,
+        drops: &[u32],
+        needs_chain: bool,
+        max_allocated: &mut u64,
+    ) -> Result<ReclaimPrep, ParallelError> {
         let durable = self.durable_version(zone);
         let rv = self.reclaim_ceiling(zone);
         let data_first = self.geometry.page_data_first();
@@ -2355,16 +2426,18 @@ impl ParallelStore {
             freed.push(page);
             Ok(())
         };
-        // Каталог: слить все группы в одну. Иначе COW-перестройка сохраняет
-        // по группе на каждый коммит, и append-фаза (Memory) оставляла бы
-        // цепочку из тысяч bucket'ов, которые потом переписываются целиком.
-        let merge_catalog = zone == 0;
+        // Каталог: слить все группы в одну. В multi — страховка от роста
+        // цепочки при отстающих `MP`/`D_z`: после порога сливаем группы в одну
+        // (drop_txn текущего коммита; рекламация откладывается, но цепочка
+        // ограничена). Иначе COW-перестройка сохраняет по группе на коммит.
+        let merge_all =
+            zone == 0 || (self.is_multi() && pool.chain.buckets().len() >= MULTI_COMPACT_BUCKETS);
         for bucket in pool.chain.buckets() {
             // Страница 0 — группа, созданная GC и ещё не закодированная.
             if bucket.page != 0 {
                 push(bucket.page)?;
             }
-            if merge_catalog {
+            if merge_all {
                 for page in &bucket.pages {
                     push(*page)?;
                 }
@@ -2376,7 +2449,7 @@ impl ParallelStore {
         for page in std::mem::take(&mut pool.immediate) {
             push(page)?;
         }
-        if merge_catalog {
+        if merge_all {
             pool.chain = FreeChain::empty();
         }
         pool.chain.push_group(version, &freed, data_first)?;
@@ -2424,7 +2497,7 @@ impl ParallelStore {
                 pool.chain.push_group(version, &[extra], data_first)?;
             }
         }
-        let (free_head, images) = pool.chain.encode_images(zone, &pages)?;
+        let (free_head, images) = pool.chain.encode_images(zone, &pages, self.is_multi())?;
         pool.dirty = false;
         let max_page = Self::chain_max_page(&pool.chain);
         Ok(ReclaimPrep {
@@ -2575,10 +2648,11 @@ impl ParallelStore {
         max_allocated: &mut u64,
         reuse: bool,
     ) -> Result<u32, ParallelError> {
-        // Межпроцессный режим и append-only каталог не переиспользуют
-        // durable-пул: выдача из него без пересборки цепочки дала бы дубль
-        // страницы в bucket-группах. Bump-only сохраняет инвариант «страница
-        // выдана один раз».
+        // `reuse == false` — append-путь (multi без COW или append-каталог):
+        // выдача из durable-пула без пересборки цепочки дала бы дубль
+        // страницы в bucket-группах. COW-путь передаёт `reuse = true`: цепочка
+        // будет пересобрана, поэтому страница удаляется из старой группы. Bump
+        // сохраняет инвариант «страница выдана один раз».
         if reuse && let Some(page) = chain.take_eligible(durable, rv, version) {
             return Ok(page);
         }
@@ -3395,6 +3469,63 @@ impl ParallelStore {
             zone,
             generation: 0,
         })
+    }
+
+    /// Берёт lease каталога (`zone = 0`) и ждёт освобождения в multi.
+    ///
+    /// Каталог-мутации короткие, но создание зоны включает коммит зоны, поэтому
+    /// `ZoneBusy` в multi — обычная конкуренция, а не ошибка вызывающего:
+    /// каталог сериализуется lease'ом каталога (ADR 0007 §7.1).
+    ///
+    /// # Errors
+    ///
+    /// `ZoneBusy` — lease не освободился за [`CATALOG_LEASE_TIMEOUT`];
+    /// `Io`/`InvalidArgument` — как у [`ParallelStore::lease_guard`].
+    pub(crate) fn catalog_lease_guard(&self) -> Result<ZoneLease<'_>, ParallelError> {
+        let Some(coord) = &self.shared else {
+            return self.lease_guard(0);
+        };
+        let deadline = std::time::Instant::now() + CATALOG_LEASE_TIMEOUT;
+        loop {
+            match self.lease_guard(0) {
+                Ok(lease) => return Ok(lease),
+                Err(ParallelError::ZoneBusy { .. }) if std::time::Instant::now() < deadline => {
+                    // Мёртвый держатель не должен блокировать до таймаута.
+                    let _ = coord.sanitize_dead();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Очередь свободных `zone_seq` восстановлена (multi).
+    #[must_use]
+    pub(crate) fn zone_free_ready(&self) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|coord| coord.free_zone_ready())
+    }
+
+    /// Помечает очередь свободных `zone_seq` восстановленной.
+    pub(crate) fn mark_zone_free_ready(&self) {
+        if let Some(coord) = &self.shared {
+            coord.mark_free_zone_ready();
+        }
+    }
+
+    /// Забирает свободный `zone_seq` (под lease каталога).
+    pub(crate) fn pop_free_zone_seq(&self) -> Option<u32> {
+        self.shared
+            .as_ref()
+            .and_then(|coord| coord.pop_free_zone_seq())
+    }
+
+    /// Возвращает `zone_seq` в очередь переиспользования (под lease каталога).
+    pub(crate) fn push_free_zone_seq(&self, zone: u32) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|coord| coord.push_free_zone_seq(zone))
     }
 
     /// Голова зоны без проверки читаемости (включая каталог `0`).

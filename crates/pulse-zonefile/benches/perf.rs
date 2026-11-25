@@ -376,10 +376,46 @@ fn micro(size: u32) {
     );
 }
 
+fn hot_loop(size: u32) {
+    let (store, tree) = build_rrset_tree(size);
+    let cache = PageCache::new(PAGE_SIZE);
+    let working: Vec<Key> = (0..256_u32)
+        .map(|step| rrset_key(step.wrapping_mul(2_654_435_761) % size))
+        .collect();
+    for key in &working {
+        assert!(
+            tree.lookup_cached(&store, &cache, TXN, key)
+                .unwrap()
+                .is_some()
+        );
+    }
+    let started = Instant::now();
+    for step in 0..20_000_000_usize {
+        let key = working.get(step % working.len()).unwrap();
+        black_box(
+            tree.lookup_cached(black_box(&store), &cache, TXN, black_box(key))
+                .unwrap(),
+        );
+    }
+    println!(
+        "hot loop: {:?}/op, working_set={}",
+        started.elapsed() / 20_000_000,
+        working.len()
+    );
+}
+
 fn main() {
     println!("page_size={PAGE_SIZE}, lookups/run={LOOKUPS}, runs={RUNS}, batch={BATCH}");
     let only = std::env::args().nth(1);
     match only.as_deref() {
+        Some("hot") => {
+            let size = std::env::args()
+                .nth(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1_000_000);
+            hot_loop(size);
+            return;
+        }
         Some("insert") => {
             bench_insert(1_000_000);
             return;

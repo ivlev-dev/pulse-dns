@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use pulse_zonefile::key::NameRle;
 use pulse_zonefile::parallel::{
     CrashHook, CrashPoint, FsckLiteReport, OpenConfigV2, ParallelError, ParallelStore,
-    ParallelZone, ParallelZones, RrsetData, StoreConfig, SyncModeV2, ZoneCreateMeta,
+    ParallelZone, ParallelZones, RrsetData, StoreConfig, SyncModeV2, ZoneCreateMeta, ZoneMetaV2,
 };
 
 const CHILD: &str = "PULSE_MP_CHILD";
@@ -405,6 +405,132 @@ fn child_body() -> Result<(), String> {
             }
             Ok(())
         }
+        "catalog_create" => {
+            // Без внешнего flock: сериализация — catalog lease + commit-lock.
+            let store = open_multi(&path).map_err(|error| error.to_string())?;
+            for zone in parse_list(ZONES) {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let result = {
+                        let mut catalog =
+                            ParallelZones::open(&store).map_err(|error| error.to_string())?;
+                        catalog.create_zone(&origin(zone), ZoneCreateMeta { soa_serial: zone })
+                    };
+                    match result {
+                        Ok(_) => break,
+                        Err(error) if error.is_retryable() && Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => return Err(format!("create zone {zone}: {error}")),
+                    }
+                }
+            }
+            Ok(())
+        }
+        "catalog_meta" => {
+            let store = open_multi(&path).map_err(|error| error.to_string())?;
+            for zone in parse_list(ZONES) {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let result = {
+                        let mut catalog =
+                            ParallelZones::open(&store).map_err(|error| error.to_string())?;
+                        catalog.set_zone_meta(
+                            &origin(zone),
+                            ZoneMetaV2 {
+                                default_ttl: 1000 + zone,
+                                ..ZoneMetaV2::default()
+                            },
+                        )
+                    };
+                    match result {
+                        Ok(_) => break,
+                        Err(error) if error.is_retryable() && Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => return Err(format!("meta zone {zone}: {error}")),
+                    }
+                }
+            }
+            Ok(())
+        }
+        "catalog_churn" => {
+            let store = open_multi(&path).map_err(|error| error.to_string())?;
+            for zone in parse_list(ZONES) {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let result = {
+                        let mut catalog =
+                            ParallelZones::open(&store).map_err(|error| error.to_string())?;
+                        catalog.set_zone_meta(
+                            &origin(zone),
+                            ZoneMetaV2 {
+                                default_ttl: 1000 + zone,
+                                ..ZoneMetaV2::default()
+                            },
+                        )
+                    };
+                    match result {
+                        Ok(_) => break,
+                        Err(error) if error.is_retryable() && Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => return Err(format!("meta zone {zone}: {error}")),
+                    }
+                }
+                if zone % 2 != 0 {
+                    continue;
+                }
+                // Tombstone → global sync (D_z) → gc каталога → повторное
+                // создание на переиспользованном slot.
+                loop {
+                    let result = {
+                        let mut catalog =
+                            ParallelZones::open(&store).map_err(|error| error.to_string())?;
+                        catalog.delete_zone(&origin(zone))
+                    };
+                    match result {
+                        Ok(_) => break,
+                        Err(error) if error.is_retryable() && Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => return Err(format!("delete zone {zone}: {error}")),
+                    }
+                }
+                store.sync().map_err(|error| error.to_string())?;
+                {
+                    let mut catalog =
+                        ParallelZones::open(&store).map_err(|error| error.to_string())?;
+                    catalog.gc_catalog().map_err(|error| error.to_string())?;
+                }
+                loop {
+                    let result = {
+                        let mut catalog =
+                            ParallelZones::open(&store).map_err(|error| error.to_string())?;
+                        catalog
+                            .create_zone_with_meta(
+                                &origin(zone),
+                                ZoneCreateMeta {
+                                    soa_serial: zone + 1000,
+                                },
+                                ZoneMetaV2 {
+                                    default_ttl: 2000 + zone,
+                                    ..ZoneMetaV2::default()
+                                },
+                            )
+                            .map(|_| ())
+                    };
+                    match result {
+                        Ok(()) => break,
+                        Err(error) if error.is_retryable() && Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => return Err(format!("recreate zone {zone}: {error}")),
+                    }
+                }
+            }
+            Ok(())
+        }
         other => Err(format!("unknown child mode {other}")),
     }
 }
@@ -469,6 +595,109 @@ fn verify_zones(path: &Path, zones: u32, expected: u32) {
 fn fsck_multi(path: &Path) -> FsckLiteReport {
     let store = open_multi(path).expect("open multi for fsck");
     store.fsck_lite().expect("fsck")
+}
+
+/// 4 процесса × 250 зон: каталог пишется параллельно без внешнего flock
+/// (сериализация — catalog lease + commit-lock), читатель между процессами
+/// видит консистентный каталог через polling (`refresh`).
+#[test]
+fn four_processes_create_1000_zones_without_external_lock() {
+    const PER_PROCESS: u32 = 250;
+    const TOTAL: u32 = PER_PROCESS * 4;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("catalog-1000.v2");
+    let cfg = StoreConfig {
+        multi_process: true,
+        sync_mode: SyncModeV2::Memory,
+        ..StoreConfig::small(TOTAL + 64, 1 << 18)
+    };
+    drop(ParallelStore::create(&path, cfg).expect("create"));
+
+    let children: Vec<Child> = (0..4_u32)
+        .map(|process| {
+            let start = process * PER_PROCESS + 1;
+            let end = start + PER_PROCESS - 1;
+            let zones: Vec<String> = (start..=end).map(|zone| zone.to_string()).collect();
+            spawn_child("catalog_create", &path, &[(ZONES, zones.join(","))])
+        })
+        .collect();
+
+    let store = open_multi(&path).expect("open multi");
+    let mut catalog = ParallelZones::open(&store).expect("catalog");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        catalog.refresh().expect("refresh catalog");
+        if catalog.entry_count() == usize::try_from(TOTAL).unwrap() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "каталог не собрал {TOTAL} зон: {}",
+            catalog.entry_count()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for child in children {
+        assert_success(child);
+    }
+    catalog.refresh().expect("final refresh");
+    let zones = catalog.zones();
+    assert_eq!(zones.len(), usize::try_from(TOTAL).unwrap());
+    let mut seqs = std::collections::HashSet::new();
+    for zone in 1..=TOTAL {
+        assert!(catalog.zone_seq(&origin(zone)).is_some(), "зона {zone}");
+        assert!(seqs.insert(catalog.zone_seq(&origin(zone)).unwrap()));
+    }
+    assert!(store.fsck_lite().expect("fsck").ok);
+}
+
+/// 4 процесса: update meta, delete/gc/recreate части зон. Каталог не теряет
+/// обновления; slot'ы переиспользуются, записи консистентны.
+#[test]
+fn four_processes_update_delete_recreate_catalog_consistently() {
+    const PER_PROCESS: u32 = 40;
+    const TOTAL: u32 = PER_PROCESS * 4;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("catalog-churn.v2");
+    let cfg = StoreConfig {
+        multi_process: true,
+        sync_mode: SyncModeV2::Sync,
+        ..StoreConfig::small(TOTAL + 64, 1 << 18)
+    };
+    let store = setup(&path, TOTAL, cfg);
+    drop(store);
+
+    let children: Vec<Child> = (0..4_u32)
+        .map(|process| {
+            let start = process * PER_PROCESS + 1;
+            let end = start + PER_PROCESS - 1;
+            let zones: Vec<String> = (start..=end).map(|zone| zone.to_string()).collect();
+            spawn_child("catalog_churn", &path, &[(ZONES, zones.join(","))])
+        })
+        .collect();
+    for child in children {
+        assert_success(child);
+    }
+
+    let store = open_multi(&path).expect("open multi");
+    let catalog = ParallelZones::open(&store).expect("catalog");
+    let zones = catalog.zones();
+    assert_eq!(zones.len(), usize::try_from(TOTAL).unwrap());
+    let mut seqs = std::collections::HashSet::new();
+    for zone in 1..=TOTAL {
+        let origin = origin(zone);
+        let seq = catalog.zone_seq(&origin).expect("zone missing");
+        assert!(seqs.insert(seq), "zone_seq {seq} дублируется");
+        let meta = catalog.zone_meta(&origin).expect("meta missing");
+        let expected = if zone % 2 == 0 {
+            2000 + zone
+        } else {
+            1000 + zone
+        };
+        assert_eq!(meta.default_ttl, expected, "zone {zone}: meta потеряна");
+    }
+    assert!(store.fsck_lite().expect("fsck").ok);
+    assert!(store.fsck_graph().expect("graph").fatal.is_none());
 }
 
 /// 4 процесса × 4 зоны: параллельные коммиты, нет потерь/дублей, reopen+fsck.

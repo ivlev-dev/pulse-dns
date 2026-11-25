@@ -330,6 +330,15 @@ impl<'a> ParallelZones<'a> {
     /// `Corrupt`/`Io` — каталог не читается; `Tree` — повреждён B+tree.
     #[allow(clippy::too_many_lines)]
     pub fn open(store: &'a ParallelStore) -> Result<Self, ParallelError> {
+        // Чтение каталога идёт под его lease: в multi-режиме другой процесс
+        // иначе мог бы переиспользовать страницу дерева каталога между
+        // чтением головы и обходом узлов.
+        let _lease = store.catalog_lease_guard()?;
+        Self::open_inner(store)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_inner(store: &'a ParallelStore) -> Result<Self, ParallelError> {
         let mut zones = Self {
             store,
             tree: BTree::empty(),
@@ -340,7 +349,11 @@ impl<'a> ParallelZones<'a> {
         };
         // `next_seq` восстанавливается и по головам (включая tombstone), иначе
         // после удаления всех зон каталог пуст и свободные слоты терялись бы.
-        zones.next_seq = Self::scan_next_seq(store);
+        // В multi полный скан не нужен: очередь свободных слотов живёт в
+        // sidecar, а для orphan-голов есть проверка кандидата в `create_zone`.
+        if !store.multi_process() {
+            zones.next_seq = Self::scan_next_seq(store);
+        }
         let Some(head) = store.catalog_head() else {
             return Ok(zones);
         };
@@ -375,6 +388,35 @@ impl<'a> ParallelZones<'a> {
         Ok(zones)
     }
 
+    /// Перечитывает каталог, если другой процесс его изменил.
+    ///
+    /// Возвращает `true`, если локальный снапшот был обновлён. Долгоживущий
+    /// читатель каталога должен периодически вызывать `refresh()` (polling):
+    /// сам `ParallelZones` — снимок, а не живое представление.
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt`/`Io` — каталог не читается.
+    pub fn refresh(&mut self) -> Result<bool, ParallelError> {
+        let current = self.store.catalog_head().map_or(0, |head| head.version);
+        if current == self.version {
+            return Ok(false);
+        }
+        let store = self.store;
+        *self = Self::open(store)?;
+        Ok(true)
+    }
+
+    /// Перечитывает каталог под уже взятым lease каталога.
+    fn reload_locked(&mut self) -> Result<(), ParallelError> {
+        let current = self.store.catalog_head().map_or(0, |head| head.version);
+        if current != self.version {
+            let store = self.store;
+            *self = Self::open_inner(store)?;
+        }
+        Ok(())
+    }
+
     fn scan_next_seq(store: &ParallelStore) -> u32 {
         let mut next = 1_u32;
         for seq in 1..store.geometry().max_zones() {
@@ -395,6 +437,21 @@ impl<'a> ParallelZones<'a> {
     #[must_use]
     pub const fn catalog_version(&self) -> u64 {
         self.version
+    }
+
+    /// Число записей в снимке каталога (включая tombstone-записи до `gc`).
+    ///
+    /// Дешёвая операция для polling: не читает головы зон. Для живого
+    /// состава вызывайте [`ParallelZones::zones`] после [`ParallelZones::refresh`].
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Снимок каталога пуст.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// `zone_seq` по origin (включая tombstone).
@@ -438,6 +495,8 @@ impl<'a> ParallelZones<'a> {
         meta: ZoneMetaV2,
     ) -> Result<bool, ParallelError> {
         meta.validate()?;
+        let _lease = self.store.catalog_lease_guard()?;
+        self.reload_locked()?;
         let Some(mut value) = self.entries.get(origin).copied() else {
             return Err(ParallelError::InvalidArgument { field: "origin" });
         };
@@ -445,7 +504,7 @@ impl<'a> ParallelZones<'a> {
             return Ok(false);
         }
         value.meta = meta;
-        self.write_catalog_edit(CatalogEdit::Upsert(origin, value))?;
+        self.write_catalog_edit_locked(CatalogEdit::Upsert(origin, value))?;
         self.entries.insert(*origin, value);
         Ok(true)
     }
@@ -514,6 +573,11 @@ impl<'a> ParallelZones<'a> {
         zone_meta: ZoneMetaV2,
     ) -> Result<u32, ParallelError> {
         zone_meta.validate()?;
+        // Каталог сериализуется lease'ом каталога между процессами; под ним
+        // перечитываем актуальное состояние, чтобы не потерять чужую запись
+        // (M3-L1 снят).
+        let _lease = self.store.catalog_lease_guard()?;
+        self.reload_locked()?;
         if self.entries.contains_key(origin) {
             return Err(ParallelError::InvalidArgument { field: "origin" });
         }
@@ -522,26 +586,28 @@ impl<'a> ParallelZones<'a> {
                 what: "soa_serial (max 0x7fff_ffff)",
             });
         }
+        self.ensure_free_list()?;
         let max_zones = self.store.geometry().max_zones();
-        let mut zone_seq = self.reusable_slot();
-        if zone_seq.is_none() {
-            let mut candidate = self.next_seq;
-            // Пропускаем «осиротевшие» головы от краха между коммитом зоны и
-            // каталогом (PW-L7): слот занят, но в каталоге его нет.
-            while candidate < max_zones && self.store.head_entry(candidate).is_some() {
-                candidate = candidate.saturating_add(1);
-            }
-            zone_seq = Some(candidate);
-        }
-        let zone_seq = zone_seq.ok_or(ParallelError::InvalidArgument { field: "max_zones" })?;
-        if zone_seq >= max_zones {
-            return Err(ParallelError::InvalidArgument { field: "max_zones" });
-        }
-        self.next_seq = self.next_seq.max(zone_seq.saturating_add(1));
+        let (zone_seq, from_free) = self
+            .allocate_zone_seq(max_zones)
+            .ok_or(ParallelError::InvalidArgument { field: "max_zones" })?;
         self.store.reset_zone_slot(zone_seq);
-        let mut zone = ParallelZone::open_new(self.store, *origin, zone_seq, meta.soa_serial)?;
-        let outcome = zone.commit_with(self.store.effective_mode())?;
-        // Порядок локов (ADR 0007 §8): lease зоны не удерживается при правке
+        let mut zone = match ParallelZone::open_new(self.store, *origin, zone_seq, meta.soa_serial)
+        {
+            Ok(zone) => zone,
+            Err(error) => {
+                self.release_zone_seq(zone_seq, from_free);
+                return Err(error);
+            }
+        };
+        let outcome = match zone.commit_with(self.store.effective_mode()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.release_zone_seq(zone_seq, from_free);
+                return Err(error);
+            }
+        };
+        // Порядок локов (ADR 0007 §8): lease зоны отпускается до правки
         // каталога. Каталог живёт в выделенном шарде (`CATALOG_LEASE_SHARD`),
         // поэтому зоны 256/512/… не делят с ним нереентерабельный mutex.
         drop(zone);
@@ -552,10 +618,75 @@ impl<'a> ParallelZones<'a> {
             created_txn: outcome.version,
             meta: zone_meta,
         };
-        self.write_catalog_edit(CatalogEdit::Upsert(origin, value))?;
+        self.write_catalog_edit_locked(CatalogEdit::Upsert(origin, value))?;
+        self.next_seq = self.next_seq.max(zone_seq.saturating_add(1));
         self.origins.insert(zone_seq, *origin);
         self.entries.insert(*origin, value);
         Ok(zone_seq)
+    }
+
+    /// Восстанавливает общую очередь свободных `zone_seq` из durable
+    /// tombstone'ов (multi; один раз на sidecar).
+    #[allow(clippy::unnecessary_wraps)]
+    fn ensure_free_list(&mut self) -> Result<(), ParallelError> {
+        if !self.store.multi_process() || self.store.zone_free_ready() {
+            return Ok(());
+        }
+        let max_zones = self.store.geometry().max_zones();
+        for seq in 1..max_zones {
+            if self.origins.contains_key(&seq) {
+                continue;
+            }
+            if self.slot_reusable(seq) {
+                self.store.push_free_zone_seq(seq);
+            }
+        }
+        self.store.mark_zone_free_ready();
+        Ok(())
+    }
+
+    /// Durable tombstone-слот, пригодный для повторного создания.
+    fn slot_reusable(&self, seq: u32) -> bool {
+        let Some(head) = self.store.head_entry(seq) else {
+            return false;
+        };
+        head.is_tombstone()
+            && head.deleted_txn != 0
+            && self.store.durable_version(seq) >= head.deleted_txn
+    }
+
+    /// Выдаёт `zone_seq` из очереди переиспользования или bump-курсора.
+    fn allocate_zone_seq(&mut self, max_zones: u32) -> Option<(u32, bool)> {
+        if self.store.multi_process() {
+            while let Some(seq) = self.store.pop_free_zone_seq() {
+                if seq < max_zones && !self.origins.contains_key(&seq) && self.slot_reusable(seq) {
+                    return Some((seq, true));
+                }
+            }
+        } else if let Some(seq) = self.reusable_slot() {
+            return Some((seq, true));
+        }
+        let mut candidate = self.next_seq.max(1);
+        // Пропускаем «осиротевшие» головы от краха между коммитом зоны и
+        // каталогом (PW-L7): слот занят, но в каталоге его нет.
+        while candidate < max_zones && self.store.head_entry(candidate).is_some() {
+            candidate = candidate.saturating_add(1);
+        }
+        (candidate < max_zones).then_some((candidate, false))
+    }
+
+    /// Возвращает `zone_seq` в очередь, если слот так и не стал зоной.
+    fn release_zone_seq(&self, zone_seq: u32, from_free: bool) {
+        if !from_free {
+            return;
+        }
+        let still_free = self
+            .store
+            .head_entry(zone_seq)
+            .is_none_or(|head| head.is_tombstone());
+        if still_free {
+            let _ = self.store.push_free_zone_seq(zone_seq);
+        }
     }
 
     /// Durable tombstone-слот без записи в каталоге, который можно
@@ -590,6 +721,9 @@ impl<'a> ParallelZones<'a> {
     ///
     /// `Io`/`Corrupt`/`MapFull` — коммит каталога.
     pub fn gc_catalog(&mut self) -> Result<Vec<NameRle>, ParallelError> {
+        let _lease = self.store.catalog_lease_guard()?;
+        self.reload_locked()?;
+        self.ensure_free_list()?;
         let mut candidates = Vec::new();
         for (origin, value) in &self.entries {
             let Some(head) = self.store.head_entry(value.zone_seq) else {
@@ -606,9 +740,11 @@ impl<'a> ParallelZones<'a> {
         candidates.sort_by_key(|(_, zone)| *zone);
         let mut removed = Vec::new();
         for (origin, zone) in candidates {
-            if self.write_catalog_edit(CatalogEdit::Remove(&origin))? {
+            if self.write_catalog_edit_locked(CatalogEdit::Remove(&origin))? {
                 self.entries.remove(&origin);
                 self.origins.remove(&zone);
+                // Слот durable-tombstone'а снова доступен любому процессу.
+                let _ = self.store.push_free_zone_seq(zone);
                 removed.push(origin);
             }
         }
@@ -624,6 +760,9 @@ impl<'a> ParallelZones<'a> {
     ///
     /// `NoZoneVersion` — зоны нет; `Busy`/`Io` — lease/запись.
     pub fn delete_zone(&mut self, origin: &NameRle) -> Result<CommitOutcome, ParallelError> {
+        // Каталог мог измениться в другом процессе; tombstone пишется по
+        // `zone_seq`, поэтому перед открытием writer'а обновляем снимок.
+        self.refresh()?;
         let mut zone = self.writer(origin)?;
         zone.commit_tombstone()
     }
@@ -681,8 +820,9 @@ impl<'a> ParallelZones<'a> {
         })
     }
 
-    fn write_catalog_edit(&mut self, edit: CatalogEdit<'_>) -> Result<bool, ParallelError> {
-        let _lease = self.store.lease_guard(0)?;
+    /// Публикует правку каталога; вызывающий держит lease каталога и
+    /// перечитал снимок под ним.
+    fn write_catalog_edit_locked(&mut self, edit: CatalogEdit<'_>) -> Result<bool, ParallelError> {
         // Правка каталога короткоживущая: локальный батч `WriteIo::new`
         // (64 страницы) терялся бы на каждом коммите каталога, раздувая файл
         // на ~64 страницы на зону. Каталог резервирует страницы точно.
@@ -2131,10 +2271,12 @@ impl ZoneReader<'_> {
         .map_err(|error| self.io.take_error().unwrap_or(error))
     }
 
-    /// Zero-copy `lookup` inline-значения (без аллокаций payload).
+    /// Zero-copy `lookup` значения (без аллокаций payload).
     ///
-    /// Для `OVERFLOW` возвращает `value.kind == Overflow` и `payload = &[]`;
-    /// полный набор даёт [`ZoneReader::lookup`].
+    /// Для `OVERFLOW`, умещающегося в одну страницу, `payload` — непрерывный
+    /// поток `[u16 length][rdata]…` этой страницы. Для цепочки из нескольких
+    /// страниц `value.kind == Overflow`, а `payload = &[]`: полный набор даёт
+    /// [`ZoneReader::lookup`] (материализация).
     ///
     /// # Errors
     ///
@@ -2164,6 +2306,18 @@ impl ZoneReader<'_> {
         if value.kind == ValueKind::Node {
             return Ok(None);
         }
+        let payload = if value.kind == ValueKind::Overflow {
+            let chain = self
+                .tree
+                .read_overflow(&self.io, self.version(), &value)
+                .map_err(ParallelError::Tree)?;
+            chain
+                .as_ref()
+                .and_then(crate::overflow::OverflowRrset::contiguous)
+                .unwrap_or(&[])
+        } else {
+            payload
+        };
         // Имя/тип уже провалидированы при разборе ключа страницы.
         let name =
             NameRle::from_validated(entry.key.owner_bytes()).ok_or(ParallelError::Corrupt {
@@ -2226,9 +2380,11 @@ impl ZoneReader<'_> {
     ///
     /// `Corrupt`/`Io`.
     pub fn node(&self, name: &NameRle) -> Result<NodeInfo, ParallelError> {
-        self.tree
-            .node(&self.io, self.version(), name)
-            .map_err(|error| tree_error(&self.io, error))
+        let node = match self.store.node_cache() {
+            Some(cache) => self.tree.node_cached(&self.io, cache, self.version(), name),
+            None => self.tree.node(&self.io, self.version(), name),
+        };
+        node.map_err(|error| tree_error(&self.io, error))
     }
 
     /// Следующее имя в каноническом порядке.
@@ -2237,9 +2393,13 @@ impl ZoneReader<'_> {
     ///
     /// `Corrupt`/`Io`.
     pub fn next_name(&self, after: Option<&NameRle>) -> Result<Option<NameRle>, ParallelError> {
-        self.tree
-            .next_name(&self.io, self.version(), after)
-            .map_err(|error| tree_error(&self.io, error))
+        let name = match self.store.node_cache() {
+            Some(cache) => self
+                .tree
+                .next_name_cached(&self.io, cache, self.version(), after),
+            None => self.tree.next_name(&self.io, self.version(), after),
+        };
+        name.map_err(|error| tree_error(&self.io, error))
     }
 
     /// Предыдущее имя (`predecessor`) в каноническом порядке до `before`
@@ -2251,9 +2411,13 @@ impl ZoneReader<'_> {
     ///
     /// `Corrupt`/`Io`.
     pub fn prev_name(&self, before: Option<&NameRle>) -> Result<Option<NameRle>, ParallelError> {
-        self.tree
-            .prev_name(&self.io, self.version(), before)
-            .map_err(|error| tree_error(&self.io, error))
+        let name = match self.store.node_cache() {
+            Some(cache) => self
+                .tree
+                .prev_name_cached(&self.io, cache, self.version(), before),
+            None => self.tree.prev_name(&self.io, self.version(), before),
+        };
+        name.map_err(|error| tree_error(&self.io, error))
     }
 
     /// Обходит владельцев записей заданного типа в каноническом порядке.

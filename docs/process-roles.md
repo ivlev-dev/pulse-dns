@@ -53,11 +53,16 @@ CLI-эквиваленты: `--role dns|api|all`, `--dns-workers N`, `--api-work
 
 ## Ограничения
 
-* Каталог зон (`create_zone`/`delete_zone`/метаданные) должен менять один
-  процесс (M3-L1): на практике это роль `api`; роль `dns` каталог только читает.
+* Каталог зон (`create_zone`/`delete_zone`/метаданные) может менять любой
+  процесс: мутации сериализуются catalog lease + commit-lock (ADR 0007 §8);
+  роль `dns` каталог обычно только читает и периодически делает `refresh()`.
 * Durable-фаза коммитов сериализуется глобальным commit-lock: потолок
   throughput — `fdatasync` одного inode (M3-L2).
-* Рекламация страниц в multi — bump-only до quiescent-окна (PW-L13).
+* Рекламация страниц в multi идёт под lease зоны с гейтом
+  `drop_txn < min(D_z, MP всех процессов, freeze)`; `fsck --repair` и возврат
+  `[DP, cursor)` после `kill -9` — только в quiescent-окне.
+* В multi отключён page/node-кеш (общей генерации страницы нет):
+  single-process путь не затронут.
 * `dns_workers` задаёт число UDP/DNSCrypt worker'ов. `api_workers` — лимит
   одновременных REST-соединений (на соединение — один поток),
   `api_rate_limit_per_sec` — token bucket на токен (по умолчанию 100).

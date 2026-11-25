@@ -100,6 +100,12 @@ pub(crate) struct BucketImage {
 /// Образы bucket-страниц: `(page_no, bytes)`.
 pub(crate) type BucketImages = Vec<(u32, Vec<u8>)>;
 
+/// Фрагмент группы, которому при COW-пересборке нужна отдельная страница.
+struct BucketChunk<'a> {
+    drop_txn: u64,
+    pages: &'a [u32],
+}
+
 /// Цепочка bucket'ов одной зоны (в памяти, порядок `drop_txn` возрастает).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FreeChain {
@@ -406,6 +412,12 @@ impl FreeChain {
     /// `pages.len()` обязан совпадать с [`FreeChain::needed_images`].
     /// Возвращает `(new_head, images)`; цепочка обновляется на новые страницы.
     ///
+    /// `descending` задаёт порядок on-disk цепочки: `false` — по возрастанию
+    /// `drop_txn` (COW single-process, голова — самая старая группа),
+    /// `true` — по убыванию (append-режим multi: голова — самая новая группа).
+    /// Смешивать порядки в одной цепочке нельзя: загрузка отвергает такую
+    /// цепочку как `WatermarkRegression`.
+    ///
     /// # Errors
     ///
     /// `Corrupt` — несовпадение числа образов/пустая группа.
@@ -413,14 +425,17 @@ impl FreeChain {
         &mut self,
         zone: u32,
         pages: &[u32],
+        descending: bool,
     ) -> Result<(u32, BucketImages), ParallelError> {
         let needed = self.needed_images();
         if pages.len() != needed {
             return Err(corrupt(0, V2CorruptKind::WatermarkRegression));
         }
-        let mut assigned = 0_usize;
-        let mut images = Vec::with_capacity(needed);
-        let mut rebuilt = Vec::with_capacity(self.buckets.len());
+        // Нарезаем группы на будущие страницы в порядке возрастания
+        // `drop_txn` (внутри группы — по порядку страниц). `buckets` всегда
+        // хранится по возрастанию, поэтому этот список — канонический порядок
+        // для памяти; on-disk цепочка может идти и в обратном направлении.
+        let mut chunks: Vec<BucketChunk<'_>> = Vec::with_capacity(needed);
         for bucket in &self.buckets {
             if bucket.pages.is_empty() {
                 // Пустой bucket уже отдан в группу `version` (его страница
@@ -432,24 +447,47 @@ impl FreeChain {
                 let end = offset
                     .saturating_add(FREE_BUCKET_CAPACITY)
                     .min(bucket.pages.len());
-                let chunk = bucket.pages.get(offset..end).unwrap_or(&[]);
-                let page = *pages
-                    .get(assigned)
-                    .ok_or_else(|| corrupt(0, V2CorruptKind::WatermarkRegression))?;
-                assigned += 1;
-                let next = pages.get(assigned).copied().unwrap_or(0);
-                let raw = encode_bucket(page, zone, bucket.drop_txn, next, chunk)?;
-                images.push((page, raw));
-                rebuilt.push(FreeBucket {
-                    page,
+                chunks.push(BucketChunk {
                     drop_txn: bucket.drop_txn,
-                    pages: chunk.to_vec(),
+                    pages: bucket.pages.get(offset..end).unwrap_or(&[]),
                 });
                 offset = end;
             }
         }
-        self.buckets = rebuilt;
-        self.head_page = self.buckets.first().map_or(0, |bucket| bucket.page);
+        // Порядок обхода = порядок on-disk цепочки: для убывающей (multi)
+        // начинаем с самой новой группы.
+        let mut order: Vec<usize> = (0..chunks.len()).collect();
+        if descending {
+            order.reverse();
+        }
+        let mut assigned = 0_usize;
+        let mut images = Vec::with_capacity(needed);
+        let mut new_pages: Vec<u32> = vec![0; chunks.len()];
+        for index in order {
+            let Some(chunk) = chunks.get(index) else {
+                continue;
+            };
+            let page = *pages
+                .get(assigned)
+                .ok_or_else(|| corrupt(0, V2CorruptKind::WatermarkRegression))?;
+            assigned += 1;
+            if let Some(slot) = new_pages.get_mut(index) {
+                *slot = page;
+            }
+            let next = pages.get(assigned).copied().unwrap_or(0);
+            let raw = encode_bucket(page, zone, chunk.drop_txn, next, chunk.pages)?;
+            images.push((page, raw));
+        }
+        self.buckets = chunks
+            .iter()
+            .zip(new_pages)
+            .map(|(chunk, page)| FreeBucket {
+                page,
+                drop_txn: chunk.drop_txn,
+                pages: chunk.pages.to_vec(),
+            })
+            .collect();
+        self.head_page = pages.first().copied().unwrap_or(0);
         Ok((self.head(), images))
     }
 }
@@ -664,6 +702,44 @@ mod tests {
     }
 
     #[test]
+    fn encode_images_descending_keeps_append_order() {
+        let mut chain = FreeChain::from_buckets(vec![
+            FreeBucket {
+                page: 10,
+                drop_txn: 3,
+                pages: vec![100, 101],
+            },
+            FreeBucket {
+                page: 11,
+                drop_txn: 5,
+                pages: vec![102],
+            },
+        ]);
+        let needed = chain.needed_images();
+        assert_eq!(needed, 2);
+        let (head, images) = chain.encode_images(7, &[200, 201], true).unwrap();
+        // Голова — самая новая группа (drop_txn = 5), её next — старая.
+        assert_eq!(head, 200);
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].0, 200);
+        assert_eq!(wire::read_u32(&images[0].1, FREE_OFF_NEXT), Some(201));
+        assert_eq!(wire::read_u64(&images[0].1, 48), Some(5));
+        assert_eq!(images[1].0, 201);
+        assert_eq!(wire::read_u32(&images[1].1, FREE_OFF_NEXT), Some(0));
+        assert_eq!(wire::read_u64(&images[1].1, 48), Some(3));
+        // В памяти группы по-прежнему по возрастанию `drop_txn`.
+        assert_eq!(
+            chain
+                .buckets()
+                .iter()
+                .map(|bucket| bucket.drop_txn)
+                .collect::<Vec<_>>(),
+            vec![3, 5]
+        );
+        assert_eq!(chain.head(), 200);
+    }
+
+    #[test]
     fn encode_images_assigns_pages_in_order() {
         let mut chain = FreeChain::from_buckets(vec![
             FreeBucket {
@@ -679,7 +755,7 @@ mod tests {
         ]);
         let needed = chain.needed_images();
         assert_eq!(needed, 2);
-        let (head, images) = chain.encode_images(7, &[200, 201]).unwrap();
+        let (head, images) = chain.encode_images(7, &[200, 201], false).unwrap();
         assert_eq!(head, 200);
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].0, 200);

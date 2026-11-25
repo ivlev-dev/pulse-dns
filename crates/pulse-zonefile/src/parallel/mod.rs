@@ -18,7 +18,9 @@
 //! ([`ParallelZones::gc_catalog`]); sweep утечек ([`ParallelStore::leak_report`],
 //! [`ParallelStore::repair_leaks`], [`fsck_repair`]). M3 (ADR 0007):
 //! `multi_process` — общий sidecar-координатор (`coord`), per-zone
-//! `fcntl`-lease, reader table и seqlock публикации. B3: `pulsed` работает
+//! `fcntl`-lease, reader table и seqlock публикации; каталог пишут все
+//! процессы под catalog lease, durable-пулы рекламируются под lease с гейтом
+//! `drop_txn < min(D_z, MP, freeze)`. B3: `pulsed` работает
 //! поверх v2 (`--data`), а пользовательские
 //! метаданные зоны (вид, TTL по умолчанию, denial) хранятся в записи каталога
 //! ([`ZoneMetaV2`]); v1-модули остаются для чтения legacy-файлов и
