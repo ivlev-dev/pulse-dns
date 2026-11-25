@@ -25,7 +25,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use pulse_runtime::{BackendPreference, Reply, RuntimeConfig, UdpServer};
+use pulse_runtime::{BackendPreference, HugePages, Reply, RuntimeConfig, UdpServer, mem};
 use rustix::net::sockopt;
 
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +50,7 @@ struct Args {
     coop: bool,
     busy_poll: Option<u16>,
     prefer_busy_poll: bool,
+    huge_pages: HugePages,
 }
 
 impl Default for Args {
@@ -75,6 +76,7 @@ impl Default for Args {
             coop: false,
             busy_poll: None,
             prefer_busy_poll: false,
+            huge_pages: HugePages::Auto,
         }
     }
 }
@@ -146,6 +148,11 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Option<Args>, St
                 );
             }
             "--prefer-busy-poll" => args.prefer_busy_poll = true,
+            "--huge-pages" => {
+                args.huge_pages = value()?
+                    .parse()
+                    .map_err(|error: String| format!("--huge-pages: {error}"))?;
+            }
             "--backend" => {
                 args.backend = match value()?.as_str() {
                     "auto" => BackendPreference::Auto,
@@ -214,7 +221,8 @@ fn run(args: Args) -> Result<(), String> {
         .with_register_files(args.register_files)
         .with_coop_taskrun(args.coop)
         .with_sqpoll(args.sqpoll)
-        .with_sqpoll_cpu(args.sqpoll_cpu);
+        .with_sqpoll_cpu(args.sqpoll_cpu)
+        .with_huge_pages(args.huge_pages);
     if let Some(buffers) = args.rx_buffers {
         config.rx_buffers = buffers;
     }
@@ -262,6 +270,11 @@ fn run(args: Args) -> Result<(), String> {
     println!(
         "  tuning       : rx_buf={}B, rx_buffers={}, tx_slots={}, cqe_batch={}, stack={}KiB, pin={}, busy_poll={:?}",
         args.rx_buffer, tuning.0, tuning.1, tuning.2, args.stack_kb, args.pin, args.busy_poll
+    );
+    println!(
+        "  huge_pages   : {} (global THP: {:?})",
+        args.huge_pages,
+        mem::thp_status()
     );
     println!(
         "  clients      : {} (window {}, {} B payload)",

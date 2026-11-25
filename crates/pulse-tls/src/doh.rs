@@ -4,29 +4,41 @@
 //! `Content-Type: application/dns-message` и `GET /healthz`. ALPN сервера —
 //! `http/1.1`, preface HTTP/2 получает `505 HTTP Version Not Supported`.
 //! Для HTTP/2 используйте `Doh2Server` (feature `http2`).
+//!
+//! Keep-alive-соединения обслуживаются задачами общего tokio event-loop
+//! ([`crate::net::TcpServer`]). Медленный заголовок/тело ограничены
+//! `request_timeout`, простой между запросами — `idle_timeout`; один
+//! slowloris-клиент не блокирует остальные соединения.
 
-use std::net::{Shutdown as SocketShutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
+use tokio::time::{Instant, timeout, timeout_at};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 
 use crate::acl::Acl;
 use crate::doh_core::DohCore;
 use crate::dot::DnsHandler;
 use crate::error::Error;
 use crate::http::{HttpResponse, Method, ParseError, find_head_end, parse_head};
+use crate::net::{BufferPool, ConnectionHandler, ServerHooks, TcpServer, shrink};
 use crate::ratelimit::RateLimitConfig;
-use crate::server::{ConnectionGuard, ConnectionSet};
 use crate::stats::{Stats, StatsSnapshot};
 use crate::tls::TlsConfig;
-use crate::transport::TlsStream;
 
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const DEFAULT_MAX_BODY: usize = 65_535;
 const DEFAULT_MAX_HEADER: usize = 16 * 1024;
 const MAX_HEADER_SOFT_LIMIT: usize = 1024 * 1024;
 const DEFAULT_MAX_REQUESTS: usize = 100;
+const READ_CHUNK: usize = 4096;
+const BODY_BUFFER_CHUNK: usize = 4096;
+const BODY_BUFFER_POOL: usize = 512;
+const PENDING_KEEP: usize = 8 * 1024;
 
 /// Конфигурация DoH-сервера.
 #[derive(Clone, Debug)]
@@ -41,6 +53,8 @@ pub struct DohConfig {
     pub handshake_timeout: Duration,
     /// Таймаут простоя между HTTP-запросами.
     pub idle_timeout: Duration,
+    /// Таймаут чтения заголовка/тела одного запроса и записи ответа.
+    pub request_timeout: Duration,
     /// Таймаут ожидания соединений при shutdown.
     pub shutdown_timeout: Duration,
     /// Максимальный размер HTTP-тела и DNS-сообщения.
@@ -67,6 +81,7 @@ impl DohConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             handshake_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(5),
             max_body_size: DEFAULT_MAX_BODY,
             max_header_size: DEFAULT_MAX_HEADER,
@@ -96,6 +111,7 @@ impl DohConfig {
         }
         if self.handshake_timeout.is_zero()
             || self.idle_timeout.is_zero()
+            || self.request_timeout.is_zero()
             || self.shutdown_timeout.is_zero()
         {
             return Err(Error::InvalidConfig("timeouts must be positive"));
@@ -108,17 +124,13 @@ struct Shared {
     config: DohConfig,
     core: DohCore,
     stats: Arc<Stats>,
-    shutdown: Arc<AtomicBool>,
+    buffers: Arc<BufferPool>,
 }
 
 /// Запущенный DoH-сервер.
 pub struct DohServer {
-    local_addr: SocketAddr,
-    shutdown: Arc<AtomicBool>,
+    tcp: TcpServer,
     stats: Arc<Stats>,
-    connections: Arc<ConnectionSet>,
-    acceptor: Option<JoinHandle<()>>,
-    shutdown_timeout: Duration,
     tls: TlsConfig,
 }
 
@@ -126,7 +138,7 @@ impl std::fmt::Debug for DohServer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DohServer")
-            .field("local_addr", &self.local_addr)
+            .field("local_addr", &self.tcp.local_addr())
             .field("stats", &self.stats.snapshot())
             .finish_non_exhaustive()
     }
@@ -138,7 +150,7 @@ impl DohServer {
     /// # Errors
     ///
     /// Ошибка bind/настройки listener, некорректная конфигурация или
-    /// невозможность создать поток.
+    /// невозможность запустить event-loop.
     pub fn bind<H>(config: DohConfig, handler: H) -> Result<Self, Error>
     where
         H: Fn(&[u8], SocketAddr) -> Option<Vec<u8>> + Send + Sync + 'static,
@@ -181,61 +193,34 @@ impl DohServer {
             Arc::clone(&stats),
         )?;
         let listener = TcpListener::bind(config.listen)?;
-        let local_addr = listener.local_addr()?;
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let connections = Arc::new(ConnectionSet::new(Arc::clone(&stats)));
         let shared = Arc::new(Shared {
             config: config.clone(),
             core,
             stats: Arc::clone(&stats),
-            shutdown: Arc::clone(&shutdown),
+            buffers: Arc::new(BufferPool::new(BODY_BUFFER_CHUNK, BODY_BUFFER_POOL)),
         });
-        let on_connection = {
-            let shared = Arc::clone(&shared);
-            Arc::new(
-                move |stream: TcpStream, peer: SocketAddr, guard: ConnectionGuard| {
-                    if let Some(acl) = &shared.config.acl
-                        && !acl.allows(peer.ip())
-                    {
-                        shared.stats.connection_rejected();
-                        let _ = stream.shutdown(SocketShutdown::Both);
-                        return;
-                    }
-                    let stats = Arc::clone(&shared.stats);
-                    let shared = Arc::clone(&shared);
-                    let thread_name = format!("pulse-doh-{}", guard.id());
-                    let spawned = thread::Builder::new().name(thread_name).spawn(move || {
-                        let _guard = guard;
-                        if let Err(error) = handle_connection(stream, peer, &shared) {
-                            if error.is_timeout() {
-                                shared.stats.timeout();
-                            } else if !error.is_closed() {
-                                shared.stats.error();
-                            }
-                        }
-                    });
-                    if spawned.is_err() {
-                        stats.error();
-                    }
-                },
-            )
-        };
-        let acceptor = crate::server::spawn_acceptor(
-            "pulse-doh-accept".to_owned(),
+        let connection_handler = make_connection_handler(Arc::clone(&shared));
+        let hooks = ServerHooks::new(
+            Some({
+                let stats = Arc::clone(&stats);
+                Arc::new(move || stats.connection_rejected())
+            }),
+            Some({
+                let stats = Arc::clone(&stats);
+                Arc::new(move || stats.error())
+            }),
+        );
+        let tcp = TcpServer::start(
+            "pulse-doh",
             listener,
-            Arc::clone(&shutdown),
-            Arc::clone(&stats),
-            Arc::clone(&connections),
             config.max_connections,
-            on_connection,
+            config.shutdown_timeout,
+            hooks,
+            connection_handler,
         )?;
         Ok(Self {
-            local_addr,
-            shutdown,
+            tcp,
             stats,
-            connections,
-            acceptor: Some(acceptor),
-            shutdown_timeout: config.shutdown_timeout,
             tls: config.tls,
         })
     }
@@ -243,7 +228,7 @@ impl DohServer {
     /// Фактический адрес (полезен при `port = 0`).
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        self.tcp.local_addr()
     }
 
     /// Текущая статистика.
@@ -255,7 +240,7 @@ impl DohServer {
     /// Проверяет, остановлен ли сервер.
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
+        self.tcp.is_shutdown()
     }
 
     /// Перечитывает сертификат из PEM-байтов для новых соединений.
@@ -279,20 +264,47 @@ impl DohServer {
     ///
     /// # Errors
     ///
-    /// [`Error::ThreadPanicked`], если accept-поток запаниковал.
+    /// [`Error::Io`] с [`std::io::ErrorKind::TimedOut`], если соединения не
+    /// закрылись за `shutdown_timeout`.
     pub fn shutdown(&mut self) -> Result<(), Error> {
-        crate::server::stop(
-            &self.shutdown,
-            &mut self.acceptor,
-            &self.connections,
-            self.shutdown_timeout,
-        )
+        self.tcp.shutdown().map_err(Error::Io)
     }
 }
 
 impl Drop for DohServer {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+fn make_connection_handler(shared: Arc<Shared>) -> ConnectionHandler {
+    Arc::new(move |stream, peer, shutdown| {
+        let shared = Arc::clone(&shared);
+        Box::pin(async move {
+            if let Some(acl) = &shared.config.acl
+                && !acl.allows(peer.ip())
+            {
+                shared.stats.connection_rejected();
+                return;
+            }
+            shared.stats.connection_opened();
+            let _guard = ActiveGuard(Arc::clone(&shared.stats));
+            if let Err(error) = handle_connection(stream, peer, &shared, shutdown).await {
+                if error.is_timeout() {
+                    shared.stats.timeout();
+                } else if !error.is_closed() {
+                    shared.stats.error();
+                }
+            }
+        })
+    })
+}
+
+struct ActiveGuard(Arc<Stats>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.connection_closed();
     }
 }
 
@@ -304,28 +316,50 @@ enum HeadError {
     Failed(Error),
 }
 
-fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Result<(), Error> {
-    let mut tls =
-        match TlsStream::accept(&shared.config.tls, stream, shared.config.handshake_timeout) {
-            Ok(tls) => {
-                shared.stats.handshake_ok();
-                tls
-            }
-            Err(error) => {
-                shared.stats.handshake_failed();
-                return Err(error);
-            }
-        };
-    tls.set_idle_timeout(shared.config.idle_timeout)?;
+async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    shared: &Shared,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), Error> {
+    if let Err(error) = stream.set_nodelay(true) {
+        shared.stats.handshake_failed();
+        return Err(Error::Io(error));
+    }
+    let acceptor = TlsAcceptor::from(shared.config.tls.server_config());
+    let handshake = tokio::select! {
+        biased;
+        _ = shutdown.changed() => return Ok(()),
+        result = timeout(shared.config.handshake_timeout, acceptor.accept(stream)) => result,
+    };
+    let mut tls = match handshake {
+        Ok(Ok(tls)) => {
+            shared.stats.handshake_ok();
+            tls
+        }
+        Ok(Err(error)) => {
+            shared.stats.handshake_failed();
+            return Err(Error::Io(error));
+        }
+        Err(_) => {
+            shared.stats.handshake_failed();
+            return Err(Error::HandshakeTimeout);
+        }
+    };
+    shared.config.tls.verify_alpn(tls.get_ref().1)?;
+
     let mut pending = Vec::new();
     let mut requests = 0_usize;
-    loop {
-        if shared.shutdown.load(Ordering::Acquire)
-            || requests >= shared.config.max_requests_per_connection
-        {
+    while requests < shared.config.max_requests_per_connection {
+        if *shutdown.borrow() {
             break;
         }
-        let head = match read_head(&mut tls, &mut pending, shared.config.max_header_size) {
+        let head = tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            head = read_head(&mut tls, &mut pending, shared) => head,
+        };
+        let head = match head {
             Ok(Some(head)) => head,
             Ok(None) | Err(HeadError::Closed) => break,
             Err(HeadError::Timeout) => {
@@ -335,7 +369,13 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Re
             Err(HeadError::TooLarge) => {
                 shared.stats.http_error();
                 let response = HttpResponse::error(400, "request header too large", true);
-                send_response(&mut tls, &response, &shared.stats)?;
+                send_response(
+                    &mut tls,
+                    &response,
+                    &shared.stats,
+                    shared.config.request_timeout,
+                )
+                .await?;
                 break;
             }
             Err(HeadError::Failed(error)) => return Err(error),
@@ -347,13 +387,25 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Re
             Err(ParseError::UnsupportedVersion) => {
                 shared.stats.http_error();
                 let response = HttpResponse::error(505, "HTTP/2 is not supported", true);
-                send_response(&mut tls, &response, &shared.stats)?;
+                send_response(
+                    &mut tls,
+                    &response,
+                    &shared.stats,
+                    shared.config.request_timeout,
+                )
+                .await?;
                 break;
             }
             Err(ParseError::Malformed) => {
                 shared.stats.http_error();
                 let response = HttpResponse::error(400, "malformed HTTP request", true);
-                send_response(&mut tls, &response, &shared.stats)?;
+                send_response(
+                    &mut tls,
+                    &response,
+                    &shared.stats,
+                    shared.config.request_timeout,
+                )
+                .await?;
                 break;
             }
         };
@@ -361,14 +413,26 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Re
             && requests < shared.config.max_requests_per_connection;
         if !shared.core.allow_rate(peer) {
             let response = HttpResponse::error(429, "rate limit exceeded", true);
-            send_response(&mut tls, &response, &shared.stats)?;
+            send_response(
+                &mut tls,
+                &response,
+                &shared.stats,
+                shared.config.request_timeout,
+            )
+            .await?;
             break;
         }
         let (method, target, _version, headers) = head.into_parts();
         if headers.has_transfer_encoding() {
             shared.stats.http_error();
             let response = HttpResponse::error(400, "Transfer-Encoding is not supported", true);
-            send_response(&mut tls, &response, &shared.stats)?;
+            send_response(
+                &mut tls,
+                &response,
+                &shared.stats,
+                shared.config.request_timeout,
+            )
+            .await?;
             break;
         }
         let content_length = match headers.content_length() {
@@ -376,7 +440,13 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Re
             Err(()) => {
                 shared.stats.http_error();
                 let response = HttpResponse::error(400, "invalid Content-Length", true);
-                send_response(&mut tls, &response, &shared.stats)?;
+                send_response(
+                    &mut tls,
+                    &response,
+                    &shared.stats,
+                    shared.config.request_timeout,
+                )
+                .await?;
                 break;
             }
         };
@@ -385,16 +455,28 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Re
                 let Some(length) = content_length else {
                     shared.stats.http_error();
                     let response = HttpResponse::error(400, "Content-Length is required", true);
-                    send_response(&mut tls, &response, &shared.stats)?;
+                    send_response(
+                        &mut tls,
+                        &response,
+                        &shared.stats,
+                        shared.config.request_timeout,
+                    )
+                    .await?;
                     break;
                 };
                 if length > shared.config.max_body_size {
                     shared.stats.http_error();
                     let response = HttpResponse::error(413, "request body too large", true);
-                    send_response(&mut tls, &response, &shared.stats)?;
+                    send_response(
+                        &mut tls,
+                        &response,
+                        &shared.stats,
+                        shared.config.request_timeout,
+                    )
+                    .await?;
                     break;
                 }
-                match read_body(&mut tls, &mut pending, length) {
+                match read_body(&mut tls, &mut pending, length, shared).await {
                     Ok(body) => body,
                     Err(error) if error.is_timeout() => {
                         shared.stats.timeout();
@@ -408,7 +490,13 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Re
                 if content_length.unwrap_or(0) > 0 {
                     shared.stats.http_error();
                     let response = HttpResponse::error(400, "request body is not allowed", true);
-                    send_response(&mut tls, &response, &shared.stats)?;
+                    send_response(
+                        &mut tls,
+                        &response,
+                        &shared.stats,
+                        shared.config.request_timeout,
+                    )
+                    .await?;
                     break;
                 }
                 Vec::new()
@@ -418,85 +506,114 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Re
         let mut response = shared
             .core
             .route(peer, method, &target, headers.content_type(), &body);
+        drop(body);
         response.close |= !keep_alive;
         let status = response.status;
         let close = response.close;
-        send_response(&mut tls, &response, &shared.stats)?;
+        send_response(
+            &mut tls,
+            &response,
+            &shared.stats,
+            shared.config.request_timeout,
+        )
+        .await?;
         if status >= 400 {
             shared.stats.http_error();
+        }
+        if pending.capacity() > PENDING_KEEP {
+            shrink(&mut pending, PENDING_KEEP);
         }
         if close {
             break;
         }
     }
-    tls.close();
+    let _ = timeout(shared.config.request_timeout, tls.shutdown()).await;
     Ok(())
 }
 
-fn read_head(
-    tls: &mut TlsStream,
+async fn read_head(
+    tls: &mut TlsStream<tokio::net::TcpStream>,
     pending: &mut Vec<u8>,
-    max_size: usize,
+    shared: &Shared,
 ) -> Result<Option<Vec<u8>>, HeadError> {
+    let mut deadline: Option<Instant> = None;
     loop {
         if let Some(end) = find_head_end(pending) {
             let head = pending.get(..end).ok_or(HeadError::TooLarge)?.to_vec();
             pending.drain(..end);
             return Ok(Some(head));
         }
-        if pending.len() >= max_size {
+        if pending.len() >= shared.config.max_header_size {
             return Err(HeadError::TooLarge);
         }
-        let capacity = max_size - pending.len();
-        let mut chunk = [0_u8; 4096];
+        let capacity = shared.config.max_header_size - pending.len();
+        let mut chunk = [0_u8; READ_CHUNK];
         let read_len = chunk.len().min(capacity);
         let buffer = chunk.get_mut(..read_len).ok_or(HeadError::TooLarge)?;
-        match tls.read(buffer) {
-            Ok(0) if pending.is_empty() => return Ok(None),
-            Ok(0) => return Err(HeadError::Closed),
-            Ok(read) => {
+        let wait = deadline.map_or(shared.config.idle_timeout, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        let read = if deadline.is_some() {
+            timeout_at(deadline.unwrap_or_else(Instant::now), tls.read(buffer)).await
+        } else {
+            timeout(wait, tls.read(buffer)).await
+        };
+        match read {
+            Ok(Ok(0)) if pending.is_empty() => return Ok(None),
+            Ok(Ok(0)) => return Err(HeadError::Closed),
+            Ok(Ok(read)) => {
+                deadline.get_or_insert_with(|| Instant::now() + shared.config.request_timeout);
                 let data = chunk.get(..read).ok_or(HeadError::TooLarge)?;
                 pending.extend_from_slice(data);
             }
-            Err(error) if error.is_timeout() => return Err(HeadError::Timeout),
-            Err(error) if error.is_closed() => return Err(HeadError::Closed),
-            Err(error) => return Err(HeadError::Failed(error)),
+            Ok(Err(error)) => return Err(HeadError::Failed(Error::Io(error))),
+            Err(_) => return Err(HeadError::Timeout),
         }
     }
 }
 
-fn read_body(tls: &mut TlsStream, pending: &mut Vec<u8>, length: usize) -> Result<Vec<u8>, Error> {
-    let mut body = Vec::with_capacity(length);
+async fn read_body(
+    tls: &mut TlsStream<tokio::net::TcpStream>,
+    pending: &mut Vec<u8>,
+    length: usize,
+    shared: &Shared,
+) -> Result<Vec<u8>, Error> {
+    let mut body = shared.buffers.acquire();
+    body.prepare(length);
     let take = length.min(pending.len());
     let initial = pending
         .get(..take)
         .ok_or_else(|| Error::Http("body offset out of bounds".to_owned()))?;
-    body.extend_from_slice(initial);
+    body.get_mut(..take)
+        .ok_or_else(|| Error::Http("body offset out of bounds".to_owned()))?
+        .copy_from_slice(initial);
     pending.drain(..take);
-    while body.len() < length {
-        let mut chunk = [0_u8; 8192];
-        let want = (length - body.len()).min(chunk.len());
-        let buffer = chunk
-            .get_mut(..want)
-            .ok_or_else(|| Error::Http("body chunk out of bounds".to_owned()))?;
-        let read = tls.read(buffer)?;
-        if read == 0 {
-            return Err(Error::Closed);
-        }
-        let data = chunk
-            .get(..read)
-            .ok_or_else(|| Error::Http("body read out of bounds".to_owned()))?;
-        body.extend_from_slice(data);
+    let end = body.len().min(length);
+    let remaining = body
+        .get_mut(take..end)
+        .ok_or_else(|| Error::Http("body chunk out of bounds".to_owned()))?;
+    match timeout(shared.config.request_timeout, tls.read_exact(remaining)).await {
+        Ok(Ok(_)) => Ok(body.take_vec(length)),
+        Ok(Err(error)) => Err(Error::Io(error)),
+        Err(_) => Err(Error::Timeout),
     }
-    Ok(body)
 }
 
-fn send_response(tls: &mut TlsStream, response: &HttpResponse, stats: &Stats) -> Result<(), Error> {
+async fn send_response(
+    tls: &mut TlsStream<tokio::net::TcpStream>,
+    response: &HttpResponse,
+    stats: &Stats,
+    deadline: Duration,
+) -> Result<(), Error> {
     let bytes = response.to_bytes();
-    tls.write_all(&bytes)?;
-    stats.written_bytes(bytes.len());
     if response.status == 200 && response.content_type == "application/dns-message" {
         stats.response();
     }
+    match timeout(deadline, tls.write_all(&bytes)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(Error::Io(error)),
+        Err(_) => return Err(Error::Timeout),
+    }
+    stats.written_bytes(bytes.len());
     Ok(())
 }

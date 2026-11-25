@@ -82,6 +82,7 @@ impl Stats {
         }
     }
 
+    #[cfg(any(feature = "http2", feature = "http3", feature = "doq"))]
     pub(crate) fn try_open(&self, max_connections: usize) -> bool {
         let limit = u64::try_from(max_connections).unwrap_or(u64::MAX);
         let active = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;
@@ -94,12 +95,13 @@ impl Stats {
         true
     }
 
-    pub(crate) fn active(&self) -> u64 {
-        self.active_connections.load(Ordering::Relaxed)
-    }
-
     pub(crate) fn connection_rejected(&self) {
         self.rejected_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn connection_opened(&self) {
+        self.connections.fetch_add(1, Ordering::Relaxed);
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn connection_closed(&self) {

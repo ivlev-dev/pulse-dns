@@ -4,6 +4,8 @@ use std::fmt;
 use std::num::NonZeroU16;
 use std::time::Duration;
 
+use crate::mem::HugePages;
+
 /// Приёмный режим UDP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RxMode {
@@ -107,7 +109,12 @@ pub struct RuntimeConfig {
     pub pin_to_cpu: bool,
     /// Явный список CPU для worker'ов (`sched_getaffinity`/cpuset учитываются);
     /// пусто — все разрешённые процессу CPU.
+    ///
+    /// Непустой список включает пиннинг worker'ов даже при `pin_to_cpu = false`;
+    /// затем CPU раздаются по кругу (`allowed[index % len]`).
     pub cpu_affinity: Vec<usize>,
+    /// Политика transparent huge pages для RX-арены (provided buffers).
+    pub huge_pages: HugePages,
     /// Включить `IORING_SETUP_SQPOLL` с указанным idle-таймаутом.
     ///
     /// При отсутствии прав ядро вернёт ошибку; рантайм продолжит без SQPOLL
@@ -153,6 +160,7 @@ impl Default for RuntimeConfig {
             thread_stack_size: 512 * 1024,
             pin_to_cpu: false,
             cpu_affinity: Vec::new(),
+            huge_pages: HugePages::Auto,
             sqpoll_idle: None,
             sqpoll_cpu: None,
             busy_poll_us: None,
@@ -243,6 +251,13 @@ impl RuntimeConfig {
     #[must_use]
     pub fn with_cpu_affinity(mut self, cpus: Vec<usize>) -> Self {
         self.cpu_affinity = cpus;
+        self
+    }
+
+    /// Задать политику huge pages для RX-арены.
+    #[must_use]
+    pub const fn with_huge_pages(mut self, policy: HugePages) -> Self {
+        self.huge_pages = policy;
         self
     }
 
@@ -440,6 +455,11 @@ mod tests {
         assert_eq!(cfg.cqe_batch, 512);
         assert_eq!(cfg.thread_stack_size, 256 * 1024);
         assert_eq!(cfg.cpu_affinity, vec![0, 2]);
+        assert_eq!(cfg.huge_pages, HugePages::Auto);
+        assert_eq!(
+            cfg.clone().with_huge_pages(HugePages::Never).huge_pages,
+            HugePages::Never
+        );
         assert_eq!(cfg.sqpoll_idle, Some(1000));
         assert_eq!(cfg.sqpoll_cpu, Some(2));
         assert_eq!(cfg.busy_poll_us, Some(50));

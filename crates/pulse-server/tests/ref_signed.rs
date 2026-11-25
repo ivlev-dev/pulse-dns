@@ -77,7 +77,13 @@ fn base_data() -> Vec<Rrset> {
             "*.wc.example.com",
             Rtype::CNAME,
             120,
-            [Rdata::Cname(name("www.example.com"))],
+            [Rdata::Cname(name("chain1.example.com"))],
+        ),
+        rrset(
+            "*.wcd.example.com",
+            Rtype::CNAME,
+            120,
+            [Rdata::Cname(name("host.dname.example.com"))],
         ),
         rrset(
             "alias.example.com",
@@ -123,6 +129,18 @@ fn base_data() -> Vec<Rrset> {
             Rtype::A,
             300,
             [Rdata::A("192.0.2.53".parse().expect("ipv4"))],
+        ),
+        rrset(
+            "dname.example.com",
+            Rtype::DNAME,
+            300,
+            [Rdata::Dname(name("dname-target.example.com"))],
+        ),
+        rrset(
+            "host.dname-target.example.com",
+            Rtype::A,
+            300,
+            [Rdata::A("192.0.2.61".parse().expect("ipv4"))],
         ),
         // Insecure delegation: без DS.
         rrset(
@@ -323,8 +341,14 @@ fn case_list(denial: &str) -> Vec<(&'static str, String, Rtype)> {
             Rtype::AAAA,
         ),
         ("wildcard-cname", "x.wc.example.com".to_owned(), Rtype::A),
+        (
+            "wildcard-cname-dname",
+            "x.wcd.example.com".to_owned(),
+            Rtype::A,
+        ),
         ("cname", "alias.example.com".to_owned(), Rtype::A),
         ("chain", "chain1.example.com".to_owned(), Rtype::A),
+        ("dname", "host.dname.example.com".to_owned(), Rtype::A),
         (
             "referral-secure",
             "host.sub.example.com".to_owned(),

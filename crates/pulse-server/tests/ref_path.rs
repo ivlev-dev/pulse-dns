@@ -2,9 +2,10 @@
 //!
 //! Быстрый путь обязан выдавать ровно те же октеты, что и `respond_into`
 //! (и `respond` + `encode`) для всех горячих случаев: точные `A`/`AAAA`/`MX`/
-//! `TXT`/`SRV`/`CNAME`, `CNAME`-цепочки, wildcard, `NXDOMAIN`/`NODATA`,
-//! EDNS0 без `DO`, усечение по payload. Не-горячие случаи (делегирования,
-//! `DNAME`, `ANY`, `DO = 1`, циклы) обязаны уходить на полный путь.
+//! `TXT`/`SRV`/`CNAME`, `CNAME`-цепочки, wildcard, `DNAME`, циклы
+//! `CNAME`/`DNAME` (`SERVFAIL`), `YXDOMAIN`, `NXDOMAIN`/`NODATA`, EDNS0 без
+//! `DO`, oversized `RRset` и усечение по payload. Не-горячие случаи
+//! (трансферы, запросы вне зоны) обязаны уходить на полный путь.
 
 mod common;
 
@@ -106,6 +107,81 @@ fn zone() -> InMemoryZone {
     zone
 }
 
+/// Зона с `DNAME` (в зоне/вне зоны/цикл) и `CNAME`-входами в `DNAME`.
+fn dname_zone() -> InMemoryZone {
+    let mut zone = zone();
+    zone.insert(rrset(
+        "dname-ext.example.com",
+        Rtype::DNAME,
+        300,
+        [Rdata::Dname(name("target.outside.test"))],
+    ))
+    .expect("dname external");
+    zone.insert(rrset(
+        "cname-to-dname.example.com",
+        Rtype::CNAME,
+        120,
+        [Rdata::Cname(name("host.dname.example.com"))],
+    ))
+    .expect("cname to dname");
+    zone.insert(rrset(
+        "*.wcd.example.com",
+        Rtype::CNAME,
+        120,
+        [Rdata::Cname(name("host.dname.example.com"))],
+    ))
+    .expect("wildcard to dname");
+    zone.insert(rrset(
+        "a.example.com",
+        Rtype::DNAME,
+        300,
+        [Rdata::Dname(name("b.example.com"))],
+    ))
+    .expect("dname a");
+    zone.insert(rrset(
+        "b.example.com",
+        Rtype::DNAME,
+        300,
+        [Rdata::Dname(name("a.example.com"))],
+    ))
+    .expect("dname b");
+    zone.insert(rrset(
+        "d1.example.com",
+        Rtype::DNAME,
+        300,
+        [Rdata::Dname(name("mid.example.com"))],
+    ))
+    .expect("dname d1");
+    zone.insert(rrset(
+        "mid.example.com",
+        Rtype::DNAME,
+        300,
+        [Rdata::Dname(name("final.example.com"))],
+    ))
+    .expect("dname mid");
+    zone.insert(rrset(
+        "host.final.example.com",
+        Rtype::A,
+        300,
+        [Rdata::A("192.0.2.62".parse().expect("ipv4"))],
+    ))
+    .expect("dname final target");
+    zone
+}
+
+/// Зона с wildcard-`CNAME`, продолжающим цепочку.
+fn wildcard_cname_zone() -> InMemoryZone {
+    let mut zone = dname_zone();
+    zone.insert(rrset(
+        "*.wc.example.com",
+        Rtype::CNAME,
+        120,
+        [Rdata::Cname(name("chain1.example.com"))],
+    ))
+    .expect("wildcard cname");
+    zone
+}
+
 #[test]
 fn exact_types_and_negative_paths_match() {
     let mut fixture = Fixture::new(zone());
@@ -148,9 +224,77 @@ fn cname_chains_match() {
             assert!(hot, "{label}: expected hot path");
         }
     }
-    // Цикл: быстрый путь обязан уступить полному (SERVFAIL, не NXDOMAIN).
+    // Цикл: быстрый путь отвечает `SERVFAIL` сам, байты совпадают с полным.
     let request = query("loop1.example.com", Rtype::A);
-    assert!(!fixture.check("loop", &request, Transport::Udp));
+    assert!(
+        fixture.check("loop", &request, Transport::Udp),
+        "loop must be answered (SERVFAIL) on the fast path"
+    );
+}
+
+#[test]
+fn dname_matches_and_chases() {
+    let mut fixture = Fixture::new(dname_zone());
+    for (label, qname, qtype) in [
+        ("dname-in-zone", "host.dname.example.com", Rtype::A),
+        ("dname-outside", "host.dname-ext.example.com", Rtype::A),
+        ("dname-via-cname", "cname-to-dname.example.com", Rtype::A),
+        ("dname-via-wildcard", "x.wcd.example.com", Rtype::A),
+        ("dname-target-aaaa", "host.dname.example.com", Rtype::AAAA),
+        ("dname-any", "host.dname.example.com", Rtype::ANY),
+        ("dname-qtype", "dname.example.com", Rtype::DNAME),
+        ("dname-double", "host.d1.example.com", Rtype::A),
+    ] {
+        let request = query(qname, qtype);
+        assert!(
+            fixture.check(label, &request, Transport::Udp),
+            "{label}: expected hot path"
+        );
+    }
+
+    // Цикл DNAME: быстрый путь обязан вернуть SERVFAIL, не зависнуть.
+    let request = query("x.a.example.com", Rtype::A);
+    assert!(
+        fixture.check("dname-loop", &request, Transport::Udp),
+        "dname loop must be answered (SERVFAIL) on the fast path"
+    );
+}
+
+#[test]
+fn dname_overflow_is_yxdomain_on_fast_path() {
+    let label = "a".repeat(63);
+    let target = format!("{label}.{label}.{label}");
+    let origin = name("dlong.example");
+    let mut zone = InMemoryZone::new(origin);
+    zone.insert(common::soa_for("dlong.example")).expect("soa");
+    zone.insert(rrset(
+        "long.dlong.example",
+        Rtype::DNAME,
+        300,
+        [Rdata::Dname(name(&target))],
+    ))
+    .expect("dname");
+    let mut fixture = Fixture::new(zone);
+    let request = query(&format!("{label}.long.dlong.example"), Rtype::A);
+    assert!(
+        fixture.check("dname-yxdomain", &request, Transport::Udp),
+        "YXDOMAIN must be answered on the fast path"
+    );
+}
+
+#[test]
+fn wildcard_cname_continues_chain() {
+    let mut fixture = Fixture::new(wildcard_cname_zone());
+    for (label, qname) in [
+        ("wildcard-cname-chain", "x.wc.example.com"),
+        ("wildcard-cname-dname", "y.wcd.example.com"),
+    ] {
+        let request = query(qname, Rtype::A);
+        assert!(
+            fixture.check(label, &request, Transport::Udp),
+            "{label}: expected hot path"
+        );
+    }
 }
 
 #[test]
@@ -218,7 +362,6 @@ fn truncation_and_tcp_match() {
 fn non_hot_queries_fall_back() {
     let mut fixture = Fixture::new(zone());
     for (label, request) in [
-        ("dname", query("host.dname.example.com", Rtype::A)),
         ("transfer", query("example.com", Rtype::AXFR)),
         ("outside", query("example.org", Rtype::A)),
     ] {
@@ -643,6 +786,59 @@ fn wire_zone() -> WireZone {
             pulse_dns::TxtData::new([b"base".to_vec()]).expect("txt"),
         )],
     ));
+    zone.insert(rrset(
+        "dname.example.com",
+        Rtype::DNAME,
+        300,
+        [Rdata::Dname(name("dname-target.example.com"))],
+    ));
+    zone.insert(rrset(
+        "host.dname-target.example.com",
+        Rtype::A,
+        300,
+        [Rdata::A("192.0.2.60".parse().expect("ipv4"))],
+    ));
+    zone.insert(rrset(
+        "loop1.example.com",
+        Rtype::CNAME,
+        120,
+        [Rdata::Cname(name("loop2.example.com"))],
+    ));
+    zone.insert(rrset(
+        "loop2.example.com",
+        Rtype::CNAME,
+        120,
+        [Rdata::Cname(name("loop1.example.com"))],
+    ));
+    zone.insert(rrset(
+        "*.wc.example.com",
+        Rtype::CNAME,
+        120,
+        [Rdata::Cname(name("c1.example.com"))],
+    ));
+    zone.insert(rrset(
+        "c1.example.com",
+        Rtype::CNAME,
+        120,
+        [Rdata::Cname(name("c2.example.com"))],
+    ));
+    zone.insert(rrset(
+        "c2.example.com",
+        Rtype::CNAME,
+        120,
+        [Rdata::Cname(name("www.example.com"))],
+    ));
+    zone.insert(rrset(
+        "big.example.com",
+        Rtype::TXT,
+        300,
+        (0..20).map(|index| {
+            Rdata::Txt(
+                pulse_dns::TxtData::new([format!("{index:04}-{}", "x".repeat(100)).into_bytes()])
+                    .expect("txt"),
+            )
+        }),
+    ));
     zone
 }
 
@@ -665,10 +861,20 @@ fn wire_backed_zone_matches_owned_path() {
         ("wire-nx", "missing.example.com", Rtype::A),
         ("wire-nodata", "www.example.com", Rtype::MX),
         ("wire-apex-soa", "example.com", Rtype::SOA),
+        ("wire-dname", "host.dname.example.com", Rtype::A),
+        ("wire-wildcard-cname", "x.wc.example.com", Rtype::A),
+        ("wire-cname-loop", "loop1.example.com", Rtype::A),
+        ("wire-big-udp", "big.example.com", Rtype::TXT),
+        ("wire-big-tcp", "big.example.com", Rtype::TXT),
     ] {
+        let transport = if label.contains("tcp") {
+            Transport::Tcp
+        } else {
+            Transport::Udp
+        };
         let request = query(qname, qtype);
         assert!(
-            fixture.check(label, &request, Transport::Udp),
+            fixture.check(label, &request, transport),
             "{label}: expected hot path"
         );
     }

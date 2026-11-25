@@ -266,3 +266,46 @@ fn shutdown_closes_listener() {
     thread::sleep(Duration::from_millis(20));
     assert_eq!(server.stats().active_connections, 0);
 }
+
+#[test]
+fn slowloris_header_does_not_block_other_clients() {
+    let cert = test_cert();
+    let mut server = doh_server(&cert, echo_handler, |config| {
+        config.idle_timeout = Duration::from_secs(5);
+        config.request_timeout = Duration::from_millis(150);
+    });
+    let addr = server.local_addr();
+    let mut slow =
+        TlsClient::connect(addr, &cert.cert_der, Some(b"http/1.1")).expect("slow client");
+    slow.send(b"POST /dns-query HTTP/1.1\r\nHost: localhost\r\n")
+        .expect("partial header");
+
+    let started = std::time::Instant::now();
+    let mut fast =
+        TlsClient::connect(addr, &cert.cert_der, Some(b"http/1.1")).expect("fast client");
+    let query = dns_query(44);
+    let response = fast
+        .request(&post_request(
+            "/dns-query",
+            "application/dns-message",
+            &query,
+        ))
+        .expect("fast request");
+    assert_eq!(response.status, 200);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "slowloris blocked the active client: {:?}",
+        started.elapsed()
+    );
+
+    assert!(
+        slow.read_http().is_err(),
+        "slowloris HTTP connection must be closed"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while server.stats().timeouts == 0 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(server.stats().timeouts >= 1);
+    server.shutdown().expect("shutdown");
+}

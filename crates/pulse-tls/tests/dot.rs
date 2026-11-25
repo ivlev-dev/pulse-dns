@@ -3,10 +3,10 @@
 
 mod common;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{TlsClient, dns_query, echo_handler, test_cert};
 use pulse_tls::{Acl, DotConfig, DotServer, RateLimitConfig, TlsConfig};
@@ -208,5 +208,90 @@ fn hot_reload_certificate_for_new_connections() {
         .expect("new certificate client");
     client.send_dot(&query).expect("send");
     assert_eq!(client.read_dot().expect("read"), query);
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn handshake_timeout_closes_stalled_client() {
+    let cert = test_cert();
+    let mut server = dot_server(&cert, |config| {
+        config.handshake_timeout = Duration::from_millis(150);
+    });
+    let mut socket = TcpStream::connect(server.local_addr()).expect("raw connect");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    thread::sleep(Duration::from_millis(500));
+    let mut byte = [0_u8; 1];
+    match socket.read(&mut byte) {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        other => panic!("stalled handshake must be closed, got {other:?}"),
+    }
+    let stats = server.stats();
+    assert!(stats.handshake_failures >= 1);
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn slowloris_prefix_does_not_block_other_clients() {
+    let cert = test_cert();
+    let mut server = dot_server(&cert, |config| {
+        config.idle_timeout = Duration::from_secs(5);
+        config.request_timeout = Duration::from_millis(150);
+    });
+    let addr = server.local_addr();
+    let mut slow = TlsClient::connect(addr, &cert.cert_der, Some(b"dot")).expect("slow client");
+    slow.send(&[0_u8]).expect("first prefix byte");
+
+    let started = Instant::now();
+    let mut fast = TlsClient::connect(addr, &cert.cert_der, Some(b"dot")).expect("fast client");
+    let query = dns_query(41);
+    fast.send_dot(&query).expect("fast send");
+    assert_eq!(fast.read_dot().expect("fast read"), query);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "slow client blocked the active one: {:?}",
+        started.elapsed()
+    );
+
+    assert!(
+        slow.read_dot().is_err(),
+        "slowloris connection must be closed by request timeout"
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while server.stats().timeouts == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(server.stats().timeouts >= 1);
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn connection_limit_rejects_excess_and_keeps_existing() {
+    let cert = test_cert();
+    let mut server = dot_server(&cert, |config| {
+        config.max_connections = 2;
+    });
+    let addr = server.local_addr();
+    let mut first = TlsClient::connect(addr, &cert.cert_der, Some(b"dot")).expect("first");
+    let second = TlsClient::connect(addr, &cert.cert_der, Some(b"dot")).expect("second");
+    assert!(TlsClient::connect(addr, &cert.cert_der, Some(b"dot")).is_err());
+
+    let query = dns_query(42);
+    first.send_dot(&query).expect("first send");
+    assert_eq!(first.read_dot().expect("first read"), query);
+    drop(second);
+    thread::sleep(Duration::from_millis(50));
+    let mut third = TlsClient::connect(addr, &cert.cert_der, Some(b"dot")).expect("slot freed");
+    third.send_dot(&query).expect("third send");
+    assert_eq!(third.read_dot().expect("third read"), query);
+    assert!(server.stats().rejected_connections >= 1);
     server.shutdown().expect("shutdown");
 }

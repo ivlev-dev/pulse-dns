@@ -421,6 +421,7 @@ enum ThreadState {
 }
 
 impl ServerCore {
+    #[allow(clippy::too_many_lines)]
     fn start(self: &Arc<Self>, runtime: &RuntimeInner) -> Result<(), RuntimeError> {
         let mut state = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
         match &*state {
@@ -480,10 +481,15 @@ impl ServerCore {
                 builder = builder.stack_size(cfg.thread_stack_size);
             }
             let result = builder.spawn(move || {
-                if cfg.pin_to_cpu
+                // Непустой `cpu_affinity` — уже явное намерение пинить; флаг
+                // `pin_to_cpu` остаётся для совместимости.
+                if (cfg.pin_to_cpu || !cfg.cpu_affinity.is_empty())
                     && let Some(cpu) = cpu
+                    && let Err(error) = socket::pin_current_thread(cpu)
                 {
-                    let _ = socket::pin_current_thread(cpu);
+                    eprintln!(
+                        "pulse-runtime: warning: worker {index} cannot pin to CPU {cpu}: {error}"
+                    );
                 }
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_worker(

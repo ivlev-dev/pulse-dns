@@ -387,10 +387,12 @@ impl QueryEngine {
     ///   ограничивает ответ, `TC` выставляется по тем же правилам, что и в
     ///   полном пути.
     ///
-    /// `DNAME` выше `QNAME`, циклы `CNAME`, неподдерживаемые представления
-    /// данных (например, `OVERFLOW`-payload зоны v2) и прочие не-горячие
-    /// случаи остаются на полном пути. `None` означает «случай не горячий» —
-    /// вызывающий обязан обработать пакет обычным путём.
+    /// `DNAME` выше `QNAME` (синтез `CNAME` и продолжение цепочки), циклы
+    /// `CNAME`/`DNAME` (SERVFAIL) и `YXDOMAIN` обслуживаются здесь же.
+    /// Неподдерживаемые представления данных (например, `OVERFLOW`-payload
+    /// зоны v2, требующий материализации нескольких страниц) и прочие
+    /// не-горячие случаи остаются на полном пути. `None` означает «случай не
+    /// горячий» — вызывающий обязан обработать пакет обычным путём.
     #[must_use]
     pub fn respond_ref_into(
         &self,
@@ -424,14 +426,12 @@ impl QueryEngine {
                 .with_dnssec_ok(edns.dnssec_ok())
         });
 
-        let mut wildcard_wire = [0_u8; MAX_NAME_WIRE_LEN];
         let mut encoded = None;
         let available = zone.with_snapshot(&mut |snapshot| {
             encoded = Self::encode_fast(
                 request,
                 snapshot,
                 transport,
-                &mut wildcard_wire,
                 out,
                 scratch,
                 response_edns.as_ref(),
@@ -446,7 +446,8 @@ impl QueryEngine {
         match response.status {
             FastStatus::NxDomain => self.stats.record_nxdomain(),
             FastStatus::NoData => self.stats.record_nodata(),
-            FastStatus::Answer | FastStatus::Referral => {}
+            FastStatus::ServFail => self.stats.record_servfail(),
+            FastStatus::Answer | FastStatus::Referral | FastStatus::YxDomain => {}
         }
         if response.truncated {
             self.stats.record_truncated();
@@ -460,7 +461,6 @@ impl QueryEngine {
         request: &'a MessageRef<'_>,
         snapshot: &'a dyn ZoneSnapshot,
         transport: Transport,
-        wildcard_wire: &'a mut [u8; MAX_NAME_WIRE_LEN],
         out: &'a mut [u8],
         scratch: &'a mut Scratch,
         response_edns: Option<&Edns>,
@@ -472,28 +472,43 @@ impl QueryEngine {
         if !qname.is_subdomain_of(origin) {
             return None;
         }
-        // DNAME на предке перекрывает и точное совпадение, и NXDOMAIN:
-        // такие имена обслуживает полный путь.
-        if dname_above(snapshot, qname, origin) {
-            return None;
-        }
         let do_bit = response_edns.is_some_and(Edns::dnssec_ok);
         let signed = do_bit && snapshot.signed_ref();
 
+        let mut wildcard_wire = [0_u8; MAX_NAME_WIRE_LEN];
+        let mut synth_storage = [[0_u8; MAX_NAME_WIRE_LEN]; MAX_CNAME_CHAIN];
+        let mut synth_pool = NameBufferPool::new(&mut synth_storage);
         let mut plan = FastPlan::new();
-        resolve_fast(
+        match resolve_fast(
             snapshot,
             qname,
             qtype,
             origin,
-            wildcard_wire,
+            &mut wildcard_wire,
+            &mut synth_pool,
             hinfo_ttl,
             &mut plan,
-        )?;
+        )? {
+            ResolveOutcome::Done => {}
+            ResolveOutcome::ServFail => {
+                return Self::encode_fast_error(
+                    request,
+                    qname,
+                    qtype,
+                    transport,
+                    out,
+                    scratch,
+                    response_edns,
+                    Rcode::SERVFAIL,
+                );
+            }
+        }
 
         let mut targets = NameSlots::new();
         for entry in plan.answers.iter().take(plan.answer_len).flatten() {
-            add_targets(entry.rrset, &mut targets)?;
+            if let FastAnswerData::Ref(rrset) = entry.data {
+                add_targets(rrset, &mut targets)?;
+            }
         }
         let mut glue_targets = NameSlots::new();
         for index in 0..targets.len {
@@ -539,7 +554,9 @@ impl QueryEngine {
         let buffer = out.get_mut(..capacity)?;
         let rcode = match plan.status {
             FastStatus::NxDomain => Rcode::NXDOMAIN,
+            FastStatus::YxDomain => Rcode::YXDOMAIN,
             FastStatus::Answer | FastStatus::NoData | FastStatus::Referral => Rcode::NOERROR,
+            FastStatus::ServFail => Rcode::SERVFAIL,
         };
         let flags = Flags::new()
             .with_qr(true)
@@ -567,49 +584,43 @@ impl QueryEngine {
         let mut truncated = false;
         let mut stopped = false;
 
-        if let Some(ttl) = plan.hinfo {
-            stopped = write_fast_hinfo(
-                &mut encoder,
-                transport,
-                budget,
-                &mut truncated,
-                qname,
-                ttl,
-                &mut counts,
-            )
-            .ok()?
-                == Flow::Stop;
-            if !stopped && signed {
-                stopped = write_signature_fast(
-                    snapshot,
+        for entry in plan.answers.iter().take(plan.answer_len).flatten() {
+            if stopped {
+                break;
+            }
+            let flow = match entry.data {
+                FastAnswerData::Ref(rrset) => write_fast_group(
                     &mut encoder,
                     transport,
                     budget,
                     &mut truncated,
                     Section::Answer,
-                    qname,
-                    HINFO_TYPE,
-                    qname,
+                    entry.owner,
+                    rrset,
+                    None,
+                    None,
                     &mut counts,
-                )? == Flow::Stop;
+                ),
+                FastAnswerData::DnameCname { dname } => write_fast_dname_cname(
+                    &mut encoder,
+                    transport,
+                    budget,
+                    &mut truncated,
+                    entry.owner,
+                    dname,
+                    snapshot.class_ref(),
+                    &mut counts,
+                ),
+                FastAnswerData::Hinfo { ttl } => write_fast_hinfo(
+                    &mut encoder,
+                    transport,
+                    budget,
+                    &mut truncated,
+                    entry.owner,
+                    ttl,
+                    &mut counts,
+                ),
             }
-        }
-        for entry in plan.answers.iter().take(plan.answer_len).flatten() {
-            if stopped {
-                break;
-            }
-            let flow = write_fast_group(
-                &mut encoder,
-                transport,
-                budget,
-                &mut truncated,
-                Section::Answer,
-                entry.owner,
-                entry.rrset,
-                None,
-                None,
-                &mut counts,
-            )
             .ok()?;
             if flow == Flow::Stop {
                 stopped = true;
@@ -625,7 +636,7 @@ impl QueryEngine {
                     &mut truncated,
                     Section::Answer,
                     entry.owner,
-                    entry.rrset.rr_type(),
+                    entry.rr_type(),
                     source,
                     &mut counts,
                 )?;
@@ -657,15 +668,17 @@ impl QueryEngine {
                         RefLookup::Absent => continue,
                         RefLookup::Unsupported => return None,
                     };
-                    let already =
-                        plan.answers
-                            .iter()
-                            .take(plan.answer_len)
-                            .flatten()
-                            .any(|entry| {
-                                entry.owner.as_wire() == rrset.owner().as_wire()
-                                    && entry.rrset.rr_type() == rrset.rr_type()
-                            });
+                    let already = plan.answers.iter().take(plan.answer_len).flatten().any(
+                        |entry| match entry.data {
+                            FastAnswerData::Ref(answer) => {
+                                answer.owner().as_wire() == rrset.owner().as_wire()
+                                    && answer.rr_type() == rrset.rr_type()
+                            }
+                            FastAnswerData::DnameCname { .. } | FastAnswerData::Hinfo { .. } => {
+                                false
+                            }
+                        },
+                    );
                     if already {
                         continue;
                     }
@@ -727,6 +740,65 @@ impl QueryEngine {
             len,
             status: plan.status,
             truncated,
+        })
+    }
+
+    /// Кодирует ошибочный ответ (`SERVFAIL`) в том же виде, что и полный путь.
+    ///
+    /// Используется для цикла `CNAME`/`DNAME`: ответ не содержит answer, но
+    /// содержит вопрос и эхо `OPT`, поэтому байты совпадают с `error_into`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_fast_error(
+        request: &MessageRef<'_>,
+        qname: NameRef<'_>,
+        qtype: Rtype,
+        transport: Transport,
+        out: &mut [u8],
+        scratch: &mut Scratch,
+        response_edns: Option<&Edns>,
+        rcode: Rcode,
+    ) -> Option<FastResponse> {
+        let limit = match transport {
+            Transport::Udp => {
+                usize::from(response_edns.map_or(UDP_PAYLOAD_WITHOUT_EDNS, negotiated_payload))
+            }
+            Transport::Tcp => MAX_MESSAGE_LEN,
+        };
+        let capacity = out.len().min(limit);
+        let buffer = out.get_mut(..capacity)?;
+        let flags = Flags::new()
+            .with_qr(true)
+            .with_opcode(Opcode::QUERY)
+            .with_rd(request.flags().rd())
+            .with_cd(request.flags().cd())
+            .with_aa(false)
+            .with_ra(false)
+            .with_ad(false)
+            .with_tc(false)
+            .with_rcode_bits(rcode.header_bits());
+        let mut encoder = Encoder::new(buffer, EncodeOptions::compressed(), &mut scratch.encode);
+        encoder.begin_message(request.id()).ok()?;
+        encoder
+            .write_question_wire(qname.as_wire(), qtype, request.qclass())
+            .ok()?;
+        if let Some(edns) = response_edns {
+            encoder.write_edns(edns).ok()?;
+        }
+        let len = encoder
+            .finish(
+                flags,
+                HeaderCounts {
+                    question: 1,
+                    answer: 0,
+                    authority: 0,
+                    additional: u16::from(response_edns.is_some()),
+                },
+            )
+            .ok()?;
+        Some(FastResponse {
+            len,
+            status: FastStatus::ServFail,
+            truncated: false,
         })
     }
 
@@ -1258,8 +1330,9 @@ impl QueryEngine {
     }
 }
 
-/// Максимум записей ответа в быстром пути: цепочка `CNAME` + финальный RRset.
-const FAST_ANSWER_SLOTS: usize = MAX_CNAME_CHAIN + 1;
+/// Максимум записей ответа в быстром пути: цепочка `CNAME`/`DNAME` + финальный
+/// RRset. Шаг `DNAME` добавляет две записи (`DNAME` и синтезированный `CNAME`).
+const FAST_ANSWER_SLOTS: usize = 2 * MAX_CNAME_CHAIN + 1;
 /// Максимум целей additional, обрабатываемых без аллокаций.
 const FAST_TARGET_SLOTS: usize = 16;
 /// Максимум proof-владельцев, запоминаемых для dedup в быстром пути.
@@ -1273,17 +1346,54 @@ enum FastStatus {
     Answer,
     NoData,
     NxDomain,
+    YxDomain,
     Referral,
+    /// Цикл `CNAME`/`DNAME`: ответ `SERVFAIL` без answer.
+    ServFail,
+}
+
+/// Источник записей ответа в быстром пути.
+#[derive(Debug, Clone, Copy)]
+enum FastAnswerData<'a> {
+    /// Заимствованный RRset зоны.
+    Ref(RrsetRef<'a>),
+    /// `CNAME`, синтезированный из `DNAME` (RFC 6672). Цель строится из
+    /// `owner` и RDATA `DNAME` при кодировании, без материализации RRset.
+    DnameCname {
+        /// `DNAME`-набор, из которого синтезируется `CNAME`.
+        dname: RrsetRef<'a>,
+    },
+    /// Синтезированный `HINFO` для `QTYPE = ANY` (RFC 8482).
+    Hinfo {
+        /// TTL синтезированной записи.
+        ttl: Ttl,
+    },
+}
+
+impl FastAnswerData<'_> {
+    const fn rr_type(self) -> Rtype {
+        match self {
+            Self::Ref(rrset) => rrset.rr_type(),
+            Self::DnameCname { .. } => Rtype::CNAME,
+            Self::Hinfo { .. } => HINFO_TYPE,
+        }
+    }
 }
 
 /// Запись ответа с возможным переименованием владельца (wildcard).
 #[derive(Debug, Clone, Copy)]
 struct FastAnswer<'a> {
     owner: NameRef<'a>,
-    rrset: RrsetRef<'a>,
+    data: FastAnswerData<'a>,
     /// Имя, под которым хранятся подписи: wildcard-владелец для
     /// развёрнутого ответа. `None` — подписи под владельцем набора.
     sig_source: Option<NameRef<'a>>,
+}
+
+impl FastAnswer<'_> {
+    const fn rr_type(self) -> Rtype {
+        self.data.rr_type()
+    }
 }
 
 /// Referral-план: `NS`/`DS` и точка cut из refs.
@@ -1301,8 +1411,6 @@ struct FastPlan<'a> {
     status: FastStatus,
     aa: bool,
     needs_soa: bool,
-    /// TTL синтезированного `HINFO`; `Some` — ответ на `QTYPE = ANY`.
-    hinfo: Option<Ttl>,
     referral: Option<FastReferral<'a>>,
     /// Wildcard-владелец для denial-доказательств.
     wildcard: Option<NameRef<'a>>,
@@ -1316,7 +1424,6 @@ impl<'a> FastPlan<'a> {
             status: FastStatus::Answer,
             aa: true,
             needs_soa: false,
-            hinfo: None,
             referral: None,
             wildcard: None,
         }
@@ -1384,6 +1491,26 @@ impl FastSeen {
         }
         self.len = self.len.saturating_add(1);
         true
+    }
+}
+
+/// Стековый пул буферов имён для синтеза `DNAME`-`CNAME`.
+///
+/// Каждый шаг цепочки получает отдельный слот: имена синтезированных
+/// `CNAME` живут до конца кодирования ответа.
+struct NameBufferPool<'a> {
+    slots: core::slice::IterMut<'a, [u8; MAX_NAME_WIRE_LEN]>,
+}
+
+impl<'a> NameBufferPool<'a> {
+    fn new(storage: &'a mut [[u8; MAX_NAME_WIRE_LEN]; MAX_CNAME_CHAIN]) -> Self {
+        Self {
+            slots: storage.iter_mut(),
+        }
+    }
+
+    fn next(&mut self) -> Option<&'a mut [u8; MAX_NAME_WIRE_LEN]> {
+        self.slots.next()
     }
 }
 
@@ -1548,7 +1675,8 @@ fn wildcard_lookup<'a>(
         LookupOutcomeRef::NxDomain => WildcardOutcome::NxDomain,
         LookupOutcomeRef::Delegation { .. }
         | LookupOutcomeRef::Referral
-        | LookupOutcomeRef::ZoneNotFound => WildcardOutcome::Unsupported,
+        | LookupOutcomeRef::ZoneNotFound
+        | LookupOutcomeRef::Unsupported => WildcardOutcome::Unsupported,
     }
 }
 
@@ -1571,57 +1699,96 @@ fn find_delegation_ref<'a>(
     None
 }
 
-/// Можно ли продолжать `CNAME`-цепочку и не замыкается ли она.
-///
-/// `None` — цикл (полный путь вернёт `SERVFAIL`); `Some(false)` — остановка
-/// на уже собранном ответе.
+/// Итог разбора быстрым путём.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolveOutcome {
+    /// Ответ собран в плане.
+    Done,
+    /// Обнаружен цикл `CNAME`/`DNAME`; нужен `SERVFAIL`.
+    ServFail,
+}
+
+/// Найденный `DNAME` на предке имени.
+#[derive(Debug, Clone, Copy)]
+struct DnameRedirect<'a> {
+    owner: NameRef<'a>,
+    rrset: RrsetRef<'a>,
+    target: NameRef<'a>,
+}
+
+/// Результат поиска `DNAME` на предках.
+#[derive(Debug, Clone, Copy)]
+enum DnameLookup<'a> {
+    /// `DNAME` на предке нет.
+    Absent,
+    /// Найден `DNAME` и его цель.
+    Redirect(DnameRedirect<'a>),
+    /// Заимствованное представление недоступно (полный путь).
+    Unsupported,
+}
+
+/// Решение о продолжении цепочки `CNAME`/`DNAME`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChaseDecision {
+    /// Продолжать цепочку.
+    Chase,
+    /// Остановиться на уже собранном ответе.
+    Stop,
+    /// Цикл: ответ `SERVFAIL`.
+    ServFail,
+}
+
+/// Можно ли продолжать `CNAME`/`DNAME`-цепочку и не замыкается ли она.
 fn chase_allowed<'a>(
     snapshot: &dyn ZoneSnapshot,
     current: NameRef<'a>,
     target: NameRef<'a>,
     origin: NameRef<'_>,
     visited: &[NameRef<'a>],
-) -> Option<bool> {
+) -> ChaseDecision {
     if target.as_wire() == current.as_wire()
         || visited
             .iter()
             .any(|name| name.as_wire() == target.as_wire())
     {
-        return None;
+        return ChaseDecision::ServFail;
     }
     if visited.len().saturating_add(1) >= MAX_CNAME_CHAIN
         || !target.is_subdomain_of(origin)
         || delegation_above(snapshot, target, origin)
-        || dname_above(snapshot, target, origin)
     {
-        return Some(false);
+        return ChaseDecision::Stop;
     }
-    Some(true)
+    ChaseDecision::Chase
 }
 
 /// Разбирает ответ по заимствованному снимку: referral, `ANY` или цепочка.
 #[allow(clippy::too_many_lines)]
-fn resolve_fast<'a>(
-    snapshot: &'a dyn ZoneSnapshot,
-    qname: NameRef<'a>,
+#[allow(clippy::too_many_arguments)]
+fn resolve_fast<'s: 'b, 'b, 'r: 'b>(
+    snapshot: &'s dyn ZoneSnapshot,
+    qname: NameRef<'r>,
     qtype: Rtype,
-    origin: NameRef<'a>,
-    wildcard_wire: &'a mut [u8; MAX_NAME_WIRE_LEN],
+    origin: NameRef<'s>,
+    wildcard_wire: &'b mut [u8; MAX_NAME_WIRE_LEN],
+    synth_pool: &mut NameBufferPool<'b>,
     hinfo_ttl: Ttl,
-    plan: &mut FastPlan<'a>,
-) -> Option<()> {
+    plan: &mut FastPlan<'b>,
+) -> Option<ResolveOutcome> {
     if let Some(cut) = find_delegation_ref(snapshot, qname, origin) {
         if cut.as_wire() == qname.as_wire() && qtype == Rtype::DS {
             return match snapshot.lookup_ref(qname, Rtype::DS) {
-                LookupOutcomeRef::Answer(ds) => plan.push(FastAnswer {
-                    owner: qname,
-                    rrset: ds,
-                    sig_source: None,
-                }),
+                LookupOutcomeRef::Answer(ds) => plan
+                    .push(FastAnswer {
+                        owner: qname,
+                        data: FastAnswerData::Ref(ds),
+                        sig_source: None,
+                    })
+                    .map(|()| ResolveOutcome::Done),
                 LookupOutcomeRef::NoData => {
                     plan.status = FastStatus::NoData;
                     plan.needs_soa = true;
-                    Some(())
+                    Some(ResolveOutcome::Done)
                 }
                 _ => None,
             };
@@ -1632,40 +1799,90 @@ fn resolve_fast<'a>(
         plan.status = FastStatus::Referral;
         plan.aa = false;
         plan.referral = Some(FastReferral { cut, ns, ds });
-        return Some(());
-    }
-    if qtype == Rtype::ANY {
-        return resolve_any_fast(snapshot, qname, origin, wildcard_wire, hinfo_ttl, plan);
+        return Some(ResolveOutcome::Done);
     }
 
     let mut visited = [ROOT_NAME; MAX_CNAME_CHAIN];
     let mut visited_len = 0_usize;
-    let mut current = qname;
+    let mut current: NameRef<'b> = qname;
     loop {
-        match snapshot.lookup_ref(current, qtype) {
-            LookupOutcomeRef::Answer(rrset) => {
+        // `DNAME` на предке перекрывает и точное совпадение, и `NXDOMAIN`:
+        // синтезируем `CNAME` и продолжаем разбор цели (RFC 6672).
+        match dname_redirect_ref(snapshot, current, origin) {
+            DnameLookup::Absent => {}
+            DnameLookup::Unsupported => return None,
+            DnameLookup::Redirect(redirect) => {
                 plan.push(FastAnswer {
-                    owner: current,
-                    rrset,
+                    owner: redirect.owner,
+                    data: FastAnswerData::Ref(redirect.rrset),
                     sig_source: None,
                 })?;
                 plan.status = FastStatus::Answer;
-                return Some(());
-            }
-            LookupOutcomeRef::Cname(rrset, target) => {
+                plan.aa = true;
+                let synth = synth_pool.next()?;
+                let Some(target) =
+                    substitute_suffix_ref(current, redirect.owner, redirect.target, synth)
+                else {
+                    // Переполнение имени при синтезе (RFC 6672 §2.2).
+                    plan.status = FastStatus::YxDomain;
+                    return Some(ResolveOutcome::Done);
+                };
                 plan.push(FastAnswer {
                     owner: current,
-                    rrset,
+                    data: FastAnswerData::DnameCname {
+                        dname: redirect.rrset,
+                    },
                     sig_source: None,
                 })?;
-                if !chase_allowed(
+                match chase_allowed(
                     snapshot,
                     current,
                     target,
                     origin,
                     visited.get(..visited_len)?,
-                )? {
-                    return Some(());
+                ) {
+                    ChaseDecision::ServFail => return Some(ResolveOutcome::ServFail),
+                    ChaseDecision::Stop => return Some(ResolveOutcome::Done),
+                    ChaseDecision::Chase => {}
+                }
+                *visited.get_mut(visited_len)? = current;
+                visited_len = visited_len.checked_add(1)?;
+                current = target;
+                continue;
+            }
+        }
+
+        if qtype == Rtype::ANY {
+            resolve_any_fast(snapshot, current, origin, wildcard_wire, hinfo_ttl, plan)?;
+            return Some(ResolveOutcome::Done);
+        }
+
+        match snapshot.lookup_ref(current, qtype) {
+            LookupOutcomeRef::Answer(rrset) => {
+                plan.push(FastAnswer {
+                    owner: current,
+                    data: FastAnswerData::Ref(rrset),
+                    sig_source: None,
+                })?;
+                plan.status = FastStatus::Answer;
+                return Some(ResolveOutcome::Done);
+            }
+            LookupOutcomeRef::Cname(rrset, target) => {
+                plan.push(FastAnswer {
+                    owner: current,
+                    data: FastAnswerData::Ref(rrset),
+                    sig_source: None,
+                })?;
+                match chase_allowed(
+                    snapshot,
+                    current,
+                    target,
+                    origin,
+                    visited.get(..visited_len)?,
+                ) {
+                    ChaseDecision::ServFail => return Some(ResolveOutcome::ServFail),
+                    ChaseDecision::Stop => return Some(ResolveOutcome::Done),
+                    ChaseDecision::Chase => {}
                 }
                 *visited.get_mut(visited_len)? = current;
                 visited_len = visited_len.checked_add(1)?;
@@ -1675,19 +1892,19 @@ fn resolve_fast<'a>(
                 plan.status = FastStatus::NoData;
                 plan.aa = true;
                 plan.needs_soa = true;
-                return Some(());
+                return Some(ResolveOutcome::Done);
             }
             LookupOutcomeRef::NxDomain => {
                 match wildcard_lookup(snapshot, current, qtype, origin, wildcard_wire) {
                     WildcardOutcome::Answer { rrset, wildcard } => {
                         plan.push(FastAnswer {
                             owner: current,
-                            rrset,
+                            data: FastAnswerData::Ref(rrset),
                             sig_source: Some(wildcard),
                         })?;
                         plan.status = FastStatus::Answer;
                         plan.wildcard = Some(wildcard);
-                        return Some(());
+                        return Some(ResolveOutcome::Done);
                     }
                     WildcardOutcome::Cname {
                         rrset,
@@ -1696,25 +1913,30 @@ fn resolve_fast<'a>(
                     } => {
                         plan.push(FastAnswer {
                             owner: current,
-                            rrset,
+                            data: FastAnswerData::Ref(rrset),
                             sig_source: Some(wildcard),
                         })?;
                         plan.status = FastStatus::Answer;
                         plan.wildcard = Some(wildcard);
-                        if !chase_allowed(
+                        match chase_allowed(
                             snapshot,
                             current,
                             target,
                             origin,
                             visited.get(..visited_len)?,
-                        )? {
-                            return Some(());
+                        ) {
+                            ChaseDecision::ServFail => {
+                                return Some(ResolveOutcome::ServFail);
+                            }
+                            ChaseDecision::Stop => return Some(ResolveOutcome::Done),
+                            ChaseDecision::Chase => {}
                         }
                         *visited.get_mut(visited_len)? = current;
                         visited_len = visited_len.checked_add(1)?;
                         // После wildcard-CNAME цепочка продолжается только
-                        // точными данными: повторный wildcard-поиск и
-                        // негативный ответ остаются полному пути.
+                        // точными данными и `DNAME`: повторный wildcard-поиск
+                        // (и связанный с ним второй буфер имени) остаётся
+                        // полному пути.
                         return chase_exact_fast(
                             snapshot,
                             target,
@@ -1722,6 +1944,7 @@ fn resolve_fast<'a>(
                             origin,
                             &mut visited,
                             &mut visited_len,
+                            synth_pool,
                             plan,
                         );
                     }
@@ -1730,79 +1953,139 @@ fn resolve_fast<'a>(
                         plan.aa = true;
                         plan.needs_soa = true;
                         plan.wildcard = Some(wildcard);
-                        return Some(());
+                        return Some(ResolveOutcome::Done);
                     }
                     WildcardOutcome::NxDomain => {
                         plan.status = FastStatus::NxDomain;
                         plan.aa = true;
                         plan.needs_soa = true;
-                        return Some(());
+                        return Some(ResolveOutcome::Done);
                     }
                     WildcardOutcome::Unsupported => return None,
                 }
             }
+            LookupOutcomeRef::Unsupported => return None,
             LookupOutcomeRef::Delegation { .. }
             | LookupOutcomeRef::Referral
             | LookupOutcomeRef::ZoneNotFound => {
                 // Делегирование в цепочке — штатная остановка; в начале —
                 // не горячий случай.
-                return if plan.answer_len == 0 { None } else { Some(()) };
+                return if plan.answer_len == 0 {
+                    None
+                } else {
+                    Some(ResolveOutcome::Done)
+                };
             }
         }
     }
 }
 
-/// Продолжает цепочку после wildcard-`CNAME`: только точные данные.
+/// Продолжает цепочку после wildcard-`CNAME`: точные данные и `DNAME`.
 #[allow(clippy::too_many_arguments)]
-fn chase_exact_fast<'a>(
-    snapshot: &'a dyn ZoneSnapshot,
-    mut current: NameRef<'a>,
+fn chase_exact_fast<'s: 'b, 'b>(
+    snapshot: &'s dyn ZoneSnapshot,
+    mut current: NameRef<'b>,
     qtype: Rtype,
-    origin: NameRef<'a>,
-    visited: &mut [NameRef<'a>; MAX_CNAME_CHAIN],
+    origin: NameRef<'s>,
+    visited: &mut [NameRef<'b>; MAX_CNAME_CHAIN],
     visited_len: &mut usize,
-    plan: &mut FastPlan<'a>,
-) -> Option<()> {
+    synth_pool: &mut NameBufferPool<'b>,
+    plan: &mut FastPlan<'b>,
+) -> Option<ResolveOutcome> {
     loop {
-        match snapshot.lookup_ref(current, qtype) {
-            LookupOutcomeRef::Answer(rrset) => {
+        match dname_redirect_ref(snapshot, current, origin) {
+            DnameLookup::Absent => {}
+            DnameLookup::Unsupported => return None,
+            DnameLookup::Redirect(redirect) => {
                 plan.push(FastAnswer {
-                    owner: current,
-                    rrset,
+                    owner: redirect.owner,
+                    data: FastAnswerData::Ref(redirect.rrset),
                     sig_source: None,
                 })?;
                 plan.status = FastStatus::Answer;
-                return Some(());
-            }
-            LookupOutcomeRef::Cname(rrset, target) => {
+                plan.aa = true;
+                let synth = synth_pool.next()?;
+                let Some(target) =
+                    substitute_suffix_ref(current, redirect.owner, redirect.target, synth)
+                else {
+                    plan.status = FastStatus::YxDomain;
+                    return Some(ResolveOutcome::Done);
+                };
                 plan.push(FastAnswer {
                     owner: current,
-                    rrset,
+                    data: FastAnswerData::DnameCname {
+                        dname: redirect.rrset,
+                    },
                     sig_source: None,
                 })?;
-                if !chase_allowed(
+                match chase_allowed(
                     snapshot,
                     current,
                     target,
                     origin,
                     visited.get(..*visited_len)?,
-                )? {
-                    return Some(());
+                ) {
+                    ChaseDecision::ServFail => return Some(ResolveOutcome::ServFail),
+                    ChaseDecision::Stop => return Some(ResolveOutcome::Done),
+                    ChaseDecision::Chase => {}
+                }
+                *visited.get_mut(*visited_len)? = current;
+                *visited_len = visited_len.checked_add(1)?;
+                current = target;
+                continue;
+            }
+        }
+
+        match snapshot.lookup_ref(current, qtype) {
+            LookupOutcomeRef::Answer(rrset) => {
+                plan.push(FastAnswer {
+                    owner: current,
+                    data: FastAnswerData::Ref(rrset),
+                    sig_source: None,
+                })?;
+                plan.status = FastStatus::Answer;
+                return Some(ResolveOutcome::Done);
+            }
+            LookupOutcomeRef::Cname(rrset, target) => {
+                plan.push(FastAnswer {
+                    owner: current,
+                    data: FastAnswerData::Ref(rrset),
+                    sig_source: None,
+                })?;
+                match chase_allowed(
+                    snapshot,
+                    current,
+                    target,
+                    origin,
+                    visited.get(..*visited_len)?,
+                ) {
+                    ChaseDecision::ServFail => return Some(ResolveOutcome::ServFail),
+                    ChaseDecision::Stop => return Some(ResolveOutcome::Done),
+                    ChaseDecision::Chase => {}
                 }
                 *visited.get_mut(*visited_len)? = current;
                 *visited_len = visited_len.checked_add(1)?;
                 current = target;
             }
             LookupOutcomeRef::NoData => {
-                // Полный путь сохранил бы wildcard-владельца в resolution —
-                // такой NODATA обслуживает он.
-                return None;
+                // Wildcard-владелец остаётся в плане: NODATA-доказательство
+                // строится по нему, как в полном пути.
+                plan.status = FastStatus::NoData;
+                plan.aa = true;
+                plan.needs_soa = true;
+                return Some(ResolveOutcome::Done);
             }
-            LookupOutcomeRef::NxDomain => return None,
+            // `NXDOMAIN` после wildcard-CNAME требует второго wildcard-поиска
+            // с отдельным буфером имени — это полный путь.
+            LookupOutcomeRef::NxDomain | LookupOutcomeRef::Unsupported => return None,
             LookupOutcomeRef::Delegation { .. }
             | LookupOutcomeRef::Referral
             | LookupOutcomeRef::ZoneNotFound => {
-                return if plan.answer_len == 0 { None } else { Some(()) };
+                return if plan.answer_len == 0 {
+                    None
+                } else {
+                    Some(ResolveOutcome::Done)
+                };
             }
         }
     }
@@ -1821,7 +2104,7 @@ fn resolve_any_fast<'a>(
         LookupOutcomeRef::Answer(cname) => {
             plan.push(FastAnswer {
                 owner: qname,
-                rrset: cname,
+                data: FastAnswerData::Ref(cname),
                 sig_source: None,
             })?;
             plan.status = FastStatus::Answer;
@@ -1831,7 +2114,11 @@ fn resolve_any_fast<'a>(
         _ => return None,
     }
     if snapshot.node_exists_ref(qname) {
-        plan.hinfo = Some(hinfo_ttl);
+        plan.push(FastAnswer {
+            owner: qname,
+            data: FastAnswerData::Hinfo { ttl: hinfo_ttl },
+            sig_source: None,
+        })?;
         plan.status = FastStatus::Answer;
         return Some(());
     }
@@ -1846,14 +2133,18 @@ fn resolve_any_fast<'a>(
             // источник подписи: подпись ищется у QNAME.
             plan.push(FastAnswer {
                 owner: qname,
-                rrset: cname,
+                data: FastAnswerData::Ref(cname),
                 sig_source: None,
             })?;
             plan.status = FastStatus::Answer;
         }
         LookupOutcomeRef::NoData | LookupOutcomeRef::NxDomain => {
             if snapshot.node_exists_ref(wildcard) {
-                plan.hinfo = Some(hinfo_ttl);
+                plan.push(FastAnswer {
+                    owner: qname,
+                    data: FastAnswerData::Hinfo { ttl: hinfo_ttl },
+                    sig_source: None,
+                })?;
                 plan.status = FastStatus::Answer;
             } else {
                 plan.status = FastStatus::NxDomain;
@@ -2010,6 +2301,7 @@ fn proof_reason<'a>(plan: &FastPlan<'a>) -> Option<ProofReason<'a>> {
         FastStatus::Referral => plan
             .referral
             .map(|referral| ProofReason::Referral { cut: referral.cut }),
+        FastStatus::YxDomain | FastStatus::ServFail => None,
     }
 }
 
@@ -2732,22 +3024,81 @@ fn write_found_proof<'s: 'b, 'b>(
     )
 }
 
-/// Есть ли `DNAME` на предке имени (исключая origin).
-fn dname_above(snapshot: &dyn ZoneSnapshot, name: NameRef<'_>, origin: NameRef<'_>) -> bool {
+/// Ищет `DNAME` на предках имени (исключая origin) — RFC 6672 §2.2.
+///
+/// Цель берётся из RDATA `DNAME` заимствованно; материализации RRset нет.
+fn dname_redirect_ref<'a>(
+    snapshot: &'a dyn ZoneSnapshot,
+    name: NameRef<'a>,
+    origin: NameRef<'a>,
+) -> DnameLookup<'a> {
     let mut current = name.parent();
     while let Some(candidate) = current {
+        // INV-6: DNAME в apex запрещён; имена выше origin не принадлежат зоне.
         if candidate.as_wire() == origin.as_wire() || !candidate.is_subdomain_of(origin) {
             break;
         }
-        if matches!(
-            snapshot.lookup_ref(candidate, Rtype::DNAME),
-            LookupOutcomeRef::Answer(_)
-        ) {
-            return true;
+        match snapshot.lookup_ref(candidate, Rtype::DNAME) {
+            LookupOutcomeRef::Answer(rrset) => {
+                let Some(target) = dname_target_ref(rrset) else {
+                    return DnameLookup::Unsupported;
+                };
+                return DnameLookup::Redirect(DnameRedirect {
+                    owner: rrset.owner(),
+                    rrset,
+                    target,
+                });
+            }
+            LookupOutcomeRef::NoData | LookupOutcomeRef::NxDomain | LookupOutcomeRef::Cname(..) => {
+            }
+            LookupOutcomeRef::Delegation { .. }
+            | LookupOutcomeRef::Referral
+            | LookupOutcomeRef::ZoneNotFound
+            | LookupOutcomeRef::Unsupported => return DnameLookup::Unsupported,
         }
         current = candidate.parent();
     }
-    false
+    DnameLookup::Absent
+}
+
+/// Цель `DNAME`-RDATA как заимствованное имя.
+fn dname_target_ref(rrset: RrsetRef<'_>) -> Option<NameRef<'_>> {
+    match rrset.first_record()? {
+        RdataRef::Domain(Rdata::Dname(name)) => Some(NameRef::from_name(name)),
+        RdataRef::Domain(_) => None,
+        RdataRef::Wire { bytes, .. } => NameRef::from_wire(bytes).ok(),
+    }
+}
+
+/// Синтезирует имя из `qname` и цели `DNAME` в caller-provided буфере.
+///
+/// `None` — `qname` не под `owner` либо результат длиннее 255 октетов
+/// (`YXDOMAIN`).
+fn substitute_suffix_ref<'b>(
+    qname: NameRef<'_>,
+    owner: NameRef<'_>,
+    target: NameRef<'_>,
+    buffer: &'b mut [u8; MAX_NAME_WIRE_LEN],
+) -> Option<NameRef<'b>> {
+    let prefix_labels = qname.label_count().checked_sub(owner.label_count())?;
+    let mut out = 0_usize;
+    let mut cursor = 0_usize;
+    for _ in 0..prefix_labels {
+        let length = usize::from(*qname.as_wire().get(cursor)?);
+        if length == 0 {
+            return None;
+        }
+        let end = cursor.checked_add(1)?.checked_add(length)?;
+        let label = qname.as_wire().get(cursor..end)?;
+        let slot = buffer.get_mut(out..out.checked_add(label.len())?)?;
+        slot.copy_from_slice(label);
+        out = out.checked_add(label.len())?;
+        cursor = end;
+    }
+    let target_wire = target.as_wire();
+    let end = out.checked_add(target_wire.len())?;
+    buffer.get_mut(out..end)?.copy_from_slice(target_wire);
+    NameRef::from_wire(buffer.get(..end)?).ok()
 }
 
 /// Находится ли имя в делегированной зоне (включая саму точку cut).
@@ -2833,6 +3184,47 @@ fn negative_ttl(soa: RrsetRef<'_>) -> Option<Ttl> {
 /// Есть ли в RRSIG-RDATA поле `Type Covered`, равное `covered`.
 fn rdata_covers(rdata: RdataRef<'_>, covered: Rtype) -> bool {
     rdata.type_covered() == Some(covered)
+}
+
+/// Записывает `CNAME`, синтезированный из `DNAME`, без материализации RRset.
+///
+/// Владелец — `owner` (QNAME текущего шага), TTL и класс — как у `DNAME`.
+#[allow(clippy::too_many_arguments)]
+fn write_fast_dname_cname(
+    encoder: &mut Encoder<'_>,
+    transport: Transport,
+    budget: usize,
+    truncated: &mut bool,
+    owner: NameRef<'_>,
+    dname: RrsetRef<'_>,
+    class: Rclass,
+    counts: &mut FastCounts,
+) -> Result<Flow, ()> {
+    let target = dname_target_ref(dname).ok_or(())?;
+    let mut name_wire = [0_u8; MAX_NAME_WIRE_LEN];
+    let target = substitute_suffix_ref(owner, dname.owner(), target, &mut name_wire).ok_or(())?;
+    let length = target.as_wire().len();
+    let mut payload = [0_u8; MAX_NAME_WIRE_LEN + 2];
+    let slot = payload
+        .get_mut(..length.checked_add(2).ok_or(())?)
+        .ok_or(())?;
+    let (prefix, rest) = slot.split_at_mut(2);
+    prefix.copy_from_slice(&u16::try_from(length).map_err(|_| ())?.to_be_bytes());
+    rest.copy_from_slice(target.as_wire());
+    let payload = payload.get(..length.checked_add(2).ok_or(())?).ok_or(())?;
+    let rrset = RrsetRef::from_wire(owner, Rtype::CNAME, class, dname.ttl(), payload);
+    write_fast_group(
+        encoder,
+        transport,
+        budget,
+        truncated,
+        Section::Answer,
+        owner,
+        rrset,
+        None,
+        None,
+        counts,
+    )
 }
 
 /// Записывает RRset в секцию с теми же правилами усечения, что у `WireSink`.

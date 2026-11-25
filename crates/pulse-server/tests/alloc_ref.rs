@@ -105,6 +105,18 @@ fn signed_zone_data() -> Vec<Rrset> {
             300,
             [Rdata::A("192.0.2.53".parse().expect("ipv4"))],
         ),
+        rrset(
+            "dname.example.com",
+            Rtype::DNAME,
+            300,
+            [Rdata::Dname(name("dname-target.example.com"))],
+        ),
+        rrset(
+            "host.dname-target.example.com",
+            Rtype::A,
+            300,
+            [Rdata::A("192.0.2.60".parse().expect("ipv4"))],
+        ),
     ]
 }
 
@@ -132,9 +144,73 @@ fn signed_engine(policy: &DenialPolicy) -> (QueryEngine, Vec<DnskeyData>) {
     (engine_for(zone), signed_zone.dnskeys)
 }
 
+fn ref_zone() -> InMemoryZone {
+    let mut zone = example_zone();
+    zone.insert(rrset(
+        "dname-ext.example.com",
+        Rtype::DNAME,
+        300,
+        [Rdata::Dname(name("target.outside.test"))],
+    ))
+    .expect("dname external");
+    zone.insert(rrset(
+        "a.example.com",
+        Rtype::DNAME,
+        300,
+        [Rdata::Dname(name("b.example.com"))],
+    ))
+    .expect("dname a");
+    zone.insert(rrset(
+        "b.example.com",
+        Rtype::DNAME,
+        300,
+        [Rdata::Dname(name("a.example.com"))],
+    ))
+    .expect("dname b");
+    zone.insert(rrset(
+        "*.wc.example.com",
+        Rtype::CNAME,
+        120,
+        [Rdata::Cname(name("chain1.example.com"))],
+    ))
+    .expect("wildcard cname");
+    zone
+}
+
+fn yxdomain_engine() -> QueryEngine {
+    let label = "a".repeat(63);
+    let target = format!("{label}.{label}.{label}");
+    let origin = name("dlong.example");
+    let mut zone = InMemoryZone::new(origin);
+    zone.insert(rrset(
+        "dlong.example",
+        Rtype::SOA,
+        3600,
+        [Rdata::Soa(pulse_dns::SoaData::new(
+            name("ns1.dlong.example"),
+            name("hostmaster.dlong.example"),
+            pulse_dns::Serial::new(1),
+            3600,
+            600,
+            604_800,
+            300,
+        ))],
+    ))
+    .expect("soa");
+    zone.insert(rrset(
+        "long.dlong.example",
+        Rtype::DNAME,
+        300,
+        [Rdata::Dname(name(&target))],
+    ))
+    .expect("dname");
+    engine_for(zone)
+}
+
 #[test]
+#[allow(clippy::too_many_lines)]
 fn ref_fast_path_is_allocation_free() {
-    let engine = engine_for(example_zone());
+    let engine = engine_for(ref_zone());
     let mut scratch = Scratch::new();
     let mut out = vec![0_u8; 4096];
 
@@ -151,6 +227,14 @@ fn ref_fast_path_is_allocation_free() {
             edns_query("www.example.com", Rtype::A, 1232, false),
         ),
         ("edns-mx", edns_query("example.com", Rtype::MX, 1232, false)),
+        ("dname", query("host.dname.example.com", Rtype::A)),
+        (
+            "dname-outside",
+            query("host.dname-ext.example.com", Rtype::A),
+        ),
+        ("cname-loop", query("loop1.example.com", Rtype::A)),
+        ("dname-loop", query("x.a.example.com", Rtype::A)),
+        ("wildcard-cname-chain", query("x.wc.example.com", Rtype::A)),
     ] {
         let bytes = request
             .encode(&EncodeOptions::compressed())
@@ -167,11 +251,30 @@ fn ref_fast_path_is_allocation_free() {
             assert!(len <= 512, "{label}: UDP response exceeds 512 bytes");
         });
         println!("{label}: zero-copy UDP allocs={allocations}");
-        assert!(
-            allocations <= 5,
-            "{label}: {allocations} allocs/query exceeds warm budget of 5"
-        );
+        assert_eq!(allocations, 0, "{label}: zero-copy path must not allocate");
     }
+
+    // `YXDOMAIN` при переполнении синтеза `DNAME` — без аллокаций.
+    let label = "a".repeat(63);
+    let request = query(&format!("{label}.long.dlong.example"), Rtype::A);
+    let bytes = request
+        .encode(&EncodeOptions::compressed())
+        .expect("encoded query");
+    let parsed = MessageRef::decode_simple_edns(&bytes).expect("simple query");
+    let yx = yxdomain_engine();
+    assert!(
+        yx.respond_ref_into(&parsed, Transport::Udp, &mut out, &mut scratch)
+            .is_some(),
+        "dname-yxdomain: hot path must answer"
+    );
+    let allocations = measure(|| {
+        let len = yx
+            .respond_ref_into(&parsed, Transport::Udp, &mut out, &mut scratch)
+            .expect("hot path response");
+        assert!(len <= 512, "dname-yxdomain: UDP response exceeds 512");
+    });
+    println!("dname-yxdomain: zero-copy UDP allocs={allocations}");
+    assert_eq!(allocations, 0, "dname-yxdomain: expected zero allocations");
 
     // Подписанные ответы, referral и ANY: те же refs, никаких `Vec`/`Message`.
     for (kind, policy) in [
@@ -204,6 +307,10 @@ fn ref_fast_path_is_allocation_free() {
                 "signed-referral",
                 edns_query("host.sub.example.com", Rtype::A, 1232, true),
             ),
+            (
+                "signed-dname",
+                edns_query("host.dname.example.com", Rtype::A, 1232, true),
+            ),
             ("any", edns_query("www.example.com", Rtype::ANY, 1232, true)),
         ] {
             let bytes = request
@@ -219,9 +326,9 @@ fn ref_fast_path_is_allocation_free() {
                 assert!(len <= 1232, "{kind}-{label}: response too large");
             });
             println!("{kind}-{label}: zero-copy UDP allocs={allocations}");
-            assert!(
-                allocations <= 5,
-                "{kind}-{label}: {allocations} allocs/query exceeds warm budget of 5"
+            assert_eq!(
+                allocations, 0,
+                "{kind}-{label}: zero-copy path must not allocate"
             );
         }
     }

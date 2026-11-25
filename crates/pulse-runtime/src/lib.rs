@@ -30,6 +30,10 @@
 //! - **Тюнинг без изменения API**: размеры ring/CQE-батча, число provided
 //!   буферов и TX-слотов, стек worker'а (по умолчанию 512 КиБ), CPU-affinity
 //!   поверх `sched_getaffinity`, `SO_BUSY_POLL` и опциональный SQPOLL.
+//! - **CPU-affinity и THP.** [`affinity`] разбирает списки CPU, пересекает их с
+//!   маской процесса (cpuset) и пинит потоки; пустое пересечение — ошибка
+//!   старта. [`mem::HugePages`] применяет `madvise(MADV_HUGEPAGE)` к RX-арене
+//!   (`auto` — best-effort, `always` — требование, `never` — выключено).
 //!
 //! `SO_REUSEPORT` — не изоляция: другой процесс того же uid может привязаться
 //! к тому же порту и получать часть трафика.
@@ -137,10 +141,12 @@
     clippy::unnecessary_box_returns
 )]
 
+pub mod affinity;
 mod backend;
 mod config;
 mod error;
 mod handler;
+pub mod mem;
 mod panic_hook;
 mod pktinfo;
 mod server;
@@ -150,5 +156,6 @@ mod stats;
 pub use config::{BackendKind, BackendPreference, Capabilities, RuntimeConfig, RxMode};
 pub use error::RuntimeError;
 pub use handler::{Handler, OwnedFn, Reply, owned};
+pub use mem::HugePages;
 pub use server::{Runtime, UdpServer};
 pub use stats::{ServerStats, WorkerStats};

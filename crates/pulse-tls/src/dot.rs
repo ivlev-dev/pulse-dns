@@ -1,20 +1,30 @@
 //! DNS over TLS (RFC 7858): TLS 1.2/1.3, length-prefixed DNS, keep-alive
-//! нескольких сообщений на соединение, idle timeout и graceful shutdown.
+//! нескольких сообщений на соединение, idle/request-таймауты и graceful
+//! shutdown.
+//!
+//! Соединения обслуживаются задачами общего tokio event-loop
+//! ([`crate::net::TcpServer`]), а не отдельными OS-потоками: тысяча idle
+//! клиентов не создаёт тысячу потоков, а медленный клиент не блокирует
+//! остальные соединения. Публичный API остаётся синхронным: [`DotServer`] —
+//! RAII-объект с `local_addr`/`stats`/`shutdown`.
 
-use std::net::{Shutdown as SocketShutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
+use tokio::time::timeout;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 
 use crate::acl::Acl;
 use crate::error::Error;
+use crate::net::{BufferPool, ConnectionHandler, ServerHooks, TcpServer};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
-use crate::server::{ConnectionGuard, ConnectionSet};
 use crate::stats::{Stats, StatsSnapshot};
 use crate::tls::TlsConfig;
-use crate::transport::TlsStream;
 
 /// Обработчик DNS-запроса: возвращает готовый DNS-ответ или `None`, чтобы
 /// закрыть соединение без ответа.
@@ -23,6 +33,8 @@ pub type DnsHandler = Arc<dyn Fn(&[u8], SocketAddr) -> Option<Vec<u8>> + Send + 
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 65_535;
 const DEFAULT_MAX_MESSAGES: usize = 1000;
+const REQUEST_BUFFER_CHUNK: usize = 4096;
+const REQUEST_BUFFER_POOL: usize = 1024;
 
 /// Конфигурация DoT-сервера.
 #[derive(Clone, Debug)]
@@ -37,6 +49,11 @@ pub struct DotConfig {
     pub handshake_timeout: Duration,
     /// Таймаут простоя между DNS-сообщениями.
     pub idle_timeout: Duration,
+    /// Таймаут чтения одного сообщения и записи ответа.
+    ///
+    /// Ограничивает slowloris: клиент, присылающий длину кадра и байты
+    /// слишком медленно, закрывается, не занимая воркер бесконечно.
+    pub request_timeout: Duration,
     /// Таймаут ожидания соединений при shutdown.
     pub shutdown_timeout: Duration,
     /// Максимальный размер DNS-сообщения (без 2-байтового префикса).
@@ -59,6 +76,7 @@ impl DotConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             handshake_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(5),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_messages_per_connection: DEFAULT_MAX_MESSAGES,
@@ -83,6 +101,7 @@ impl DotConfig {
         }
         if self.handshake_timeout.is_zero()
             || self.idle_timeout.is_zero()
+            || self.request_timeout.is_zero()
             || self.shutdown_timeout.is_zero()
         {
             return Err(Error::InvalidConfig("timeouts must be positive"));
@@ -96,17 +115,13 @@ struct Shared {
     handler: DnsHandler,
     limiter: Option<RateLimiter>,
     stats: Arc<Stats>,
-    shutdown: Arc<AtomicBool>,
+    buffers: Arc<BufferPool>,
 }
 
 /// Запущенный DoT-сервер.
 pub struct DotServer {
-    local_addr: SocketAddr,
-    shutdown: Arc<AtomicBool>,
+    tcp: TcpServer,
     stats: Arc<Stats>,
-    connections: Arc<ConnectionSet>,
-    acceptor: Option<JoinHandle<()>>,
-    shutdown_timeout: Duration,
     tls: TlsConfig,
 }
 
@@ -114,7 +129,7 @@ impl std::fmt::Debug for DotServer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DotServer")
-            .field("local_addr", &self.local_addr)
+            .field("local_addr", &self.tcp.local_addr())
             .field("stats", &self.stats.snapshot())
             .finish_non_exhaustive()
     }
@@ -126,7 +141,7 @@ impl DotServer {
     /// # Errors
     ///
     /// Ошибка bind/настройки listener, некорректная конфигурация или
-    /// невозможность создать поток.
+    /// невозможность запустить event-loop.
     pub fn bind<H>(config: DotConfig, handler: H) -> Result<Self, Error>
     where
         H: Fn(&[u8], SocketAddr) -> Option<Vec<u8>> + Send + Sync + 'static,
@@ -166,62 +181,35 @@ impl DotServer {
             None => None,
         };
         let listener = TcpListener::bind(config.listen)?;
-        let local_addr = listener.local_addr()?;
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let connections = Arc::new(ConnectionSet::new(Arc::clone(&stats)));
         let shared = Arc::new(Shared {
             config: config.clone(),
             handler,
             limiter,
             stats: Arc::clone(&stats),
-            shutdown: Arc::clone(&shutdown),
+            buffers: Arc::new(BufferPool::new(REQUEST_BUFFER_CHUNK, REQUEST_BUFFER_POOL)),
         });
-        let on_connection = {
-            let shared = Arc::clone(&shared);
-            Arc::new(
-                move |stream: TcpStream, peer: SocketAddr, guard: ConnectionGuard| {
-                    if let Some(acl) = &shared.config.acl
-                        && !acl.allows(peer.ip())
-                    {
-                        shared.stats.connection_rejected();
-                        let _ = stream.shutdown(SocketShutdown::Both);
-                        return;
-                    }
-                    let stats = Arc::clone(&shared.stats);
-                    let shared = Arc::clone(&shared);
-                    let thread_name = format!("pulse-dot-{}", guard.id());
-                    let spawned = thread::Builder::new().name(thread_name).spawn(move || {
-                        let _guard = guard;
-                        if let Err(error) = handle_connection(stream, peer, &shared) {
-                            if error.is_timeout() {
-                                shared.stats.timeout();
-                            } else if !error.is_closed() {
-                                shared.stats.error();
-                            }
-                        }
-                    });
-                    if spawned.is_err() {
-                        stats.error();
-                    }
-                },
-            )
-        };
-        let acceptor = crate::server::spawn_acceptor(
-            "pulse-dot-accept".to_owned(),
+        let connection_handler = make_connection_handler(Arc::clone(&shared));
+        let hooks = ServerHooks::new(
+            Some({
+                let stats = Arc::clone(&stats);
+                Arc::new(move || stats.connection_rejected())
+            }),
+            Some({
+                let stats = Arc::clone(&stats);
+                Arc::new(move || stats.error())
+            }),
+        );
+        let tcp = TcpServer::start(
+            "pulse-dot",
             listener,
-            Arc::clone(&shutdown),
-            Arc::clone(&stats),
-            Arc::clone(&connections),
             config.max_connections,
-            on_connection,
+            config.shutdown_timeout,
+            hooks,
+            connection_handler,
         )?;
         Ok(Self {
-            local_addr,
-            shutdown,
+            tcp,
             stats,
-            connections,
-            acceptor: Some(acceptor),
-            shutdown_timeout: config.shutdown_timeout,
             tls: config.tls,
         })
     }
@@ -229,7 +217,7 @@ impl DotServer {
     /// Фактический адрес (полезен при `port = 0`).
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        self.tcp.local_addr()
     }
 
     /// Текущая статистика.
@@ -241,7 +229,7 @@ impl DotServer {
     /// Проверяет, остановлен ли сервер.
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
+        self.tcp.is_shutdown()
     }
 
     /// Перечитывает сертификат из PEM-байтов для новых соединений.
@@ -265,14 +253,10 @@ impl DotServer {
     ///
     /// # Errors
     ///
-    /// [`Error::ThreadPanicked`], если accept-поток запаниковал.
+    /// [`Error::Io`] с [`std::io::ErrorKind::TimedOut`], если соединения не
+    /// закрылись за `shutdown_timeout`.
     pub fn shutdown(&mut self) -> Result<(), Error> {
-        crate::server::stop(
-            &self.shutdown,
-            &mut self.acceptor,
-            &self.connections,
-            self.shutdown_timeout,
-        )
+        self.tcp.shutdown().map_err(Error::Io)
     }
 }
 
@@ -282,41 +266,83 @@ impl Drop for DotServer {
     }
 }
 
-fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Result<(), Error> {
-    let mut tls =
-        match TlsStream::accept(&shared.config.tls, stream, shared.config.handshake_timeout) {
-            Ok(tls) => {
-                shared.stats.handshake_ok();
-                tls
+fn make_connection_handler(shared: Arc<Shared>) -> ConnectionHandler {
+    Arc::new(move |stream, peer, shutdown| {
+        let shared = Arc::clone(&shared);
+        Box::pin(async move {
+            if let Some(acl) = &shared.config.acl
+                && !acl.allows(peer.ip())
+            {
+                shared.stats.connection_rejected();
+                return;
             }
-            Err(error) => {
-                shared.stats.handshake_failed();
-                return Err(error);
+            shared.stats.connection_opened();
+            let _guard = ActiveGuard(Arc::clone(&shared.stats));
+            if let Err(error) = handle_connection(stream, peer, &shared, shutdown).await {
+                if error.is_timeout() {
+                    shared.stats.timeout();
+                } else if !error.is_closed() {
+                    shared.stats.error();
+                }
             }
-        };
-    tls.set_idle_timeout(shared.config.idle_timeout)?;
+        })
+    })
+}
+
+struct ActiveGuard(Arc<Stats>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.connection_closed();
+    }
+}
+
+async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    shared: &Shared,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), Error> {
+    if let Err(error) = stream.set_nodelay(true) {
+        shared.stats.handshake_failed();
+        return Err(Error::Io(error));
+    }
+    let acceptor = TlsAcceptor::from(shared.config.tls.server_config());
+    let handshake = tokio::select! {
+        biased;
+        _ = shutdown.changed() => return Ok(()),
+        result = timeout(shared.config.handshake_timeout, acceptor.accept(stream)) => result,
+    };
+    let mut tls = match handshake {
+        Ok(Ok(tls)) => {
+            shared.stats.handshake_ok();
+            tls
+        }
+        Ok(Err(error)) => {
+            shared.stats.handshake_failed();
+            return Err(Error::Io(error));
+        }
+        Err(_) => {
+            shared.stats.handshake_failed();
+            return Err(Error::HandshakeTimeout);
+        }
+    };
+    shared.config.tls.verify_alpn(tls.get_ref().1)?;
+
     let mut messages = 0_usize;
-    loop {
-        if shared.shutdown.load(Ordering::Acquire)
-            || messages >= shared.config.max_messages_per_connection
-        {
+    while messages < shared.config.max_messages_per_connection {
+        if *shutdown.borrow() {
             break;
         }
-        let Some(length) = read_prefix(&mut tls)? else {
+        let message = tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            message = read_message(&mut tls, shared) => message?,
+        };
+        let Some(request) = message else {
             break;
         };
-        if length == 0 {
-            return Err(Error::Http("zero-length DNS/TCP frame".to_owned()));
-        }
-        let length = usize::from(length);
-        if length > shared.config.max_message_size {
-            return Err(Error::MessageTooLarge {
-                limit: shared.config.max_message_size,
-            });
-        }
-        let mut request = vec![0_u8; length];
-        tls.read_exact(&mut request)?;
-        shared.stats.read_bytes(length);
+        shared.stats.read_bytes(request.len());
         shared.stats.query();
 
         if let Some(limiter) = &shared.limiter
@@ -344,28 +370,77 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Re
             u16::try_from(response.len()).map_err(|_| Error::MessageTooLarge {
                 limit: usize::from(u16::MAX),
             })?;
-        tls.write_all(&response_length.to_be_bytes())?;
-        tls.write_all(&response)?;
-        shared.stats.written_bytes(response.len() + 2);
         shared.stats.response();
+        let write = async {
+            tls.write_all(&response_length.to_be_bytes()).await?;
+            tls.write_all(&response).await?;
+            tls.flush().await?;
+            Ok::<(), std::io::Error>(())
+        };
+        match timeout(shared.config.request_timeout, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(Error::Io(error)),
+            Err(_) => return Err(Error::Timeout),
+        }
+        shared.stats.written_bytes(response.len() + 2);
         messages += 1;
     }
-    tls.close();
+    let _ = timeout(shared.config.request_timeout, tls.shutdown()).await;
     Ok(())
 }
 
-fn read_prefix(tls: &mut TlsStream) -> Result<Option<u16>, Error> {
+async fn read_message(
+    tls: &mut TlsStream<tokio::net::TcpStream>,
+    shared: &Shared,
+) -> Result<Option<Vec<u8>>, Error> {
+    let Some(length) = read_prefix(tls, shared).await? else {
+        return Ok(None);
+    };
+    if length == 0 {
+        return Err(Error::Http("zero-length DNS/TCP frame".to_owned()));
+    }
+    let length = usize::from(length);
+    if length > shared.config.max_message_size {
+        return Err(Error::MessageTooLarge {
+            limit: shared.config.max_message_size,
+        });
+    }
+    let mut buffer = shared.buffers.acquire();
+    let request = buffer.prepare(length);
+    match timeout(shared.config.request_timeout, tls.read_exact(request)).await {
+        Ok(Ok(_)) => Ok(Some(buffer.take_vec(length))),
+        Ok(Err(error)) => Err(Error::Io(error)),
+        Err(_) => Err(Error::Timeout),
+    }
+}
+
+async fn read_prefix(
+    tls: &mut TlsStream<tokio::net::TcpStream>,
+    shared: &Shared,
+) -> Result<Option<u16>, Error> {
     let mut prefix = [0_u8; 2];
-    let mut filled = 0;
-    while filled < prefix.len() {
-        let rest = prefix
-            .get_mut(filled..)
-            .ok_or_else(|| Error::Http("prefix offset out of bounds".to_owned()))?;
-        match tls.read(rest)? {
-            0 if filled == 0 => return Ok(None),
-            0 => return Err(Error::Closed),
-            read => filled += read,
-        }
+    let (first, second) = prefix.split_at_mut(1);
+    if !read_exact_deadline(tls, first, shared.config.idle_timeout).await? {
+        return Ok(None);
+    }
+    if !read_exact_deadline(tls, second, shared.config.request_timeout).await? {
+        return Err(Error::Closed);
     }
     Ok(Some(u16::from_be_bytes(prefix)))
+}
+
+async fn read_exact_deadline<S>(
+    stream: &mut S,
+    buffer: &mut [u8],
+    deadline: Duration,
+) -> Result<bool, Error>
+where
+    S: AsyncRead + Unpin,
+{
+    match timeout(deadline, stream.read_exact(buffer)).await {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Ok(Err(error)) => Err(Error::Io(error)),
+        Err(_) => Err(Error::Timeout),
+    }
 }

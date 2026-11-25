@@ -20,6 +20,7 @@ use crate::backend::probe::build_ring;
 use crate::config::{RuntimeConfig, RxMode};
 use crate::error::RuntimeError;
 use crate::handler::{Handler, Reply};
+use crate::mem::HugePages;
 use crate::panic_hook;
 use crate::pktinfo::{CMSG_BUF_LEN, DstInfo};
 use crate::socket::sockaddr_from_bytes;
@@ -430,7 +431,7 @@ impl RxArena {
         }
     }
 
-    fn new(buffers: u16, stride: usize) -> io::Result<Self> {
+    fn new(buffers: u16, stride: usize, huge_pages: HugePages) -> io::Result<Self> {
         // Нечётное число cache line в шаге: иначе при степени двойки буферы
         // ложатся в ограниченный набор cache set'ов и конфликтуют в L1/L2.
         let mut stride = align_up(stride, ARENA_ALIGN);
@@ -441,7 +442,12 @@ impl RxArena {
             .checked_mul(usize::from(buffers))
             .and_then(|value| value.checked_add(ARENA_ALIGN))
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let mem = vec![0_u8; payload];
+        let mut mem = vec![0_u8; payload];
+        // Арена живёт всё время работы worker'а: THP уменьшает dTLB-misses на
+        // каждом пакете. `auto`/`never` не фатальны, `always` — требование.
+        let ptr = std::ptr::NonNull::new(mem.as_mut_ptr())
+            .ok_or_else(|| io::Error::other("RX arena pointer is null"))?;
+        crate::mem::advise(ptr, mem.len(), huge_pages)?;
         let base = mem.as_ptr() as usize;
         let offset = align_up(base, ARENA_ALIGN) - base;
         Ok(Self {
@@ -616,7 +622,7 @@ impl UringWorker {
             .rx_buffer_size
             .checked_add(RECVMSG_OUT_LEN + SOCKADDR_STORAGE_LEN + RECVMSG_CTRL_LEN)
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let arena = RxArena::new(cfg.rx_buffers, stride)?;
+        let arena = RxArena::new(cfg.rx_buffers, stride, cfg.huge_pages)?;
         let ring_buf = ProvidedBufRing::new(cfg.rx_buffers, BGID_RX)?;
         // SAFETY: ring_buf не перемещается (живёт в worker до shutdown, где
         // снимается регистрация) и переживает io_uring.
@@ -1210,7 +1216,7 @@ mod tests {
             512 + RECVMSG_OUT_LEN + SOCKADDR_STORAGE_LEN + RECVMSG_CTRL_LEN,
             2256,
         ] {
-            let arena = RxArena::new(64, raw).unwrap();
+            let arena = RxArena::new(64, raw, HugePages::Auto).unwrap();
             let stride = arena.stride();
             assert_eq!(stride % ARENA_ALIGN, 0);
             // Нечётное число линий — нет алиасинга на степень двойки.

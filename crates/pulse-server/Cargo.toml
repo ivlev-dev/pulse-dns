@@ -35,3 +35,7 @@ harness = false
 [[bench]]
 name = "signed_ref"
 harness = false
+
+[[bench]]
+name = "fast_paths"
+harness = false

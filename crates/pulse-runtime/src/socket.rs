@@ -198,12 +198,7 @@ pub(crate) unsafe fn write_sockaddr(addr: SocketAddr, storage: *mut SocketAddrSt
 
 /// CPUs, разрешённые процессу (`sched_getaffinity`).
 pub(crate) fn allowed_cpus() -> Vec<usize> {
-    let Ok(set) = rustix::thread::sched_getaffinity(None) else {
-        return Vec::new();
-    };
-    (0..rustix::thread::CpuSet::MAX_CPU)
-        .filter(|&cpu| set.is_set(cpu))
-        .collect()
+    crate::affinity::current_cpus()
 }
 
 /// CPU-список для worker'ов: пересечение `sched_getaffinity`/cpuset и
@@ -212,31 +207,7 @@ pub(crate) fn allowed_cpus() -> Vec<usize> {
 /// Пустой явный список — все разрешённые CPU. Если явный список не пересекается
 /// с разрешёнными, возвращается `EINVAL`: пинить на чужие CPU нельзя.
 pub(crate) fn worker_cpus(explicit: &[usize]) -> io::Result<Vec<usize>> {
-    let allowed = allowed_cpus();
-    if explicit.is_empty() {
-        return Ok(allowed);
-    }
-    if allowed.is_empty() {
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
-    }
-    select_cpus(&allowed, explicit).map_err(|()| io::Error::from_raw_os_error(libc::EINVAL))
-}
-
-/// Чистый выбор CPU: пересечение разрешённых и явных.
-pub(crate) fn select_cpus(allowed: &[usize], explicit: &[usize]) -> Result<Vec<usize>, ()> {
-    if explicit.is_empty() {
-        return Ok(allowed.to_vec());
-    }
-    let filtered: Vec<usize> = allowed
-        .iter()
-        .copied()
-        .filter(|cpu| explicit.contains(cpu))
-        .collect();
-    if filtered.is_empty() {
-        Err(())
-    } else {
-        Ok(filtered)
-    }
+    crate::affinity::resolve(explicit)
 }
 
 /// Выбрать CPU для kernel-потока SQPOLL (`IORING_SETUP_SQ_AFF`).
@@ -265,13 +236,7 @@ pub(crate) fn select_sqpoll_cpu(
 
 /// Прибить текущий поток к ядру `cpu`. Ошибки не критичны (например, EPERM в cgroup).
 pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
-    if cpu >= rustix::thread::CpuSet::MAX_CPU {
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
-    }
-    let mut set = rustix::thread::CpuSet::new();
-    set.set(cpu);
-    rustix::thread::sched_setaffinity(None, &set)
-        .map_err(|errno| io::Error::from_raw_os_error(errno.raw_os_error()))
+    crate::affinity::pin_current(cpu)
 }
 
 #[cfg(test)]
@@ -312,11 +277,19 @@ mod tests {
 
     #[test]
     fn cpu_selection_respects_affinity() {
-        assert_eq!(select_cpus(&[0, 1, 2, 3], &[]).unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            crate::affinity::intersection(&[0, 1, 2, 3], &[]),
+            Vec::<usize>::new()
+        );
         // Явный CPU вне разрешённого множества не пинится.
-        assert_eq!(select_cpus(&[0, 1, 2, 3], &[2, 7]).unwrap(), vec![2]);
-        assert_eq!(select_cpus(&[0, 1], &[5]), Err(()));
-        assert_eq!(select_cpus(&[], &[]).unwrap(), Vec::<usize>::new());
+        assert_eq!(
+            crate::affinity::intersection(&[0, 1, 2, 3], &[2, 7]),
+            vec![2]
+        );
+        assert_eq!(
+            crate::affinity::intersection(&[0, 1], &[5]),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]

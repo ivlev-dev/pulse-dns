@@ -11,7 +11,7 @@ authors.workspace = true
 [dependencies]
 io-uring = "0.7.16"
 libc = "0.2"
-rustix = { version = "1.1", features = ["event", "net", "std", "thread"] }
+rustix = { version = "1.1", features = ["event", "net", "param", "std", "thread"] }
 thiserror = "2"
 
 [features]

@@ -35,11 +35,12 @@
 //!   stream на запрос, 2-байтовый length-prefix, лимиты stream'ов/размера/
 //!   времени, idle timeout, 0-RTT выключен.
 //!
-//! Синхронные DoT/DoH/1.1 работают на std-потоках без tokio. Асинхронные
-//! DoH/2, DoH/3 и DoQ включаются feature-флагами `http2`, `http3` и `doq`;
-//! каждый сервер поднимает собственный tokio runtime в фоновом потоке, а
-//! наружу отдаёт синхронный RAII-API (`bind` → `local_addr`/`stats` →
-//! `shutdown`).
+//! Все транспорты неблокирующие и обслуживаются задачами tokio, а не
+//! OS-потоком на соединение. DoT, DoH/1.1 и plain TCP DNS используют общий
+//! event-loop [`net::TcpServer`] с ограничением соединений, idle/request-
+//! таймаутами, backpressure и graceful shutdown. DoH/2, DoH/3 и DoQ
+//! включаются feature-флагами `http2`, `http3` и `doq`. Наружу все серверы
+//! отдают синхронный RAII-API (`bind` → `local_addr`/`stats` → `shutdown`).
 //!
 //! # Пример: поднять любой транспорт
 //!
@@ -74,7 +75,9 @@
 //! - DoH/3 реализован только как сервер; HTTP/3-клиента для upstream нет.
 //!   HTTP/1.1-сервер отвечает `505` на preface HTTP/2; для HTTP/2
 //!   используйте `Doh2Server`, для HTTP/3 — `Doh3Server`.
-//! - DoT/DoH/1.1 — поток на соединение, ограниченный `max_connections`.
+//! - DoT/DoH/1.1/plain TCP не создают поток на соединение: соединения —
+//!   задачи общего event-loop, память idle-соединения ограничена буфером
+//!   кадра (4 KiB) и состоянием задачи.
 //! - `Cache-Control: max-age=<min TTL>` включается опционально
 //!   (`DohConfig::cache_control`/`Doh2Config::cache_control`/
 //!   `Doh3Config::cache_control`) и вычисляется по ответу через `pulse-dns`.
@@ -166,6 +169,7 @@ pub mod client;
 pub mod doh;
 pub mod dot;
 pub mod error;
+pub mod net;
 pub mod ratelimit;
 pub mod stats;
 pub mod tls;
@@ -180,8 +184,6 @@ pub mod doq;
 mod doh_core;
 mod http;
 mod pool;
-mod server;
-mod transport;
 
 pub use acl::Acl;
 pub use client::{ClientTlsConfig, DohClient, DotClient};
