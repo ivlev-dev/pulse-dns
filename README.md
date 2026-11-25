@@ -25,7 +25,8 @@ upstream по UDP, TCP, DoT и DoH/1.1 (пул keep-alive, backoff). Остат�
 - Авторитетный движок запросов (`pulse-server`): NXDOMAIN/NODATA/ENT, wildcard и
   closest encloser, CNAME/DNAME, делегация/glue/DS, EDNS/BADVERS, TC, ANY по
   RFC 8482, детерминированный additional; zero-copy ответ (`respond_ref_into`),
-  NSEC/NSEC3 индексы для быстрого NXDOMAIN.
+  0 аллокаций на ответ (unsigned/signed/referral/ANY/EDNS); NSEC/NSEC3 индексы
+  для быстрого NXDOMAIN.
 - Рантайм (`pulse-runtime`): io_uring UDP (ring на ядро, multishot recv +
   provided buffers, `REGISTER_FILES`, `COOP/DEFER_TASKRUN`, опции SQPOLL/
   `SO_BUSY_POLL`, IP_PKTINFO, проверка NODROP, backpressure, graceful
@@ -97,10 +98,13 @@ ring 4096), import только `text/plain`. DNSCrypt-сертификат бе
 REST — MVP-подмножество спецификации; API доступен только на loopback (без
 TLS). DNS Cookies и полноценный RRL авторитетного сервера (`pulsed`) нет; у
 резолвера RRL есть. 0x20 echo нет. Loom в CI нет (Miri — continue-on-error).
-RRset warm wide ~1.36–1.45 µs при 1M (цель 500 нс не достигнута). Signed/DO=1,
-referral, ANY, wildcard-CNAME — полный (медленный) путь. Bulk требует
+RRset warm wide ~1.36–1.45 µs при 1M (цель 500 нс не достигнута). Signed/DO/ANY/referral — zero-copy; DNAME/циклы/oversized/wildcard-CNAME —
+fallback. Bulk требует
 отсортированный вход; `Memory` incremental не реклеймит (bulk рекомендуется).
-Замеры на loopback + SMT (8 vCPU общие), абсолютные qps занижены. HTTP/3 используется только
+Замеры на loopback + SMT (8 vCPU общие), абсолютные qps занижены. REST под 8 UDP
+workers по-прежнему делит CPU с DNS в режиме `all`; для разделения есть роли
+`--role dns` и `--role api` на одном v2-файле (см.
+[`docs/process-roles.md`](docs/process-roles.md)). HTTP/3 используется только
 для DoH: WebTransport, server push, datagrams и 0-RTT выключены.
 
 ## Архитектура
@@ -156,6 +160,23 @@ cargo run -p pulsed -- \
 поля и значения по умолчанию одинаковые. Ошибка разбора содержит путь, строку
 и колонку; неизвестное расширение отклоняется с подсказкой.
 `examples/*.json` — legacy-эквиваленты `examples/*.toml`.
+
+### DNS и REST в разных процессах
+
+На одном `--data`-файле можно запустить два процесса (multi-process v2,
+ADR 0007): DNS-транспорты и REST API не делят CPU и не мешают друг другу.
+
+```bash
+pulsed --config examples/pulsed-dns.toml      # роль dns: UDP/TCP/DoT/DoH/DoQ/DNSCrypt
+PULSED_API_TOKEN='...' \
+  pulsed --config examples/pulsed-api.toml    # роль api: REST + write-ahead journal
+```
+
+Роль задаётся `role = "dns" | "api" | "all"` (или `--role`). `dns` подхватывает
+новые версии зон опросом (`zone_poll_ms`, по умолчанию 250 мс) без рестарта;
+`api` владеет журналом и восстанавливает его при рестарте. Второй `all` на
+занятом файле получает `Busy`. Подробности и ограничения —
+[`docs/process-roles.md`](docs/process-roles.md).
 
 Проверка UDP/TCP:
 
@@ -355,7 +376,7 @@ curl -sS -X PUT "$API/api/v1/zones/dynamic.test." \
 cargo test --workspace
 ```
 
-Полный набор workspace-тестов (1444 теста, включая doctests) проходит. Также проходят
+Полный набор workspace-тестов (1478 тестов, включая doctests) проходит. Также проходят
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` и
 rustdoc без warnings.
 
@@ -378,17 +399,21 @@ cargo deny check
 | NXDOMAIN 10k qps | p50 757 µs, p99 1.56 мс, timeouts 0 (было 260 мс/16912) |
 | NXDOMAIN, окно 1 | p50 235 µs |
 | NSEC/NSEC3 NXDOMAIN p99 (100k signed) | 367 мс → 0.71 мс |
+| Signed NXDOMAIN (NSEC3/NSEC) | p99 307 µs / 343 µs (было 38–47 мс) |
 | NSEC/NSEC3 in-memory (1M) | p99 18 µs (цель <2 мс) |
-| Zero-copy ответ (allocs/query) | 52 → 0–0.01 (udp-e2e) |
-| v2 чтение 1M RRset (RssAnon) | 6.3 МБ (было ~9.6); soak 600 с без роста |
+| Zero-copy ответ (allocs/query) | 52 → 0–0.01 (udp-e2e); 0 аллокаций на ответ (unsigned/signed/referral/ANY/EDNS) |
+| v2 чтение 1M RRset (RssAnon) | 6.3 МБ (−41%); soak 600 с без роста |
 | Сервер на 1M RRset (RSS) | ~36 МБ |
 | PageCache | 1024 страницы (~4 MiB образов) |
 | Zone snapshot | 87–92 нс |
 | RRset warm wide (1M) | ~1.36–1.45 µs (−20%); warm lookup 0 аллокаций |
-| Bulk-load 1M RRset | 2.5–2.8 с (было 26 мин), 91 МБ RSS, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с |
+| Bulk-load 1M RRset | 2.5–2.8 с (было 26 мин), пик RSS 91–103 МБ, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с |
 | io_uring RSS (1/4/8 workers) | 4.7/10.2/17.5 МБ (было 12.7/40.6/104.9) |
 | io_uring p99 (8 workers) | 650 → 440 µs; SQPOLL медленнее (выкл), registered files вкл |
 | Каталог зон | 1000 зон за 83 мс, 4096 за 651 мс |
+| Кеш резолвера | 113.8 B/entry на 1M |
+| Резолвер (библиотека) cache hit | p50 0.396 µs, p99 0.572 µs, 0 allocs, ~2.3M qps/поток |
+| pulseresolved hot path | p50 578 нс, p99 750 нс, 0 allocs; 200k qps без таймаутов |
 | UDP echo, 4 worker / 4 клиента, окно 16 | 220 117 qps |
 | epoll, те же условия | 230 352 qps |
 | UDP echo, окно 1 | 89 036 qps, p50 35 µs, p99 182 µs |
@@ -403,6 +428,7 @@ cargo deny check
 | DoH HTTP/3 (qps) | ~13.6–14.9k |
 | DoQ (qps) | ~5.25k |
 | Межпроцессная запись v2 | 4 процесса × 4 зоны без потерь; 10k коммитов в 2 процессах без пересечений; ~20k zone-commit/s |
+| Роли `dns`+`api` (8 DNS + 8 REST, 8 vCPU) | DNS 85–93k qps (p99 0.53–0.66 ms), REST 359–361 PUT/s (p99 29–30 ms); `all`: 98–106k qps (p99 0.36–0.41 ms), 381–385 PUT/s (p99 27–28 ms) |
 
 ## Ограничения и roadmap
 

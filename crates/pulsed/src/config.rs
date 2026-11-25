@@ -191,6 +191,72 @@ impl FromStr for CommitMode {
     }
 }
 
+/// Роль процесса `pulsed`.
+///
+/// Разделение позволяет запустить DNS-транспорты и REST API отдельными
+/// процессами на одном zonefile (multi-process v2, ADR 0007), чтобы REST не
+/// голодал под DNS-нагрузкой.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Один процесс: DNS-транспорты и REST API (текущее поведение).
+    #[default]
+    All,
+    /// Только DNS-транспорты; zonefile открыт в multi-process режиме.
+    Dns,
+    /// Только REST API и write-ahead journal; DNS-транспорты не поднимаются.
+    Api,
+}
+
+impl Role {
+    /// `true`, если роль требует multi-process открытия zonefile.
+    #[must_use]
+    pub const fn is_multi_process(self) -> bool {
+        !matches!(self, Self::All)
+    }
+
+    /// Поднимает ли роль DNS-транспорты.
+    #[must_use]
+    pub const fn serves_dns(self) -> bool {
+        matches!(self, Self::All | Self::Dns)
+    }
+
+    /// Поднимает ли роль REST API.
+    #[must_use]
+    pub const fn serves_api(self) -> bool {
+        matches!(self, Self::All | Self::Api)
+    }
+
+    /// Строковое представление для CLI/логов.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Dns => "dns",
+            Self::Api => "api",
+        }
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Role {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "dns" => Ok(Self::Dns),
+            "api" => Ok(Self::Api),
+            other => Err(format!("unknown role {other:?}; expected all, dns or api")),
+        }
+    }
+}
+
 /// Параметры TCP-транспорта.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -661,8 +727,20 @@ pub struct Config {
     /// Per-zone allowlist REST API (точный origin или `*.suffix.`); пусто — все зоны.
     #[serde(alias = "api_scopes", default, skip_serializing_if = "Vec::is_empty")]
     pub api_scope: Vec<String>,
+    /// Роль процесса (`all` — DNS+API, `dns` — только DNS, `api` — только REST).
+    pub role: Role,
     /// Число UDP worker'ов; `0` — по числу доступных ядер.
     pub workers: usize,
+    /// Переопределение числа DNS worker'ов (`null` — использовать `workers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_workers: Option<usize>,
+    /// Максимум одновременных API-соединений (по одному потоку на соединение).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_workers: Option<usize>,
+    /// Rate limit REST API в запросах в секунду на токен.
+    pub api_rate_limit_per_sec: u32,
+    /// Интервал опроса новых версий зон ролью `dns`, мс (`0` — отключить).
+    pub zone_poll_ms: u64,
     /// Уровень логирования.
     pub log_level: LogLevel,
     /// Параметры TCP.
@@ -743,7 +821,12 @@ impl Default for Config {
             api_listen: None,
             api_token: None,
             api_scope: Vec::new(),
+            role: Role::All,
             workers: 0,
+            dns_workers: None,
+            api_workers: None,
+            api_rate_limit_per_sec: pulse_api::config::DEFAULT_RATE_LIMIT_PER_SEC,
+            zone_poll_ms: 250,
             log_level: LogLevel::Info,
             tcp: TcpConfig::default(),
             zonefile: None,
@@ -870,20 +953,25 @@ impl Config {
     /// worker'ов выходит за разумные пределы или параметры TCP некорректны.
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.listen_udp.is_none()
-            && self.listen_tcp.is_none()
-            && self.dot_listen.is_none()
-            && self.doh_listen.is_none()
-            && self.doh_h2_listen.is_none()
-            && self.doh3_listen.is_none()
-            && self.doq_listen.is_none()
-            && self.dnscrypt_listen.is_none()
-            && self.dnscrypt_tcp_listen.is_none()
-        {
+        let dns_configured = self.listen_udp.is_some()
+            || self.listen_tcp.is_some()
+            || self.dot_listen.is_some()
+            || self.doh_listen.is_some()
+            || self.doh_h2_listen.is_some()
+            || self.doh3_listen.is_some()
+            || self.doq_listen.is_some()
+            || self.dnscrypt_listen.is_some()
+            || self.dnscrypt_tcp_listen.is_some();
+        if self.role.serves_dns() && !dns_configured {
             return Err(ConfigError::Invalid(
                 "at least one of listen_udp/listen_tcp/dot_listen/doh_listen/\
                  doh_h2_listen/doh3_listen/doq_listen/dnscrypt_listen/dnscrypt_tcp_listen must be set"
                     .to_owned(),
+            ));
+        }
+        if self.role == Role::Api && self.api_listen.is_none() {
+            return Err(ConfigError::Invalid(
+                "role=api requires api_listen (or --api-listen)".to_owned(),
             ));
         }
         self.validate_tls()?;
@@ -893,6 +981,30 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "workers must be in 0..=1024, got {}",
                 self.workers
+            )));
+        }
+        if self.dns_workers.is_some_and(|workers| workers > 1024) {
+            return Err(ConfigError::Invalid(format!(
+                "dns_workers must be in 0..=1024, got {}",
+                self.dns_workers.unwrap_or_default()
+            )));
+        }
+        if let Some(workers) = self.api_workers
+            && !(1..=65_535).contains(&workers)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "api_workers must be in 1..=65535, got {workers}"
+            )));
+        }
+        if self.api_rate_limit_per_sec == 0 {
+            return Err(ConfigError::Invalid(
+                "api_rate_limit_per_sec must be greater than zero".to_owned(),
+            ));
+        }
+        if self.zone_poll_ms > 60_000 {
+            return Err(ConfigError::Invalid(format!(
+                "zone_poll_ms must be in 0..=60000, got {}",
+                self.zone_poll_ms
             )));
         }
         if self.tcp.max_connections == 0 || self.tcp.max_connections > 65_535 {
@@ -1058,6 +1170,12 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Число DNS worker'ов с учётом `dns_workers` (роль `dns`/`all`).
+    #[must_use]
+    pub fn effective_dns_workers(&self) -> usize {
+        self.dns_workers.unwrap_or(self.workers)
     }
 
     /// Проверяет параметры DoT/DoH/DoQ.
@@ -1399,6 +1517,18 @@ impl Config {
         if let Some(workers) = overrides.workers {
             self.workers = workers;
         }
+        if let Some(role) = overrides.role {
+            self.role = role;
+        }
+        if let Some(workers) = overrides.dns_workers {
+            self.dns_workers = Some(workers);
+        }
+        if let Some(workers) = overrides.api_workers {
+            self.api_workers = Some(workers);
+        }
+        if let Some(poll_ms) = overrides.zone_poll_ms {
+            self.zone_poll_ms = poll_ms;
+        }
         if let Some(level) = overrides.log_level {
             self.log_level = level;
         }
@@ -1456,6 +1586,14 @@ pub struct Overrides {
     pub dnscrypt_provider_name: Option<String>,
     /// Новое число UDP worker'ов.
     pub workers: Option<usize>,
+    /// Новая роль процесса.
+    pub role: Option<Role>,
+    /// Новое число DNS worker'ов.
+    pub dns_workers: Option<usize>,
+    /// Новый лимит API-соединений (API worker'ов).
+    pub api_workers: Option<usize>,
+    /// Новый интервал опроса зон ролью `dns`.
+    pub zone_poll_ms: Option<u64>,
     /// Новый уровень логирования.
     pub log_level: Option<LogLevel>,
     /// Путь к файлу persistence.
@@ -1573,6 +1711,10 @@ mod tests {
             dnscrypt_cert: None,
             dnscrypt_provider_name: None,
             workers: Some(3),
+            role: None,
+            dns_workers: None,
+            api_workers: None,
+            zone_poll_ms: None,
             log_level: Some(LogLevel::Debug),
             zonefile: None,
             durability: Some(Durability::Sync),
@@ -2191,6 +2333,10 @@ tick_secs = 300
             dnscrypt_cert: Some(PathBuf::from("cli-cert.json")),
             dnscrypt_provider_name: Some("2.dnscrypt-cert.cli.example.".to_owned()),
             workers: Some(3),
+            role: None,
+            dns_workers: None,
+            api_workers: None,
+            zone_poll_ms: None,
             log_level: Some(LogLevel::Trace),
             zonefile: Some(PathBuf::from("cli.pulse")),
             durability: Some(Durability::Memory),
@@ -2307,6 +2453,82 @@ tick_secs = 300
 
         config.journal = true;
         config.journal_max_bytes = 1024;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn role_parses_and_defaults_to_all() {
+        assert_eq!(Config::default().role, Role::All);
+        for (text, expected) in [
+            ("all", Role::All),
+            ("dns", Role::Dns),
+            ("api", Role::Api),
+            (" DNS ", Role::Dns),
+        ] {
+            assert_eq!(text.parse::<Role>().expect("role"), expected);
+        }
+        assert!("worker".parse::<Role>().is_err());
+        assert!(Role::Dns.is_multi_process());
+        assert!(Role::Api.is_multi_process());
+        assert!(!Role::All.is_multi_process());
+    }
+
+    #[test]
+    fn api_role_does_not_require_dns_transports() {
+        let config = Config {
+            role: Role::Api,
+            listen_udp: None,
+            listen_tcp: None,
+            api_listen: Some("127.0.0.1:8080".parse().expect("addr")),
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+
+        let missing_api = Config {
+            role: Role::Api,
+            listen_udp: None,
+            listen_tcp: None,
+            api_listen: None,
+            ..Config::default()
+        };
+        assert!(missing_api.validate().is_err());
+
+        let dns_without_transport = Config {
+            role: Role::Dns,
+            listen_udp: None,
+            listen_tcp: None,
+            ..Config::default()
+        };
+        assert!(dns_without_transport.validate().is_err());
+    }
+
+    #[test]
+    fn role_examples_parse_and_validate() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let dns = Config::from_path(root.join("pulsed-dns.toml")).expect("pulsed-dns.toml");
+        assert_eq!(dns.role, Role::Dns);
+        dns.validate().expect("dns role example");
+        let api = Config::from_path(root.join("pulsed-api.toml")).expect("pulsed-api.toml");
+        assert_eq!(api.role, Role::Api);
+        assert!(api.api_listen.is_some());
+        api.validate().expect("api role example");
+    }
+
+    #[test]
+    fn worker_overrides_and_poll_limits_are_validated() {
+        let mut config = Config {
+            dns_workers: Some(3),
+            workers: 7,
+            ..Config::default()
+        };
+        assert_eq!(config.effective_dns_workers(), 3);
+        config.dns_workers = None;
+        assert_eq!(config.effective_dns_workers(), 7);
+
+        config.api_workers = Some(0);
+        assert!(config.validate().is_err());
+        config.api_workers = Some(64);
+        config.zone_poll_ms = 60_001;
         assert!(config.validate().is_err());
     }
 }

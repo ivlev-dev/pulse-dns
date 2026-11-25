@@ -1,0 +1,17 @@
+# Роль `dns`: только DNS-транспорты на общем v2-zonefile.
+#
+# Запускается рядом с отдельным процессом `pulsed --config pulsed-api.toml`
+# на том же `zonefile` (multi-process, ADR 0007). REST API в этой роли не
+# поднимается, write-ahead journal не открывается.
+listen_udp = "127.0.0.1:5353"
+listen_tcp = "127.0.0.1:5353"
+role = "dns"
+workers = 4
+dns_workers = 8
+zone_poll_ms = 250
+log_level = "info"
+zonefile = "/tmp/pulse-dns.zonefile"
+durability = "flush"
+map_size = 268435456
+
+# API-настройки здесь не нужны: роль `dns` их игнорирует.

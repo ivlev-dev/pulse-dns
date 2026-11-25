@@ -1,0 +1,20 @@
+# Роль `api`: только REST API и write-ahead journal на общем v2-zonefile.
+#
+# Запускается рядом с `pulsed --config pulsed-dns.toml` на том же `zonefile`.
+# DNS-транспорты не поднимаются; `dns_poll` не нужен.
+role = "api"
+api_listen = "127.0.0.1:8080"
+# Токен лучше передавать через PULSED_API_TOKEN, чтобы не хранить на диске:
+#   PULSED_API_TOKEN=... pulsed --config examples/pulsed-api.toml
+# api_token = "..."
+api_workers = 32
+log_level = "info"
+zonefile = "/tmp/pulse-dns.zonefile"
+durability = "flush"
+map_size = 268435456
+journal = true
+# journal_path = "/tmp/pulse-dns.zonefile.journal"
+journal_max_bytes = 8388608
+journal_fsync = true
+
+# DNS-адреса намеренно не заданы: роль `api` их не открывает.

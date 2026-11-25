@@ -140,7 +140,7 @@ pub(crate) struct ZoneEntry {
 }
 
 /// Зона в кэше каталога (без головы; версия читается при обращении).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CatalogEntry {
     origin: Name,
     apex: NameRle,
@@ -176,22 +176,31 @@ impl ZoneStore {
     ///
     /// Пустой файл трактуется как «создать» (совместимо с `pulsed import`).
     /// v1-файл отвергается с подсказкой про `pulsed convert`.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn open_or_create(
         path: &Path,
         map_size: u64,
         requested: SyncModeV2,
         commit_mode: CommitMode,
+        multi_process: bool,
     ) -> Result<Self, ZoneFileSourceError> {
         let existed = match std::fs::symlink_metadata(path) {
             Ok(meta) => {
                 if meta.file_type().is_file() && meta.len() == 0 {
-                    std::fs::remove_file(path).map_err(|error| {
-                        ZoneFileSourceError::new(format!(
-                            "cannot initialise empty zone file {}: {error}",
-                            path.display()
-                        ))
-                    })?;
-                    false
+                    // Другой процесс (`dns`/`api`) мог создать файл и ещё не
+                    // записать суперблок. Несколько коротких попыток не дают
+                    // одному процессу удалить файл под руками другого.
+                    if multi_process && wait_non_empty(path, Duration::from_millis(500)) {
+                        true
+                    } else {
+                        std::fs::remove_file(path).map_err(|error| {
+                            ZoneFileSourceError::new(format!(
+                                "cannot initialise empty zone file {}: {error}",
+                                path.display()
+                            ))
+                        })?;
+                        false
+                    }
                 } else {
                     true
                 }
@@ -212,17 +221,33 @@ impl ZoneStore {
             )));
         }
         let store = if existed {
-            ParallelStore::open(path, OpenConfigV2::default())
+            if multi_process {
+                open_multi_with_grace(path)
+            } else {
+                ParallelStore::open(path, OpenConfigV2::default())
+            }
         } else {
-            ParallelStore::create(
+            let created = ParallelStore::create(
                 path,
                 StoreConfig {
                     page_count_max: page_count(map_size),
                     max_zones: MAX_ZONES,
                     sync_mode: requested,
+                    multi_process,
                     ..StoreConfig::default()
                 },
-            )
+            );
+            match created {
+                Ok(store) => Ok(store),
+                // Гонка старта `dns`+`api`: второй процесс проиграл `O_EXCL`
+                // и должен открыть уже созданный файл.
+                Err(ParallelError::Busy | ParallelError::Io(_))
+                    if multi_process && path.exists() =>
+                {
+                    open_multi_with_grace(path)
+                }
+                Err(error) => Err(error),
+            }
         }
         .map_err(|error| file_error(path, "open", &error))?;
         let store = Arc::new(store);
@@ -295,6 +320,23 @@ impl ZoneStore {
 
     pub(crate) fn stats(&self) -> Arc<ZoneFileStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Перечитывает каталог зон из файла (multi-process роль `dns`).
+    ///
+    /// Возвращает `true`, если набор зон или их метаданные изменились.
+    /// Головы зон не копируются: [`ZoneStore::zone_entry`] читает их из файла
+    /// при каждом обращении, поэтому новые версии видны без полной перезагрузки.
+    pub(crate) fn refresh_catalog(&self) -> Result<bool, String> {
+        let mut fresh = CatalogCache::default();
+        Self::load_catalog_into(&self.store, &mut fresh)
+            .map_err(|error| self.error("reload catalog", &error))?;
+        let mut cache = self.catalog.lock().unwrap_or_else(PoisonError::into_inner);
+        if cache.entries == fresh.entries {
+            return Ok(false);
+        }
+        *cache = fresh;
+        Ok(true)
     }
 
     /// Режим коммита с учётом липкого `Sync` файла.
@@ -1037,6 +1079,45 @@ fn is_v1_file(path: &Path) -> Result<bool, ZoneFileSourceError> {
             "cannot read zone file {}: {error}",
             path.display()
         ))),
+    }
+}
+
+/// Открывает multi-process стор, пережидая окно инициализации sidecar.
+///
+/// При одновременном старте `dns` и `api` один процесс уже держит `LOCK_EX`
+/// на `ALIVE`, но ещё не записал заголовок; второй получает `Busy`. Короткий
+/// retry превращает эту гонку в ожидание init-окна.
+fn open_multi_with_grace(path: &Path) -> Result<ParallelStore, ParallelError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match ParallelStore::open(
+            path,
+            OpenConfigV2 {
+                multi_process: true,
+                ..OpenConfigV2::default()
+            },
+        ) {
+            Err(ParallelError::Busy | ParallelError::Corrupt { .. })
+                if std::time::Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(2));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Ждёт, пока другой процесс допишет суперблок в только что созданный файл.
+fn wait_non_empty(path: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::fs::metadata(path).is_ok_and(|meta| meta.len() > 0) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -2388,6 +2469,7 @@ mod tests {
                 16 * 1024 * 1024,
                 SyncModeV2::Sync,
                 CommitMode::PerZone,
+                false,
             )
             .expect("store"),
         );

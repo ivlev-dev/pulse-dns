@@ -44,6 +44,8 @@ pub(crate) struct SharedZoneAdmin {
     store: Option<Arc<ZoneStore>>,
     /// `origin → view`; движок собирается из этих view.
     views: RwLock<HashMap<Name, Arc<FileZoneView>>>,
+    /// Версия головы, из которой построена view (для poll роли `dns`).
+    view_versions: RwLock<HashMap<Name, u64>>,
     engine: RwLock<Arc<QueryEngine>>,
     query_stats: Arc<QueryStats>,
     file_stats: Arc<ZoneFileStats>,
@@ -102,6 +104,7 @@ impl SharedZoneAdmin {
         .map_err(|error| StoreError(format!("cannot initialise secondary zones: {error}")))?;
         let expired = secondary.expired_origins();
         let mut views = HashMap::with_capacity(zones.len());
+        let mut versions = HashMap::with_capacity(zones.len());
         for entry in &zones {
             let Some(store) = &store else {
                 continue;
@@ -109,11 +112,13 @@ impl SharedZoneAdmin {
             let view = FileZoneView::new(Arc::clone(store), entry, server_state(entry, &expired))
                 .map_err(StoreError)?;
             views.insert(entry.origin.clone(), Arc::new(view));
+            versions.insert(entry.origin.clone(), entry.version);
         }
         let engine = build_engine(&views, &query_stats);
         Ok(Self {
             store,
             views: RwLock::new(views),
+            view_versions: RwLock::new(versions),
             engine: RwLock::new(engine),
             query_stats,
             file_stats,
@@ -438,23 +443,86 @@ impl SharedZoneAdmin {
         let entry = store.zone_entry(origin).map_err(AdminError::Storage)?;
         let expired = self.secondary.expired_origins();
         let mut views = self.views.write().unwrap_or_else(PoisonError::into_inner);
-        match entry {
-            Some(entry) => {
-                let view =
-                    FileZoneView::new(Arc::clone(store), &entry, server_state(&entry, &expired))
-                        .map_err(|error| {
-                            logging::error("zone_store", &error);
-                            AdminError::Internal
-                        })?;
-                views.insert(origin.clone(), Arc::new(view));
-            }
-            None => {
-                views.remove(origin);
-            }
+        let mut versions = self
+            .view_versions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = entry {
+            let view = FileZoneView::new(Arc::clone(store), &entry, server_state(&entry, &expired))
+                .map_err(|error| {
+                    logging::error("zone_store", &error);
+                    AdminError::Internal
+                })?;
+            views.insert(origin.clone(), Arc::new(view));
+            versions.insert(origin.clone(), entry.version);
+        } else {
+            views.remove(origin);
+            versions.remove(origin);
         }
         let engine = build_engine(&views, &self.query_stats);
         *self.engine.write().unwrap_or_else(PoisonError::into_inner) = engine;
         Ok(())
+    }
+
+    /// Подхватывает внешние изменения zonefile (multi-process роль `dns`).
+    ///
+    /// Перечитывает каталог, сравнивает версии голов и перестраивает только
+    /// изменившиеся view; данные зон не копируются — точечные чтения идут из
+    /// mmap по текущей голове. Возвращает число обновлённых/удалённых зон.
+    pub(crate) fn poll_zonefile(&self) -> Result<usize, String> {
+        let Some(store) = &self.store else {
+            return Ok(0);
+        };
+        if store.refresh_catalog()? {
+            // Изменился набор зон или метаданные каталога (create/delete/
+            // settings): перестраиваем view целиком, это редкое событие.
+            let count = store.list_zones()?.len();
+            self.rebuild_all_views().map_err(|error| match error {
+                AdminError::Storage(error) => error,
+                _ => "cannot rebuild DNS views after catalog change".to_owned(),
+            })?;
+            return Ok(count.max(1));
+        }
+        let zones = store.list_zones()?;
+        let expired = self.secondary.expired_origins();
+        let mut changed = 0_usize;
+        {
+            let mut views = self.views.write().unwrap_or_else(PoisonError::into_inner);
+            let mut versions = self
+                .view_versions
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let known: HashSet<Name> = versions.keys().cloned().collect();
+            for entry in &zones {
+                let same = versions.get(&entry.origin) == Some(&entry.version);
+                if same {
+                    continue;
+                }
+                let view =
+                    FileZoneView::new(Arc::clone(store), entry, server_state(entry, &expired))
+                        .map_err(|error| format!("zone {}: {error}", entry.origin))?;
+                views.insert(entry.origin.clone(), Arc::new(view));
+                versions.insert(entry.origin.clone(), entry.version);
+                changed = changed.saturating_add(1);
+            }
+            let present: HashSet<Name> = zones.iter().map(|entry| entry.origin.clone()).collect();
+            for origin in known.difference(&present) {
+                // `list_zones` пропускает зону с нестабильной головой на время
+                // публикации; не удаляем view, пока каталог её ещё содержит.
+                if store.zone_entry(origin).ok().flatten().is_some() {
+                    continue;
+                }
+                views.remove(origin);
+                versions.remove(origin);
+                changed = changed.saturating_add(1);
+            }
+        }
+        if changed > 0 {
+            let views = self.views.read().unwrap_or_else(PoisonError::into_inner);
+            let engine = build_engine(&views, &self.query_stats);
+            *self.engine.write().unwrap_or_else(PoisonError::into_inner) = engine;
+        }
+        Ok(changed)
     }
 
     fn rebuild_all_views(&self) -> Result<(), AdminError> {
@@ -466,6 +534,7 @@ impl SharedZoneAdmin {
         let zones = store.list_zones().map_err(AdminError::Storage)?;
         let expired = self.secondary.expired_origins();
         let mut views = HashMap::with_capacity(zones.len());
+        let mut versions = HashMap::with_capacity(zones.len());
         for entry in &zones {
             let view = FileZoneView::new(Arc::clone(store), entry, server_state(entry, &expired))
                 .map_err(|error| {
@@ -473,9 +542,14 @@ impl SharedZoneAdmin {
                 AdminError::Internal
             })?;
             views.insert(entry.origin.clone(), Arc::new(view));
+            versions.insert(entry.origin.clone(), entry.version);
         }
         let engine = build_engine(&views, &self.query_stats);
         *self.views.write().unwrap_or_else(PoisonError::into_inner) = views;
+        *self
+            .view_versions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = versions;
         *self.engine.write().unwrap_or_else(PoisonError::into_inner) = engine;
         Ok(())
     }

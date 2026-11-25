@@ -16,7 +16,7 @@ use pulse_api::server::{ApiServerError, RunningServer, serve_with_journal};
 use pulse_server::StatsSnapshot as QueryStatsSnapshot;
 use thiserror::Error;
 
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, Role};
 use crate::dnscrypt::{DnscryptError, DnscryptService, DnscryptTcpService};
 use crate::dnssec::{self, DnssecError};
 use crate::metrics::{EnabledTransports, TransportMetrics};
@@ -66,6 +66,7 @@ pub struct Server {
     api: Option<RunningServer>,
     secondary: Option<SecondaryScheduler>,
     rotation: Option<RotationScheduler>,
+    zone_poll: Option<ZonePoller>,
 }
 
 impl Server {
@@ -93,6 +94,12 @@ impl Server {
     #[allow(clippy::too_many_lines)]
     pub fn start_with_api(config: &Config, api: Option<ApiOptions>) -> Result<Self, ServerError> {
         config.validate()?;
+        let role = config.role;
+        if role == Role::Api && api.is_none() {
+            return Err(ServerError::Store(
+                "role=api requires REST API options (--api-listen and --api-token)".to_owned(),
+            ));
+        }
         let dnssec = dnssec::load(config).map_err(ServerError::Dnssec)?;
         let store = match &config.zonefile {
             Some(path) => {
@@ -102,42 +109,57 @@ impl Server {
                         config.map_size,
                         config.durability.sync_mode_v2(),
                         config.commit_mode,
+                        role.is_multi_process(),
                     )
                     .map_err(|error| ServerError::Store(error.to_string()))?,
                 );
-                crate::logging::info("zonefile", &format!("opened zone file {}", path.display()));
+                crate::logging::info(
+                    "zonefile",
+                    &format!(
+                        "opened zone file {} (role={role}, multi_process={})",
+                        path.display(),
+                        role.is_multi_process()
+                    ),
+                );
                 Some(store)
             }
             None => None,
         };
         if let Some(store) = &store {
-            let signed =
-                store::sign_configured_zones(store, &dnssec).map_err(ServerError::Store)?;
-            if signed > 0 {
-                crate::logging::info(
-                    "dnssec",
-                    &format!("{signed} zone(s) signed into zonefile at startup"),
-                );
+            // Подпись меняет зону: в роли `dns` и `api` это делает только
+            // `all`-процесс или REST `/sign`, иначе два процесса конкурируют
+            // за lease и пишут одновременно.
+            if role == Role::All {
+                let signed =
+                    store::sign_configured_zones(store, &dnssec).map_err(ServerError::Store)?;
+                if signed > 0 {
+                    crate::logging::info(
+                        "dnssec",
+                        &format!("{signed} zone(s) signed into zonefile at startup"),
+                    );
+                }
             }
         } else if dnssec.origins().next().is_some() {
             return Err(ServerError::Store(
                 "dnssec zones require --data <zonefile>".to_owned(),
             ));
         }
-        let notify = if config.transfer.notify.is_empty() {
-            None
-        } else {
+        let notify = if role != Role::Api && !config.transfer.notify.is_empty() {
             let key = transfer::notify_key(&config.transfer, &config.tsig_keys)
                 .map_err(|error| ServerError::Store(error.to_string()))?;
             Some(Arc::new(
                 NotifyDispatcher::start(&config.transfer, key).map_err(ServerError::Notify)?,
             ))
+        } else {
+            None
         };
         let admin = Arc::new(SharedZoneAdmin::new(store, dnssec, config, notify).map_err(
             |error| ServerError::Store(format!("cannot build initial DNS snapshot: {error}")),
         )?);
+        // Журнал принадлежит роли `api`: два процесса не должны повторять одни
+        // и те же интенты. `dns` читает зоны напрямую из файла.
         let journal = match config.journal_file() {
-            Some(path) => Some(Arc::new(
+            Some(path) if role.serves_api() => Some(Arc::new(
                 Journal::open(JournalConfig {
                     path: path.clone(),
                     max_bytes: config.journal_max_bytes,
@@ -146,7 +168,7 @@ impl Server {
                 })
                 .map_err(ServerError::Journal)?,
             )),
-            None => None,
+            _ => None,
         };
         if let Some(journal) = &journal {
             let report = journal.recover(&*admin).map_err(ServerError::Journal)?;
@@ -164,7 +186,7 @@ impl Server {
                 );
             }
         }
-        let secondary = if admin.has_secondary_zones() {
+        let secondary = if role.serves_dns() && admin.has_secondary_zones() {
             Some(
                 SecondaryScheduler::start(Arc::downgrade(&admin))
                     .map_err(ServerError::Secondary)?,
@@ -173,11 +195,11 @@ impl Server {
             None
         };
         let rotation = match admin.rotation_tick() {
-            Some(interval) => Some(
+            Some(interval) if role.serves_dns() => Some(
                 RotationScheduler::start(Arc::downgrade(&admin), interval)
                     .map_err(ServerError::Rotation)?,
             ),
-            None => None,
+            _ => None,
         };
         let stats = Arc::new(Stats::new());
         let metrics = Arc::new(TransportMetrics::new(EnabledTransports {
@@ -189,35 +211,39 @@ impl Server {
             dnscrypt: config.dnscrypt_listen.is_some(),
             dnscrypt_tcp: config.dnscrypt_tcp_listen.is_some(),
         }));
-        let tls = TlsTransports::start(
-            config,
-            Arc::clone(&admin),
-            Arc::clone(&stats),
-            Arc::clone(&metrics),
-        )?;
+        let tls = if role.serves_dns() {
+            TlsTransports::start(
+                config,
+                Arc::clone(&admin),
+                Arc::clone(&stats),
+                Arc::clone(&metrics),
+            )?
+        } else {
+            None
+        };
         let dnscrypt = match config.dnscrypt_listen {
-            Some(addr) => Some(DnscryptService::start(
+            Some(addr) if role.serves_dns() => Some(DnscryptService::start(
                 config,
                 addr,
                 Arc::clone(&admin),
                 Arc::clone(&stats),
                 Arc::clone(&metrics),
             )?),
-            None => None,
+            _ => None,
         };
         let dnscrypt_tcp = match config.dnscrypt_tcp_listen {
-            Some(addr) => Some(DnscryptTcpService::start(
+            Some(addr) if role.serves_dns() => Some(DnscryptTcpService::start(
                 config,
                 addr,
                 Arc::clone(&admin),
                 Arc::clone(&stats),
                 Arc::clone(&metrics),
             )?),
-            None => None,
+            _ => None,
         };
 
         let tcp = match config.listen_tcp {
-            Some(addr) => Some(
+            Some(addr) if role.serves_dns() => Some(
                 TcpService::start(
                     addr,
                     config.tcp.max_connections,
@@ -227,19 +253,19 @@ impl Server {
                 )
                 .map_err(|source| ServerError::TcpStart { addr, source })?,
             ),
-            None => None,
+            _ => None,
         };
         let udp = match config.listen_udp {
-            Some(addr) => Some(UdpService::start(
+            Some(addr) if role.serves_dns() => Some(UdpService::start(
                 addr,
-                config.workers,
+                config.effective_dns_workers(),
                 Arc::clone(&admin),
                 Arc::clone(&stats),
             )?),
-            None => None,
+            _ => None,
         };
         let api = match api {
-            Some(options) => {
+            Some(options) if role.serves_api() => {
                 let tokens = vec![TokenConfig {
                     id: "pulsed-api".to_owned(),
                     token: options.token,
@@ -252,6 +278,10 @@ impl Server {
                 }];
                 let mut api_config = ApiConfig::new(tokens);
                 api_config.bind = options.listen;
+                api_config.rate_limit_per_sec = config.api_rate_limit_per_sec;
+                if let Some(workers) = config.api_workers {
+                    api_config.max_connections = workers;
+                }
                 let metric_source = {
                     let metrics = Arc::clone(&metrics);
                     Arc::new(move || metrics.render())
@@ -263,7 +293,19 @@ impl Server {
                     journal.clone(),
                 )?)
             }
-            None => None,
+            _ => None,
+        };
+        let zone_poll = if role == Role::Dns && config.zonefile.is_some() && config.zone_poll_ms > 0
+        {
+            Some(
+                ZonePoller::start(
+                    Arc::downgrade(&admin),
+                    Duration::from_millis(config.zone_poll_ms),
+                )
+                .map_err(ServerError::ZonePoll)?,
+            )
+        } else {
+            None
         };
 
         Ok(Self {
@@ -278,6 +320,7 @@ impl Server {
             api,
             secondary,
             rotation,
+            zone_poll,
         })
     }
 
@@ -502,6 +545,9 @@ impl Server {
         if let Some(rotation) = self.rotation.take() {
             rotation.shutdown();
         }
+        if let Some(zone_poll) = self.zone_poll.take() {
+            zone_poll.shutdown();
+        }
         let mut first_error = None;
         if let Some(mut tls) = self.tls.take()
             && let Err(error) = tls.shutdown()
@@ -540,6 +586,74 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+/// Фоновый опрос новых версий zonefile ролью `dns`.
+///
+/// Перечитывает каталог и головы зон, обновляя только изменившиеся view.
+/// Данные зон не копируются: точечные чтения идут из mmap по текущей голове.
+struct ZonePoller {
+    stop: Arc<AtomicBool>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl ZonePoller {
+    fn start(admin: Weak<SharedZoneAdmin>, interval: Duration) -> io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("pulse-zone-poll".to_owned())
+            .spawn(move || {
+                while !stop_clone.load(Ordering::Acquire) {
+                    if let Some(admin) = admin.upgrade() {
+                        match admin.poll_zonefile() {
+                            Ok(0) => {}
+                            Ok(changed) => crate::logging::info(
+                                "zonefile",
+                                &format!(
+                                    "dns role: applied {changed} external zone change(s) from zone file"
+                                ),
+                            ),
+                            Err(error) => {
+                                crate::logging::warn("zonefile", &error);
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                    // Просыпаемся чаще интервала, чтобы shutdown не ждал tick.
+                    let mut remaining = interval;
+                    let tick = Duration::from_millis(25);
+                    while remaining > Duration::ZERO && !stop_clone.load(Ordering::Acquire) {
+                        let sleep = remaining.min(tick);
+                        thread::sleep(sleep);
+                        remaining = remaining.saturating_sub(sleep);
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            handle: Mutex::new(Some(handle)),
+        })
+    }
+
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ZonePoller {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -642,6 +756,9 @@ pub enum ServerError {
     /// Не удалось запустить фоновый планировщик ротации.
     #[error("cannot start key rotation scheduler: {0}")]
     Rotation(#[source] io::Error),
+    /// Не удалось запустить фоновый опрос zonefile.
+    #[error("cannot start zone poll worker: {0}")]
+    ZonePoll(#[source] io::Error),
     /// Ошибка встроенного API.
     #[error(transparent)]
     Api(#[from] ApiServerError),

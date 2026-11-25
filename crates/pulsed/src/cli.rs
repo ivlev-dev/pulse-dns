@@ -11,7 +11,7 @@ use pulse_dns::Name;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::config::{CommitMode, Config, DnssecKeyRole, Durability, LogLevel, Overrides};
+use crate::config::{CommitMode, Config, DnssecKeyRole, Durability, LogLevel, Overrides, Role};
 use crate::dnscrypt::{GenCertOptions, generate_certificate};
 use crate::logging;
 use crate::server::{ApiOptions, Server, ServerError};
@@ -57,6 +57,10 @@ pub(crate) fn run() -> ExitCode {
         dnscrypt_cert: matches.get_one::<PathBuf>("dnscrypt-cert").cloned(),
         dnscrypt_provider_name: matches.get_one::<String>("dnscrypt-provider-name").cloned(),
         workers: matches.get_one::<usize>("workers").copied(),
+        role: matches.get_one::<Role>("role").copied(),
+        dns_workers: matches.get_one::<usize>("dns-workers").copied(),
+        api_workers: matches.get_one::<usize>("api-workers").copied(),
+        zone_poll_ms: matches.get_one::<u64>("zone-poll-ms").copied(),
         log_level: matches.get_one::<LogLevel>("log-level").copied(),
         zonefile: matches.get_one::<PathBuf>("data").cloned(),
         durability: matches.get_one::<Durability>("durability").copied(),
@@ -72,6 +76,11 @@ pub(crate) fn run() -> ExitCode {
         }
     };
     config.apply_overrides(&overrides);
+    // `Config::validate` проверяет `role=api`, поэтому CLI-адрес API должен
+    // быть виден конфигурации до валидации.
+    if let Some(addr) = matches.get_one::<SocketAddr>("api-listen").copied() {
+        config.api_listen = Some(addr);
+    }
     match dnssec_keys(&matches) {
         Ok(keys) => {
             for (origin, role, path) in keys {
@@ -100,13 +109,30 @@ pub(crate) fn run() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let api = match api_options(&matches, &config) {
-        Ok(api) => api,
-        Err(error) => {
-            logging::error("api", &error);
-            return ExitCode::from(2);
+    let api = if config.role == Role::Dns {
+        None
+    } else {
+        match api_options(&matches, &config) {
+            Ok(api) => api,
+            Err(error) => {
+                logging::error("api", &error);
+                return ExitCode::from(2);
+            }
         }
     };
+    if config.role == Role::Dns && config.api_listen.is_some() {
+        logging::warn(
+            "api",
+            "role=dns ignores the REST API configuration; run a separate role=api process",
+        );
+    }
+    if config.role == Role::Api && api.is_none() {
+        logging::error(
+            "api",
+            "role=api requires --api-listen and --api-token (or PULSED_API_TOKEN)",
+        );
+        return ExitCode::from(2);
+    }
     let mut server = match Server::start_with_api(&config, api) {
         Ok(server) => server,
         Err(error) => {
@@ -117,8 +143,9 @@ pub(crate) fn run() -> ExitCode {
     logging::info(
         "startup",
         &format!(
-            "pulsed {} listening: udp={:?} tcp={:?} dot={:?} doh={:?} doh_h2={:?} doh3={:?} doq={:?} dnscrypt={:?} api={:?} workers={:?} backend={:?}",
+            "pulsed {} role={} listening: udp={:?} tcp={:?} dot={:?} doh={:?} doh_h2={:?} doh3={:?} doq={:?} dnscrypt={:?} api={:?} workers={:?} backend={:?}",
             env!("CARGO_PKG_VERSION"),
+            config.role,
             server.udp_addr(),
             server.tcp_addr(),
             server.dot_addr(),
@@ -459,6 +486,7 @@ fn import_zone(matches: &ArgMatches) -> ExitCode {
         map_size,
         durability.sync_mode_v2(),
         CommitMode::PerZone,
+        false,
     ) {
         Ok(store) => store,
         Err(error) => {
@@ -813,6 +841,7 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
         | ServerError::Notify(_)
         | ServerError::Secondary(_)
         | ServerError::Rotation(_)
+        | ServerError::ZonePoll(_)
         | ServerError::Tls(_)
         | ServerError::Dnscrypt(_) => ExitCode::from(1),
     }
@@ -948,6 +977,34 @@ fn command() -> Command {
                 .long("dnscrypt-provider-name")
                 .value_name("NAME")
                 .help("Full DNSCrypt provider name, e.g. 2.dnscrypt-cert.example.com."),
+        )
+        .arg(
+            Arg::new("role")
+                .long("role")
+                .value_name("ROLE")
+                .value_parser(value_parser!(Role))
+                .help("Process role: all (DNS+API), dns (DNS only) or api (REST+journal only)"),
+        )
+        .arg(
+            Arg::new("dns-workers")
+                .long("dns-workers")
+                .value_name("N")
+                .value_parser(value_parser!(usize))
+                .help("Override the number of DNS (UDP) workers for role dns/all"),
+        )
+        .arg(
+            Arg::new("api-workers")
+                .long("api-workers")
+                .value_name("N")
+                .value_parser(value_parser!(usize))
+                .help("Maximum concurrent REST connections (one worker thread each)"),
+        )
+        .arg(
+            Arg::new("zone-poll-ms")
+                .long("zone-poll-ms")
+                .value_name("MS")
+                .value_parser(value_parser!(u64))
+                .help("Poll interval for new zone versions in role dns (0 disables, default 250)"),
         )
         .arg(
             Arg::new("workers")

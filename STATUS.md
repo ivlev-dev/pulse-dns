@@ -19,7 +19,7 @@
 
 ## Проверки (зелёные)
 
-- `cargo test --workspace --all-features` — **1444 теста**, 0 failures.
+- `cargo test --workspace --all-features` — **1478 тестов**, 0 failures.
 - `cargo fmt --check`.
 - `cargo clippy --workspace --all-targets -D warnings`.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
@@ -49,14 +49,15 @@
 
 - **Zero-copy ответ**: `respond_ref_into` покрывает A/AAAA/MX/TXT/SRV/CNAME/NS/SVCB/HTTPS,
   NXDOMAIN/NODATA, wildcard (unsigned), EDNS без DO; `udp-e2e` allocs/query с 52 → 0–0.01.
-  Signed/DO=1, referral, ANY, wildcard-CNAME — полный (медленный) путь.
+  **0 аллокаций** на ответ (unsigned/signed/referral/ANY/EDNS); DNAME/циклы/oversized/wildcard-CNAME — fallback.
 - **NSEC/NSEC3 индексы**: NXDOMAIN p99 на 100k signed с 367 мс → 0.71 мс; 1M in-memory p99 18 µs (цель <2 мс).
-- **Bulk-load**: 1M RRset за 2.5–2.8 с (было 26 мин), 91 МБ RSS, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с.
-- **Память**: v2 чтение 1M RRset RssAnon 6.3 МБ (было ~9.6), soak 600 с без роста; сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов).
+  Signed NXDOMAIN: NSEC3 p99 307 µs (было 38–47 мс), NSEC p99 343 µs.
+- **Bulk-load**: 1M RRset за 2.5–2.8 с (было 26 мин), пик RSS 91–103 МБ, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с.
+- **Память**: v2 чтение 1M RRset RssAnon 6.3 МБ (−41%, было ~9.6), soak 600 с без роста; сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов); кеш резолвера 113.8 B/entry на 1M.
 - **Чтение**: zone snapshot 87–92 нс, RRset warm wide ~1.36–1.45 µs (−20%), order-key memcmp; warm lookup 0 аллокаций.
 - **io_uring**: RSS 4.7/10.2/17.5 МБ на 1/4/8 workers (было 12.7/40.6/104.9); p99 8 workers 650→440 µs; SQPOLL на этом ядре медленнее (выкл), registered files вкл.
 - **Каталог 1000 зон**: исправлено зависание (выделенный lease-шард каталога); 1000 зон за 83 мс, 4096 за 651 мс.
-- **Тесты**: утечка дочерних процессов закрыта RAII-guard; 3× без утечек.
+- **Тесты**: утечка дочерних процессов закрыта RAII-guard; 15× pulsed lib без флейков.
 
 ## Проверено руками
 
@@ -129,15 +130,18 @@
   A p50 68 µs, p99 141 µs; mix p50 68 µs, p99 604 µs, ~44k qps на 4 клиентах;
   10k open-loop mix p99 777 µs (было 2361); NXDOMAIN 10k qps p50 757 µs, p99 1.56 мс,
   timeouts 0 (было 260 мс/16912); NX window1 p50 235 µs.
+  Signed NXDOMAIN: NSEC3 p99 307 µs (было 38–47 мс), NSEC p99 343 µs.
   NSEC/NSEC3: NXDOMAIN p99 на 100k signed 367 мс → 0.71 мс; 1M in-memory p99 18 µs.
-  Zero-copy: allocs/query 52 → 0–0.01 (udp-e2e); signed/DO=1, referral, ANY, wildcard-CNAME — полный путь.
-  Память: v2 чтение 1M RRset RssAnon 6.3 МБ (было ~9.6); soak 600 с без роста;
-  сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов).
+  Zero-copy: allocs/query 52 → 0–0.01 (udp-e2e); 0 аллокаций на ответ (unsigned/signed/referral/ANY/EDNS).
+  Память: v2 чтение 1M RRset RssAnon 6.3 МБ (−41%); soak 600 с без роста;
+  сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов); кеш резолвера 113.8 B/entry на 1M.
   Чтение: zone snapshot 87–92 нс; RRset warm wide ~1.36–1.45 µs (−20%); order-key memcmp; warm lookup 0 аллокаций.
   io_uring: RSS 4.7/10.2/17.5 МБ на 1/4/8 workers (было 12.7/40.6/104.9); p99 8 workers 650→440 µs;
   SQPOLL медленнее (выкл), registered files вкл.
-  Bulk-load: 1M RRset 2.5–2.8 с (было 26 мин), 91 МБ RSS, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с.
+  Bulk-load: 1M RRset 2.5–2.8 с (было 26 мин), пик RSS 91–103 МБ, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с.
   Каталог: 1000 зон за 83 мс, 4096 за 651 мс (исправлен self-deadlock на 256-й зоне).
+  Резолвер: библиотека cache hit p50 0.396 µs, p99 0.572 µs, 0 allocs, ~2.3M qps/поток (было 6–7.6 µs);
+  pulseresolved hot path p50 578 нс, p99 750 нс, 0 allocs; 200k qps без таймаутов (было захлёбывался на 150k).
   Старые замеры (loopback, хост нагружен): UDP echo 220 117 qps (4w/4c, окно 16); epoll 230 352 qps;
   окно 1 — 89 036 qps, p50 35 µs, p99 182 µs; zone lookup 156–268 нс; insert ~10 000/s;
   alloc reserve ~50M/s; per-zone commit 49k zone-commit/s; group commit 2 fsync/группу (2.4×/3.36×);
@@ -163,8 +167,9 @@
 - REST — MVP-подмножество спецификации (хотя доведён по jobs/transfers/audit);
   API доступен только на loopback (без TLS).
 - RRset warm wide ~1.36–1.45 µs при 1M (−20%); цель 500 нс не достигнута.
-- Signed/DO=1, referral, ANY, wildcard-CNAME — полный (медленный) путь ответа (zero-copy не покрывает).
+- Signed/DO/ANY/referral теперь zero-copy; DNAME/циклы/oversized/wildcard-CNAME — fallback.
 - Bulk-load требует отсортированный вход; `Memory` incremental не реклеймит (bulk рекомендуется).
+- В режиме `all` REST под 8 UDP workers делит CPU с DNS; для разделения есть роли `--role dns|api` на одном v2-файле (multi-process, ADR 0007), см. `docs/process-roles.md`.
 - Замеры на loopback + SMT: клиент и сервер делят 8 vCPU, абсолютные qps занижены.
 - perf record заблокирован (paranoid=2), flamegraph не снят.
 - Loom отсутствует (fuzz и Miri есть); Miri — continue-on-error.
@@ -200,8 +205,9 @@ dig @127.0.0.1 -p 5353 example.com. A +norecurse
 ## Риски и известные дефекты
 
 - RRset warm wide ~1.36–1.45 µs при 1M (−20%); цель 500 нс не достигнута.
-- Signed/DO=1, referral, ANY, wildcard-CNAME — полный (медленный) путь.
+- Signed/DO/ANY/referral теперь zero-copy; DNAME/циклы/oversized/wildcard-CNAME — fallback.
 - Bulk требует отсортированный вход; `Memory` incremental не реклеймит (bulk рекомендуется).
+- В режиме `all` REST под 8 UDP workers делит CPU с DNS; для разделения есть роли `--role dns|api` на одном v2-файле (multi-process, ADR 0007), см. `docs/process-roles.md`.
 - Замеры на loopback + SMT: клиент и сервер делят 8 vCPU, абсолютные qps занижены.
 - perf record заблокирован (paranoid=2), flamegraph не снят.
 - API доступен только на loopback, TLS отсутствует.
