@@ -154,6 +154,17 @@ pub enum ParallelError {
         field: &'static str,
     },
 
+    /// Bulk-вход не отсортирован по каноническому ключу или содержит дубликат.
+    #[error("v2 bulk input is not strictly ordered by canonical key")]
+    BulkOrder,
+
+    /// Записи одного owner'а превысили лимит буфера bulk-загрузки.
+    #[error("v2 bulk owner buffer exceeded: {bytes} bytes")]
+    BulkTooLarge {
+        /// Сколько байт накоплено.
+        bytes: usize,
+    },
+
     /// Свободных слотов читателя нет.
     #[error("v2 reader table is full")]
     TooManyReaders,

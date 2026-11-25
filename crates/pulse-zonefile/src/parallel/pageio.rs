@@ -39,16 +39,33 @@ use crate::wire;
 /// Размер страницы v2 (фаза A/B1 — только 4096).
 pub const V2_PAGE_BYTES: u32 = PAGE_SIZE_V2;
 
+/// Число страниц, обслуживаемых inline-слотами без хеш-таблицы.
+///
+/// Типичный запрос читает 2–4 страницы B+tree, поэтому `HashMap` на каждый
+/// `ZoneReader` — это аллокация на горячем пути. Первые слоты живут в самой
+/// арене; overflow уходит в хеш-карту для широких/глубоких обходов.
+const INLINE_PAGE_SLOTS: usize = 16;
+
+/// Слоты inline-арены: `(page_no, образ)`.
+type InlinePages = [Option<(u32, Arc<[u8]>)>; INLINE_PAGE_SLOTS];
+
 /// Арена прочитанных страниц: append-only, слоты не переиспользуются.
 ///
 /// Ссылка на страницу живёт столько же, сколько `&self`; буферы — отдельные
 /// `Arc<[u8]>`, поэтому рост/перестроение таблицы их не перемещает.
-///
-/// Таблица — хеш-карта `page_no → Arc<[u8]>`: поиск `O(1)` вместо линейного
-/// скана (на широких зонах арена держит тысячи страниц).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PageArena {
-    pages: RefCell<PageMap>,
+    inline: RefCell<InlinePages>,
+    overflow: RefCell<PageMap>,
+}
+
+impl Default for PageArena {
+    fn default() -> Self {
+        Self {
+            inline: RefCell::new(std::array::from_fn(|_| None)),
+            overflow: RefCell::new(PageMap::default()),
+        }
+    }
 }
 
 /// Быстрый хешер номеров страниц (номер уже равномерный, `SipHash` избыточен).
@@ -73,41 +90,91 @@ impl Hasher for PageHasher {
 
 type PageMap = HashMap<u32, Arc<[u8]>, BuildHasherDefault<PageHasher>>;
 
+#[allow(unsafe_code)]
+fn page_parts(buffer: &Arc<[u8]>) -> (*const u8, usize) {
+    (buffer.as_ptr(), buffer.len())
+}
+
+#[allow(unsafe_code)]
+unsafe fn slice_at(pointer: *const u8, length: usize) -> &'static [u8] {
+    // SAFETY: вызывающий гарантирует, что указатель живёт достаточно долго;
+    // в арене буфер не удаляется/не заменяется до `&mut self` (clear).
+    unsafe { std::slice::from_raw_parts(pointer, length) }
+}
+
 impl PageArena {
-    // Обоснование `unsafe`: арена только дополняется, `Arc<[u8]>` не
-    // перемещаются при росте таблицы (данные лежат в отдельной аллокации),
-    // а очистка доступна лишь через `&mut self`, поэтому выданный срез живёт
-    // не дольше заимствования арены.
     #[allow(unsafe_code)]
     fn lookup(&self, page: u32) -> Option<&[u8]> {
-        let pages = self.pages.borrow();
+        {
+            let inline = self.inline.borrow();
+            if let Some(buffer) = inline
+                .iter()
+                .flatten()
+                .find(|(candidate, _)| *candidate == page)
+                .map(|(_, buffer)| buffer)
+            {
+                let (pointer, length) = page_parts(buffer);
+                drop(inline);
+                // SAFETY: буфер живёт в арене и не удаляется до `clear`.
+                return Some(unsafe { slice_at(pointer, length) });
+            }
+        }
+        let pages = self.overflow.borrow();
         let buffer = pages.get(&page)?;
-        let pointer = buffer.as_ptr();
-        let length = buffer.len();
-        // SAFETY: см. комментарий к `PageArena`; буфер не освобождается, пока
-        // жив `&self`.
-        Some(unsafe { std::slice::from_raw_parts(pointer, length) })
+        let (pointer, length) = page_parts(buffer);
+        drop(pages);
+        // SAFETY: см. выше; overflow очищается только через `&mut self`.
+        Some(unsafe { slice_at(pointer, length) })
     }
 
     #[allow(unsafe_code)]
     fn store(&self, page: u32, buffer: Arc<[u8]>) -> &[u8] {
-        let mut pages = self.pages.borrow_mut();
+        {
+            let mut inline = self.inline.borrow_mut();
+            for slot in inline.iter() {
+                if let Some((candidate, existing)) = slot
+                    && *candidate == page
+                {
+                    let (pointer, length) = page_parts(existing);
+                    drop(inline);
+                    // SAFETY: буфер живёт в арене и не удаляется до `clear`.
+                    return unsafe { slice_at(pointer, length) };
+                }
+            }
+            for slot in inline.iter_mut() {
+                if slot.is_none() {
+                    let (pointer, length) = page_parts(&buffer);
+                    *slot = Some((page, buffer));
+                    drop(inline);
+                    // SAFETY: данные `Arc<[u8]>` не перемещаются; клон не нужен,
+                    // потому что владение перешло в арену.
+                    return unsafe { slice_at(pointer, length) };
+                }
+            }
+        }
+        let mut pages = self.overflow.borrow_mut();
         // Повторная вставка не подменяет образ: на него могут ссылаться
         // выданные ранее срезы.
-        let buffer = pages.entry(page).or_insert(buffer);
-        let pointer = buffer.as_ptr();
-        let length = buffer.len();
-        // SAFETY: см. `lookup`; буфер только что добавлен и не будет
-        // удалён/заменён до конца жизни `&self`.
-        unsafe { std::slice::from_raw_parts(pointer, length) }
+        let stored = pages.entry(page).or_insert(buffer);
+        let (pointer, length) = page_parts(stored);
+        drop(pages);
+        // SAFETY: см. `lookup`; overflow очищается только через `&mut self`.
+        unsafe { slice_at(pointer, length) }
     }
 
     fn clear(&mut self) {
-        self.pages.get_mut().clear();
+        self.inline.get_mut().fill(None);
+        self.overflow.get_mut().clear();
     }
 
     fn len(&self) -> usize {
-        self.pages.borrow().len()
+        let inline = self
+            .inline
+            .borrow()
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count();
+        inline.saturating_add(self.overflow.borrow().len())
     }
 }
 

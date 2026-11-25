@@ -15,8 +15,8 @@ v1-модули, их публичный API и поведение не изме
 
 | Раздел спеки | Реализация |
 |---|---|
-| §7.1 group commit | `GroupCommitter` (channel + фоновый координатор) батчит подготовленные коммиты разных зон: `MAX_BATCH_ZONES = 256`, `MAX_BATCH_BYTES = 1 МиБ`, `MAX_BATCH_DELAY = 1 мс`, bulk-коммит > `256 КиБ` — отдельной группой. Фаза 1: `ALLOC_RECORD` + chain/bucket всех зон → `fdatasync`; фаза 2: две копии `RootEntry` всех зон → `fdatasync`; затем публикация голов и ack. Синхронный вход — `ParallelStore::commit_group`. |
-| §7.1/§7.3 backpressure | Очередь координатора `QUEUE_ZONES = 1024` (bounded `sync_channel`) + байтовый шлюз `QUEUE_BYTES = 64 МиБ` (condvar). Писатель ждёт ack; ошибка I/O → `CommitUncertain` (`write_locked`) для **всех** зон группы и ни одной публикации; `ReaderContended` — per-zone retryable. |
+| §7.1 group commit | `GroupCommitter` (channel + фоновый координатор) батчит подготовленные коммиты разных зон: `MAX_BATCH_ZONES = 256`, `MAX_BATCH_BYTES = 1 MiB`, `MAX_BATCH_DELAY = 1 мс`, bulk-коммит > `256 КиБ` — отдельной группой. Фаза 1: `ALLOC_RECORD` + chain/bucket всех зон → `fdatasync`; фаза 2: две копии `RootEntry` всех зон → `fdatasync`; затем публикация голов и ack. Синхронный вход — `ParallelStore::commit_group`. |
+| §7.1/§7.3 backpressure | Очередь координатора `QUEUE_ZONES = 1024` (bounded `sync_channel`) + байтовый шлюз `QUEUE_BYTES = 64 MiB` (condvar). Писатель ждёт ack; ошибка I/O → `CommitUncertain` (`write_locked`) для **всех** зон группы и ни одной публикации; `ReaderContended` — per-zone retryable. |
 | §7.2 `Flush`/`Memory` | `commit_with(Durability)`/`commit_via_with`: `Sync` — 2 fsync и двигает `D_z`; `Flush` — fsync данных (фаза 1), корни без fsync, `D_z`/`DT` не двигаются; `Memory` — ни одного fsync. Липкий `Sync` (`DT > 1` или `sync_mode = Sync`) → слабее нельзя (`DurabilityBelowFileMode`). `sync()` — durable-чекпойнт: alloc + fsync, `D_z := head.version`, липкий `Sync`. Recovery учитывает режим: корни новее `ALLOC_RECORD` для `Flush`/`Memory` не file-fatal. |
 | §5.6/§6.5 tombstone-GC | `delete_zone` пишет tombstone; `ParallelZones::gc_catalog` удаляет каталог-запись **после** durable `deleted_txn`, после чего `zone_seq` переиспользуется `create_zone` (origin можно создать заново). Крах на любой стадии не оставляет каталог-запись на удалённую зону. |
 | §6.5/R4 утечки | `ParallelStore::leak_report` (leaked `[data_first, DP)`, aborted `[DP, cursor)`, `MAX_LEAK_RATIO = 1 %`); `repair_leaks` возвращает утёкшие страницы durable-free в bucket каталога, проверяет дизъюнктность и идемпотентность; `fsck_repair(path)` — offline `LOCK_EX`. Пересечение множеств (`PageOverlap`) — отказ, не «починка». |
@@ -71,6 +71,58 @@ assert!(repair.ok || repair.remaining_leaks == 0);
   `Sync`, `max_members`, `aborted`.
 - `create_zone` переиспользует свободный tombstone-слот; каталог чистится
   `gc_catalog` (после durable-удаления).
+
+## Bulk-load: полная замена зоны без COW на каждый `RRset`
+
+`ParallelZone::bulk_load` строит B+tree **снизу вверх** из отсортированного
+потока `BulkRrset` (листья → ветвления → корень), пишет каждую страницу один
+раз и делает **один** `commit`/`commit_with`. `T_NODE`/ENT и overflow-цепочки
+материализуются на лету; старые страницы дерева уходят в `drops` того же
+коммита (ring/chain/catalog/PageCache/GC работают штатно).
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use pulse_zonefile::key::NameRle;
+use pulse_zonefile::parallel::{BulkRrset, ParallelStore, ParallelZones, RrsetData, StoreConfig, ZoneCreateMeta};
+let dir = tempfile::tempdir()?;
+let store = ParallelStore::create(&dir.path().join("z.v2"), StoreConfig::small(4, 1 << 20))?;
+let mut zones = ParallelZones::open(&store)?;
+let apex = NameRle::from_ascii("example.com")?;
+let seq = zones.create_zone(&apex, ZoneCreateMeta { soa_serial: 1 })?;
+let name = NameRle::from_ascii("www.example.com")?;
+let mut writer = zones.writer_by_seq(seq)?;
+writer.bulk_load([BulkRrset {
+    name,
+    rr_type: 1,
+    subtype: 0,
+    data: RrsetData::from_slices(300, 0, &[&[192, 0, 2, 1]])?,
+}])?;                                   // вход строго по каноническому ключу
+writer.commit()?;                       // одна публикация; старый root в drops
+# Ok(())
+# }
+```
+
+Инварианты:
+
+- вход строго возрастает по `(owner, type, subtype)` (`RRSIG` — по covered
+  type); нарушение/дубликат → `ParallelError::BulkOrder` **до** публикации,
+  writer откатывается к опубликованной голове;
+- на одного owner'а буферизуется не больше
+  [`BULK_MAX_OWNER_BYTES`](crate::parallel::BULK_MAX_OWNER_BYTES) = 256 MiB
+  (нужно для точного `CHILDREN_MAY_EXIST` по следующему имени); превышение →
+  `BulkTooLarge`;
+- память самого загрузчика — O(лист + ветвление + один owner), а не O(зона);
+- `Memory`-коммит публикует `page_limit_at_commit ≥ cursor` (F-4): после
+  reopen recovery не занижает `DP` и не выдаёт занятые страницы повторно;
+- `pulsed import`/`--replace`, secondary/sign и `pulse-zonegen` используют
+  bulk; обычный `upsert_rrset`/`delete_*` не изменены.
+
+Замер (`pulse-zonegen --sync memory`, AMD Ryzen 5 3500U, loopback-стенд):
+
+| RRset | было (COW) | bulk | страниц записано | пик RSS |
+|---|---|---|---|---|
+| 100k | ~60 с, 2.3 GiB диска | **0.25 с**, 9.2 MiB диска | 2 369 (9.3 MiB) | 14 MiB |
+| 1M | ~1578 с, 16 GiB диска | **2.5–2.8 с**, 91 MiB диска | 20 292 (79 MiB) | 91–103 MiB |
 
 ## Что реализовано (фаза B2a): кеш и рекламация
 

@@ -549,13 +549,31 @@ impl BTree {
         P: PageIo + ?Sized,
         I: IntoIterator<Item = LeafItem>,
     {
+        let mut items = items.into_iter();
+        Self::bulk_load_with(io, txn, |_io| Ok(items.next()))
+    }
+
+    /// То же, что [`BTree::bulk_load`], но следующий item выдаёт замыкание.
+    ///
+    /// Замыкание получает `&mut P`, поэтому может писать вспомогательные
+    /// страницы (overflow-цепочки) прямо во время построения дерева. Память
+    /// ограничена текущим листом/ветвлением и одним item'ом.
+    ///
+    /// # Errors
+    ///
+    /// См. [`BTree::bulk_load`]; ошибки замыкания пробрасываются как есть.
+    pub fn bulk_load_with<P, F>(io: &mut P, txn: u64, mut next: F) -> Result<Self, ZoneFileError>
+    where
+        P: PageIo + ?Sized,
+        F: FnMut(&mut P) -> Result<Option<LeafItem>, ZoneFileError>,
+    {
         let page_size = io.page_size();
         let mut current: Vec<LeafItem> = Vec::new();
         let mut item_bytes = 0_usize;
         let mut previous_in_chunk: Option<Key> = None;
         let mut children: Vec<(Key, u32)> = Vec::new();
         let mut last: Option<Key> = None;
-        for item in items {
+        while let Some(item) = next(io)? {
             if let Some(previous) = last
                 && compare_validated(&previous, &item.key) != Ordering::Less
             {

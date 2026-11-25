@@ -1739,26 +1739,32 @@ impl ParallelStore {
         let mut record = entry;
         record.prev_record = prev_record;
         record.free_head = reclaim.free_head;
+        // `cursor` уже включает все выданные страницы, в том числе записанные
+        // после корня (overflow/пул/каталог другого потока). Без него
+        // `Memory`-коммит мог опубликовать `page_limit_at_commit` ниже
+        // реального курсора: на reopen recovery берёт DP из голов, и следующая
+        // выдача страниц пересекалась бы с достижимыми (W-10).
         let minimum_limit = [
-            record.page_limit_at_commit,
-            head.map_or(0, |current| current.page_limit_at_commit),
-            record.root_page.saturating_add(1),
-            record.meta_root.saturating_add(1),
-            record.free_head.saturating_add(1),
-            record.prev_record.saturating_add(1),
-            reclaim.max_page.saturating_add(1),
-            self.geometry.page_data_first(),
+            max_allocated.saturating_add(1),
+            u64::from(record.page_limit_at_commit),
+            u64::from(head.map_or(0, |current| current.page_limit_at_commit)),
+            u64::from(record.root_page.saturating_add(1)),
+            u64::from(record.meta_root.saturating_add(1)),
+            u64::from(record.free_head.saturating_add(1)),
+            u64::from(record.prev_record.saturating_add(1)),
+            u64::from(reclaim.max_page.saturating_add(1)),
+            u64::from(self.geometry.page_data_first()),
         ]
         .into_iter()
         .max()
-        .unwrap_or(self.geometry.page_data_first());
-        if minimum_limit > self.geometry.page_count_max() {
+        .unwrap_or(u64::from(self.geometry.page_data_first()));
+        if minimum_limit > u64::from(self.geometry.page_count_max()) {
             return Err(ParallelError::MapFull {
-                high_water: u64::from(minimum_limit),
+                high_water: minimum_limit,
                 page_count_max: self.geometry.page_count_max(),
             });
         }
-        record.page_limit_at_commit = minimum_limit;
+        record.page_limit_at_commit = u32::try_from(minimum_limit).unwrap_or(u32::MAX);
         if record.check_fields(self.geometry.page_count_max()).is_err() {
             return Err(ParallelError::InvalidArgument {
                 field: "root entry",
@@ -1775,7 +1781,7 @@ impl ParallelStore {
             slot,
             chain_write,
             reclaim,
-            minimum_limit: u64::from(minimum_limit),
+            minimum_limit,
             old,
             base_version: head.map_or(0, |current| current.version),
             fence: self
@@ -2378,13 +2384,20 @@ impl ParallelStore {
         let mut pages: Vec<u32> = Vec::new();
         let mut assigned: HashSet<u32> = HashSet::new();
         let mut iterations = 0_u32;
+        // Верхняя граница — ёмкость файла, а не константа: `Memory` не
+        // двигает `D_z`, поэтому пул не реклеймится и COW-цепочка растёт со
+        // всеми освобождёнными страницами. На ~565k RRset это >4096
+        // bucket-страниц; прежний лимит 4096 ошибочно возвращал
+        // `WatermarkRegression` на здоровом файле. Каждая итерация выдаёт
+        // страницу, поэтому `MapFull`/`page_count_max` ограничивает цикл.
+        let max_iterations = self.geometry.page_count_max();
         loop {
             let needed = pool.chain.needed_images();
             if pages.len() == needed {
                 break;
             }
             iterations = iterations.saturating_add(1);
-            if iterations > 4096 {
+            if iterations > max_iterations {
                 return Err(ParallelError::Corrupt {
                     kind: V2CorruptKind::WatermarkRegression,
                     page: None,

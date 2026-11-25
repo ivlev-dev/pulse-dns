@@ -18,14 +18,16 @@
 //! `Durability::Sync` — единственный режим B1; `Flush`/`Memory` возвращают
 //! [`ParallelError::Unsupported`] (B2).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::consts::{MAX_OVERFLOW_PAGES, PAGE_TYPE_OVERFLOW};
+use crate::consts::{INLINE_VALUE_MAX, MAX_OVERFLOW_PAGES, PAGE_TYPE_OVERFLOW};
 use crate::errors::{CorruptDetail, CorruptKind, ZoneFileError};
-use crate::key::{Key, NameRle, T_ZONE_ENTRY};
+use crate::key::{CLASS_IN, Key, NameRle, T_NODE, T_ZONE_ENTRY};
 use crate::node::{
-    DecodedBranch, DecodedLeaf, DecodedValue, ItemValue, LeafItem, LeafValue, ValueKind,
+    DecodedBranch, DecodedLeaf, DecodedValue, ItemValue, LeafItem, LeafValue, RR_FLAG_APEX,
+    RR_FLAG_CHILDREN_MAY_EXIST, RR_FLAG_EMPTY_NON_TERMINAL, RR_FLAG_WILDCARD, ValueKind,
 };
+use crate::overflow;
 use crate::page::PageHeader;
 use crate::parallel::error::ParallelError;
 use crate::parallel::layout::SyncModeV2;
@@ -174,6 +176,52 @@ pub struct RrsetRecord {
     /// RDATA всех RR в каноническом порядке.
     pub rdata: Vec<Vec<u8>>,
 }
+
+/// Входной `RRset` bulk-загрузки.
+///
+/// Поток обязан идти строго по возрастанию канонического ключа
+/// (`name`, затем `rr_type`, `subtype`; `RRSIG` раскладывается по `subtype`).
+/// Нарушение порядка — [`ParallelError::BulkOrder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkRrset {
+    /// Владелец.
+    pub name: NameRle,
+    /// Тип RR.
+    pub rr_type: u16,
+    /// Подтип (`RRSIG` — type covered).
+    pub subtype: u16,
+    /// TTL, флаги и RDATA.
+    pub data: RrsetData,
+}
+
+impl BulkRrset {
+    /// Канонический ключ записи.
+    ///
+    /// # Errors
+    ///
+    /// `NameTooLong`/`Bounds` — имя/тип вне контракта ключа.
+    pub fn key(&self) -> Result<Key, ZoneFileError> {
+        Key::new(&self.name, self.rr_type, CLASS_IN, self.subtype)
+    }
+}
+
+/// Итог bulk-загрузки (до коммита).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkOutcome {
+    /// Записей `RRset` принято.
+    pub rrsets: u32,
+    /// `T_NODE` (owner/apex/ENT) материализовано.
+    pub nodes: u32,
+    /// Страниц дерева/overflow выделено под новую версию.
+    pub pages: u32,
+    /// Корень построенного дерева (`0` — пусто).
+    pub root_page: u32,
+    /// Уровень корня (`0` — пусто).
+    pub tree_level: u16,
+}
+
+/// Максимум байт, буферизуемых для одного owner'а (fail-closed лимит).
+pub const BULK_MAX_OWNER_BYTES: usize = 256 * 1024 * 1024;
 
 /// Zero-copy `RRset` из inline-значения (см. [`ZoneReader::lookup_ref`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1107,6 +1155,88 @@ impl<'a> ParallelZone<'a> {
             .map_err(|error| self.io.take_error().unwrap_or(error))
     }
 
+    /// Полностью заменяет дерево зоны bulk-загрузкой (без COW на каждый
+    /// `RRset`).
+    ///
+    /// Вход — поток [`BulkRrset`] в строго возрастающем каноническом порядке
+    /// (см. [`BulkRrset`]). Страницы листьев и ветвлений собираются снизу
+    /// вверх и пишутся ровно один раз; `T_NODE`/ENT материализуются на лету,
+    /// overflow-цепочки пишутся в том же `txn`. Старое дерево освобождается
+    /// в этом же коммите, публикация одна — обычный [`ParallelZone::commit`].
+    ///
+    /// Память ограничена [`BULK_MAX_OWNER_BYTES`] на одного owner'а плюс
+    /// страницы, уже собранные под коммит. Ошибка входа не меняет
+    /// опубликованную версию (rollback).
+    ///
+    /// # Errors
+    ///
+    /// [`ParallelError::BulkOrder`] — вход не отсортирован/дубликат ключа;
+    /// [`ParallelError::BulkTooLarge`] — owner превысил лимит буфера;
+    /// `NameOutsideZone`, `Tree`/`Corrupt`/`MapFull`/`Io`.
+    pub fn bulk_load<I>(&mut self, records: I) -> Result<BulkOutcome, ParallelError>
+    where
+        I: IntoIterator<Item = BulkRrset>,
+    {
+        self.ensure_txn()?;
+        let txn = self.txn.unwrap_or(self.base_version);
+        let old_pages = if self.tree.root() == 0 {
+            Vec::new()
+        } else {
+            let reader = ReaderIo::new(self.store, self.zone, self.base_version);
+            collect_zone_pages(
+                &reader,
+                self.tree.root(),
+                self.tree.level(),
+                self.base_version,
+            )?
+        };
+        let mut feed = BulkFeed::new(self.origin, records.into_iter(), txn);
+        let built = BTree::bulk_load_with(&mut self.io, txn, |io| feed.next(io));
+        let btree = match built {
+            Ok(tree) => tree,
+            Err(error) => {
+                let error = match feed.take_error() {
+                    Some(error) => error,
+                    None if matches!(
+                        error,
+                        ZoneFileError::InvariantViolation(crate::errors::InvariantId::KeyOrder)
+                    ) =>
+                    {
+                        ParallelError::BulkOrder
+                    }
+                    None => writer_error(&self.io, error),
+                };
+                self.rollback();
+                return Err(error);
+            }
+        };
+        for page in old_pages {
+            if let Err(error) = self.io.free_page(page) {
+                let error = writer_error(&self.io, error);
+                self.rollback();
+                return Err(error);
+            }
+        }
+        let tree = match ZoneTree::new(self.origin, btree.root(), btree.level()) {
+            Ok(tree) => tree,
+            Err(error) => {
+                let error = writer_error(&self.io, error);
+                self.rollback();
+                return Err(error);
+            }
+        };
+        self.tree = tree;
+        self.rrset_count = feed.rrsets;
+        let pages = u32::try_from(self.io.dirty_pages()).unwrap_or(u32::MAX);
+        Ok(BulkOutcome {
+            rrsets: feed.rrsets,
+            nodes: feed.nodes,
+            pages,
+            root_page: self.tree.root(),
+            tree_level: self.tree.level(),
+        })
+    }
+
     /// Коммит в режиме `Durability::Sync`.
     ///
     /// # Errors
@@ -1419,6 +1549,232 @@ impl<'a> ParallelZone<'a> {
             }
         }
     }
+}
+
+/// Потоковый генератор `LeafItem` для bulk-загрузки зоны.
+///
+/// Держит в памяти только записи одного owner'а (для точного флага
+/// `CHILDREN_MAY_EXIST` нужен взгляд на следующее имя) и цепочку предков.
+struct BulkFeed<I: Iterator> {
+    apex: NameRle,
+    iter: std::iter::Peekable<I>,
+    queue: VecDeque<LeafItem>,
+    group: std::vec::IntoIter<BulkRrset>,
+    last_chain: Vec<NameRle>,
+    last_key: Option<Key>,
+    rrsets: u32,
+    nodes: u32,
+    txn: u64,
+    error: Option<ParallelError>,
+}
+
+impl<I: Iterator<Item = BulkRrset>> BulkFeed<I> {
+    fn new(apex: NameRle, iter: I, txn: u64) -> Self {
+        Self {
+            apex,
+            iter: iter.peekable(),
+            queue: VecDeque::new(),
+            group: Vec::new().into_iter(),
+            last_chain: Vec::new(),
+            last_key: None,
+            rrsets: 0,
+            nodes: 0,
+            txn,
+            error: None,
+        }
+    }
+
+    fn take_error(&mut self) -> Option<ParallelError> {
+        self.error.take()
+    }
+
+    fn next<P: PageIo + ?Sized>(&mut self, io: &mut P) -> Result<Option<LeafItem>, ZoneFileError> {
+        loop {
+            if let Some(item) = self.queue.pop_front() {
+                return Ok(Some(item));
+            }
+            if let Some(record) = self.group.next() {
+                self.rrsets = self.rrsets.saturating_add(1);
+                return self.rrset_item(io, &record).map(Some);
+            }
+            if !self.begin_owner()? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Начинает новый owner: собирает его записи, проверяет порядок и
+    /// ставит в очередь `T_NODE` предков/owner'а.
+    #[allow(clippy::while_let_loop)] // `peek`-borrow должен закончиться до `next`.
+    fn begin_owner(&mut self) -> Result<bool, ZoneFileError> {
+        let Some(first) = self.iter.next() else {
+            return Ok(false);
+        };
+        let owner = first.name;
+        let mut records = Vec::new();
+        let mut bytes = record_bytes(&first)?;
+        let mut previous = first.key()?;
+        self.check_order(&previous)?;
+        records.push(first);
+        loop {
+            let Some(next) = self.iter.peek() else {
+                break;
+            };
+            if next.name != owner {
+                break;
+            }
+            let Some(record) = self.iter.next() else {
+                break;
+            };
+            bytes = bytes.saturating_add(record_bytes(&record)?);
+            if bytes > BULK_MAX_OWNER_BYTES {
+                self.error = Some(ParallelError::BulkTooLarge { bytes });
+                return Err(order_error());
+            }
+            let key = record.key()?;
+            if key.compare(&previous) != std::cmp::Ordering::Greater {
+                self.error = Some(ParallelError::BulkOrder);
+                return Err(order_error());
+            }
+            previous = key;
+            records.push(record);
+        }
+        self.last_key = Some(previous);
+        let chain = ancestor_chain(self.apex, owner)?;
+        let common = self.common_prefix(&chain);
+        let ancestor_end = chain.len().saturating_sub(1);
+        if let Some(new_ancestors) = chain.get(common..ancestor_end) {
+            for name in new_ancestors {
+                let flags = node_flags(*name, &self.apex, false, true);
+                self.queue.push_back(node_item(*name, flags)?);
+                self.nodes = self.nodes.saturating_add(1);
+            }
+        }
+        let has_children = self
+            .iter
+            .peek()
+            .is_some_and(|next| is_descendant(&next.name, &owner));
+        let flags = node_flags(owner, &self.apex, true, has_children);
+        self.queue.push_back(node_item(owner, flags)?);
+        self.nodes = self.nodes.saturating_add(1);
+        self.last_chain = chain;
+        self.group = records.into_iter();
+        Ok(true)
+    }
+
+    fn check_order(&mut self, key: &Key) -> Result<(), ZoneFileError> {
+        if let Some(previous) = &self.last_key
+            && key.compare(previous) != std::cmp::Ordering::Greater
+        {
+            self.error = Some(ParallelError::BulkOrder);
+            return Err(order_error());
+        }
+        Ok(())
+    }
+
+    fn common_prefix(&self, chain: &[NameRle]) -> usize {
+        let mut common = 0_usize;
+        while let (Some(left), Some(right)) = (self.last_chain.get(common), chain.get(common)) {
+            if left != right {
+                break;
+            }
+            common += 1;
+        }
+        common
+    }
+
+    fn rrset_item<P: PageIo + ?Sized>(
+        &mut self,
+        io: &mut P,
+        record: &BulkRrset,
+    ) -> Result<LeafItem, ZoneFileError> {
+        if record.rr_type == T_NODE || record.rr_type == T_ZONE_ENTRY {
+            return Err(order_error());
+        }
+        if record.rr_type == crate::key::T_RRSIG && record.subtype == 0 {
+            return Err(ZoneFileError::WrongAccessor);
+        }
+        let key = record.key()?;
+        let payload = record.data.payload()?;
+        let inline = u32::try_from(payload.len()).is_ok_and(|bytes| bytes <= INLINE_VALUE_MAX);
+        let kind = if inline {
+            ValueKind::Inline
+        } else {
+            ValueKind::Overflow
+        };
+        let expected = LeafValue {
+            kind,
+            flags: record.data.flags(),
+            rr_count: record.data.rr_count()?,
+            ttl: record.data.ttl(),
+            val_u32: u32::from(!inline),
+            rdlen: record.data.rdlen()?,
+        };
+        let value = match kind {
+            ValueKind::Inline => ItemValue::inline(expected, payload)?,
+            ValueKind::Overflow => {
+                let first = overflow::write_chain(io, self.txn, &payload)?;
+                ItemValue::overflow(LeafValue {
+                    val_u32: first,
+                    ..expected
+                })?
+            }
+            ValueKind::Node => return Err(order_error()),
+        };
+        Ok(LeafItem::new(key, value))
+    }
+}
+
+fn order_error() -> ZoneFileError {
+    ZoneFileError::InvariantViolation(crate::errors::InvariantId::KeyOrder)
+}
+
+fn record_bytes(record: &BulkRrset) -> Result<usize, ZoneFileError> {
+    let payload = usize::try_from(record.data.payload_len()?).unwrap_or(usize::MAX);
+    Ok(payload.saturating_add(record.name.len()).saturating_add(64))
+}
+
+fn node_item(name: NameRle, flags: u16) -> Result<LeafItem, ZoneFileError> {
+    Ok(LeafItem::new(
+        Key::new(&name, T_NODE, 0, 0)?,
+        ItemValue::node(flags),
+    ))
+}
+
+fn node_flags(name: NameRle, apex: &NameRle, has_rrsets: bool, has_children: bool) -> u16 {
+    let mut flags = 0_u16;
+    if name == *apex {
+        flags |= RR_FLAG_APEX;
+    } else if !has_rrsets {
+        flags |= RR_FLAG_EMPTY_NON_TERMINAL;
+    }
+    if name.is_wildcard() {
+        flags |= RR_FLAG_WILDCARD;
+    }
+    if has_children {
+        flags |= RR_FLAG_CHILDREN_MAY_EXIST;
+    }
+    flags
+}
+
+fn is_descendant(descendant: &NameRle, ancestor: &NameRle) -> bool {
+    descendant.len() > ancestor.len()
+        && descendant.as_rle().starts_with(ancestor.without_terminal())
+}
+
+fn ancestor_chain(apex: NameRle, name: NameRle) -> Result<Vec<NameRle>, ZoneFileError> {
+    let mut chain = vec![name];
+    let mut current = name;
+    while current != apex {
+        let parent = current.parent().ok_or(ZoneFileError::NameOutsideZone)?;
+        chain.push(parent);
+        current = parent;
+        if chain.len() > crate::key::LABELS_MAX + 1 {
+            return Err(ZoneFileError::NameOutsideZone);
+        }
+    }
+    chain.reverse();
+    Ok(chain)
 }
 
 impl Drop for ParallelZone<'_> {

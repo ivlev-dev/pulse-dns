@@ -89,8 +89,9 @@ pub use store::{
 };
 pub use verify::GraphReport;
 pub use zone::{
-    CommitOutcome, ParallelZone, ParallelZones, RrsetRecord, RrsetRef, ZONE_KIND_FLAG_FORWARD,
-    ZONE_KIND_FLAG_SECONDARY, ZoneCreateMeta, ZoneInfo, ZoneMetaV2, ZoneReader,
+    BULK_MAX_OWNER_BYTES, BulkOutcome, BulkRrset, CommitOutcome, ParallelZone, ParallelZones,
+    RrsetRecord, RrsetRef, ZONE_KIND_FLAG_FORWARD, ZONE_KIND_FLAG_SECONDARY, ZoneCreateMeta,
+    ZoneInfo, ZoneMetaV2, ZoneReader,
 };
 
 /// Алиас режима durability v2: `Durability::Sync`/`Flush`/`Memory` (§7.2).
