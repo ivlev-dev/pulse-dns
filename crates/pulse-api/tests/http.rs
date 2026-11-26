@@ -18,6 +18,8 @@ const WRITER: &str = "pd_live_writer_0123456789abcdef";
 const DELETER: &str = "pd_live_deleter_0123456789abcdef";
 const SCOPED: &str = "pd_live_scoped_0123456789abcdef";
 const SCOPED_READER: &str = "pd_live_scopedreader_0123456789ab";
+const KEY_READER: &str = "pd_live_keyreader_0123456789abcdef";
+const KEY_WRITER: &str = "pd_live_keywriter_0123456789abcdef";
 
 struct TestServer {
     server: Option<RunningServer>,
@@ -54,6 +56,8 @@ impl TestServer {
                 &["zones:read"],
                 Some(&["*.internal."]),
             ),
+            token("key-reader", KEY_READER, &["keys:read"], None),
+            token("key-writer", KEY_WRITER, &["keys:write"], None),
         ];
         let mut config = ApiConfig::new(tokens);
         config.bind = SocketAddr::from(([127, 0, 0, 1], 0));
@@ -1611,4 +1615,72 @@ fn sign_prefer_async_returns_job() {
             .as_array()
             .is_some_and(|items| items.len() == 1)
     );
+}
+
+#[test]
+fn tsig_keys_require_keys_scopes_and_never_return_secret() {
+    let server = TestServer::start();
+    let addr = server.addr();
+    let reader = format!("Bearer {KEY_READER}");
+    let writer = format!("Bearer {KEY_WRITER}");
+    let admin = format!("Bearer {ADMIN}");
+    let secret = "c2VjcmV0LWtleQ==";
+    let body =
+        format!(r#"{{"name":"api-key.example.","algorithm":"hmac-sha256","secret":"{secret}"}}"#);
+
+    let denied = request(
+        addr,
+        "POST",
+        "/api/v1/tsig-keys",
+        &[("Authorization", &reader)],
+        Some(body.as_bytes()),
+    );
+    assert_eq!(denied.status, 403);
+    assert_eq!(denied.problem_code(), "forbidden");
+
+    let created = request(
+        addr,
+        "POST",
+        "/api/v1/tsig-keys",
+        &[("Authorization", &writer)],
+        Some(body.as_bytes()),
+    );
+    assert_eq!(
+        created.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&created.body)
+    );
+    assert!(!created.text().contains(secret));
+    assert_eq!(created.json()["algorithm"], "hmac-sha256");
+    assert!(created.header("Location").is_some());
+
+    let denied_read = request(
+        addr,
+        "GET",
+        "/api/v1/tsig-keys",
+        &[("Authorization", &writer)],
+        None,
+    );
+    assert_eq!(denied_read.status, 403);
+
+    let listed = request(
+        addr,
+        "GET",
+        "/api/v1/tsig-keys",
+        &[("Authorization", &reader)],
+        None,
+    );
+    assert_eq!(listed.status, 200);
+    assert!(!listed.text().contains(secret));
+    assert_eq!(listed.json()["items"].as_array().expect("items").len(), 1);
+
+    let deleted = request(
+        addr,
+        "DELETE",
+        "/api/v1/tsig-keys/api-key.example.",
+        &[("Authorization", &admin)],
+        None,
+    );
+    assert_eq!(deleted.status, 204);
 }

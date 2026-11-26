@@ -127,9 +127,9 @@ pub use port::{
     Denial, ImportMode, ImportReport, KeyRotationKeyView, KeyRotationView, ListRrsets, ListZones,
     Precondition, Preconditions, RolloverRequest, RrsetInput, RrsetPage, RrsetPatch,
     RrsetPatchOutcome, RrsetView, SerialState, SerialUpdate, SerialUpdateResult, TransferKind,
-    TransferRequest, TransferResult, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneFileMetrics, ZoneId,
-    ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, ZoneView,
-    next_serial,
+    TransferRequest, TransferResult, TsigKeyInput, TsigKeyView, WriteOutcome, ZoneAdmin, ZoneAllow,
+    ZoneFileMetrics, ZoneId, ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch,
+    ZoneSettingsView, ZoneView, next_serial,
 };
 pub use server::{
     ApiServerError, MetricsProvider, RunningServer, serve, serve_with_journal, serve_with_metrics,

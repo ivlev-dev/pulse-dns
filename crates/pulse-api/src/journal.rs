@@ -1358,8 +1358,11 @@ fn error_code(error: &AdminError) -> String {
     match error {
         AdminError::NotFound(NotFound::Zone) => "zone_not_found",
         AdminError::NotFound(NotFound::Rrset) => "rrset-not-found",
+        AdminError::NotFound(NotFound::TsigKey) => "tsig-key-not-found",
         AdminError::Conflict(crate::error::Conflict::ZoneExists) => "zone-exists",
         AdminError::Conflict(crate::error::Conflict::RrsetExists) => "rrset-exists",
+        AdminError::Conflict(crate::error::Conflict::TsigKeyExists) => "tsig-key-exists",
+        AdminError::Conflict(crate::error::Conflict::TsigKeyImmutable) => "tsig-key-immutable",
         AdminError::Conflict(crate::error::Conflict::ZoneBusy) | AdminError::Busy => "zone-busy",
         AdminError::Conflict(crate::error::Conflict::ZoneReadOnly) => "zone-read-only",
         AdminError::Conflict(crate::error::Conflict::SerialNotNewer) => "serial-not-newer",

@@ -11,6 +11,9 @@ pub enum NotFound {
     /// RRset отсутствует.
     #[error("rrset not found")]
     Rrset,
+    /// TSIG-ключ отсутствует.
+    #[error("TSIG key not found")]
+    TsigKey,
 }
 
 /// Конфликт состояния ресурса.
@@ -28,6 +31,12 @@ pub enum Conflict {
     /// Запись в secondary/forward-зону запрещена.
     #[error("zone is read-only")]
     ZoneReadOnly,
+    /// TSIG-ключ уже существует.
+    #[error("TSIG key already exists")]
+    TsigKeyExists,
+    /// TSIG-ключ объявлен в конфигурации и неизменяем.
+    #[error("TSIG key is immutable")]
+    TsigKeyImmutable,
     /// Запрошенный serial не новее текущего (RFC 1982).
     #[error("serial is not newer than the current one")]
     SerialNotNewer,

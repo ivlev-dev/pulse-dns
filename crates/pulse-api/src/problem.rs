@@ -128,6 +128,27 @@ impl Problem {
                 instance,
                 request_id,
             ),
+            AdminError::NotFound(NotFound::TsigKey) => Self::new(
+                404,
+                "tsig-key-not-found",
+                "The TSIG key does not exist.",
+                instance,
+                request_id,
+            ),
+            AdminError::Conflict(Conflict::TsigKeyExists) => Self::new(
+                409,
+                "tsig-key-exists",
+                "The TSIG key already exists.",
+                instance,
+                request_id,
+            ),
+            AdminError::Conflict(Conflict::TsigKeyImmutable) => Self::new(
+                409,
+                "tsig-key-immutable",
+                "The TSIG key is declared in the configuration and cannot be changed via the API.",
+                instance,
+                request_id,
+            ),
             AdminError::Conflict(Conflict::ZoneExists) => Self::new(
                 409,
                 "zone-exists",

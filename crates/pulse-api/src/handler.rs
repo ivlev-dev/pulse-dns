@@ -593,6 +593,16 @@ impl Api {
                 self.rollover_keys(request, origin, request_id, instance)
             }
             Route::ZoneSign(origin) => self.sign_zone(request, origin, request_id, instance),
+            Route::TsigKeys => match request.method {
+                Method::Get => self.list_tsig_keys(request_id, instance),
+                Method::Post => self.create_tsig_key(request, request_id, instance),
+                _ => Err(internal(instance, request_id)),
+            },
+            Route::TsigKey(name) => match request.method {
+                Method::Get => self.get_tsig_key(name, request_id, instance),
+                Method::Delete => self.delete_tsig_key(name, request_id, instance),
+                _ => Err(internal(instance, request_id)),
+            },
             Route::Jobs => self.list_jobs(request, principal, request_id, instance),
             Route::Job(job_id) => match request.method {
                 Method::Get => self.get_job(job_id, principal, request_id, instance),
@@ -1344,6 +1354,124 @@ impl Api {
         self.jobs.start(&job_id);
         self.jobs.finish(&job_id, Ok(rotation_json(&rotation)));
         Ok(self.accepted_job(&job_id, instance))
+    }
+
+    fn list_tsig_keys(&self, request_id: &str, instance: &str) -> Result<HttpResponse, Problem> {
+        let items = self
+            .store
+            .list_tsig_keys()
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "items": items.iter().map(tsig_key_json).collect::<Vec<_>>(),
+                "next_cursor": Value::Null,
+                "has_more": false,
+            }),
+        ))
+    }
+
+    fn get_tsig_key(
+        &self,
+        name: &Name,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let items = self
+            .store
+            .list_tsig_keys()
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        items
+            .iter()
+            .find(|view| &view.name == name)
+            .map(|view| HttpResponse::json(200, tsig_key_json(view)))
+            .ok_or_else(|| {
+                Problem::from_admin(
+                    AdminError::NotFound(NotFound::TsigKey),
+                    instance,
+                    request_id,
+                )
+            })
+    }
+
+    fn create_tsig_key(
+        &self,
+        request: &HttpRequest,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        let value = self.json_body(request, instance, request_id)?;
+        let body: TsigKeyWriteBody = deserialize(value, instance, request_id)?;
+        let name = Name::parse(body.name.trim()).map_err(|_| {
+            validation(
+                instance,
+                request_id,
+                "/name",
+                "invalid-name",
+                "TSIG key name must be a valid DNS name",
+            )
+        })?;
+        if name == Name::root() || name.labels().any(|label| label == b"*") {
+            return Err(validation(
+                instance,
+                request_id,
+                "/name",
+                "invalid-name",
+                "TSIG key name must be a non-root name without wildcards",
+            ));
+        }
+        let algorithm = body
+            .algorithm
+            .unwrap_or_else(|| "hmac-sha256".to_owned())
+            .trim()
+            .to_ascii_lowercase();
+        let secret = base64::engine::general_purpose::STANDARD
+            .decode(body.secret.trim())
+            .map_err(|_| {
+                validation(
+                    instance,
+                    request_id,
+                    "/secret",
+                    "invalid-secret",
+                    "secret must be valid base64",
+                )
+            })?;
+        if secret.is_empty() || secret.len() > 1024 {
+            return Err(validation(
+                instance,
+                request_id,
+                "/secret",
+                "invalid-secret",
+                "secret must be 1..=1024 bytes",
+            ));
+        }
+        let input = crate::port::TsigKeyInput {
+            name: name.clone(),
+            algorithm,
+            secret,
+        };
+        let view = self
+            .store
+            .create_tsig_key(&input)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        let mut response = HttpResponse::json(201, tsig_key_json(&view));
+        response.set_header(
+            "Location",
+            format!("/api/v1/tsig-keys/{}", encode_segment(&name.to_string())),
+        );
+        Ok(response)
+    }
+
+    fn delete_tsig_key(
+        &self,
+        name: &Name,
+        request_id: &str,
+        instance: &str,
+    ) -> Result<HttpResponse, Problem> {
+        self.store
+            .delete_tsig_key(name)
+            .map_err(|error| Problem::from_admin(error, instance, request_id))?;
+        Ok(HttpResponse::empty(204))
     }
 
     fn list_jobs(
@@ -2570,6 +2698,8 @@ enum Route {
     ZoneKeysStatus(Name),
     ZoneRollover(Name),
     ZoneSign(Name),
+    TsigKeys,
+    TsigKey(Name),
     Jobs,
     Job(String),
     TransferJob(String),
@@ -2599,6 +2729,8 @@ impl Route {
             Self::ZoneKeysStatus(_) => "/api/v1/zones/{origin}/keys/status",
             Self::ZoneRollover(_) => "/api/v1/zones/{origin}/keys/rollover",
             Self::ZoneSign(_) => "/api/v1/zones/{origin}/sign",
+            Self::TsigKeys => "/api/v1/tsig-keys",
+            Self::TsigKey(_) => "/api/v1/tsig-keys/{name}",
             Self::Jobs => "/api/v1/jobs",
             Self::Job(_) => "/api/v1/jobs/{job_id}",
             Self::TransferJob(_) => "/api/v1/transfers/{job_id}",
@@ -2637,6 +2769,8 @@ impl Route {
             Self::ZoneKeys(_) | Self::ZoneKeysStatus(_) => &["GET"],
             Self::ZoneRollover(_) | Self::ZoneSign(_) => &["POST"],
             Self::Jobs | Self::Audit => &["GET"],
+            Self::TsigKeys => &["GET", "POST"],
+            Self::TsigKey(_) => &["GET", "DELETE"],
             Self::Job(_) | Self::TransferJob(_) => &["GET", "DELETE"],
             Self::Rrset { .. } => &["GET", "PUT", "PATCH", "DELETE"],
             Self::RrsetList(_) => &["GET"],
@@ -2657,6 +2791,7 @@ impl Route {
             | Self::RrsetList(origin) => origin.to_string(),
             Self::Rrset { origin, .. } => origin.to_string(),
             Self::Job(job_id) | Self::TransferJob(job_id) => job_id.clone(),
+            Self::TsigKey(name) => name.to_string(),
             _ => "-".to_owned(),
         }
     }
@@ -2674,6 +2809,8 @@ impl Route {
             (Self::ZoneRollover(_), Method::Post) => "zone.keys.rollover",
             (Self::ZoneSign(_), Method::Post) => "zone.sign",
             (Self::Job(_) | Self::TransferJob(_), Method::Delete) => "job.cancel",
+            (Self::TsigKeys, Method::Post) => "tsig-key.create",
+            (Self::TsigKey(_), Method::Delete) => "tsig-key.delete",
             (Self::Rrset { .. }, Method::Put) => "rrset.put",
             (Self::Rrset { .. }, Method::Patch) => "rrset.patch",
             (Self::Rrset { .. }, Method::Delete) => "rrset.delete",
@@ -2740,6 +2877,12 @@ fn parse_route(request: &HttpRequest, instance: &str, request_id: &str) -> Resul
             Ok(Route::ZoneRollover(parse_origin(
                 origin, instance, request_id,
             )?))
+        }
+        [api, version, keys] if api == "api" && version == "v1" && keys == "tsig-keys" => {
+            Ok(Route::TsigKeys)
+        }
+        [api, version, keys, name] if api == "api" && version == "v1" && keys == "tsig-keys" => {
+            Ok(Route::TsigKey(parse_name(name, instance, request_id)?))
         }
         [api, version, jobs] if api == "api" && version == "v1" && jobs == "jobs" => {
             Ok(Route::Jobs)
@@ -2848,6 +2991,8 @@ fn required_scope(route: &Route, method: &Method) -> Option<&'static str> {
         }
         (Route::Job(_), _) | (Route::TransferJob(_), _) => Some("jobs:cancel"),
         (Route::Audit, _) => Some("audit:read"),
+        (Route::TsigKeys, Method::Get) | (Route::TsigKey(_), Method::Get) => Some("keys:read"),
+        (Route::TsigKeys, _) | (Route::TsigKey(_), _) => Some("keys:write"),
         (Route::RrsetList(_), _) | (Route::Rrset { .. }, Method::Get) => Some("zones:read"),
         (Route::Rrset { .. }, _) => Some("zones:write"),
         _ => None,
@@ -2870,6 +3015,12 @@ fn route_label(path: &str) -> &'static str {
         }
         [api, version, zones, _] if api == "api" && version == "v1" && zones == "zones" => {
             "/api/v1/zones/{origin}"
+        }
+        [api, version, keys] if api == "api" && version == "v1" && keys == "tsig-keys" => {
+            "/api/v1/tsig-keys"
+        }
+        [api, version, keys, _] if api == "api" && version == "v1" && keys == "tsig-keys" => {
+            "/api/v1/tsig-keys/{name}"
         }
         [api, version, jobs] if api == "api" && version == "v1" && jobs == "jobs" => "/api/v1/jobs",
         [api, version, jobs, _] if api == "api" && version == "v1" && jobs == "jobs" => {
@@ -2998,6 +3149,23 @@ struct RolloverBody {
     scheme: Option<String>,
     overlap: Option<Value>,
     retire_after: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TsigKeyWriteBody {
+    name: String,
+    algorithm: Option<String>,
+    secret: String,
+}
+
+fn tsig_key_json(view: &crate::port::TsigKeyView) -> Value {
+    json!({
+        "name": view.name.to_string(),
+        "algorithm": view.algorithm,
+        "created_at": rfc3339(UNIX_EPOCH + Duration::from_secs(view.created_at)),
+        "last_used": view.last_used.map(|seconds| rfc3339(UNIX_EPOCH + Duration::from_secs(seconds))),
+        "configured": view.configured,
+    })
 }
 
 fn with_replay_header(mut response: HttpResponse) -> HttpResponse {
@@ -3136,6 +3304,8 @@ fn admin_failure(error: AdminError) -> JobFailure {
         AdminError::NotFound(_) => ("not-found", false),
         AdminError::Conflict(Conflict::ZoneExists) => ("zone-exists", false),
         AdminError::Conflict(Conflict::RrsetExists) => ("rrset-exists", false),
+        AdminError::Conflict(Conflict::TsigKeyExists) => ("tsig-key-exists", false),
+        AdminError::Conflict(Conflict::TsigKeyImmutable) => ("tsig-key-immutable", false),
         AdminError::Conflict(Conflict::ZoneBusy) | AdminError::Busy => ("zone-busy", true),
         AdminError::Conflict(Conflict::ZoneReadOnly) => ("zone-read-only", false),
         AdminError::Conflict(Conflict::SerialNotNewer) => ("serial-not-newer", false),

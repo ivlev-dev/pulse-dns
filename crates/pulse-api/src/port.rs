@@ -4,6 +4,7 @@
 //! ожидаемых ошибках и проверять `If-Match` **внутри** транзакции записи,
 //! чтобы исключить окно TOCTOU между `GET` и мутацией.
 
+use std::fmt;
 use std::time::SystemTime;
 
 use pulse_dns::{Name, Rdata, Rtype, Serial, Ttl};
@@ -450,6 +451,42 @@ pub struct KeyRotationView {
     pub next_event_at: Option<u32>,
 }
 
+/// Публичное представление TSIG-ключа (секрет не раскрывается).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TsigKeyView {
+    /// Имя ключа.
+    pub name: Name,
+    /// Алгоритм (`hmac-sha256`, …).
+    pub algorithm: String,
+    /// Время создания (UNIX).
+    pub created_at: u64,
+    /// Последнее успешное использование (UNIX), если было.
+    pub last_used: Option<u64>,
+    /// Ключ объявлен в конфигурации (нельзя удалить через API).
+    pub configured: bool,
+}
+
+/// Вход создания TSIG-ключа.
+#[derive(Clone)]
+pub struct TsigKeyInput {
+    /// Имя ключа.
+    pub name: Name,
+    /// Алгоритм (`hmac-sha256`, …).
+    pub algorithm: String,
+    /// Декодированный секрет; никогда не логируется и не возвращается.
+    pub secret: Vec<u8>,
+}
+
+impl fmt::Debug for TsigKeyInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TsigKeyInput")
+            .field("name", &self.name)
+            .field("algorithm", &self.algorithm)
+            .field("secret", &"***")
+            .finish()
+    }
+}
+
 /// Режим изменения serial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SerialUpdate {
@@ -825,5 +862,35 @@ pub trait ZoneAdmin: Send + Sync + 'static {
     fn key_rotation(&self, origin: &Name) -> Result<Option<KeyRotationView>, AdminError> {
         let _ = origin;
         Ok(None)
+    }
+
+    /// Список управляемых TSIG-ключей (без секретов).
+    ///
+    /// Реализация по умолчанию — пустой список.
+    fn list_tsig_keys(&self) -> Result<Vec<TsigKeyView>, AdminError> {
+        Ok(Vec::new())
+    }
+
+    /// Создаёт управляемый TSIG-ключ.
+    ///
+    /// Реализация по умолчанию не поддерживает управление ключами.
+    fn create_tsig_key(&self, input: &TsigKeyInput) -> Result<TsigKeyView, AdminError> {
+        let _ = input;
+        Err(AdminError::Internal)
+    }
+
+    /// Удаляет управляемый TSIG-ключ.
+    ///
+    /// Реализация по умолчанию не поддерживает управление ключами.
+    fn delete_tsig_key(&self, name: &Name) -> Result<(), AdminError> {
+        let _ = name;
+        Err(AdminError::Internal)
+    }
+
+    /// Перечитывает состояние управляемых ключей (SIGHUP).
+    ///
+    /// Возвращает число загруженных ключей; реализация по умолчанию — `0`.
+    fn reload_tsig_keys(&self) -> Result<usize, AdminError> {
+        Ok(0)
     }
 }

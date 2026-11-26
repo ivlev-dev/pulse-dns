@@ -15,14 +15,15 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use pulse_dns::{Name, Rclass, Rdata, Rrset, RrsetError, Rtype, Serial, Ttl};
 
 use crate::base64url;
-use crate::error::{AdminError, InvariantViolation};
+use crate::error::{AdminError, Conflict, InvariantViolation};
 use crate::etag::{normalize_tag, rrset_etag, zone_etag};
 use crate::port::{
     Denial, ImportMode, ImportReport, KeyRotationKeyView, KeyRotationView, ListRrsets, ListZones,
     Precondition, Preconditions, RolloverRequest, RrsetInput, RrsetPage, RrsetPatch,
     RrsetPatchOutcome, RrsetView, SerialState, SerialUpdate, SerialUpdateResult, TransferRequest,
-    TransferResult, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneId, ZoneKind, ZoneMetaInput, ZonePage,
-    ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, ZoneView, next_serial,
+    TransferResult, TsigKeyInput, TsigKeyView, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneId,
+    ZoneKind, ZoneMetaInput, ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, ZoneView,
+    next_serial,
 };
 use crate::rdata_text::is_managed_type;
 
@@ -147,6 +148,26 @@ pub struct InMemoryZoneAdmin {
     ready: AtomicBool,
     /// Синтетическое состояние ротации ключей для тестов/`pulsed` без DNSSEC.
     rotation: Mutex<HashMap<String, KeyRotationView>>,
+    /// Управляемые TSIG-ключи (только метаданные; секрет не возвращается).
+    tsig_keys: Mutex<HashMap<String, InMemoryTsigKey>>,
+}
+
+struct InMemoryTsigKey {
+    name: Name,
+    algorithm: String,
+    _secret: Vec<u8>,
+    created_at: u64,
+    last_used: Option<u64>,
+}
+
+fn in_memory_tsig_view(entry: &InMemoryTsigKey) -> TsigKeyView {
+    TsigKeyView {
+        name: entry.name.clone(),
+        algorithm: entry.algorithm.clone(),
+        created_at: entry.created_at,
+        last_used: entry.last_used,
+        configured: false,
+    }
 }
 
 impl InMemoryZoneAdmin {
@@ -158,6 +179,7 @@ impl InMemoryZoneAdmin {
             next_txn: AtomicU64::new(1),
             ready: AtomicBool::new(true),
             rotation: Mutex::new(HashMap::new()),
+            tsig_keys: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1120,6 +1142,85 @@ impl ZoneAdmin for InMemoryZoneAdmin {
     fn key_rotation(&self, origin: &Name) -> Result<Option<KeyRotationView>, AdminError> {
         let rotation = self.rotation.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(rotation.get(&Self::zone_key(origin)).cloned())
+    }
+
+    fn list_tsig_keys(&self) -> Result<Vec<TsigKeyView>, AdminError> {
+        let keys = self
+            .tsig_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut views: Vec<TsigKeyView> = keys.values().map(in_memory_tsig_view).collect();
+        views.sort_by(|left, right| left.name.cmp_canonical(&right.name));
+        Ok(views)
+    }
+
+    fn create_tsig_key(&self, input: &TsigKeyInput) -> Result<TsigKeyView, AdminError> {
+        if input.name == Name::root() || input.name.labels().any(|label| label == b"*") {
+            return Err(AdminError::invariant(
+                "/name",
+                "invalid-name",
+                "TSIG key name must be a non-root name without wildcards",
+            ));
+        }
+        let algorithm = input.algorithm.trim().to_ascii_lowercase();
+        if !matches!(
+            algorithm.as_str(),
+            "hmac-sha1"
+                | "hmac-sha224"
+                | "hmac-sha256"
+                | "hmac-sha384"
+                | "hmac-sha512"
+                | "sha1"
+                | "sha224"
+                | "sha256"
+                | "sha384"
+                | "sha512"
+        ) {
+            return Err(AdminError::invariant(
+                "/algorithm",
+                "unsupported-algorithm",
+                "unsupported TSIG algorithm",
+            ));
+        }
+        if input.secret.is_empty() {
+            return Err(AdminError::invariant(
+                "/secret",
+                "empty-secret",
+                "secret must not be empty",
+            ));
+        }
+        let key = input.name.to_string();
+        let mut keys = self
+            .tsig_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if keys.contains_key(&key) {
+            return Err(AdminError::Conflict(Conflict::TsigKeyExists));
+        }
+        let entry = InMemoryTsigKey {
+            name: input.name.clone(),
+            algorithm,
+            _secret: input.secret.clone(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs()),
+            last_used: None,
+        };
+        let view = in_memory_tsig_view(&entry);
+        keys.insert(key, entry);
+        Ok(view)
+    }
+
+    fn delete_tsig_key(&self, name: &Name) -> Result<(), AdminError> {
+        let key = name.to_string();
+        let mut keys = self
+            .tsig_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if keys.remove(&key).is_none() {
+            return Err(AdminError::NotFound(crate::error::NotFound::TsigKey));
+        }
+        Ok(())
     }
 
     fn put_zone(

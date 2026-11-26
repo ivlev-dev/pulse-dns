@@ -416,6 +416,55 @@ pub(crate) fn document() -> Value {
                     }
                 }
             },
+            "/api/v1/tsig-keys": {
+                "get": {
+                    "summary": "List managed TSIG keys (secrets are never returned)",
+                    "responses": {
+                        "200": { "description": "TSIG key list" },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" }
+                    }
+                },
+                "post": {
+                    "summary": "Create a managed TSIG key",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/TsigKeyWrite" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": { "description": "Created" },
+                        "409": { "$ref": "#/components/responses/Problem" },
+                        "422": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
+            "/api/v1/tsig-keys/{name}": {
+                "get": {
+                    "summary": "Read a managed TSIG key",
+                    "parameters": [
+                        { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "TSIG key" },
+                        "404": { "$ref": "#/components/responses/Problem" }
+                    }
+                },
+                "delete": {
+                    "summary": "Delete a managed TSIG key",
+                    "parameters": [
+                        { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "204": { "description": "Deleted" },
+                        "404": { "$ref": "#/components/responses/Problem" },
+                        "409": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
             "/api/v1/audit": {
                 "get": {
                     "summary": "Read the control-plane audit ring",
@@ -564,6 +613,35 @@ pub(crate) fn document() -> Value {
                         "retire_after": { "type": "string", "example": "30d" }
                     }
                 },
+                "TsigKey": {
+                    "type": "object",
+                    "required": ["name", "algorithm", "created_at", "configured"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "algorithm": { "type": "string" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "last_used": { "type": ["string", "null"], "format": "date-time" },
+                        "configured": { "type": "boolean" }
+                    }
+                },
+                "TsigKeyList": {
+                    "type": "object",
+                    "required": ["items", "next_cursor", "has_more"],
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/TsigKey" } },
+                        "next_cursor": { "type": ["string", "null"] },
+                        "has_more": { "type": "boolean" }
+                    }
+                },
+                "TsigKeyWrite": {
+                    "type": "object",
+                    "required": ["name", "secret"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "algorithm": { "type": "string", "default": "hmac-sha256" },
+                        "secret": { "type": "string", "description": "Base64; write-only" }
+                    }
+                },
                 "Job": {
                     "type": "object",
                     "required": ["job_id", "kind", "state", "resource", "created_at"],
@@ -639,6 +717,8 @@ mod tests {
         assert!(document["paths"]["/api/v1/zones/{origin}/import"].is_object());
         assert!(document["paths"]["/api/v1/jobs/{job_id}"].is_object());
         assert!(document["paths"]["/api/v1/audit"].is_object());
+        assert!(document["paths"]["/api/v1/tsig-keys"].is_object());
+        assert!(document["paths"]["/api/v1/tsig-keys/{name}"].is_object());
         assert!(document["paths"]["/api/v1/zones/{origin}/keys/status"].is_object());
         assert_eq!(
             document["components"]["securitySchemes"]["bearerAuth"]["scheme"],
