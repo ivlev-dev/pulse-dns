@@ -31,3 +31,17 @@ enabled = true
 max_entries = 100000
 max_bytes = 67108864
 shards = 16
+
+# RFC 2136 DNS UPDATE (opcode 5). По умолчанию выключен: сервер отвечает
+# REFUSED. Включайте только вместе с TSIG и source ACL.
+[update]
+enabled = false
+require_tsig = true
+# allow_from = ["127.0.0.1/32", "::1/128"]
+# allow_zones = ["example.com."]   # пусто — все primary-зоны
+# tsig_keys = ["update-key.example."]  # имена из [[tsig_keys]]
+
+# [[tsig_keys]]
+# name = "update-key.example."
+# algorithm = "hmac-sha256"
+# secret = "c2VjcmV0LWJhc2U2NA=="

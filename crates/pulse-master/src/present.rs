@@ -131,6 +131,7 @@ pub(crate) fn rdata_to_text(rdata: &Rdata) -> String {
                 format!("\\# {} {}", rdata.len(), encode_hex(rdata))
             }
         }
+        Rdata::Empty(_) => "\\# 0".to_owned(),
     }
 }
 

@@ -1,0 +1,28 @@
+# Минимальный пример authoritative `pulsed` с RFC 2136 DNS UPDATE.
+#
+# Клиент (nsupdate-совместимый):
+#   nsupdate -y hmac-sha256:update-key.example.:c2VjcmV0LWJhc2U2NA== <<'DNS'
+#   server 127.0.0.1 5353
+#   zone example.com.
+#   update add host.example.com. 300 A 192.0.2.50
+#   send
+#   DNS
+listen_udp = "127.0.0.1:5353"
+listen_tcp = "127.0.0.1:5353"
+workers = 1
+zonefile = "/tmp/pulse-dns-update.zonefile"
+map_size = 268435456
+durability = "flush"
+
+# Ключ объявляется один раз; transfer/update ссылаются на него по имени.
+[[tsig_keys]]
+name = "update-key.example."
+algorithm = "hmac-sha256"
+secret = "c2VjcmV0LWJhc2U2NA=="
+
+[update]
+enabled = true
+require_tsig = true
+allow_from = ["127.0.0.1/32", "::1/128"]
+allow_zones = ["example.com."]
+tsig_keys = ["update-key.example."]

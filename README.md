@@ -58,6 +58,14 @@ upstream по UDP, TCP, DoT и DoH/1.1 (пул keep-alive, backoff). Остат�
   IXFR-история, NOTIFY-out/in и secondary-зоны (AXFR/IXFR-in, bootstrap,
   SOA-refresh, expire → SERVFAIL), DNSSEC-подпись в zonefile (NSEC или
   NSEC3), Dockerfile.
+- DNS UPDATE (RFC 2136) на UDP/TCP/DoT/DoH/DoQ/DNSCrypt: `opcode 5`, Zone/
+  Prerequisite/Update секции, prerequisites (`YXDOMAIN`/`NXRRSET`/…),
+  add/delete RR, RRset и name, CNAME/apex-инварианты, атомарный writer +
+  один commit, автоинкремент SOA serial (RFC 1982), NOTIFY-out после
+  изменения. Политика `[update]`: выключено по умолчанию, `allow_from`
+  IP/CIDR, `allow_zones`, список `tsig_keys`, обязательный TSIG, replay-кэш;
+  secondary/forward → `REFUSED`, неизвестная зона → `NOTAUTH`; метрики
+  `pulsed_update_*`; пример `examples/pulsed-update.toml`.
 - Защищённые транспорты `pulsed`: DoT (`dot_listen`, RFC 7858), DoH/1.1
   (`doh_listen`), DoH/2 (`doh_h2_listen`), DoH/3 (`doh3_listen`, RFC 9114,
   ALPN `h3`, QUIC/TLS 1.3) и DNSCrypt v2 по UDP (`dnscrypt_listen`) и TCP
@@ -153,7 +161,7 @@ workers по-прежнему делит CPU с DNS в режиме `all`; дл�
 | `pulse-transfer` | TSIG, AXFR/IXFR, NOTIFY |
 | `pulse-zonefile` | Бинарный mmap-формат зон: reader, writer/commit, fsck, compact |
 | `pulse-runtime` | io_uring UDP-рантайм + epoll-фолбэк |
-| `pulse-server` | Авторитетный движок запросов |
+| `pulse-server` | Авторитетный движок запросов и движок DNS UPDATE |
 | `pulse-tls` | DNS over TLS (RFC 7858), DoH/1.1 (RFC 8484), DoH/2 (`http2`), DoH/3 (`http3`, RFC 9114) и DoQ (`doq`): серверы и клиенты для upstream |
 | `pulse-dnscrypt` | DNSCrypt v2: сертификаты, сервер, клиент |
 | `pulse-api` | REST API управления зонами |
@@ -196,6 +204,26 @@ cargo run -p pulsed -- \
 поля и значения по умолчанию одинаковые. Ошибка разбора содержит путь, строку
 и колонку; неизвестное расширение отклоняется с подсказкой.
 `examples/*.json` — legacy-эквиваленты `examples/*.toml`.
+
+### DNS UPDATE (RFC 2136)
+
+UPDATE включается только явно и по умолчанию требует TSIG. Минимальный
+конфиг — `examples/pulsed-update.toml`; `nsupdate`-совместимый клиент:
+
+```bash
+nsupdate -y hmac-sha256:update-key.example.:c2VjcmV0LWJhc2U2NA== <<'DNS'
+server 127.0.0.1 5353
+zone example.com.
+update add host.example.com. 300 A 192.0.2.50
+send
+DNS
+```
+
+Политика: `[update] enabled`, `require_tsig`, `allow_from` (IP/CIDR),
+`allow_zones`, `tsig_keys` (имена из `[[tsig_keys]]`). Без настроек сервер
+отвечает `REFUSED`; неизвестная зона — `NOTAUTH`; secondary/forward —
+`REFUSED`. Изменение коммитится одной транзакцией `pulse-zonefile`, serial
+SOA растёт, после успеха уходит NOTIFY-out. Метрики — `pulsed_update_*`.
 
 ### DNS и REST в разных процессах
 
@@ -532,6 +560,13 @@ cargo deny check
   `spawn_blocking`, потому что трансфер пишет серию кадров синхронно.
 - REST — MVP-подмножество спецификации (jobs/transfers/audit/serial/keys
   реализованы); API доступен только на loopback (без TLS).
+- DNS UPDATE: только primary-зоны в состоянии `Serving` (secondary/forward →
+  `REFUSED`); авторизация — статические TSIG-ключи + IP/CIDR + allowlist зон,
+  без per-name update-policy; DNSSEC-записи (`RRSIG`/`NSEC`/`NSEC3`/
+  `NSEC3PARAM`/`DNSKEY`) управляются сигнатором и UPDATE не меняются;
+  SIG(0) (RFC 3007) не поддерживается — авторизация только TSIG (RFC 8945);
+  персистентность — общий commit `pulse-zonefile` (отдельного UPDATE-journal
+  нет).
 - DNSSEC: NSEC и NSEC3 (SHA-1, Opt-Out включается `nsec3_opt_out`),
   автоматическая ротация KSK/ZSK по RFC 7583 (`rotation`: pre-publish →
   double-sign → active → retire, состояние в `0600`-файле), RFC 5011 для
