@@ -5,9 +5,10 @@
 //! `ALLOC_RECORD` (две копии в разных страницах). Курсор монотонен: CAS только
 //! вперёд, `[DP, cursor)` — учтённая утечка.
 
-use std::cell::Cell;
-use std::sync::Arc;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::parallel::consts::{
     ALLOC_EXTENT_PAGES, ALLOC_THREAD_CACHE_PAGES, NO_VERSION, TXN_BATCH,
@@ -38,6 +39,133 @@ impl AllocTicket {
     }
 }
 
+/// Активные резервации страниц (для онлайн-sweep утечек).
+///
+/// `floor` — нижняя граница страниц, которые писатель получил, но ещё не
+/// сделал durable (`u64::MAX` — таких нет). Sweep возвращает в пул только
+/// диапазоны строго ниже минимума по всем живым писателям, поэтому
+/// зарезервированные под незавершённый коммит страницы не переиспользуются.
+#[derive(Debug)]
+struct PendingRegistry {
+    entries: Arc<Mutex<BTreeMap<u64, u64>>>,
+    next_id: AtomicU64,
+    shared: Option<Arc<SharedCoord>>,
+}
+
+impl PendingRegistry {
+    fn new(shared: Option<Arc<SharedCoord>>) -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(BTreeMap::new())),
+            next_id: AtomicU64::new(1),
+            shared,
+        }
+    }
+
+    fn floor(&self) -> u64 {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.values().copied().min().unwrap_or(u64::MAX)
+    }
+
+    fn publish(&self) {
+        if let Some(coord) = &self.shared
+            && let Some(slot) = coord.client_slot()
+        {
+            coord.set_pending_floor(slot, self.floor());
+        }
+    }
+
+    fn register(&self, floor: u64) -> PendingToken {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries.insert(id, floor);
+        }
+        self.publish();
+        PendingToken {
+            registry: Arc::clone(&self.entries),
+            shared: self.shared.clone(),
+            id,
+        }
+    }
+}
+
+/// RAII-резервация: существует, пока писатель может использовать страницы.
+#[derive(Debug)]
+pub(crate) struct PendingToken {
+    registry: Arc<Mutex<BTreeMap<u64, u64>>>,
+    shared: Option<Arc<SharedCoord>>,
+    id: u64,
+}
+
+impl PendingToken {
+    fn set(&self, floor: u64) {
+        let mut entries = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = entries.get_mut(&self.id) else {
+            return;
+        };
+        if *current != floor {
+            *current = floor;
+            drop(entries);
+            publish_floor(&self.registry, self.shared.as_deref());
+        }
+    }
+
+    /// Понижает границу (новая резервация ниже текущей) — только вниз.
+    fn lower_to(&self, floor: u64) {
+        let mut entries = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = entries.get_mut(&self.id) else {
+            return;
+        };
+        if floor < *current {
+            *current = floor;
+            drop(entries);
+            publish_floor(&self.registry, self.shared.as_deref());
+        }
+    }
+}
+
+impl Drop for PendingToken {
+    fn drop(&mut self) {
+        let removed = {
+            let mut entries = self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries.remove(&self.id).is_some()
+        };
+        if removed {
+            publish_floor(&self.registry, self.shared.as_deref());
+        }
+    }
+}
+
+fn publish_floor(registry: &Mutex<BTreeMap<u64, u64>>, shared: Option<&SharedCoord>) {
+    if let Some(coord) = shared
+        && let Some(slot) = coord.client_slot()
+    {
+        let floor = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(u64::MAX);
+        coord.set_pending_floor(slot, floor);
+    }
+}
+
 /// Общий аллокатор файла.
 #[derive(Debug)]
 pub struct Allocator {
@@ -53,6 +181,8 @@ pub struct Allocator {
     start_page_limit: u64,
     cas_retries: AtomicU64,
     txn_cas_retries: AtomicU64,
+    /// Активные резервации (нижняя граница ещё не закоммиченных страниц).
+    pending: Arc<PendingRegistry>,
 }
 
 impl Allocator {
@@ -78,6 +208,7 @@ impl Allocator {
             start_page_limit: dp,
             cas_retries: AtomicU64::new(0),
             txn_cas_retries: AtomicU64::new(0),
+            pending: Arc::new(PendingRegistry::new(None)),
         })
     }
 
@@ -106,11 +237,12 @@ impl Allocator {
         Ok(Self {
             reserve_cursor: AtomicU64::new(dp),
             reserve_txn: AtomicU64::new(next_txn),
-            shared: Some(shared),
+            shared: Some(shared.clone()),
             hard_limit: u64::from(hard_limit),
             start_page_limit: dp,
             cas_retries: AtomicU64::new(0),
             txn_cas_retries: AtomicU64::new(0),
+            pending: Arc::new(PendingRegistry::new(Some(shared))),
         })
     }
 
@@ -196,6 +328,15 @@ impl Allocator {
         self.cursor().saturating_sub(durable_page_limit)
     }
 
+    /// Нижняя граница активных незакоммиченных резерваций.
+    ///
+    /// `u64::MAX` — активных резерваций нет. Sweep не возвращает в пул
+    /// страницы `>= floor`.
+    #[must_use]
+    pub fn pending_floor(&self) -> u64 {
+        self.pending.floor()
+    }
+
     /// Резервирует ровно `pages` страниц (без локального кеша).
     ///
     /// CAS `cursor → cursor + pages`; диапазоны не пересекаются и не убывают.
@@ -252,6 +393,8 @@ impl Allocator {
             txn_start: Cell::new(0),
             txn_len: Cell::new(0),
             exact: false,
+            pending: RefCell::new(None),
+            exact_pending: RefCell::new(Vec::new()),
         }
     }
 
@@ -269,7 +412,18 @@ impl Allocator {
             txn_start: Cell::new(0),
             txn_len: Cell::new(0),
             exact: true,
+            pending: RefCell::new(None),
+            exact_pending: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Держит `pending_floor` на `floor`, пока жив токен.
+    ///
+    /// Нужен планам коммита: их chain/bucket-страницы выделяются без
+    /// per-handle резервации, но до публикации sweep не должен их вернуть.
+    #[must_use]
+    pub(crate) fn pin_pending(&self, floor: u64) -> PendingToken {
+        self.pending.register(floor)
     }
 
     /// Выдаёт следующий `txn` одним CAS (без кеша; для тестов/утилит).
@@ -353,6 +507,10 @@ pub struct AllocHandle<'a> {
     txn_start: Cell<u64>,
     txn_len: Cell<u64>,
     exact: bool,
+    /// Резервация текущего батча/страниц от sweep.
+    pending: RefCell<Option<PendingToken>>,
+    /// Резервации точных выдач, живущие до коммита/rollback.
+    exact_pending: RefCell<Vec<PendingToken>>,
 }
 
 impl AllocHandle<'_> {
@@ -366,12 +524,19 @@ impl AllocHandle<'_> {
             return Err(ParallelError::InvalidArgument { field: "pages" });
         }
         if self.exact {
-            return self.allocator.reserve_exact(pages);
+            let ticket = self.allocator.reserve_exact(pages)?;
+            let token = self
+                .allocator
+                .pending
+                .register(u64::from(ticket.first_page));
+            self.exact_pending_push(token);
+            return Ok(ticket);
         }
         if self.pages_len.get() < pages {
             let (start, batch) = self.allocator.reserve_batch(pages)?;
             self.pages_start.set(start);
             self.pages_len.set(batch);
+            self.note_pending(start);
         }
         let start = self.pages_start.get();
         let first = u32::try_from(start).map_err(|_| ParallelError::MapFull {
@@ -387,6 +552,31 @@ impl AllocHandle<'_> {
         self.allocator
             .bump_generations(ticket.first_page, ticket.pages);
         Ok(ticket)
+    }
+
+    fn exact_pending_push(&self, token: PendingToken) {
+        self.exact_pending.borrow_mut().push(token);
+    }
+
+    fn note_pending(&self, start: u64) {
+        let mut pending = self.pending.borrow_mut();
+        if let Some(token) = pending.as_ref() {
+            token.lower_to(start);
+        } else {
+            *pending = Some(self.allocator.pending.register(start));
+        }
+    }
+
+    /// Вызывается после успешного коммита/rollback: страницы ниже `DP`
+    /// больше не защищаются, но оставшийся кеш батча — защищается.
+    pub(crate) fn on_transaction_end(&self) {
+        self.exact_pending.borrow_mut().clear();
+        let mut pending = self.pending.borrow_mut();
+        if self.exact || self.pages_len.get() == 0 {
+            *pending = None;
+        } else if let Some(token) = pending.as_ref() {
+            token.set(self.pages_start.get());
+        }
     }
 
     /// Остаток локального кеша страниц.

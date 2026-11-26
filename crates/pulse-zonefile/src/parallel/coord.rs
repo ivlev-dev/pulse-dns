@@ -68,9 +68,12 @@ pub(crate) const COORD_MAGIC: [u8; 8] = *b"PULSCD01";
 /// `PageCacheV2`/node-cache инвалидируют переиспользованную страницу (ADR 0007
 /// §7.4). v4 добавила межпроцессную очередь group commit: слоты клиентов с
 /// готовыми `RootEntry`, счётчики групп/`fsync` и lease координирующего
-/// процесса. Это не формат данных: sidecar пересоздаётся при старте, а
-/// live-процессы старой версии получают `Busy`, а не читают чужую раскладку.
-pub(crate) const COORD_VERSION: u16 = 4;
+/// процесса. v5 добавила общий `freeze_epoch` с TTL/fencing, счётчики
+/// онлайн-sweep утечек и `pending_floor` каждого писателя (нижняя граница
+/// зарезервированных, но ещё не закоммиченных страниц). Это не формат данных:
+/// sidecar пересоздаётся при старте, а live-процессы старой версии получают
+/// `Busy`, а не читают чужую раскладку.
+pub(crate) const COORD_VERSION: u16 = 5;
 /// Суффикс sidecar-файла.
 pub(crate) const COORD_FILE_SUFFIX: &str = ".pulsecoord";
 
@@ -111,7 +114,26 @@ const SC_OFF_LEADER_PID: usize = PAGE + 1024;
 const SC_OFF_LEADER_STARTTIME: usize = PAGE + 1088;
 /// Сколько групп отработал текущий лидер (диагностика/тесты).
 const SC_OFF_LEADER_GROUPS: usize = PAGE + 1152;
+/// Общий retention-барьер `freeze_epoch` (v5): активность, эпоха, владелец,
+/// TTL, fencing-поколение.
+const SC_OFF_FREEZE_ACTIVE: usize = PAGE + 1216;
+const SC_OFF_FREEZE_EPOCH: usize = PAGE + 1280;
+const SC_OFF_FREEZE_OWNER: usize = PAGE + 1344;
+const SC_OFF_FREEZE_EXPIRES: usize = PAGE + 1408;
+const SC_OFF_FREEZE_TTL: usize = PAGE + 1472;
+const SC_OFF_FREEZE_GENERATION: usize = PAGE + 1536;
+/// Диагностика онлайн-sweep утечек (`v2`): прогоны/просканировано/возвращено.
+const SC_OFF_SWEEP_RUNS: usize = PAGE + 1600;
+const SC_OFF_SWEEP_PAGES: usize = PAGE + 1664;
+const SC_OFF_SWEEP_RECLAIMED: usize = PAGE + 1728;
+/// Писатели без слота очереди: их `pending_floor` не виден, aborted-sweep
+/// консервативно запрещён.
+const SC_OFF_UNREGISTERED: usize = PAGE + 1792;
 const ARRAYS_OFF: usize = 2 * PAGE;
+
+/// Состояние общего freeze.
+const FREEZE_INACTIVE: u64 = 0;
+const FREEZE_ACTIVE: u64 = 1;
 
 /// Слотов клиентов общей очереди group commit.
 pub(crate) const CLIENT_SLOTS: usize = 256;
@@ -178,6 +200,8 @@ const RS_PINS: usize = 6;
 /// `fcntl` разрешает блокировки и за EOF.
 const LOCK_OFF_ALIVE: u64 = 1;
 const LOCK_OFF_COMMIT: u64 = 2;
+const LOCK_OFF_SWEEP: u64 = 3;
+const LOCK_OFF_FREEZE: u64 = 4;
 const LOCK_OFF_ZONE_BASE: u64 = 1 << 20;
 
 const LOCK_SH: i16 = libc::F_RDLCK as i16;
@@ -311,6 +335,27 @@ pub struct SharedGroupStats {
     pub max_members: u64,
 }
 
+/// Снимок общего `freeze_epoch` (sidecar v5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SharedFreezeStatus {
+    /// Барьер активен (и не истёк по TTL).
+    pub active: bool,
+    /// Барьер истёк по TTL (запись ещё лежит, но не действует).
+    pub expired: bool,
+    /// Зафиксированная версия (`0` — барьера нет).
+    pub epoch: u64,
+    /// Владелец (`pid`).
+    pub owner_pid: u64,
+    /// Владелец (`starttime`).
+    pub owner_starttime: u64,
+    /// Абсолютное время истечения (unix ns).
+    pub expires_ns: u64,
+    /// TTL, с которым барьер выставлен.
+    pub ttl_ns: u64,
+    /// Fencing-поколение барьера.
+    pub generation: u64,
+}
+
 /// Идентичность текущего процесса (кэшируется: `/proc/self/stat` стабилен).
 pub(crate) fn self_identity() -> ProcessIdentity {
     static SELF: OnceLock<ProcessIdentity> = OnceLock::new();
@@ -412,12 +457,16 @@ pub(crate) struct SharedCoord {
     page_gen_count: usize,
     /// Слоты общей очереди group commit (`CLIENT_SLOTS × CLIENT_SLOT_SIZE`).
     clients_off: usize,
+    /// `pending_floor` каждого слота клиента.
+    pending_off: usize,
     /// Слот этого процесса в очереди (только writable-стор).
     client: Option<usize>,
     page_data_first: u32,
     page_count_max: u32,
     /// Держим `LOCK_SH` на `LOCK_OFF_ALIVE` всё время жизни.
     alive_lock: Option<RangeLock>,
+    /// Процесс не получил слот очереди (его `pending_floor` не опубликован).
+    unregistered: bool,
 }
 
 impl std::fmt::Debug for SharedCoord {
@@ -506,10 +555,12 @@ impl SharedCoord {
             page_gen_off: layout.page_gen_off,
             page_gen_count: layout.page_gen_count,
             clients_off: layout.clients_off,
+            pending_off: layout.pending_off,
             client: None,
             page_data_first: geometry.page_data_first(),
             page_count_max: geometry.page_count_max(),
             alive_lock: None,
+            unregistered: false,
         };
 
         let header_matches = coord.header_matches(geometry, instance_uuid);
@@ -534,6 +585,10 @@ impl SharedCoord {
         }
         if writable {
             coord.client = coord.client_register(self_identity());
+            if coord.client.is_none() {
+                coord.unregistered = true;
+                coord.note_unregistered(1);
+            }
         }
         Ok(Arc::new(coord))
     }
@@ -607,6 +662,314 @@ impl SharedCoord {
     #[must_use]
     pub(crate) fn alive_count(&self) -> u64 {
         self.alive_hint().load(Ordering::Acquire)
+    }
+
+    // --- общий freeze (v5) ---
+
+    /// Захватывает общий retention-барьер.
+    ///
+    /// `epoch` — версия, ниже которой рекламация разрешена. Барьер живёт до
+    /// `freeze_release`/`unfreeze` или до истечения `ttl` (crash-safe: TTL
+    /// переживает `kill -9`, но не блокирует рекламацию навсегда).
+    ///
+    /// # Errors
+    ///
+    /// `Busy` — барьер активен и принадлежит другому процессу/поколению;
+    /// `Io` — ошибка `fcntl`.
+    pub(crate) fn freeze_acquire(
+        &self,
+        identity: ProcessIdentity,
+        epoch: u64,
+        ttl: std::time::Duration,
+    ) -> Result<u64, ParallelError> {
+        if epoch == 0 {
+            return Err(ParallelError::InvalidArgument {
+                field: "freeze_epoch",
+            });
+        }
+        let _lock = self.lock_range_blocking(LOCK_OFF_FREEZE)?;
+        let now = unix_now_ns();
+        let owner_token = Self::owner_token(identity);
+        let active = self
+            .atomic_u64(SC_OFF_FREEZE_ACTIVE)
+            .load(Ordering::Acquire);
+        if active == FREEZE_ACTIVE {
+            let owner = self.atomic_u64(SC_OFF_FREEZE_OWNER).load(Ordering::Acquire);
+            let expires = self
+                .atomic_u64(SC_OFF_FREEZE_EXPIRES)
+                .load(Ordering::Acquire);
+            if owner != owner_token && now < expires {
+                return Err(ParallelError::Busy);
+            }
+        }
+        let ttl_ns = u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX);
+        let expires = now.saturating_add(ttl_ns.max(1));
+        let generation = self
+            .atomic_u64(SC_OFF_FREEZE_GENERATION)
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        self.atomic_u64(SC_OFF_FREEZE_EPOCH)
+            .store(epoch, Ordering::Release);
+        self.atomic_u64(SC_OFF_FREEZE_OWNER)
+            .store(owner_token, Ordering::Release);
+        self.atomic_u64(SC_OFF_FREEZE_TTL)
+            .store(ttl_ns, Ordering::Release);
+        self.atomic_u64(SC_OFF_FREEZE_EXPIRES)
+            .store(expires, Ordering::Release);
+        self.atomic_u64(SC_OFF_FREEZE_ACTIVE)
+            .store(FREEZE_ACTIVE, Ordering::Release);
+        // Публикуем `epoch` до активации: читатель видит согласованную пару.
+        fence(Ordering::SeqCst);
+        Ok(generation)
+    }
+
+    /// Снимает барьер, если его держит `identity` и поколение совпало.
+    pub(crate) fn freeze_release(&self, identity: ProcessIdentity, generation: u64) -> bool {
+        let Ok(_lock) = self.lock_range_blocking(LOCK_OFF_FREEZE) else {
+            return false;
+        };
+        let owner_token = Self::owner_token(identity);
+        let owner = self.atomic_u64(SC_OFF_FREEZE_OWNER).load(Ordering::Acquire);
+        let current = self
+            .atomic_u64(SC_OFF_FREEZE_GENERATION)
+            .load(Ordering::Acquire);
+        if owner != owner_token || (generation != 0 && current != generation) {
+            return false;
+        }
+        self.atomic_u64(SC_OFF_FREEZE_ACTIVE)
+            .store(FREEZE_INACTIVE, Ordering::Release);
+        self.atomic_u64(SC_OFF_FREEZE_EPOCH)
+            .store(0, Ordering::Release);
+        self.atomic_u64(SC_OFF_FREEZE_OWNER)
+            .store(0, Ordering::Release);
+        self.atomic_u64(SC_OFF_FREEZE_EXPIRES)
+            .store(0, Ordering::Release);
+        true
+    }
+
+    /// Снимает барьер независимо от владельца (`unfreeze()` из любого
+    /// процесса — административная операция).
+    pub(crate) fn freeze_force_release(&self) -> bool {
+        let Ok(_lock) = self.lock_range_blocking(LOCK_OFF_FREEZE) else {
+            return false;
+        };
+        let was = self
+            .atomic_u64(SC_OFF_FREEZE_ACTIVE)
+            .load(Ordering::Acquire)
+            == FREEZE_ACTIVE;
+        self.atomic_u64(SC_OFF_FREEZE_ACTIVE)
+            .store(FREEZE_INACTIVE, Ordering::Release);
+        self.atomic_u64(SC_OFF_FREEZE_EPOCH)
+            .store(0, Ordering::Release);
+        self.atomic_u64(SC_OFF_FREEZE_OWNER)
+            .store(0, Ordering::Release);
+        self.atomic_u64(SC_OFF_FREEZE_EXPIRES)
+            .store(0, Ordering::Release);
+        was
+    }
+
+    /// Продлевает TTL барьера (только владелец/поколение).
+    pub(crate) fn freeze_renew(
+        &self,
+        identity: ProcessIdentity,
+        generation: u64,
+        ttl: std::time::Duration,
+    ) -> bool {
+        let Ok(_lock) = self.lock_range_blocking(LOCK_OFF_FREEZE) else {
+            return false;
+        };
+        let owner_token = Self::owner_token(identity);
+        if self.atomic_u64(SC_OFF_FREEZE_OWNER).load(Ordering::Acquire) != owner_token
+            || self
+                .atomic_u64(SC_OFF_FREEZE_GENERATION)
+                .load(Ordering::Acquire)
+                != generation
+        {
+            return false;
+        }
+        let ttl_ns = u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX).max(1);
+        let expires = unix_now_ns().saturating_add(ttl_ns);
+        self.atomic_u64(SC_OFF_FREEZE_TTL)
+            .store(ttl_ns, Ordering::Release);
+        self.atomic_u64(SC_OFF_FREEZE_EXPIRES)
+            .store(expires, Ordering::Release);
+        true
+    }
+
+    /// Снимок общего барьера. Истёкший по TTL барьер возвращается как
+    /// неактивный (`expired = true`), но запись не стирается: это позволяет
+    /// диагностике увидеть «зависший» freeze умершего процесса.
+    #[must_use]
+    pub(crate) fn freeze_status(&self) -> SharedFreezeStatus {
+        let active = self
+            .atomic_u64(SC_OFF_FREEZE_ACTIVE)
+            .load(Ordering::Acquire)
+            == FREEZE_ACTIVE;
+        if !active {
+            return SharedFreezeStatus::default();
+        }
+        let epoch = self.atomic_u64(SC_OFF_FREEZE_EPOCH).load(Ordering::Acquire);
+        let expires_ns = self
+            .atomic_u64(SC_OFF_FREEZE_EXPIRES)
+            .load(Ordering::Acquire);
+        let ttl_ns = self.atomic_u64(SC_OFF_FREEZE_TTL).load(Ordering::Acquire);
+        let owner =
+            Self::token_identity(self.atomic_u64(SC_OFF_FREEZE_OWNER).load(Ordering::Acquire));
+        let expired = unix_now_ns() >= expires_ns;
+        SharedFreezeStatus {
+            active: !expired,
+            expired,
+            epoch: if expired { 0 } else { epoch },
+            owner_pid: owner.pid,
+            owner_starttime: owner.starttime,
+            expires_ns,
+            ttl_ns,
+            generation: self
+                .atomic_u64(SC_OFF_FREEZE_GENERATION)
+                .load(Ordering::Acquire),
+        }
+    }
+
+    /// Действующий общий барьер (`0` — нет/истёк).
+    #[must_use]
+    pub(crate) fn effective_freeze_epoch(&self) -> u64 {
+        self.freeze_status().epoch
+    }
+
+    // --- pending floor писателей (v5) ---
+
+    fn pending_slot(&self, slot: usize) -> Option<&AtomicU64> {
+        if slot >= CLIENT_SLOTS {
+            return None;
+        }
+        Some(self.atomic_u64(self.pending_off + slot * 8))
+    }
+
+    /// Публикует нижнюю границу зарезервированных, но не закоммиченных страниц
+    /// этого процесса (`u64::MAX` — таких нет).
+    pub(crate) fn set_pending_floor(&self, slot: usize, floor: u64) {
+        if let Some(cell) = self.pending_slot(slot) {
+            cell.store(floor, Ordering::Release);
+        }
+    }
+
+    /// Минимум `pending_floor` по живым писателям.
+    ///
+    /// `u64::MAX` — зарезервированных страниц нет (aborted-sweep безопасен).
+    #[must_use]
+    pub(crate) fn pending_floor(&self) -> u64 {
+        let mut floor = u64::MAX;
+        for slot in 0..CLIENT_SLOTS {
+            let owner = self
+                .client_word(slot, CLIENT_OFF_OWNER)
+                .load(Ordering::Acquire);
+            if owner == 0 {
+                continue;
+            }
+            let identity = Self::token_identity(owner);
+            if !process_alive(
+                identity.pid,
+                self.client_word(slot, CLIENT_OFF_STARTTIME)
+                    .load(Ordering::Acquire),
+            ) {
+                continue;
+            }
+            if let Some(cell) = self.pending_slot(slot) {
+                floor = floor.min(cell.load(Ordering::Acquire));
+            }
+        }
+        floor
+    }
+
+    /// Зарегистрирован ли writable-процесс без слота очереди (его
+    /// `pending_floor` не виден → aborted-sweep запрещён).
+    pub(crate) fn note_unregistered(&self, delta: i64) {
+        let cell = self.atomic_u64(SC_OFF_UNREGISTERED);
+        if delta >= 0 {
+            cell.fetch_add(delta.unsigned_abs(), Ordering::AcqRel);
+        } else {
+            let _ = cell.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(delta.unsigned_abs()))
+            });
+        }
+    }
+
+    /// Есть ли писатели без видимого `pending_floor`.
+    #[must_use]
+    pub(crate) fn unregistered_writers(&self) -> u64 {
+        self.atomic_u64(SC_OFF_UNREGISTERED).load(Ordering::Acquire)
+    }
+
+    // --- онлайн-sweep (v5) ---
+
+    /// Блокирующий эксклюзивный sweep-lease (публикация под commit-lock).
+    pub(crate) fn lock_sweep_exclusive(&self) -> Result<RangeLock, ParallelError> {
+        set_lock(&self.file, FCNTL_SETLKW, LOCK_EX, LOCK_OFF_SWEEP, 1)
+            .map_err(ParallelError::Io)?;
+        let file = match self.file.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = set_lock(&self.file, FCNTL_SETLK, LOCK_UN, LOCK_OFF_SWEEP, 1);
+                return Err(ParallelError::Io(error));
+            }
+        };
+        Ok(RangeLock {
+            file,
+            start: LOCK_OFF_SWEEP,
+            len: 1,
+        })
+    }
+
+    /// Блокирующий разделяемый sweep-lease: `return_pages` не пересекается с
+    /// публикацией sweep другого процесса.
+    pub(crate) fn lock_sweep_shared(&self) -> Result<RangeLock, ParallelError> {
+        set_lock(&self.file, FCNTL_SETLKW, LOCK_SH, LOCK_OFF_SWEEP, 1)
+            .map_err(ParallelError::Io)?;
+        let file = self.file.try_clone().map_err(ParallelError::Io)?;
+        Ok(RangeLock {
+            file,
+            start: LOCK_OFF_SWEEP,
+            len: 1,
+        })
+    }
+
+    /// Учитывает результаты sweep в общих счётчиках.
+    pub(crate) fn note_sweep(&self, scanned: u64, reclaimed: u64) {
+        self.atomic_u64(SC_OFF_SWEEP_RUNS)
+            .fetch_add(1, Ordering::Relaxed);
+        self.atomic_u64(SC_OFF_SWEEP_PAGES)
+            .fetch_add(scanned, Ordering::Relaxed);
+        self.atomic_u64(SC_OFF_SWEEP_RECLAIMED)
+            .fetch_add(reclaimed, Ordering::Relaxed);
+    }
+
+    /// Счётчики sweep: `(runs, scanned_pages, reclaimed_pages)`.
+    #[must_use]
+    pub(crate) fn sweep_stats(&self) -> (u64, u64, u64) {
+        (
+            self.atomic_u64(SC_OFF_SWEEP_RUNS).load(Ordering::Relaxed),
+            self.atomic_u64(SC_OFF_SWEEP_PAGES).load(Ordering::Relaxed),
+            self.atomic_u64(SC_OFF_SWEEP_RECLAIMED)
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    fn lock_range_blocking(&self, start: u64) -> Result<RangeLock, ParallelError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if self.try_lock_exclusive(start) {
+                let file = self.file.try_clone().map_err(ParallelError::Io)?;
+                return Ok(RangeLock {
+                    file,
+                    start,
+                    len: 1,
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ParallelError::Busy);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
     }
 
     // --- очередь переиспользуемых zone_seq (каталог, ADR 0007 §7.1) ---
@@ -797,6 +1160,9 @@ impl SharedCoord {
             .store(identity.pid, Ordering::SeqCst);
         self.client_word(slot, CLIENT_OFF_STARTTIME)
             .store(identity.starttime, Ordering::SeqCst);
+        if let Some(cell) = self.pending_slot(slot) {
+            cell.store(u64::MAX, Ordering::SeqCst);
+        }
     }
 
     /// Регистрирует слот клиента очереди; `None` — таблица полна.
@@ -1728,8 +2094,23 @@ impl SharedCoord {
             SC_OFF_LEADER_PID,
             SC_OFF_LEADER_STARTTIME,
             SC_OFF_LEADER_GROUPS,
+            SC_OFF_FREEZE_ACTIVE,
+            SC_OFF_FREEZE_EPOCH,
+            SC_OFF_FREEZE_OWNER,
+            SC_OFF_FREEZE_EXPIRES,
+            SC_OFF_FREEZE_TTL,
+            SC_OFF_FREEZE_GENERATION,
+            SC_OFF_SWEEP_RUNS,
+            SC_OFF_SWEEP_PAGES,
+            SC_OFF_SWEEP_RECLAIMED,
+            SC_OFF_UNREGISTERED,
         ] {
             self.atomic_u64(offset).store(0, Ordering::SeqCst);
+        }
+        for slot in 0..CLIENT_SLOTS {
+            if let Some(cell) = self.pending_slot(slot) {
+                cell.store(u64::MAX, Ordering::SeqCst);
+            }
         }
         for slot in 0..CLIENT_SLOTS {
             self.client_word(slot, CLIENT_OFF_STATE)
@@ -1818,6 +2199,9 @@ impl SharedCoord {
 
 impl Drop for SharedCoord {
     fn drop(&mut self) {
+        if self.unregistered {
+            self.note_unregistered(-1);
+        }
         if let Some(slot) = self.client {
             let token = Self::owner_token(self_identity());
             let owner = self.client_word(slot, CLIENT_OFF_OWNER);
@@ -1850,6 +2234,8 @@ struct Layout {
     page_gen_off: usize,
     page_gen_count: usize,
     clients_off: usize,
+    /// `pending_floor` каждого слота клиента (`CLIENT_SLOTS × u64`).
+    pending_off: usize,
     len: u64,
 }
 
@@ -1915,6 +2301,13 @@ impl Layout {
             .ok_or(ParallelError::InvalidArgument {
                 field: "coord_size",
             })?;
+        let pending_off = align64(len);
+        let len =
+            pending_off
+                .checked_add(CLIENT_SLOTS * 8)
+                .ok_or(ParallelError::InvalidArgument {
+                    field: "coord_size",
+                })?;
         let len = align64(len);
         Ok(Self {
             leases_off,
@@ -1925,6 +2318,7 @@ impl Layout {
             page_gen_off,
             page_gen_count,
             clients_off,
+            pending_off,
             len: u64::try_from(len).map_err(|_| ParallelError::InvalidArgument {
                 field: "coord_size",
             })?,
@@ -1934,6 +2328,14 @@ impl Layout {
 
 fn align64(value: usize) -> usize {
     value.saturating_add(63) & !63
+}
+
+fn unix_now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Следующая генерация страницы: 0 и `u32::MAX` переходят в 1.

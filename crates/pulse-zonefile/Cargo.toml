@@ -75,3 +75,7 @@ harness = false
 [[bench]]
 name = "v2_mem"
 harness = false
+
+[[bench]]
+name = "v2_freeze_sweep"
+harness = false

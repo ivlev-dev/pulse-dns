@@ -114,6 +114,8 @@ pub struct FsckLiteReport {
     pub chain_max_depth: u32,
     /// `cursor − DP`: «выделено, но не опубликовано».
     pub leaked_pages_estimate: u64,
+    /// Зоны с zone-fatal признаками (кандидаты на `NEEDS_FSCK`).
+    pub damaged_zones: Vec<u32>,
     /// Диагностические сообщения (зона/поле).
     pub issues: Vec<String>,
 }

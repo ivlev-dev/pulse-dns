@@ -1683,6 +1683,7 @@ impl<'a> ParallelZone<'a> {
                 }
                 Err(error) => {
                     self.store.return_pages(self.zone, &pages);
+                    self.store.release_in_flight_pages(pages.iter());
                     self.rollback();
                     return Err(error);
                 }

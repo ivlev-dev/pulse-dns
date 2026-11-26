@@ -19,11 +19,16 @@
 //! процессами** через общую очередь sidecar (`§7.5`, [`SharedGroupStats`]);
 //! `Flush`/`Memory` и липкий `Sync`; tombstone-GC каталога
 //! ([`ParallelZones::gc_catalog`]); sweep утечек ([`ParallelStore::leak_report`],
-//! [`ParallelStore::repair_leaks`], [`fsck_repair`]). M3 (ADR 0007):
+//! [`ParallelStore::sweep_leaks`], [`ParallelStore::repair_leaks`],
+//! [`ParallelStore::repair_online`], [`fsck_repair`], [`fsck_repair_online`]).
+//! M3 (ADR 0007):
 //! `multi_process` — общий sidecar-координатор (`coord`), per-zone
 //! `fcntl`-lease, reader table и seqlock публикации; каталог пишут все
 //! процессы под catalog lease, durable-пулы рекламируются под lease с гейтом
-//! `drop_txn < min(D_z, MP, freeze)`. B3: `pulsed` работает
+//! `drop_txn < min(D_z, MP, freeze)`. Sidecar v5 публикует общий
+//! `freeze_epoch` (TTL/fencing, `min(local, shared)` в рекламации) и
+//! `pending_floor` писателей, по которому онлайн-sweep безопасно возвращает
+//! недостижимые страницы без остановки writers. B3: `pulsed` работает
 //! поверх v2 (`--data`), а пользовательские
 //! метаданные зоны (вид, TTL по умолчанию, denial) хранятся в записи каталога
 //! ([`ZoneMetaV2`]); v1-модули остаются для чтения legacy-файлов и
@@ -89,9 +94,10 @@ pub use recovery::{FsckLiteReport, OpenConfigV2, RecoveryReport};
 pub use ring::{CellView, CopyState, SlotView};
 pub use root::{RootEntry, RootFieldError, RootFlags, RootState};
 pub use store::{
-    CrashHook, CrashPoint, GroupCommitRequest, IoFaultHook, LeakReport, ParallelStore,
-    PublishOutcome, RepairReport, StoreConfig, StoreStats, ZoneSnapshot, fsck_repair,
-    open_read_only,
+    CrashHook, CrashPoint, FreezeStatus, GroupCommitRequest, IoFaultHook, LeakReport,
+    OnlineRepairConfig, OnlineRepairReport, ParallelStore, PublishOutcome, RepairReport,
+    StoreConfig, StoreStats, SweepConfig, SweepReport, ZoneSnapshot, fsck_repair,
+    fsck_repair_online, open_read_only,
 };
 pub use verify::GraphReport;
 pub use zone::{

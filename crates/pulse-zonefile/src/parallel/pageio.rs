@@ -397,6 +397,9 @@ pub(crate) struct WriteIo<'a> {
     dirty: RefCell<BTreeMap<u32, Box<[u8]>>>,
     allocated: RefCell<BTreeSet<u32>>,
     freed: RefCell<BTreeSet<u32>>,
+    /// Освобождённые страницы, уже переданные в `stage_commit`, но ещё не
+    /// закоммиченные: держим их вне sweep до завершения публикации.
+    reported_freed: RefCell<Vec<u32>>,
     arena: PageArena,
     error: RefCell<Option<ParallelError>>,
 }
@@ -425,6 +428,7 @@ impl<'a> WriteIo<'a> {
             dirty: RefCell::new(BTreeMap::new()),
             allocated: RefCell::new(BTreeSet::new()),
             freed: RefCell::new(BTreeSet::new()),
+            reported_freed: RefCell::new(Vec::new()),
             arena: PageArena::default(),
             error: RefCell::new(None),
         }
@@ -450,7 +454,9 @@ impl<'a> WriteIo<'a> {
 
     /// Забирает страницы, освобождённые в этой транзакции.
     pub(crate) fn take_freed(&mut self) -> Vec<u32> {
-        std::mem::take(self.freed.get_mut()).into_iter().collect()
+        let drops: Vec<u32> = std::mem::take(self.freed.get_mut()).into_iter().collect();
+        self.reported_freed.get_mut().extend_from_slice(&drops);
+        drops
     }
 
     /// Сбрасывает кэш страниц (между публичными операциями/коммитами).
@@ -461,10 +467,16 @@ impl<'a> WriteIo<'a> {
     /// Успешный коммит: сбросить учёт, не возвращая страницы в пул.
     pub(crate) fn finish_commit(&mut self) {
         self.dirty.get_mut().clear();
+        let mut released: Vec<u32> = self.freed.get_mut().iter().copied().collect();
+        released.append(self.reported_freed.get_mut());
+        self.store.release_freed_pages(&released);
+        self.store
+            .release_in_flight_pages(self.allocated.borrow().iter());
         self.allocated.get_mut().clear();
         self.freed.get_mut().clear();
         self.arena.clear();
         self.error.borrow_mut().take();
+        self.alloc.on_transaction_end();
     }
 
     /// Сбрасывает всю незакоммиченную работу (rollback).
@@ -478,10 +490,16 @@ impl<'a> WriteIo<'a> {
             self.store.return_pages(self.zone, &returned);
         }
         self.dirty.get_mut().clear();
+        let mut released: Vec<u32> = self.freed.get_mut().iter().copied().collect();
+        released.append(self.reported_freed.get_mut());
+        self.store.release_freed_pages(&released);
+        self.store
+            .release_in_flight_pages(self.allocated.borrow().iter());
         self.allocated.get_mut().clear();
         self.freed.get_mut().clear();
         self.arena.clear();
         self.error.borrow_mut().take();
+        self.alloc.on_transaction_end();
     }
 
     #[must_use]
@@ -632,6 +650,7 @@ impl PageIo for WriteIo<'_> {
                 InvariantId::DuplicatePage,
             ));
         }
+        self.store.note_freed_page(page_no);
         // Освобождение меняет жизненный цикл номера: читатель другого
         // процесса должен увидеть промах по генерации, а не старый образ.
         self.store.bump_page_generation(page_no);
@@ -640,5 +659,18 @@ impl PageIo for WriteIo<'_> {
 
     fn page_generation(&self, page_no: u32) -> u32 {
         self.store.page_generation(page_no)
+    }
+}
+
+impl Drop for WriteIo<'_> {
+    fn drop(&mut self) {
+        let mut released: Vec<u32> = self.freed.get_mut().iter().copied().collect();
+        released.append(self.reported_freed.get_mut());
+        if !released.is_empty() {
+            self.store.release_freed_pages(&released);
+            self.freed.get_mut().clear();
+        }
+        self.store
+            .release_in_flight_pages(self.allocated.borrow().iter());
     }
 }

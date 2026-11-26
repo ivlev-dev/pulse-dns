@@ -19,7 +19,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use rustix::fs::{FileType, Mode, OFlags, fdatasync, fstat, fsync, ftruncate, open as fs_open};
@@ -27,7 +27,7 @@ use rustix::fs::{FileType, Mode, OFlags, fdatasync, fstat, fsync, ftruncate, ope
 use crate::cache::PageCache;
 use crate::consts::MAX_TREE_DEPTH;
 use crate::lock::WriterLock;
-use crate::parallel::alloc::{AllocHandle, AllocTicket, Allocator};
+use crate::parallel::alloc::{AllocHandle, AllocTicket, Allocator, PendingToken};
 use crate::parallel::consts::{
     ALLOC_RECORD_SEQ_FIRST, ALLOC_RECORD_SIZE, DEFAULT_MAX_ZONES, DEFAULT_PAGE_COUNT_MAX,
     LAYOUT_HEAD_RECORD_SIZE, LEADER_TERM_M1, MAX_LEAK_RATIO, MAX_ROOT_CHAIN_HOPS,
@@ -37,8 +37,8 @@ use crate::parallel::consts::{
 };
 use crate::parallel::coord::{
     CLIENT_MAX_MEMBERS, CoordInit, MaintenanceGuard, ProcessIdentity, SharedAckCode, SharedCoord,
-    SharedGroupStats, SharedMemberResult, SharedReadyBatch, SharedRequestMember, process_alive,
-    self_identity,
+    SharedFreezeStatus, SharedGroupStats, SharedMemberResult, SharedReadyBatch,
+    SharedRequestMember, process_alive, self_identity,
 };
 use crate::parallel::error::{FatalKind, ParallelError, V2CorruptKind};
 use crate::parallel::freepool::{BucketImages, FreeChain};
@@ -224,6 +224,120 @@ pub struct RepairReport {
     pub issues: Vec<String>,
 }
 
+/// Снимок `freeze()` (локальный и/или общий sidecar-барьер).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FreezeStatus {
+    /// Барьер действует.
+    pub active: bool,
+    /// Барьер истёк по TTL (запись «зависшего» freeze ещё видна).
+    pub expired: bool,
+    /// Действующая эпоха (`0` — барьера нет).
+    pub epoch: u64,
+    /// Локальный in-process `freeze_epoch`.
+    pub local_epoch: u64,
+    /// Общий sidecar `freeze_epoch`.
+    pub shared_epoch: u64,
+    /// Владелец (`pid`; `0` — локальный/нет).
+    pub owner_pid: u64,
+    /// Владелец (`starttime`).
+    pub owner_starttime: u64,
+    /// Абсолютное время истечения (unix ns; `0` — бессрочно/локальный).
+    pub expires_ns: u64,
+    /// TTL барьера.
+    pub ttl_ns: u64,
+}
+
+/// Параметры онлайн-sweep утечек.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepConfig {
+    /// Максимум страниц, просматриваемых за вызов.
+    pub max_scan_pages: u32,
+    /// Максимум страниц, возвращаемых в пул за вызов.
+    pub max_leaks_per_call: u32,
+    /// Бюджет времени на вызов.
+    pub max_duration: std::time::Duration,
+    /// Искать orphan bucket-страницы (дороже: чтение заголовков).
+    pub orphan_buckets: bool,
+}
+
+impl Default for SweepConfig {
+    fn default() -> Self {
+        Self {
+            max_scan_pages: 8192,
+            max_leaks_per_call: 4096,
+            max_duration: std::time::Duration::from_millis(50),
+            orphan_buckets: true,
+        }
+    }
+}
+
+/// Итог онлайн-sweep утечек.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SweepReport {
+    /// Просмотрено страниц.
+    pub scanned_pages: u64,
+    /// Возвращено в durable free-пул.
+    pub reclaimed_pages: u64,
+    /// Из них «хвост» `[max_head_limit, DP)`.
+    pub tail_pages: u64,
+    /// Из них orphan bucket-страниц.
+    pub orphan_bucket_pages: u64,
+    /// Из них aborted-страниц `[DP, cursor)` (только при отсутствии
+    /// незакоммиченных резерваций).
+    pub aborted_pages: u64,
+    /// Нижняя граница незакоммиченных резерваций на момент снимка.
+    pub pending_floor: u64,
+    /// Оценка оставшихся aborted-страниц.
+    pub remaining_aborted: u64,
+    /// Кандидаты, пропущенные из-за конкурентной активности (возможна выдача
+    /// или публикация страницы writer'ом). Не ошибка: страница остаётся
+    /// утечкой до следующего безопасного окна/offline-verify.
+    pub skipped_unsafe: u64,
+    /// Sweep дошёл до конца доступного диапазона за этот вызов.
+    pub complete_pass: bool,
+    /// Нет ошибок.
+    pub ok: bool,
+    /// Диагностика.
+    pub issues: Vec<String>,
+    /// Длительность вызова.
+    pub elapsed_ms: u64,
+}
+
+/// Параметры онлайн-`fsck --repair`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnlineRepairConfig {
+    /// Параметры sweep.
+    pub sweep: SweepConfig,
+    /// Изолировать зоны с zone-fatal признаками (`NEEDS_FSCK`).
+    pub quarantine: bool,
+}
+
+impl Default for OnlineRepairConfig {
+    fn default() -> Self {
+        Self {
+            sweep: SweepConfig::default(),
+            quarantine: true,
+        }
+    }
+}
+
+/// Итог онлайн-`fsck --repair`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OnlineRepairReport {
+    /// Страниц возвращено в пул.
+    pub repaired_pages: u64,
+    /// Оценка оставшихся утечек (без полного граф-verify).
+    pub remaining_leaks: u64,
+    /// Зоны, изолированные `NEEDS_FSCK`.
+    pub quarantined_zones: Vec<u32>,
+    /// Детали sweep.
+    pub sweep: SweepReport,
+    /// Нет ошибок.
+    pub ok: bool,
+    /// Диагностика.
+    pub issues: Vec<String>,
+}
+
 /// Снимок счётчиков стора.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StoreStats {
@@ -263,6 +377,16 @@ pub struct StoreStats {
     pub group_aborted: u64,
     /// Оценка утечки `[DP, cursor)` (выделено, но не опубликовано).
     pub aborted_pages_estimate: u64,
+    /// Действующий `freeze_epoch` (0 — нет).
+    pub freeze_epoch: u64,
+    /// Онлайн-sweep: прогонов.
+    pub sweep_runs: u64,
+    /// Онлайн-sweep: просмотрено страниц.
+    pub sweep_scanned_pages: u64,
+    /// Онлайн-sweep: возвращено страниц.
+    pub sweep_reclaimed_pages: u64,
+    /// Нижняя граница незакоммиченных резерваций (`u64::MAX` — нет).
+    pub pending_floor: u64,
 }
 
 /// Открытый v2-стор.
@@ -313,6 +437,24 @@ pub struct ParallelStore {
     sync_delay_ns: AtomicU64,
     /// Сериализация моделируемого fsync (как у одного inode).
     sync_delay_gate: Mutex<()>,
+    /// Сериализация sweep внутри процесса.
+    sweep_gate: Mutex<()>,
+    /// Публикация sweep эксклюзивна к `return_pages` (rollback) и `free_page`
+    /// незакоммиченной транзакции.
+    sweep_publish_gate: RwLock<()>,
+    /// Страницы, освобождённые незакоммиченными `WriteIo` (page -> refcount).
+    freed_pages: Mutex<HashMap<u32, u32>>,
+    /// Страницы, выданные из пула незакоммиченной транзакции. Онлайн-sweep
+    /// не должен считать их утечкой: на диске у них ещё может быть заголовок
+    /// `FREELIST`, а durable-цепочка уже не содержит их номер.
+    in_flight_pages: Mutex<HashSet<u32>>,
+    /// Курсор онлайн-sweep по «хвосту» `[max_head_limit, DP)`.
+    sweep_tail_cursor: AtomicU32,
+    /// Курсор поиска orphan bucket-страниц.
+    sweep_orphan_cursor: AtomicU32,
+    /// Идут подготовка/выполнение коммита: aborted-sweep консервативно
+    /// запрещён (вне `WriteIo` могут быть точные резервации bucket-страниц).
+    commit_inflight: AtomicU64,
     stats: StatsCounters,
     report: RecoveryReport,
 }
@@ -327,6 +469,23 @@ struct AllocDurable {
 struct CommitWindow<'a> {
     _gate: Option<MutexGuard<'a, ()>>,
     _lock: Option<crate::parallel::coord::RangeLock>,
+}
+
+/// Отметка «коммит в процессе»: запрещает aborted-sweep (страницы вне
+/// `WriteIo` могут быть зарезервированы под bucket-образы).
+struct InflightGuard<'a>(&'a AtomicU64);
+
+impl<'a> InflightGuard<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// RAII-держатель writer-lease зоны.
@@ -426,6 +585,9 @@ pub(crate) struct PreparedPublish {
     fence: u64,
     /// Оценка байтов коммита для лимитов группы.
     weight: u64,
+    /// План держит незакоммиченные страницы (`chain`/bucket-образы) вне
+    /// `pending_floor`, пока не будет опубликован или отменён.
+    _pending_pin: PendingToken,
 }
 
 impl PreparedPublish {
@@ -450,6 +612,9 @@ struct StatsCounters {
     group_fsyncs: AtomicU64,
     group_max_members: AtomicU64,
     group_aborted: AtomicU64,
+    sweep_runs: AtomicU64,
+    sweep_pages: AtomicU64,
+    sweep_reclaimed: AtomicU64,
 }
 
 const ZONE_DEGRADED: u8 = 1 << 0;
@@ -482,6 +647,9 @@ const SHARED_SETTLE: Duration = Duration::from_millis(1);
 const SHARED_POLL: Duration = Duration::from_micros(500);
 /// Максимум зон в межпроцессной группе.
 const SHARED_MAX_GROUP_MEMBERS: usize = 256;
+/// TTL общего `freeze()` по умолчанию: переживает `kill -9`, но не блокирует
+/// рекламацию навсегда.
+pub const DEFAULT_FREEZE_TTL: Duration = Duration::from_secs(30);
 
 /// Шард lease для `zone` (`0` — каталог).
 ///
@@ -701,6 +869,13 @@ impl ParallelStore {
             io_fault_hook: None,
             sync_delay_ns: AtomicU64::new(0),
             sync_delay_gate: Mutex::new(()),
+            sweep_gate: Mutex::new(()),
+            sweep_publish_gate: RwLock::new(()),
+            freed_pages: Mutex::new(HashMap::new()),
+            in_flight_pages: Mutex::new(HashSet::new()),
+            sweep_tail_cursor: AtomicU32::new(0),
+            sweep_orphan_cursor: AtomicU32::new(0),
+            commit_inflight: AtomicU64::new(0),
             stats: StatsCounters::default(),
             report,
         })
@@ -850,6 +1025,13 @@ impl ParallelStore {
             io_fault_hook: None,
             sync_delay_ns: AtomicU64::new(0),
             sync_delay_gate: Mutex::new(()),
+            sweep_gate: Mutex::new(()),
+            sweep_publish_gate: RwLock::new(()),
+            freed_pages: Mutex::new(HashMap::new()),
+            in_flight_pages: Mutex::new(HashSet::new()),
+            sweep_tail_cursor: AtomicU32::new(0),
+            sweep_orphan_cursor: AtomicU32::new(0),
+            commit_inflight: AtomicU64::new(0),
             stats: StatsCounters::default(),
             report: recovered.report,
         })
@@ -987,7 +1169,7 @@ impl ParallelStore {
             return 0;
         }
         let mut rv = durable.saturating_sub(1).min(self.effective_mp(zone));
-        let freeze = self.gc.freeze_epoch();
+        let freeze = self.freeze_floor();
         if freeze != 0 {
             rv = rv.min(freeze);
         }
@@ -1098,6 +1280,10 @@ impl ParallelStore {
                 let stats = cache.stats();
                 (stats.hits, stats.misses)
             });
+        let (shared_sweep_runs, shared_sweep_pages, shared_sweep_reclaimed) = self
+            .shared
+            .as_ref()
+            .map_or((0, 0, 0), |coord| coord.sweep_stats());
         StoreStats {
             alloc_cas_retries: self.allocator.cas_retries(),
             txn_cas_retries: self.allocator.txn_cas_retries(),
@@ -1117,6 +1303,23 @@ impl ParallelStore {
             group_max_members: self.stats.group_max_members.load(Ordering::Relaxed),
             group_aborted: self.stats.group_aborted.load(Ordering::Relaxed),
             aborted_pages_estimate: self.allocator.leaked_pages(self.durable_page_limit()),
+            freeze_epoch: self.freeze_floor(),
+            sweep_runs: self
+                .stats
+                .sweep_runs
+                .load(Ordering::Relaxed)
+                .max(shared_sweep_runs),
+            sweep_scanned_pages: self
+                .stats
+                .sweep_pages
+                .load(Ordering::Relaxed)
+                .max(shared_sweep_pages),
+            sweep_reclaimed_pages: self
+                .stats
+                .sweep_reclaimed
+                .load(Ordering::Relaxed)
+                .max(shared_sweep_reclaimed),
+            pending_floor: self.pending_floor(),
         }
     }
 
@@ -1349,6 +1552,13 @@ impl ParallelStore {
         zone: u32,
         current_version: u64,
     ) -> Result<Option<u32>, ParallelError> {
+        // Выдача из пула и регистрация «в полёте» должны быть атомарны
+        // относительно sweep: иначе страница на миг исчезнет и из пула, и из
+        // набора in-flight, и sweep сочтёт её orphan-утечкой.
+        let _gate = self
+            .sweep_publish_gate
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         let durable = self.durable_version(zone);
         let rv = self.reclaim_ceiling(zone);
         {
@@ -1361,6 +1571,7 @@ impl ParallelStore {
             if let Some(page) = entry.immediate.pop() {
                 self.bump_page_generation(page);
                 self.stats.reclaimed_pages.fetch_add(1, Ordering::Relaxed);
+                lock_unpoison(&self.in_flight_pages).insert(page);
                 return Ok(Some(page));
             }
             // Под lease зоны цепочка перечитана из durable-головы, а другие
@@ -1370,10 +1581,15 @@ impl ParallelStore {
                 entry.dirty = true;
                 self.bump_page_generation(page);
                 self.stats.reclaimed_pages.fetch_add(1, Ordering::Relaxed);
+                lock_unpoison(&self.in_flight_pages).insert(page);
                 return Ok(Some(page));
             }
         }
-        Ok(self.take_donation_page())
+        if let Some(page) = self.take_donation_page() {
+            lock_unpoison(&self.in_flight_pages).insert(page);
+            return Ok(Some(page));
+        }
+        Ok(None)
     }
 
     /// Забирает eligible-страницы пула зоны под donation (без гейта выдачи).
@@ -1383,6 +1599,12 @@ impl ParallelStore {
         current_version: u64,
         max_pages: u32,
     ) -> Result<Vec<u32>, ParallelError> {
+        // Перенос в donation идёт через durable-коммит: между изъятием из пула
+        // и `donate_pages` страницы не должны выглядеть утечкой для sweep.
+        let _gate = self
+            .sweep_publish_gate
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         let durable = self.durable_version(zone);
         let rv = self.reclaim_ceiling(zone);
         let mut pages = Vec::new();
@@ -1404,6 +1626,8 @@ impl ParallelStore {
         }
         if !pages.is_empty() {
             entry.dirty = true;
+            let mut in_flight = lock_unpoison(&self.in_flight_pages);
+            in_flight.extend(pages.iter().copied());
         }
         Ok(pages)
     }
@@ -1413,6 +1637,16 @@ impl ParallelStore {
         if pages.is_empty() {
             return;
         }
+        // Публикация sweep не должна пересечься с возвратом страниц: иначе
+        // страница попадёт и в durable bucket, и в in-memory `immediate`.
+        let _gate = self
+            .sweep_publish_gate
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _shared_sweep = self
+            .shared
+            .as_ref()
+            .and_then(|coord| coord.lock_sweep_shared().ok());
         self.bump_page_generations(pages);
         let mut shard = lock_unpoison(self.pool_shard(zone));
         let entry = shard.zones.entry(zone).or_default();
@@ -1424,12 +1658,24 @@ impl ParallelStore {
         if pages.is_empty() {
             return;
         }
+        // Добавление в donation и снятие in-flight-регистрации — под одним
+        // read-гейтом: sweep либо видит страницу в donation, либо в in-flight.
+        let _gate = self
+            .sweep_publish_gate
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         self.bump_page_generations(pages);
         let mut donation = lock_unpoison(&self.donation);
         donation.extend(pages.iter().map(|page| DonationEntry {
             page: *page,
             donated_at,
         }));
+        drop(donation);
+        let mut in_flight = lock_unpoison(&self.in_flight_pages);
+        for page in pages {
+            in_flight.remove(page);
+        }
+        drop(in_flight);
         self.stats.donated_pages.fetch_add(
             u64::try_from(pages.len()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
@@ -1457,7 +1703,16 @@ impl ParallelStore {
     /// `RV_z = min(D_z − 1, MP(z), freeze_epoch)`.
     #[must_use]
     pub fn reclaim_version(&self, zone: u32) -> u64 {
-        self.gc.reclaim_version(zone, self.durable_version(zone))
+        let durable = self.durable_version(zone);
+        if durable == 0 {
+            return 0;
+        }
+        let mut rv = durable.saturating_sub(1).min(self.effective_mp(zone));
+        let freeze = self.freeze_floor();
+        if freeze != 0 {
+            rv = rv.min(freeze);
+        }
+        rv
     }
 
     /// Один GC-проход по грязным зонам (пересчёт `MP`).
@@ -1517,7 +1772,7 @@ impl ParallelStore {
                 .as_ref()
                 .and_then(|coord| coord.oldest_pin(zone))
                 .unwrap_or(NO_VERSION);
-            let freeze = self.gc.freeze_epoch();
+            let freeze = self.freeze_floor();
             if freeze == 0 {
                 local.min(foreign)
             } else {
@@ -1588,19 +1843,583 @@ impl ParallelStore {
         Ok(freed)
     }
 
+    /// Действующий retention-барьер: `min(локальный, общий)` (`0` — нет).
+    ///
+    /// `0` означает «freeze нет»; при наличии хотя бы одного ненулевого
+    /// барьера возвращается минимум (более старый удерживает сильнее).
+    fn freeze_floor(&self) -> u64 {
+        let local = self.gc.freeze_epoch();
+        let shared = self
+            .shared
+            .as_ref()
+            .map_or(0, |coord| coord.effective_freeze_epoch());
+        match (local, shared) {
+            (0, 0) => 0,
+            (0, value) | (value, 0) => value,
+            (left, right) => left.min(right),
+        }
+    }
+
     /// Включает retention-барьер `freeze_epoch = published_txn`.
+    ///
+    /// В межпроцессном режиме барьер общий (sidecar v5) и действует из любого
+    /// процесса; TTL по умолчанию [`DEFAULT_FREEZE_TTL`]. Запись и чтение не
+    /// блокируются — замораживается только рекламация версий выше эпохи.
     ///
     /// # Errors
     ///
-    /// `Busy` — freeze уже активен.
+    /// `Busy` — freeze уже активен (другой процесс или поколение).
     pub fn freeze(&self) -> Result<FreezeGuard<'_>, ParallelError> {
-        FreezeGuard::new(&self.gc, self.published_txn())
+        self.freeze_with_ttl(DEFAULT_FREEZE_TTL)
     }
 
-    /// `freeze_epoch` (0 — freeze нет).
+    /// `freeze()` с явным TTL (crash-safe окно).
+    ///
+    /// # Errors
+    ///
+    /// См. [`ParallelStore::freeze`].
+    pub fn freeze_with_ttl(&self, ttl: Duration) -> Result<FreezeGuard<'_>, ParallelError> {
+        let epoch = self.published_txn();
+        match &self.shared {
+            Some(coord) => FreezeGuard::new_shared(Arc::clone(coord), epoch, ttl),
+            None => FreezeGuard::new(&self.gc, epoch),
+        }
+    }
+
+    /// Выставляет барьер и **не снимает** его при возврате (CLI/админ).
+    ///
+    /// В multi барьер остаётся в sidecar до `unfreeze()`/TTL; в single — до
+    /// `unfreeze()` или завершения процесса. Возвращает эпоху.
+    ///
+    /// # Errors
+    ///
+    /// `Busy` — барьер держит другой процесс; `Io`.
+    pub fn freeze_persist(&self, ttl: Duration) -> Result<u64, ParallelError> {
+        let epoch = self.published_txn();
+        match &self.shared {
+            Some(coord) => {
+                coord.freeze_acquire(self.identity, epoch, ttl)?;
+                Ok(epoch)
+            }
+            None => {
+                if self.gc.set_freeze(epoch) {
+                    Ok(epoch)
+                } else {
+                    Err(ParallelError::Busy)
+                }
+            }
+        }
+    }
+
+    /// Снимает retention-барьер из любого процесса.
+    ///
+    /// `true` — барьер был активен и снят. Локальный (single-process) барьер
+    /// снимается только если он принадлежит этому стору, поэтому основной
+    /// сценарий — [`FreezeGuard`] RAII; метод удобен для `unfreeze` после
+    /// `kill -9` владельца.
+    pub fn unfreeze(&self) -> bool {
+        if let Some(coord) = &self.shared {
+            coord.freeze_force_release()
+        } else {
+            let was = self.gc.freeze_epoch() != 0;
+            self.gc.clear_freeze();
+            was
+        }
+    }
+
+    /// Снимок барьера: локальная/общая эпоха, владелец, TTL.
+    #[must_use]
+    pub fn freeze_status(&self) -> FreezeStatus {
+        let local_epoch = self.gc.freeze_epoch();
+        let shared = self
+            .shared
+            .as_ref()
+            .map_or_else(SharedFreezeStatus::default, |coord| coord.freeze_status());
+        let epoch = match (local_epoch, shared.epoch) {
+            (0, 0) => 0,
+            (0, value) | (value, 0) => value,
+            (left, right) => left.min(right),
+        };
+        FreezeStatus {
+            active: epoch != 0,
+            expired: shared.expired,
+            epoch,
+            local_epoch,
+            shared_epoch: shared.epoch,
+            owner_pid: shared.owner_pid,
+            owner_starttime: shared.owner_starttime,
+            expires_ns: shared.expires_ns,
+            ttl_ns: shared.ttl_ns,
+        }
+    }
+
+    /// `freeze_epoch` (действующий, `0` — freeze нет).
     #[must_use]
     pub fn freeze_epoch(&self) -> u64 {
-        self.gc.freeze_epoch()
+        self.freeze_floor()
+    }
+
+    /// Нижняя граница незакоммиченных резерваций всех живых писателей.
+    ///
+    /// `u64::MAX` — резерваций нет.
+    #[must_use]
+    pub fn pending_floor(&self) -> u64 {
+        let local = self.allocator.pending_floor();
+        match &self.shared {
+            Some(coord) => local.min(coord.pending_floor()),
+            None => local,
+        }
+    }
+
+    /// Снимок durable-голов и «живых» bucket/bucket-entry страниц для sweep.
+    ///
+    /// `max_limit` — максимум `page_limit_at_commit`; `live` — страницы,
+    /// которые нельзя трогать (bucket-страницы и их содержимое);
+    /// `orphan_ok=false` — хотя бы одна free-цепочка не прочиталась
+    /// (orphan-sweep консервативно запрещён).
+    fn sweep_snapshot(&self) -> (u64, HashSet<u32>, bool) {
+        let data_first = self.geometry.page_data_first();
+        let mut heads = Vec::new();
+        for zone in 0..self.geometry.max_zones() {
+            if let Some(head) = self.head_entry(zone) {
+                heads.push((zone, head));
+            }
+        }
+        let max_limit = heads
+            .iter()
+            .map(|(_, head)| u64::from(head.page_limit_at_commit))
+            .max()
+            .unwrap_or(u64::from(data_first));
+        let mut live = HashSet::new();
+        let mut orphan_ok = true;
+        for (zone, head) in &heads {
+            match self.load_free_chain(*zone, head) {
+                Ok(chain) => {
+                    for bucket in chain.buckets() {
+                        live.insert(bucket.page);
+                        live.extend(bucket.pages.iter().copied());
+                    }
+                }
+                Err(_) => orphan_ok = false,
+            }
+        }
+        (max_limit, live, orphan_ok)
+    }
+
+    /// Регистрирует страницу, освобождённую незакоммиченной транзакцией.
+    pub(crate) fn note_freed_page(&self, page: u32) {
+        let _gate = self
+            .sweep_publish_gate
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut pages = lock_unpoison(&self.freed_pages);
+        *pages.entry(page).or_insert(0) += 1;
+    }
+
+    /// Снимает регистрацию освобождённых страниц (коммит/rollback/drop).
+    pub(crate) fn release_freed_pages(&self, pages_to_release: &[u32]) {
+        if pages_to_release.is_empty() {
+            return;
+        }
+        let mut pages = lock_unpoison(&self.freed_pages);
+        for page in pages_to_release {
+            if let Some(count) = pages.get_mut(page) {
+                if *count <= 1 {
+                    pages.remove(page);
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+    }
+
+    /// Снимает регистрацию выданных из пула страниц (коммит/rollback/drop).
+    pub(crate) fn release_in_flight_pages<'a>(
+        &self,
+        pages_to_release: impl IntoIterator<Item = &'a u32>,
+    ) {
+        let gate = self
+            .sweep_publish_gate
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut pages = lock_unpoison(&self.in_flight_pages);
+        for page in pages_to_release {
+            pages.remove(page);
+        }
+        drop(pages);
+        drop(gate);
+    }
+
+    /// Страницы, лежащие в in-memory пулах (bucket/entries/immediate) и
+    /// donation. Sweep не должен добавлять их повторно.
+    fn sweep_in_memory_pages(&self) -> HashSet<u32> {
+        let mut pages: HashSet<u32> = lock_unpoison(&self.freed_pages).keys().copied().collect();
+        pages.extend(lock_unpoison(&self.in_flight_pages).iter().copied());
+        for shard in &self.pools {
+            let shard = lock_unpoison(shard);
+            for pool in shard.zones.values() {
+                for bucket in pool.chain.buckets() {
+                    pages.insert(bucket.page);
+                    pages.extend(bucket.pages.iter().copied());
+                }
+                pages.extend(pool.immediate.iter().copied());
+            }
+        }
+        let donation = lock_unpoison(&self.donation);
+        pages.extend(donation.iter().map(|entry| entry.page));
+        pages
+    }
+
+    /// Онлайн-sweep утечек: возвращает в пул страницы, которые заведомо
+    /// недостижимы из durable-голов/пулов, не останавливая писателей.
+    ///
+    /// Безопасность (без полного граф-verify — он остаётся offline):
+    /// * «хвост» `[max(page_limit_at_commit), DP)` не может быть достижим:
+    ///   любая ссылка головы лежит ниже её `page_limit_at_commit`;
+    /// * orphan bucket-страница — страница с заголовком `FREELIST`, которой нет
+    ///   ни в одной durable free-цепочке и ни в одном bucket-entry;
+    /// * aborted `[DP, cursor)` берётся только при отсутствии незакоммиченных
+    ///   резерваций (`pending_floor == MAX`) и незавершённых коммитов.
+    ///
+    /// Работа батчируется: `max_scan_pages`/`max_leaks_per_call`/`max_duration`
+    /// ограничивают один вызов, курсоры сохраняются в сторе.
+    ///
+    /// Публикация перепроверяет кандидатов по **свежим** durable-границам под
+    /// commit-window: страница возвращается, только если она заведомо
+    /// недостижима и не может быть выдана/опубликована конкурентным writer'ом
+    /// (не выше `pending_floor`, нет in-flight коммита/выдачи из пула).
+    /// Пропущенные по этой причине кандидаты учитываются в
+    /// [`SweepReport::skipped_unsafe`] и остаются утечкой до безопасного окна
+    /// или offline-verify — целостность важнее полноты.
+    ///
+    /// # Errors
+    ///
+    /// `ReadOnly`; `Busy` — другой процесс уже сканирует; `Io`/`MapFull`.
+    #[allow(clippy::too_many_lines)]
+    pub fn sweep_leaks(&self, config: SweepConfig) -> Result<SweepReport, ParallelError> {
+        self.ensure_writable()?;
+        let started = Instant::now();
+        let _gate = lock_unpoison(&self.sweep_gate);
+        let data_first = self.geometry.page_data_first();
+        let mut report = SweepReport::default();
+
+        // Снимок durable-голов и живых bucket/bucket-entry страниц.
+        let (max_limit, live, orphan_ok) = self.sweep_snapshot();
+        let dp = self.durable_page_limit();
+        let cursor = self.allocator.cursor();
+        let pending = self.pending_floor();
+        report.pending_floor = pending;
+
+        let mut candidates: Vec<u32> = Vec::new();
+        let scan_budget = u64::from(config.max_scan_pages.max(1));
+        let leak_budget = usize::try_from(config.max_leaks_per_call.max(1)).unwrap_or(usize::MAX);
+        let tail_limit = dp.min(pending);
+        let mut scanned = 0_u64;
+
+        // 1. Хвост `[max_limit, min(DP, pending))`.
+        let tail_start = u64::from(
+            self.sweep_tail_cursor
+                .load(Ordering::Acquire)
+                .max(u32::try_from(max_limit).unwrap_or(u32::MAX)),
+        )
+        .max(max_limit)
+        .max(u64::from(data_first));
+        if tail_start < tail_limit && candidates.len() < leak_budget {
+            let take = (tail_limit - tail_start)
+                .min(scan_budget)
+                .min(u64::try_from(leak_budget - candidates.len()).unwrap_or(u64::MAX));
+            let first = u32::try_from(tail_start).unwrap_or(u32::MAX);
+            let last = u32::try_from(tail_start + take).unwrap_or(u32::MAX);
+            for page in first..last {
+                if !live.contains(&page) {
+                    candidates.push(page);
+                }
+            }
+            report.tail_pages = take;
+            scanned = scanned.saturating_add(take);
+            self.sweep_tail_cursor.store(last, Ordering::Release);
+        } else if tail_start < dp {
+            self.sweep_tail_cursor.store(
+                u32::try_from(tail_limit).unwrap_or(u32::MAX),
+                Ordering::Release,
+            );
+        }
+
+        // 2. Orphan bucket-страницы ниже `max_limit`.
+        let orphan_end_limit = max_limit.min(dp);
+        if config.orphan_buckets
+            && orphan_ok
+            && scanned < scan_budget
+            && candidates.len() < leak_budget
+        {
+            let start = u64::from(self.sweep_orphan_cursor.load(Ordering::Acquire))
+                .max(u64::from(data_first))
+                .min(orphan_end_limit);
+            let end = start
+                .saturating_add(scan_budget - scanned)
+                .min(orphan_end_limit);
+            let mut page = start;
+            while page < end {
+                if started.elapsed() >= config.max_duration || candidates.len() >= leak_budget {
+                    break;
+                }
+                let page_no = u32::try_from(page).unwrap_or(u32::MAX);
+                if !live.contains(&page_no)
+                    && let Ok(raw) = self.read_raw_page(page_no)
+                    && raw_page_type(&raw) == Some(crate::consts::PAGE_TYPE_FREELIST)
+                {
+                    candidates.push(page_no);
+                    report.orphan_bucket_pages = report.orphan_bucket_pages.saturating_add(1);
+                }
+                page = page.saturating_add(1);
+                scanned = scanned.saturating_add(1);
+            }
+            if page >= orphan_end_limit {
+                self.sweep_orphan_cursor
+                    .store(data_first, Ordering::Release);
+            } else {
+                self.sweep_orphan_cursor
+                    .store(u32::try_from(page).unwrap_or(u32::MAX), Ordering::Release);
+            }
+        }
+
+        // 3. Aborted `[DP, cursor)` — только при отсутствии незакоммиченных
+        //    резерваций и незавершённых коммитов.
+        let unregistered = self
+            .shared
+            .as_ref()
+            .map_or(0, |coord| coord.unregistered_writers());
+        let aborted_safe = pending == u64::MAX
+            && unregistered == 0
+            && self.commit_inflight.load(Ordering::Acquire) == 0;
+        if aborted_safe && cursor > dp && candidates.len() < leak_budget {
+            let take = (cursor - dp)
+                .min(scan_budget.saturating_sub(scanned))
+                .min(u64::try_from(leak_budget - candidates.len()).unwrap_or(u64::MAX));
+            let first = u32::try_from(dp).unwrap_or(u32::MAX);
+            let last = u32::try_from(dp + take).unwrap_or(u32::MAX);
+            let before = candidates.len();
+            for page in first..last {
+                if !live.contains(&page) {
+                    candidates.push(page);
+                }
+            }
+            report.aborted_pages = u64::try_from(candidates.len() - before).unwrap_or(0);
+            scanned = scanned.saturating_add(take);
+        } else if cursor > dp && !aborted_safe {
+            report
+                .issues
+                .push("aborted-sweep пропущен: есть незакоммиченные резервации писателей".into());
+        }
+
+        candidates.sort_unstable();
+        candidates.dedup();
+        report.scanned_pages = scanned;
+        if candidates.is_empty() {
+            report.remaining_aborted = self.allocator.cursor().saturating_sub(dp);
+            report.complete_pass = report.remaining_aborted == 0
+                && u64::from(self.sweep_tail_cursor.load(Ordering::Acquire)) >= dp;
+            report.ok = true;
+            report.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.stats.sweep_runs.fetch_add(1, Ordering::Relaxed);
+            self.stats.sweep_pages.fetch_add(scanned, Ordering::Relaxed);
+            if let Some(coord) = &self.shared {
+                coord.note_sweep(scanned, 0);
+            }
+            return Ok(report);
+        }
+
+        // 4. Атомарно (под commit-window) перепроверяем кандидатов по свежим
+        //    durable-головам и возвращаем их в пул каталога. Это закрывает
+        //    гонку с коммитом, который добавил новую bucket-группу между
+        //    снимком и публикацией.
+        let _catalog_lease = self.catalog_lease_guard()?;
+        let _publish_gate = self
+            .sweep_publish_gate
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _shared_publish = match &self.shared {
+            Some(coord) => Some(coord.lock_sweep_exclusive()?),
+            None => None,
+        };
+        let window = self.begin_commit_window()?;
+        self.reload_durable()?;
+        // Пересчитываем ВСЕ границы под commit-window: снимок сканирования мог
+        // устареть (коммит успел опубликовать голову/продвинуть `DP` между
+        // сканом и публикацией). Свежий `max_limit_now` — max
+        // `page_limit_at_commit` по текущим durable-головам: любая ссылка
+        // головы лежит ниже него, поэтому страница `>= max_limit_now` из
+        // деревьев недостижима.
+        let (max_limit_now, live_now, orphan_ok_now) = self.sweep_snapshot();
+        let dp_now = self.durable_page_limit();
+        let pending_now = self.pending_floor();
+        let in_flight_now = self.commit_inflight.load(Ordering::Acquire);
+        let unregistered_now = self
+            .shared
+            .as_ref()
+            .map_or(0, |coord| coord.unregistered_writers());
+        // Полная тишина: никто не держит резерваций, незавершённых коммитов и
+        // страниц, выданных из пула под незакоммиченную транзакцию.
+        let quiescent = pending_now == u64::MAX
+            && in_flight_now == 0
+            && unregistered_now == 0
+            && lock_unpoison(&self.in_flight_pages).is_empty();
+        let mut busy_pages = live_now;
+        busy_pages.extend(self.sweep_in_memory_pages());
+        let mut skipped_unsafe = 0_u64;
+        candidates.retain(|page| {
+            let page64 = u64::from(*page);
+            if page64 >= pending_now {
+                // Страница могла стать частью незакоммиченной работы/пула.
+                skipped_unsafe = skipped_unsafe.saturating_add(1);
+                return false;
+            }
+            if busy_pages.contains(page) {
+                return false;
+            }
+            if page64 < max_limit_now {
+                // Ниже самой высокой головы — только orphan bucket-страница и
+                // только когда нет ни одной активной транзакции (её страница
+                // может быть выдана из пула и ещё иметь заголовок FREELIST).
+                return orphan_ok_now
+                    && quiescent
+                    && page64 < dp_now
+                    && self.read_raw_page(*page).is_ok_and(|raw| {
+                        raw_page_type(&raw) == Some(crate::consts::PAGE_TYPE_FREELIST)
+                    });
+            }
+            if page64 >= dp_now {
+                // aborted `[DP, cursor)`: только при полной тишине. Иначе
+                // страница может принадлежать готовящемуся коммиту.
+                if quiescent {
+                    true
+                } else {
+                    skipped_unsafe = skipped_unsafe.saturating_add(1);
+                    false
+                }
+            } else {
+                // «Хвост» `[max_limit_now, DP)`: недостижим из durable-голов.
+                // Незавершённый коммит мог продвинуть `DP` в фазе 1, ещё не
+                // опубликовав голову, поэтому при `commit_inflight > 0`
+                // консервативно пропускаем — страница может стать живой. Если
+                // есть писатель без слота (его `pending_floor` не виден) —
+                // тоже пропускаем.
+                if in_flight_now == 0 && unregistered_now == 0 {
+                    true
+                } else {
+                    skipped_unsafe = skipped_unsafe.saturating_add(1);
+                    false
+                }
+            }
+        });
+        if candidates.is_empty() {
+            drop(window);
+            report.reclaimed_pages = 0;
+            report.skipped_unsafe = skipped_unsafe;
+            report.remaining_aborted = self.allocator.cursor().saturating_sub(dp_now);
+            report.ok = true;
+            report.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.stats.sweep_runs.fetch_add(1, Ordering::Relaxed);
+            self.stats.sweep_pages.fetch_add(scanned, Ordering::Relaxed);
+            if let Some(coord) = &self.shared {
+                coord.note_sweep(scanned, 0);
+            }
+            return Ok(report);
+        }
+        let head = self.catalog_head();
+        let version = self.allocator.next_txn_exact()?;
+        let entry = RootEntry {
+            owner_zone: 0,
+            version,
+            root_page: head.map_or(0, |current| current.root_page),
+            tree_level: head.map_or(0, |current| current.tree_level),
+            rrset_count: head.map_or(0, |current| current.rrset_count),
+            soa_serial: head.map_or(0, |current| current.soa_serial),
+            state: crate::parallel::root::RootState::Serving,
+            flags: RootFlags::CATALOG,
+            ..RootEntry::default()
+        };
+        let prepared = self.prepare_publish(entry, &candidates, 0)?;
+        let mut results = self.execute_prepared_in_window(vec![prepared], SyncModeV2::Sync);
+        drop(window);
+        let outcome = results
+            .pop()
+            .unwrap_or(Err(ParallelError::InvalidArgument { field: "group" }))?;
+        let reclaimed = u64::try_from(candidates.len()).unwrap_or(u64::MAX);
+        report.reclaimed_pages = reclaimed;
+        report.skipped_unsafe = skipped_unsafe;
+        report.ok = true;
+        report.remaining_aborted = self
+            .allocator
+            .cursor()
+            .saturating_sub(self.durable_page_limit());
+        report.complete_pass = report.remaining_aborted == 0;
+        report.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.stats.sweep_runs.fetch_add(1, Ordering::Relaxed);
+        self.stats.sweep_pages.fetch_add(scanned, Ordering::Relaxed);
+        self.stats
+            .sweep_reclaimed
+            .fetch_add(reclaimed, Ordering::Relaxed);
+        self.stats
+            .reclaimed_pages
+            .fetch_add(reclaimed, Ordering::Relaxed);
+        if let Some(coord) = &self.shared {
+            coord.note_sweep(scanned, reclaimed);
+        }
+        let _ = outcome;
+        Ok(report)
+    }
+
+    /// Онлайн-`fsck --repair`: sweep утечек + карантин зон без `LOCK_EX`.
+    ///
+    /// Полный граф-verify остаётся offline (`fsck --verify`/`repair_leaks`).
+    ///
+    /// # Errors
+    ///
+    /// `ReadOnly`/`Busy`/`Io`.
+    pub fn repair_online(
+        &self,
+        config: OnlineRepairConfig,
+    ) -> Result<OnlineRepairReport, ParallelError> {
+        self.ensure_writable()?;
+        let mut issues = Vec::new();
+        let mut quarantined = Vec::new();
+        if config.quarantine {
+            let lite = self.fsck_lite()?;
+            if let Some(reason) = lite.fatal {
+                issues.push(format!("file-fatal: {reason:?}"));
+            }
+            for zone in &lite.damaged_zones {
+                let _lease = match self.lease_guard_wait(*zone, CATALOG_LEASE_TIMEOUT) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        issues.push(format!("zone {zone}: lease для карантина: {error}"));
+                        continue;
+                    }
+                };
+                let Some(head) = self.head_entry(*zone) else {
+                    continue;
+                };
+                match self.quarantine_zone(*zone, &head) {
+                    Ok(true) => quarantined.push(*zone),
+                    Ok(false) => issues.push(format!("zone {zone}: карантин не выставлен")),
+                    Err(error) => {
+                        issues.push(format!("zone {zone}: карантин не выставлен: {error}"));
+                    }
+                }
+            }
+        }
+        let sweep = self.sweep_leaks(config.sweep)?;
+        issues.extend(sweep.issues.iter().cloned());
+        let ok = sweep.ok && issues.is_empty();
+        Ok(OnlineRepairReport {
+            repaired_pages: sweep.reclaimed_pages,
+            remaining_leaks: sweep.remaining_aborted,
+            quarantined_zones: quarantined,
+            sweep,
+            ok,
+            issues,
+        })
     }
 
     /// Глобальный durable-барьер `Sync`: двигает `DP` до курсора и `DT` до
@@ -1703,6 +2522,7 @@ impl ParallelStore {
         &self,
         requests: Vec<GroupCommitRequest>,
     ) -> Vec<Result<PublishOutcome, ParallelError>> {
+        let _inflight = InflightGuard::new(&self.commit_inflight);
         let count = requests.len();
         if count == 0 {
             return Vec::new();
@@ -1784,6 +2604,7 @@ impl ParallelStore {
         mode: SyncModeV2,
     ) -> Result<PublishOutcome, ParallelError> {
         self.check_durability(mode)?;
+        let _inflight = InflightGuard::new(&self.commit_inflight);
         let prepared = self.prepare_publish(entry, drops, 0)?;
         match self.execute_group(vec![prepared], mode).pop() {
             Some(outcome) => outcome,
@@ -1827,6 +2648,10 @@ impl ParallelStore {
                 field: "root entry",
             });
         }
+        // План и его выполнение могут быть разнесены во времени (групповой
+        // коммит): chain/bucket-образы выделяются мимо `AllocHandle`, поэтому
+        // фиксируем нижнюю границу `pending_floor` до самой публикации.
+        let pending_pin = self.allocator.pin_pending(self.allocator.cursor());
         let head = self.head(zone);
         if let Some(current) = head
             && entry.version <= current.version
@@ -1925,6 +2750,7 @@ impl ParallelStore {
                 .as_ref()
                 .map_or(0, |coord| coord.lease_generation(zone)),
             weight,
+            _pending_pin: pending_pin,
         })
     }
 
@@ -1949,8 +2775,6 @@ impl ParallelStore {
         if count == 0 {
             return Vec::new();
         }
-        let mut results: Vec<Option<Result<PublishOutcome, ParallelError>>> =
-            (0..count).map(|_| None).collect();
         if let Err(error) = self.ensure_writable() {
             let reason = match error {
                 ParallelError::ReadOnly { reason } => reason,
@@ -1990,6 +2814,18 @@ impl ParallelStore {
         {
             return self.execute_group_shared(members, mode);
         }
+        self.execute_group_locked(members, mode)
+    }
+
+    /// Локальный путь группы при уже удержанном commit-window.
+    fn execute_group_locked(
+        &self,
+        members: Vec<PreparedPublish>,
+        mode: SyncModeV2,
+    ) -> Vec<Result<PublishOutcome, ParallelError>> {
+        let count = members.len();
+        let mut results: Vec<Option<Result<PublishOutcome, ParallelError>>> =
+            (0..count).map(|_| None).collect();
         self.stats.group_commits.fetch_add(1, Ordering::Relaxed);
         self.stats
             .group_members
@@ -2013,41 +2849,46 @@ impl ParallelStore {
                     .collect();
             }
         };
-        let page_limit = match self.phase1(&members, mode) {
-            Ok(limit) => limit,
-            Err(_error) => {
-                // Исход группы не определён: ни одна голова не публикуется.
-                drop(window);
-                self.mark_fatal(FatalKind::CommitUncertain);
-                return (0..count)
-                    .map(|_| {
-                        Err(ParallelError::ReadOnly {
-                            reason: FatalKind::CommitUncertain,
-                        })
-                    })
-                    .collect();
-            }
-        };
-        let mut pending: Vec<usize> = (0..count).collect();
-        if let Err(error) = self.phase2(&members, mode, &mut results, &mut pending) {
-            drop(window);
-            self.mark_fatal(FatalKind::CommitUncertain);
-            let reason = if let ParallelError::ReadOnly { reason } = error {
-                reason
-            } else {
-                FatalKind::CommitUncertain
-            };
-            return (0..count)
-                .map(|_| Err(ParallelError::ReadOnly { reason }))
-                .collect();
-        }
-        let aborted = count.saturating_sub(pending.len());
-        self.stats.group_aborted.fetch_add(
-            u64::try_from(aborted).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        self.publish_group(members, mode, page_limit, &pending, &mut results);
+        let result = self.execute_group_phases(members, mode, &mut results);
         drop(window);
+        result.unwrap_or_else(|| {
+            results
+                .into_iter()
+                .map(|slot| {
+                    slot.unwrap_or(Err(ParallelError::ReadOnly {
+                        reason: FatalKind::CommitUncertain,
+                    }))
+                })
+                .collect()
+        })
+    }
+
+    /// Выполняет подготовленную группу при уже удержанном commit-window
+    /// (sweep-публикация: фильтрация и коммит должны быть атомарны).
+    fn execute_prepared_in_window(
+        &self,
+        members: Vec<PreparedPublish>,
+        mode: SyncModeV2,
+    ) -> Vec<Result<PublishOutcome, ParallelError>> {
+        let count = members.len();
+        let mut results: Vec<Option<Result<PublishOutcome, ParallelError>>> =
+            (0..count).map(|_| None).collect();
+        self.stats.group_commits.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .group_members
+            .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.stats
+            .group_max_members
+            .fetch_max(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+        let fsyncs = match mode {
+            SyncModeV2::Sync => 2,
+            SyncModeV2::Flush => 1,
+            SyncModeV2::Memory => 0,
+        };
+        self.stats.group_fsyncs.fetch_add(fsyncs, Ordering::Relaxed);
+        if let Some(error_results) = self.execute_group_phases(members, mode, &mut results) {
+            return error_results;
+        }
         results
             .into_iter()
             .map(|slot| {
@@ -2056,6 +2897,53 @@ impl ParallelStore {
                 }))
             })
             .collect()
+    }
+
+    /// Фазы группы при уже удержанном commit-window.
+    fn execute_group_phases(
+        &self,
+        members: Vec<PreparedPublish>,
+        mode: SyncModeV2,
+        results: &mut [Option<Result<PublishOutcome, ParallelError>>],
+    ) -> Option<Vec<Result<PublishOutcome, ParallelError>>> {
+        let count = members.len();
+        let page_limit = match self.phase1(&members, mode) {
+            Ok(limit) => limit,
+            Err(_error) => {
+                // Исход группы не определён: ни одна голова не публикуется.
+                self.mark_fatal(FatalKind::CommitUncertain);
+                return Some(
+                    (0..count)
+                        .map(|_| {
+                            Err(ParallelError::ReadOnly {
+                                reason: FatalKind::CommitUncertain,
+                            })
+                        })
+                        .collect(),
+                );
+            }
+        };
+        let mut pending: Vec<usize> = (0..count).collect();
+        if let Err(error) = self.phase2(&members, mode, results, &mut pending) {
+            self.mark_fatal(FatalKind::CommitUncertain);
+            let reason = if let ParallelError::ReadOnly { reason } = error {
+                reason
+            } else {
+                FatalKind::CommitUncertain
+            };
+            return Some(
+                (0..count)
+                    .map(|_| Err(ParallelError::ReadOnly { reason }))
+                    .collect(),
+            );
+        }
+        let aborted = count.saturating_sub(pending.len());
+        self.stats.group_aborted.fetch_add(
+            u64::try_from(aborted).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.publish_group(members, mode, page_limit, &pending, results);
+        None
     }
 
     /// Межпроцессный group commit (§7.1, M3): готовые записи корней уходят в
@@ -3530,6 +4418,7 @@ impl ParallelStore {
             .iter()
             .map(|(zone, field)| format!("zone {zone}: {field}"))
             .collect();
+        let mut damaged_zones: Vec<u32> = scan.issues.iter().map(|(zone, _)| *zone).collect();
 
         // `fsck` сверяет on-disk пролог с `LayoutHead` (PW-AT-6).
         let layout_a_raw = read_at(
@@ -3630,8 +4519,12 @@ impl ParallelStore {
             chain_pages = chain_pages.saturating_add(stats.pages);
             chain_torn = chain_torn.saturating_add(stats.torn);
             chain_max_depth = chain_max_depth.max(stats.depth);
+            if !stats.issues.is_empty() {
+                damaged_zones.push(zone);
+            }
             issues.extend(stats.issues);
             if let Err(error) = self.load_free_chain(zone, head) {
+                damaged_zones.push(zone);
                 issues.push(format!("zone {zone}: free chain: {error}"));
             }
         }
@@ -3668,6 +4561,7 @@ impl ParallelStore {
             chain_torn,
             chain_max_depth,
             leaked_pages_estimate: leaked,
+            damaged_zones,
             issues,
         })
     }
@@ -4090,6 +4984,34 @@ impl ParallelStore {
         }
     }
 
+    /// Берёт lease зоны, ожидая освобождения в multi (до `timeout`).
+    ///
+    /// Используется онлайн-операциями (`fsck --repair`), которым нельзя
+    /// падать с `ZoneBusy` на короткой конкуренции.
+    ///
+    /// # Errors
+    ///
+    /// `ZoneBusy` — lease не освободился; `Io`/`InvalidArgument`.
+    pub(crate) fn lease_guard_wait(
+        &self,
+        zone: u32,
+        timeout: Duration,
+    ) -> Result<ZoneLease<'_>, ParallelError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.lease_guard(zone) {
+                Ok(lease) => return Ok(lease),
+                Err(ParallelError::ZoneBusy { .. }) if Instant::now() < deadline => {
+                    if let Some(coord) = &self.shared {
+                        let _ = coord.sanitize_dead();
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Очередь свободных `zone_seq` восстановлена (multi).
     #[must_use]
     pub(crate) fn zone_free_ready(&self) -> bool {
@@ -4205,7 +5127,7 @@ impl ParallelStore {
             write_unix_ns: unix_now_ns(),
             leader_term: LEADER_TERM_M1,
             epoch_hint: self.shared.as_ref().map_or_else(
-                || self.gc.freeze_epoch(),
+                || self.freeze_floor(),
                 |coord| coord.generation().load(Ordering::Acquire),
             ),
             writer_pid: u64::from(std::process::id()),
@@ -4610,6 +5532,11 @@ fn ack_shared_batches(
     }
 }
 
+fn raw_page_type(raw: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = raw.get(..4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
 fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -4765,6 +5692,28 @@ pub fn fsck_repair(path: &Path) -> Result<RepairReport, ParallelError> {
         },
     )?;
     store.repair_leaks()
+}
+
+/// Онлайн-`fsck --repair`: без `LOCK_EX`, с `LOCK_SH` и per-zone lease.
+///
+/// Возвращает утёкшие/aborted страницы в пул батчами и изолирует зоны с
+/// zone-fatal признаками. Полный граф-verify (пересечения множеств) остаётся
+/// offline: для него используйте [`fsck_repair`].
+///
+/// # Errors
+///
+/// `Busy` — файл занят эксклюзивным writer'ом; `Io`/`ReadOnly`/`MapFull`.
+pub fn fsck_repair_online(path: &Path) -> Result<OnlineRepairReport, ParallelError> {
+    let store = ParallelStore::open(
+        path,
+        OpenConfigV2 {
+            read_only: false,
+            writer_lock: false,
+            multi_process: true,
+            page_cache_entries: DEFAULT_PAGE_CACHE_V2_ENTRIES,
+        },
+    )?;
+    store.repair_online(OnlineRepairConfig::default())
 }
 
 #[cfg(test)]

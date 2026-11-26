@@ -12,10 +12,11 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 
 use crate::parallel::consts::{NO_VERSION, READER_PINS};
-use crate::parallel::coord::{SharedCoord, self_identity};
+use crate::parallel::coord::{ProcessIdentity, SharedCoord, self_identity};
 use crate::parallel::error::ParallelError;
 
 /// Смещение `zone_seq` в пине (для golden/тестов).
@@ -666,7 +667,7 @@ impl GcState {
     }
 
     /// Устанавливает `freeze_epoch` (только через [`FreezeGuard`]).
-    fn set_freeze(&self, epoch: u64) -> bool {
+    pub(crate) fn set_freeze(&self, epoch: u64) -> bool {
         if epoch == 0 {
             return false;
         }
@@ -682,7 +683,7 @@ impl GcState {
         }
     }
 
-    fn clear_freeze(&self) {
+    pub(crate) fn clear_freeze(&self) {
         self.freeze_epoch.store(0, Ordering::Release);
         self.freeze_active.store(false, Ordering::Release);
     }
@@ -708,16 +709,27 @@ impl GcState {
     }
 }
 
-/// In-process `freeze()`: EPOCH-барьер удержания (фаза A без файлового пина).
+/// In-process `freeze()`: EPOCH-барьер удержания.
+///
+/// В межпроцессном режиме барьер публикуется в sidecar (v5) и действует для
+/// всех процессов; локальный `freeze_epoch` остаётся для M1/single-process.
 #[derive(Debug)]
 pub struct FreezeGuard<'a> {
-    gc: &'a GcState,
+    gc: Option<&'a GcState>,
+    shared: Option<SharedFreezeHold>,
     epoch: u64,
+    identity: ProcessIdentity,
     _not_send: PhantomData<Cell<()>>,
 }
 
+#[derive(Debug)]
+struct SharedFreezeHold {
+    coord: Arc<SharedCoord>,
+    generation: u64,
+}
+
 impl<'a> FreezeGuard<'a> {
-    /// Устанавливает `freeze_epoch = published_txn`.
+    /// Устанавливает локальный `freeze_epoch = published_txn`.
     ///
     /// # Errors
     ///
@@ -725,8 +737,10 @@ impl<'a> FreezeGuard<'a> {
     pub fn new(gc: &'a GcState, published_txn: u64) -> Result<Self, ParallelError> {
         if gc.set_freeze(published_txn) {
             Ok(Self {
-                gc,
+                gc: Some(gc),
+                shared: None,
                 epoch: published_txn,
+                identity: self_identity(),
                 _not_send: PhantomData,
             })
         } else {
@@ -734,15 +748,50 @@ impl<'a> FreezeGuard<'a> {
         }
     }
 
+    /// Захватывает общий sidecar-барьер (мультипроцессный режим).
+    ///
+    /// # Errors
+    ///
+    /// `Busy` — барьер держит другой процесс/поколение.
+    pub(crate) fn new_shared(
+        coord: Arc<SharedCoord>,
+        published_txn: u64,
+        ttl: std::time::Duration,
+    ) -> Result<Self, ParallelError> {
+        let identity = self_identity();
+        let generation = coord.freeze_acquire(identity, published_txn, ttl)?;
+        Ok(Self {
+            gc: None,
+            shared: Some(SharedFreezeHold { coord, generation }),
+            epoch: published_txn,
+            identity,
+            _not_send: PhantomData,
+        })
+    }
+
     /// Зафиксированное `E`.
     #[must_use]
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }
+
+    /// Продлевает TTL общего барьера (локальный — no-op).
+    #[must_use]
+    pub fn renew(&self, ttl: std::time::Duration) -> bool {
+        match &self.shared {
+            Some(hold) => hold.coord.freeze_renew(self.identity, hold.generation, ttl),
+            None => true,
+        }
+    }
 }
 
 impl Drop for FreezeGuard<'_> {
     fn drop(&mut self) {
-        self.gc.clear_freeze();
+        if let Some(gc) = self.gc {
+            gc.clear_freeze();
+        }
+        if let Some(hold) = &self.shared {
+            let _ = hold.coord.freeze_release(self.identity, hold.generation);
+        }
     }
 }
