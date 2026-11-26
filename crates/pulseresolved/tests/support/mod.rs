@@ -3,6 +3,7 @@
 #![allow(dead_code, clippy::doc_markdown)]
 
 pub mod e2e;
+pub mod https_source;
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};

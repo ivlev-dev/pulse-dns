@@ -24,11 +24,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 
+use crate::blocklist::BlocklistService;
 use crate::config::{Config, ModeSetting, TrustAnchorSetting, UpstreamSetting};
 use crate::logging;
 use crate::metrics::MetricsSource;
 use crate::rrl::{ResponseClass, Rrl, RrlRate};
-use crate::stats::Stats;
 
 /// Максимальный размер тела запроса (1 МиБ).
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -278,7 +278,7 @@ impl TokenBucket {
 /// Общее состояние control-plane.
 pub(crate) struct ControlState {
     resolver: Resolver,
-    stats: Arc<Stats>,
+    blocklist: Arc<BlocklistService>,
     rrl: Option<Arc<Rrl>>,
     metrics: MetricsSource,
     config: Config,
@@ -291,7 +291,7 @@ pub(crate) struct ControlState {
 impl ControlState {
     pub(crate) fn new(
         resolver: Resolver,
-        stats: Arc<Stats>,
+        blocklist: Arc<BlocklistService>,
         rrl: Option<Arc<Rrl>>,
         metrics: MetricsSource,
         config: Config,
@@ -300,7 +300,7 @@ impl ControlState {
         let setting = config.control;
         Arc::new(Self {
             resolver,
-            stats,
+            blocklist,
             rrl,
             metrics,
             config,
@@ -706,16 +706,25 @@ fn route(state: &ControlState, request: &HttpRequest, id: &str, instance: &str) 
             }
             let blocklist = state.resolver.blocklist();
             let stats = blocklist.stats();
+            let remote = state.blocklist.remote_statuses();
             HttpResponse::json(
                 200,
                 &json!({
-                    "enabled": !state.config.blocklist.paths.is_empty(),
+                    "enabled": !state.config.blocklist.paths.is_empty()
+                        || state.blocklist.remote_configured(),
                     "sources": state
                         .config
                         .blocklist
                         .paths
                         .iter()
                         .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>(),
+                    "urls": state
+                        .config
+                        .blocklist
+                        .remote_sources()
+                        .iter()
+                        .map(|source| source.url.clone())
                         .collect::<Vec<_>>(),
                     "blocked": stats.blocked,
                     "allowed": stats.allowed,
@@ -724,6 +733,21 @@ fn route(state: &ControlState, request: &HttpRequest, id: &str, instance: &str) 
                     "allowlist": state.config.blocklist.allowlist,
                     "response": state.config.blocklist.response,
                     "reload_secs": state.config.blocklist.reload_secs,
+                    "refresh_secs": state.config.blocklist.refresh_secs,
+                    "remote": remote
+                        .iter()
+                        .map(|status| json!({
+                            "url": status.url,
+                            "active": status.active,
+                            "last_success_ts": status.last_success_ts,
+                            "bytes": status.bytes,
+                            "refresh_secs": status.refresh_secs,
+                            "next_refresh_in_secs": status.next_refresh_in_secs,
+                            "etag": status.etag,
+                            "last_modified": status.last_modified,
+                            "last_error": status.last_error,
+                        }))
+                        .collect::<Vec<_>>(),
                 }),
             )
         }
@@ -731,7 +755,7 @@ fn route(state: &ControlState, request: &HttpRequest, id: &str, instance: &str) 
             if let Some(response) = require_method(method, "POST", instance, id) {
                 return response;
             }
-            match crate::reload::reload_now(&state.resolver, &state.stats) {
+            match state.blocklist.reload() {
                 Ok(stats) => HttpResponse::json(
                     200,
                     &json!({
@@ -739,6 +763,15 @@ fn route(state: &ControlState, request: &HttpRequest, id: &str, instance: &str) 
                         "blocked": stats.blocked,
                         "allowed": stats.allowed,
                         "skipped": stats.skipped,
+                        "results": state.blocklist.remote_statuses()
+                            .iter()
+                            .map(|status| json!({
+                                "url": status.url,
+                                "active": status.active,
+                                "last_success_ts": status.last_success_ts,
+                                "last_error": status.last_error,
+                            }))
+                            .collect::<Vec<_>>(),
                     }),
                 ),
                 Err(error) => HttpResponse::problem(
@@ -1792,6 +1825,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use crate::rrl::RrlConfig;
+    use crate::stats::Stats;
     use pulse_resolver::ResolverConfig;
 
     fn test_state(config: Config, token: &str) -> Arc<ControlState> {
@@ -1800,6 +1834,10 @@ mod tests {
         ]))
         .expect("resolver");
         let stats = Arc::new(Stats::new());
+        let blocklist = Arc::new(
+            BlocklistService::new(resolver.clone(), Arc::clone(&stats), &config)
+                .expect("blocklist service"),
+        );
         let metrics = MetricsSource::new(
             resolver.clone(),
             Arc::clone(&stats),
@@ -1808,7 +1846,7 @@ mod tests {
         );
         ControlState::new(
             resolver,
-            stats,
+            blocklist,
             None,
             metrics,
             config,
@@ -1899,7 +1937,7 @@ mod tests {
         let state = test_state(config, "secret-token");
         let state = Arc::new(ControlState {
             resolver: state.resolver.clone(),
-            stats: Arc::clone(&state.stats),
+            blocklist: Arc::clone(&state.blocklist),
             rrl: Some(Arc::clone(&rrl)),
             metrics: state.metrics.clone(),
             config: state.config.clone(),

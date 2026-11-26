@@ -2,16 +2,16 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use pulse_resolver::{BlocklistStats, Resolver, ResolverError};
 
+use crate::blocklist::BlocklistService;
 use crate::config::Config;
 use crate::control::{ControlService, ControlState};
 use crate::error::ServerError;
 use crate::metrics::{MetricsService, MetricsSource, SecureMetrics};
 use crate::query::{Processor, Transport};
-use crate::reload::{Reloader, reload_now};
+use crate::reload::Reloader;
 use crate::rrl::{Rrl, RrlSnapshot};
 use crate::secure::{DnscryptService, Doh2Service, DohService, DoqService, DotService, handler};
 use crate::stats::{Stats, StatsSnapshot};
@@ -36,6 +36,7 @@ pub struct ReloadOutcome {
 pub struct Server {
     resolver: Resolver,
     stats: Arc<Stats>,
+    blocklist: Arc<BlocklistService>,
     rrl: Option<Arc<Rrl>>,
     udp: Option<UdpService>,
     tcp: Option<TcpService>,
@@ -70,6 +71,12 @@ impl Server {
         };
         let resolver = Resolver::new(config.resolver_config()?)?;
         let stats = Arc::new(Stats::new());
+        let blocklist = Arc::new(BlocklistService::new(
+            resolver.clone(),
+            Arc::clone(&stats),
+            config,
+        )?);
+        blocklist.load_initial()?;
         let acl = config.build_acl()?;
         let tls_acl = config.build_tls_acl()?;
         let limiter = config.build_rate_limiter()?;
@@ -182,7 +189,7 @@ impl Server {
                 }
                 let state = ControlState::new(
                     resolver.clone(),
-                    Arc::clone(&stats),
+                    Arc::clone(&blocklist),
                     rrl.clone(),
                     metrics_source,
                     config.clone(),
@@ -195,15 +202,8 @@ impl Server {
             }
             None => None,
         };
-        let reloader = if config.blocklist.reload_secs > 0 && !config.blocklist.paths.is_empty() {
-            Some(
-                Reloader::start(
-                    resolver.clone(),
-                    Arc::clone(&stats),
-                    Duration::from_secs(config.blocklist.reload_secs),
-                )
-                .map_err(ServerError::Reload)?,
-            )
+        let reloader = if blocklist.is_active() {
+            Some(Reloader::start(Arc::clone(&blocklist)).map_err(ServerError::Reload)?)
         } else {
             None
         };
@@ -211,6 +211,7 @@ impl Server {
         Ok(Self {
             resolver,
             stats,
+            blocklist,
             rrl,
             udp,
             tcp,
@@ -358,7 +359,19 @@ impl Server {
     /// [`ResolverError::Blocklist`] при ошибке чтения любого файла; в этом
     /// случае старый список остаётся в силе.
     pub fn reload_blocklist(&self) -> Result<BlocklistStats, ResolverError> {
-        reload_now(&self.resolver, &self.stats)
+        self.blocklist.reload()
+    }
+
+    /// Статусы удалённых blocklist-источников (для диагностики).
+    #[must_use]
+    pub fn blocklist_remote_statuses(&self) -> Vec<pulse_resolver::RemoteSourceStatus> {
+        self.blocklist.remote_statuses()
+    }
+
+    /// Настроены ли удалённые HTTPS-источники blocklist.
+    #[must_use]
+    pub fn has_remote_blocklist(&self) -> bool {
+        self.blocklist.remote_configured()
     }
 
     /// Перечитывает TLS-сертификат/ключ для новых соединений.

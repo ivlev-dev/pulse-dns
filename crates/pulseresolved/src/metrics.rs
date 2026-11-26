@@ -297,6 +297,38 @@ impl MetricsSource {
             "Failed blocklist reloads.",
             stats.reload_failures,
         );
+        out.push_str(
+            "# HELP pulseresolved_blocklist_fetch_total Remote blocklist fetch results.\n\
+             # TYPE pulseresolved_blocklist_fetch_total counter\n",
+        );
+        for (result, value) in [
+            ("updated", stats.blocklist_fetch_updated),
+            ("not_modified", stats.blocklist_fetch_not_modified),
+            ("failed", stats.blocklist_fetch_failed),
+        ] {
+            let _ = writeln!(
+                out,
+                "pulseresolved_blocklist_fetch_total{{result=\"{result}\"}} {value}"
+            );
+        }
+        counter(
+            &mut out,
+            "pulseresolved_blocklist_fetch_bytes_total",
+            "Bytes downloaded from remote blocklist sources.",
+            stats.blocklist_fetch_bytes,
+        );
+        gauge(
+            &mut out,
+            "pulseresolved_blocklist_last_success_ts",
+            "Unix timestamp of the last successful remote blocklist fetch.",
+            stats.blocklist_last_success_ts,
+        );
+        gauge(
+            &mut out,
+            "pulseresolved_blocklist_entries",
+            "Entries in the active blocklist snapshot.",
+            u64::try_from(self.resolver.blocklist().len()).unwrap_or(u64::MAX),
+        );
         gauge(
             &mut out,
             "pulseresolved_tcp_active_connections",
@@ -839,6 +871,10 @@ mod tests {
         assert!(text.contains("pulseresolved_cache_entries 0"));
         assert!(text.contains("# TYPE pulseresolved_queries_total counter"));
         assert!(text.contains("pulseresolved_blocklist_reloads_total 1"));
+        assert!(text.contains("pulseresolved_blocklist_fetch_total{result=\"updated\"} 0"));
+        assert!(text.contains("pulseresolved_blocklist_fetch_bytes_total 0"));
+        assert!(text.contains("pulseresolved_blocklist_last_success_ts 0"));
+        assert!(text.contains("pulseresolved_blocklist_entries 0"));
         assert!(text.contains("pulseresolved_refused_acl_total"));
         assert!(text.contains("pulseresolved_rate_limited_total"));
         assert!(text.contains("pulseresolved_upstream_queries_total{transport=\"tls\"}"));

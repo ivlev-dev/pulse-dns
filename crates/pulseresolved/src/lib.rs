@@ -44,7 +44,11 @@
 //!   и без TLS. Control API требует bearer-токен (`control_token` или
 //!   `PULSERESOLVED_API_TOKEN`), лимит тела — 1 МиБ.
 //! - DoH/3 не поддерживается; DNSCrypt hot-reload сертификата требует
-//!   перезапуска (SIGHUP перечитывает только TLS-пару и blocklist).
+//!   перезапуска (SIGHUP перечитывает только локальные/удалённые blocklist
+//!   и TLS-пару).
+//! - Удалённые blocklist-источники скачиваются синхронным HTTPS-клиентом
+//!   в отдельном фоновом потоке: HTTP/2, сжатие и произвольные методы не
+//!   поддерживаются, редирект разрешён максимум один и только на тот же хост.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -69,6 +73,7 @@
 )]
 
 mod anchors;
+mod blocklist;
 mod cli;
 mod control;
 mod logging;

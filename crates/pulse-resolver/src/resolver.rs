@@ -688,7 +688,16 @@ impl Resolver {
         self.replace_blocklist(blocklist)
     }
 
-    fn replace_blocklist(&self, blocklist: Blocklist) -> Result<BlocklistStats, ResolverError> {
+    /// Атомарно подменяет снимок blocklist.
+    ///
+    /// Используется фоновым загрузчиком удалённых источников: новый снимок
+    /// собирается вне горячего пути, а читатели видят либо старую, либо новую
+    /// версию без пауз.
+    ///
+    /// # Errors
+    ///
+    /// [`ResolverError::Internal`] при отравленном `RwLock`.
+    pub fn replace_blocklist(&self, blocklist: Blocklist) -> Result<BlocklistStats, ResolverError> {
         let stats = blocklist.stats();
         let mut guard = self
             .inner

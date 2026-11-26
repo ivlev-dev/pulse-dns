@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use pulse_dns::{DsData, Name, Rdata, Rtype, Ttl};
 
+use crate::blocklist::RemoteSource;
 use crate::error::ResolverError;
 
 /// Режим резолюции.
@@ -539,6 +540,26 @@ pub struct BlocklistConfig {
     pub allowlist: Vec<String>,
     /// Политика ответа на заблокированное имя.
     pub response: BlockResponse,
+    /// Удалённые HTTPS-источники.
+    pub sources: Vec<RemoteSource>,
+    /// Общая периодичность удалённых источников, секунды (`0` — вручную).
+    pub refresh_secs: u64,
+    /// Каталог кэша удалённых источников; `None` — системный по умолчанию.
+    pub cache_dir: Option<PathBuf>,
+    /// Лимит размера одного удалённого источника.
+    pub max_bytes: u64,
+    /// Разрешить один редирект на тот же хост.
+    pub allow_redirects: bool,
+    /// Разрешённые хосты источников; пусто — любой публичный хост.
+    pub allow_hosts: Vec<String>,
+    /// Таймаут одной попытки скачивания.
+    pub timeout: Duration,
+    /// Число повторов после первой неудачной попытки.
+    pub retries: u32,
+    /// Начальный backoff между повторами.
+    pub backoff: Duration,
+    /// Дополнительный PEM-CA для источников.
+    pub ca_file: Option<PathBuf>,
 }
 
 impl Default for BlocklistConfig {
@@ -548,6 +569,16 @@ impl Default for BlocklistConfig {
             paths: Vec::new(),
             allowlist: Vec::new(),
             response: BlockResponse::NxDomain,
+            sources: Vec::new(),
+            refresh_secs: crate::blocklist::remote::DEFAULT_REFRESH_SECS,
+            cache_dir: None,
+            max_bytes: crate::blocklist::remote::DEFAULT_MAX_BYTES,
+            allow_redirects: false,
+            allow_hosts: Vec::new(),
+            timeout: crate::blocklist::remote::DEFAULT_TIMEOUT,
+            retries: crate::blocklist::remote::DEFAULT_RETRIES,
+            backoff: crate::blocklist::remote::DEFAULT_BACKOFF,
+            ca_file: None,
         }
     }
 }
@@ -794,8 +825,55 @@ impl ResolverConfig {
         for entry in &self.overrides {
             Override::new(entry.name.clone(), entry.ttl, entry.data.clone())?;
         }
+        validate_blocklist(&self.blocklist)?;
         Ok(())
     }
+}
+
+fn validate_blocklist(config: &BlocklistConfig) -> Result<(), ResolverError> {
+    if config.max_bytes == 0 || config.max_bytes > 1024 * 1024 * 1024 {
+        return Err(ResolverError::config(
+            "blocklist max_bytes must be in 1..=1 GiB",
+        ));
+    }
+    if config.timeout.is_zero() || config.timeout > Duration::from_secs(600) {
+        return Err(ResolverError::config(
+            "blocklist timeout must be in 1ms..=600s",
+        ));
+    }
+    if config.retries > 10 {
+        return Err(ResolverError::config(
+            "blocklist retries must be at most 10",
+        ));
+    }
+    if config.backoff.is_zero() || config.backoff > Duration::from_secs(600) {
+        return Err(ResolverError::config(
+            "blocklist backoff must be in 1ms..=600s",
+        ));
+    }
+    if config.refresh_secs > 604_800 {
+        return Err(ResolverError::config(
+            "blocklist refresh_secs must be at most 604800",
+        ));
+    }
+    for host in &config.allow_hosts {
+        if host.is_empty() || host.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+            return Err(ResolverError::config(
+                "blocklist allow_hosts entries must be non-empty host names",
+            ));
+        }
+    }
+    for source in &config.sources {
+        if source.refresh_secs.is_some_and(|secs| secs > 604_800) {
+            return Err(ResolverError::config(
+                "blocklist source refresh_secs must be at most 604800",
+            ));
+        }
+        source
+            .validate_url()
+            .map_err(|error| ResolverError::config(error.to_string()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -4,6 +4,10 @@
 //! зависит от числа меток имени, а не от размера списка. Запись `example.com`
 //! блокирует само имя и все поддомены; `*.example.com` — только поддомены;
 //! allowlist имеет приоритет над blocklist.
+//!
+//! Источники по URL (HTTPS, кэш, условные запросы) реализованы в
+//! [`remote`]; они возвращают текст, который объединяется с локальными
+//! файлами через [`Blocklist::load_combined`].
 
 use std::collections::HashMap;
 use std::fs;
@@ -12,6 +16,14 @@ use std::path::{Path, PathBuf};
 
 use pulse_dns::Name;
 use thiserror::Error;
+
+pub mod remote;
+
+pub use remote::{
+    DEFAULT_BACKOFF, DEFAULT_MAX_BYTES, DEFAULT_REFRESH_SECS, DEFAULT_RETRIES, DEFAULT_TIMEOUT,
+    RemoteBlocklist, RemoteBlocklistConfig, RemoteError, RemoteRefreshReport, RemoteSource,
+    RemoteSourceError, RemoteSourceStatus, SourceFormat, default_cache_dir,
+};
 
 /// Максимальный размер файла blocklist (64 MiB, SEC-API-010).
 pub const MAX_BLOCKLIST_BYTES: u64 = 64 * 1024 * 1024;
@@ -155,8 +167,27 @@ impl Blocklist {
     pub fn load_paths(paths: &[PathBuf], allowlist: &[String]) -> Result<Self, BlocklistError> {
         let mut list = Self::empty(allowlist);
         for path in paths {
-            let text = read_limited(path)?;
-            list.add_text(&text);
+            list.add_path(path)?;
+        }
+        Ok(list)
+    }
+
+    /// Объединяет локальные файлы и уже скачанные удалённые источники.
+    ///
+    /// `sources` — пары «формат, текст» в порядке объединения. Allowlist
+    /// применяется один раз к итоговому дереву.
+    ///
+    /// # Errors
+    ///
+    /// [`BlocklistError::Io`] или [`BlocklistError::TooLarge`] для любого файла.
+    pub fn load_combined(
+        paths: &[PathBuf],
+        sources: &[(SourceFormat, &str)],
+        allowlist: &[String],
+    ) -> Result<Self, BlocklistError> {
+        let mut list = Self::load_paths(paths, allowlist)?;
+        for (format, text) in sources {
+            list.add_source(text, *format);
         }
         Ok(list)
     }
@@ -169,7 +200,27 @@ impl Blocklist {
         list
     }
 
+    /// Добавляет файл к снимку.
+    ///
+    /// # Errors
+    ///
+    /// [`BlocklistError::Io`] или [`BlocklistError::TooLarge`].
+    pub fn add_path(&mut self, path: impl AsRef<Path>) -> Result<(), BlocklistError> {
+        let text = read_limited(path.as_ref())?;
+        self.add_text(&text);
+        Ok(())
+    }
+
+    /// Добавляет текст удалённого источника с учётом объявленного формата.
+    pub fn add_source(&mut self, text: &str, format: SourceFormat) {
+        self.add_text_with(text, format);
+    }
+
     fn add_text(&mut self, text: &str) {
+        self.add_text_with(text, SourceFormat::Auto);
+    }
+
+    fn add_text_with(&mut self, text: &str, format: SourceFormat) {
         for raw_line in text.lines() {
             let line = raw_line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -180,8 +231,17 @@ impl Blocklist {
             } else {
                 (false, line)
             };
+            let selected = match format {
+                SourceFormat::Auto => Some(rest),
+                SourceFormat::Hosts => hosts_line(rest, is_allow),
+                SourceFormat::Domains => domains_line(rest, is_allow),
+            };
+            let Some(selected) = selected else {
+                self.stats.skipped += 1;
+                continue;
+            };
             let mut accepted = 0_usize;
-            for token in domains_in_line(rest) {
+            for token in domains_in_line(selected) {
                 if let Some((labels, wildcard)) = parse_entry(token) {
                     if is_allow {
                         self.allow.insert(&labels, wildcard);
@@ -251,6 +311,30 @@ fn domains_in_line(line: &str) -> Vec<&str> {
         return tokens;
     }
     Vec::new()
+}
+
+/// Строка hosts-формата: `IP domain [domain…]`; allow-директивы остаются
+/// доменными, чтобы `@@allow` работал и в hosts-источниках.
+fn hosts_line(line: &str, is_allow: bool) -> Option<&str> {
+    let mut tokens = line.split_whitespace();
+    let first = tokens.next()?;
+    if first.parse::<std::net::IpAddr>().is_ok() {
+        return Some(line);
+    }
+    if is_allow && tokens.next().is_none() {
+        return Some(line);
+    }
+    None
+}
+
+/// Строка формата plain-доменов: ровно один токен (allow-директивы тоже).
+fn domains_line(line: &str, _is_allow: bool) -> Option<&str> {
+    let mut tokens = line.split_whitespace();
+    let first = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 fn parse_entry(entry: &str) -> Option<(Vec<Vec<u8>>, bool)> {
@@ -374,5 +458,44 @@ mod tests {
         assert!(!list.is_blocked(&name("allowed.two.test")));
         assert!(!list.is_blocked(&name("shared.test")));
         assert_eq!(list.stats().blocked, 3);
+    }
+
+    #[test]
+    fn remote_formats_filter_lines() {
+        let hosts = "0.0.0.0 ads.test\n127.0.0.1 tracker.test\nplain.test\n";
+        let mut list = Blocklist::empty(&[]);
+        list.add_source(hosts, SourceFormat::Hosts);
+        assert!(list.is_blocked(&name("ads.test")));
+        assert!(list.is_blocked(&name("tracker.test")));
+        assert!(!list.is_blocked(&name("plain.test")));
+
+        let mut list = Blocklist::empty(&[]);
+        list.add_source("plain.test\n0.0.0.0 ads.test\n", SourceFormat::Domains);
+        assert!(list.is_blocked(&name("plain.test")));
+        assert!(!list.is_blocked(&name("ads.test")));
+
+        let mut list = Blocklist::empty(&[]);
+        list.add_source("0.0.0.0 ads.test\nplain.test\n", SourceFormat::Auto);
+        assert!(list.is_blocked(&name("ads.test")));
+        assert!(list.is_blocked(&name("plain.test")));
+    }
+
+    #[test]
+    fn load_combined_merges_files_sources_and_allowlist() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("local.txt");
+        fs::write(&path, "local.test\n").unwrap();
+        let remote = "0.0.0.0 remote.test\n*.wild.test\n";
+        let list = Blocklist::load_combined(
+            &[path],
+            &[(SourceFormat::Auto, remote)],
+            &["safe.remote.test".to_owned()],
+        )
+        .unwrap();
+        assert!(list.is_blocked(&name("local.test")));
+        assert!(list.is_blocked(&name("remote.test")));
+        assert!(!list.is_blocked(&name("safe.remote.test")));
+        assert!(list.is_blocked(&name("a.wild.test")));
+        assert!(!list.is_blocked(&name("wild.test")));
     }
 }

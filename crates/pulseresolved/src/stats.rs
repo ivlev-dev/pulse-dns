@@ -1,8 +1,10 @@
 //! Атомарные счётчики транспорта и резолвера.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pulse_dns::Rcode;
+use pulse_resolver::RemoteRefreshReport;
 
 /// Счётчики процесса без блокировок на горячем пути.
 #[derive(Debug, Default)]
@@ -52,6 +54,11 @@ pub struct Stats {
     tcp_io_errors: AtomicU64,
     reloads: AtomicU64,
     reload_failures: AtomicU64,
+    blocklist_fetch_updated: AtomicU64,
+    blocklist_fetch_not_modified: AtomicU64,
+    blocklist_fetch_failed: AtomicU64,
+    blocklist_fetch_bytes: AtomicU64,
+    blocklist_last_success_ts: AtomicU64,
 }
 
 /// Снимок счётчиков процесса.
@@ -147,6 +154,16 @@ pub struct StatsSnapshot {
     pub reloads: u64,
     /// Неудачные перезагрузки blocklist.
     pub reload_failures: u64,
+    /// Удалённые источники: успешно скачано (200).
+    pub blocklist_fetch_updated: u64,
+    /// Удалённые источники: ответ 304.
+    pub blocklist_fetch_not_modified: u64,
+    /// Удалённые источники: ошибки.
+    pub blocklist_fetch_failed: u64,
+    /// Удалённые источники: получено байт.
+    pub blocklist_fetch_bytes: u64,
+    /// Время последнего успешного ответа источника (unix, секунды).
+    pub blocklist_last_success_ts: u64,
 }
 
 impl Stats {
@@ -209,6 +226,11 @@ impl Stats {
             tcp_io_errors: self.tcp_io_errors.load(Ordering::Relaxed),
             reloads: self.reloads.load(Ordering::Relaxed),
             reload_failures: self.reload_failures.load(Ordering::Relaxed),
+            blocklist_fetch_updated: self.blocklist_fetch_updated.load(Ordering::Relaxed),
+            blocklist_fetch_not_modified: self.blocklist_fetch_not_modified.load(Ordering::Relaxed),
+            blocklist_fetch_failed: self.blocklist_fetch_failed.load(Ordering::Relaxed),
+            blocklist_fetch_bytes: self.blocklist_fetch_bytes.load(Ordering::Relaxed),
+            blocklist_last_success_ts: self.blocklist_last_success_ts.load(Ordering::Relaxed),
         }
     }
 
@@ -402,5 +424,30 @@ impl Stats {
 
     pub(crate) fn reload_failed(&self) {
         self.reload_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn blocklist_refresh(&self, report: &RemoteRefreshReport) {
+        self.blocklist_fetch_updated.fetch_add(
+            u64::try_from(report.updated).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.blocklist_fetch_not_modified.fetch_add(
+            u64::try_from(report.not_modified).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.blocklist_fetch_failed.fetch_add(
+            u64::try_from(report.failed).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.blocklist_fetch_bytes
+            .fetch_add(report.bytes, Ordering::Relaxed);
+        if report.successes() > 0 {
+            self.blocklist_last_success_ts.store(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs()),
+                Ordering::Relaxed,
+            );
+        }
     }
 }

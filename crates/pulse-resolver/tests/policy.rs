@@ -57,6 +57,7 @@ fn blocklist_exact_subdomain_wildcard_allowlist_and_hosts() {
         paths: Vec::new(),
         allowlist: vec!["safe.exact.test".to_owned()],
         response: BlockResponse::NxDomain,
+        ..BlocklistConfig::default()
     };
     let resolver = Resolver::new(config).unwrap();
 
@@ -99,6 +100,7 @@ fn null_policy_answers_sinkhole() {
             ipv4: Ipv4Addr::UNSPECIFIED,
             ipv6: std::net::Ipv6Addr::UNSPECIFIED,
         },
+        ..BlocklistConfig::default()
     };
     let resolver = Resolver::new(config).unwrap();
     let reply = resolver.resolve_qname(&Name::parse("ads.test").unwrap(), Rtype::A);
@@ -126,6 +128,7 @@ fn blocklist_reload_is_atomic() {
         paths: Vec::new(),
         allowlist: Vec::new(),
         response: BlockResponse::NxDomain,
+        ..BlocklistConfig::default()
     };
     let resolver = Resolver::new(config).unwrap();
     let blocked = Name::parse("blocked.test").unwrap();
@@ -160,6 +163,7 @@ fn overrides_take_priority_over_blocklist_and_upstream() {
         paths: Vec::new(),
         allowlist: Vec::new(),
         response: BlockResponse::NxDomain,
+        ..BlocklistConfig::default()
     };
     config.overrides.push(Override::a(
         Name::parse("router.test").unwrap(),

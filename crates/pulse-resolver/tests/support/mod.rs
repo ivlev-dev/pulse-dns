@@ -2,6 +2,8 @@
 
 #![allow(dead_code, clippy::needless_pass_by_value)]
 
+pub mod https_source;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;

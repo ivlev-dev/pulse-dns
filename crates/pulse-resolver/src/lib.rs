@@ -24,8 +24,10 @@
 //! - **DNSSEC-кеш**: результат проверки цепочки (`zone` + отпечаток DNSKEY)
 //!   и пары RRset+RRSIG переиспользуется между запросами; смена DNSKEY/DS
 //!   или trust anchors инвалидирует доказательства.
-//! - **Blocklist**: домены/hosts/`@@allow`/`*.wildcard`, суффиксное дерево,
-//!   NXDOMAIN или null-address по выбору, атомарная перезагрузка.
+//! - **Blocklist**: локальные домены/hosts/`@@allow`/`*.wildcard` и удалённые
+//!   HTTPS-источники (стриминг с лимитом, `ETag`/`Last-Modified` → 304,
+//!   атомарный кэш `0600`, SSRF-guard), суффиксное дерево, NXDOMAIN или
+//!   null-address по выбору, атомарная перезагрузка.
 //! - **Overrides**: A/AAAA/CNAME, приоритет выше blocklist и upstream.
 //! - **DNSSEC** (опционально): цепочка DS → DNSKEY → RRSIG через
 //!   `pulse-dnssec`, AD-бит, SERVFAIL на BOGUS, NSEC/NSEC3 proofs.
@@ -107,7 +109,12 @@ pub mod root_hints;
 mod rrutil;
 mod upstream;
 
-pub use blocklist::{Blocklist, BlocklistError, BlocklistStats};
+pub use blocklist::{
+    Blocklist, BlocklistError, BlocklistStats, DEFAULT_BACKOFF, DEFAULT_MAX_BYTES,
+    DEFAULT_REFRESH_SECS, DEFAULT_RETRIES, DEFAULT_TIMEOUT, RemoteBlocklist, RemoteBlocklistConfig,
+    RemoteError, RemoteRefreshReport, RemoteSource, RemoteSourceError, RemoteSourceStatus,
+    SourceFormat, default_cache_dir,
+};
 pub use cache::{Cache, CacheSnapshot};
 pub use config::{
     BlockResponse, BlocklistConfig, CacheConfig, DnssecConfig, ForwardConfig, HttpsUpstream,

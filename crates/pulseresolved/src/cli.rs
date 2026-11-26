@@ -219,9 +219,10 @@ fn overrides(matches: &ArgMatches) -> Overrides {
 
 fn server_exit_code(error: &ServerError) -> ExitCode {
     match error {
-        ServerError::Config(_) | ServerError::Resolver(_) | ServerError::Affinity(_) => {
-            ExitCode::from(2)
-        }
+        ServerError::Config(_)
+        | ServerError::Resolver(_)
+        | ServerError::Affinity(_)
+        | ServerError::BlocklistRemote(_) => ExitCode::from(2),
         ServerError::Udp(_)
         | ServerError::TcpStart { .. }
         | ServerError::Tcp(_)

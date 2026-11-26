@@ -18,8 +18,8 @@ use pulse_dnssec::{
 };
 use pulse_resolver::{
     BlockResponse, BlocklistConfig as ResolverBlocklistConfig, CacheConfig, DnssecConfig,
-    ForwardConfig, IterativeConfig, Mode, Override, ResolverConfig, TimeoutConfig, UpstreamConfig,
-    UpstreamPoolConfig,
+    ForwardConfig, IterativeConfig, Mode, Override, RemoteSource, ResolverConfig, SourceFormat,
+    TimeoutConfig, UpstreamConfig, UpstreamPoolConfig,
 };
 use pulse_runtime::affinity::MAX_CPU;
 use pulse_tls::{Acl, RateLimitConfig as TlsRateLimitConfig, RateLimiter};
@@ -318,7 +318,7 @@ impl ControlSetting {
 }
 
 /// Параметры blocklist.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlocklistSetting {
     /// Файлы blocklist (домены, hosts-формат, adblock, `@@allow`).
@@ -330,9 +330,161 @@ pub struct BlocklistSetting {
     /// Политика ответа.
     #[serde(default)]
     pub response: BlockResponseSetting,
-    /// Периодическая перезагрузка списков, секунды (`0` — только SIGHUP).
+    /// Периодическая перезагрузка локальных файлов, секунды (`0` — SIGHUP).
     #[serde(default)]
     pub reload_secs: u64,
+    /// Удалённые HTTPS-источники.
+    #[serde(default)]
+    pub sources: Vec<BlocklistSourceSetting>,
+    /// Краткая форма `sources`: только URL (формат `auto`).
+    #[serde(default)]
+    pub urls: Vec<String>,
+    /// Общая периодичность удалённых источников, секунды (`0` — вручную).
+    #[serde(default = "default_blocklist_refresh_secs")]
+    pub refresh_secs: u64,
+    /// Каталог кэша; `None` — системный (`$XDG_CACHE_HOME`/`$HOME/.cache`).
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    /// Лимит размера одного источника.
+    #[serde(default = "default_blocklist_max_bytes")]
+    pub max_bytes: u64,
+    /// Разрешить один редирект на тот же хост.
+    #[serde(default)]
+    pub allow_redirects: bool,
+    /// Разрешённые хосты источников; пусто — любой публичный хост.
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
+    /// Таймаут одной попытки, миллисекунды.
+    #[serde(default = "default_blocklist_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Число повторов после первой неудачной попытки.
+    #[serde(default = "default_blocklist_retries")]
+    pub retries: u32,
+    /// Начальный backoff между повторами, миллисекунды.
+    #[serde(default = "default_blocklist_backoff_ms")]
+    pub backoff_ms: u64,
+    /// Дополнительный PEM-CA для HTTPS-источников.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+}
+
+impl Default for BlocklistSetting {
+    fn default() -> Self {
+        Self {
+            paths: Vec::new(),
+            allowlist: Vec::new(),
+            response: BlockResponseSetting::default(),
+            reload_secs: 0,
+            sources: Vec::new(),
+            urls: Vec::new(),
+            refresh_secs: default_blocklist_refresh_secs(),
+            cache_dir: None,
+            max_bytes: default_blocklist_max_bytes(),
+            allow_redirects: false,
+            allow_hosts: Vec::new(),
+            timeout_ms: default_blocklist_timeout_ms(),
+            retries: default_blocklist_retries(),
+            backoff_ms: default_blocklist_backoff_ms(),
+            ca_file: None,
+        }
+    }
+}
+
+const fn default_blocklist_refresh_secs() -> u64 {
+    pulse_resolver::DEFAULT_REFRESH_SECS
+}
+
+const fn default_blocklist_max_bytes() -> u64 {
+    pulse_resolver::DEFAULT_MAX_BYTES
+}
+
+const fn default_blocklist_timeout_ms() -> u64 {
+    30_000
+}
+
+const fn default_blocklist_retries() -> u32 {
+    pulse_resolver::DEFAULT_RETRIES
+}
+
+const fn default_blocklist_backoff_ms() -> u64 {
+    1_000
+}
+
+/// Удалённый HTTPS-источник blocklist.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlocklistSourceSetting {
+    /// URL (только HTTPS).
+    pub url: String,
+    /// Индивидуальная периодичность; `None` — `blocklist.refresh_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_secs: Option<u64>,
+    /// Формат: `auto`, `hosts` или `domains`.
+    #[serde(default)]
+    pub format: SourceFormatSetting,
+}
+
+impl BlocklistSourceSetting {
+    fn to_remote(&self) -> RemoteSource {
+        RemoteSource {
+            url: self.url.clone(),
+            refresh_secs: self.refresh_secs,
+            format: self.format.into(),
+        }
+    }
+}
+
+impl BlocklistSetting {
+    /// Удалённые источники (отдельные + краткая форма `urls`).
+    pub(crate) fn remote_sources(&self) -> Vec<RemoteSource> {
+        self.sources
+            .iter()
+            .map(BlocklistSourceSetting::to_remote)
+            .chain(self.urls.iter().map(|url| RemoteSource::new(url.clone())))
+            .collect()
+    }
+
+    /// Параметры менеджера удалённых источников.
+    pub(crate) fn remote_config(&self) -> pulse_resolver::RemoteBlocklistConfig {
+        pulse_resolver::RemoteBlocklistConfig {
+            sources: self.remote_sources(),
+            refresh_secs: self.refresh_secs,
+            cache_dir: self
+                .cache_dir
+                .clone()
+                .unwrap_or_else(pulse_resolver::default_cache_dir),
+            max_bytes: self.max_bytes,
+            allow_redirects: self.allow_redirects,
+            allow_hosts: self.allow_hosts.clone(),
+            timeout: Duration::from_millis(self.timeout_ms),
+            retries: self.retries,
+            backoff: Duration::from_millis(self.backoff_ms),
+            ca_file: self.ca_file.clone(),
+        }
+    }
+}
+
+/// Формат удалённого источника в TOML/JSON.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceFormatSetting {
+    /// Автоопределение.
+    #[default]
+    Auto,
+    /// Hosts-формат.
+    Hosts,
+    /// Plain-домены.
+    Domains,
+}
+
+impl From<SourceFormatSetting> for SourceFormat {
+    fn from(value: SourceFormatSetting) -> Self {
+        match value {
+            SourceFormatSetting::Auto => Self::Auto,
+            SourceFormatSetting::Hosts => Self::Hosts,
+            SourceFormatSetting::Domains => Self::Domains,
+        }
+    }
 }
 
 /// Параметры кеша.
@@ -1431,6 +1583,73 @@ impl Config {
         {
             return Err(ConfigError::invalid("blocklist paths must not be empty"));
         }
+        if self.blocklist.refresh_secs > 604_800 {
+            return Err(ConfigError::invalid(
+                "blocklist.refresh_secs must be at most 604800",
+            ));
+        }
+        if self.blocklist.max_bytes == 0 || self.blocklist.max_bytes > 1024 * 1024 * 1024 {
+            return Err(ConfigError::invalid(
+                "blocklist.max_bytes must be in 1..=1 GiB",
+            ));
+        }
+        if self.blocklist.timeout_ms == 0 || self.blocklist.timeout_ms > 600_000 {
+            return Err(ConfigError::invalid(
+                "blocklist.timeout_ms must be in 1..=600000",
+            ));
+        }
+        if self.blocklist.retries > 10 {
+            return Err(ConfigError::invalid("blocklist.retries must be at most 10"));
+        }
+        if self.blocklist.backoff_ms == 0 || self.blocklist.backoff_ms > 600_000 {
+            return Err(ConfigError::invalid(
+                "blocklist.backoff_ms must be in 1..=600000",
+            ));
+        }
+        if self
+            .blocklist
+            .cache_dir
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::invalid(
+                "blocklist.cache_dir must not be empty",
+            ));
+        }
+        if self
+            .blocklist
+            .ca_file
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::invalid("blocklist.ca_file must not be empty"));
+        }
+        for host in &self.blocklist.allow_hosts {
+            if host.is_empty() || host.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+                return Err(ConfigError::invalid(
+                    "blocklist.allow_hosts entries must be non-empty host names",
+                ));
+            }
+        }
+        for url in &self.blocklist.urls {
+            RemoteSource::new(url)
+                .validate_url()
+                .map_err(|error| ConfigError::invalid(error.to_string()))?;
+        }
+        for source in &self.blocklist.sources {
+            if source.refresh_secs.is_some_and(|secs| secs > 604_800) {
+                return Err(ConfigError::invalid(
+                    "blocklist source refresh_secs must be at most 604800",
+                ));
+            }
+            RemoteSource {
+                url: source.url.clone(),
+                refresh_secs: source.refresh_secs,
+                format: source.format.into(),
+            }
+            .validate_url()
+            .map_err(|error| ConfigError::invalid(error.to_string()))?;
+        }
         match &self.trust_anchor {
             Some(TrustAnchorSetting::PathFile(path)) if path.as_os_str().is_empty() => {
                 return Err(ConfigError::invalid("trust_anchor path must not be empty"));
@@ -1678,6 +1897,16 @@ impl Config {
                 paths: self.blocklist.paths.clone(),
                 allowlist: self.blocklist.allowlist.clone(),
                 response: self.blocklist.response.into(),
+                sources: self.blocklist.remote_sources(),
+                refresh_secs: self.blocklist.refresh_secs,
+                cache_dir: self.blocklist.cache_dir.clone(),
+                max_bytes: self.blocklist.max_bytes,
+                allow_redirects: self.blocklist.allow_redirects,
+                allow_hosts: self.blocklist.allow_hosts.clone(),
+                timeout: Duration::from_millis(self.blocklist.timeout_ms),
+                retries: self.blocklist.retries,
+                backoff: Duration::from_millis(self.blocklist.backoff_ms),
+                ca_file: self.blocklist.ca_file.clone(),
             },
             overrides,
             ..ResolverConfig::default()
@@ -2176,6 +2405,21 @@ paths = ["block.txt"]
 allowlist = ["safe.example"]
 response = "null"
 reload_secs = 60
+urls = ["https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"]
+refresh_secs = 43200
+cache_dir = "blocklist-cache"
+max_bytes = 1048576
+allow_redirects = true
+allow_hosts = ["raw.githubusercontent.com"]
+timeout_ms = 5000
+retries = 1
+backoff_ms = 250
+ca_file = "private-ca.pem"
+
+[[blocklist.sources]]
+url = "https://example.com/hosts.txt"
+refresh_secs = 3600
+format = "hosts"
 
 [[overrides]]
 name = "router.home"
@@ -2236,6 +2480,17 @@ total_ms = 2000
         );
         assert_eq!(config.blocklist.response, BlockResponseSetting::Null);
         assert_eq!(config.blocklist.reload_secs, 60);
+        assert_eq!(config.blocklist.refresh_secs, 43_200);
+        assert_eq!(config.blocklist.max_bytes, 1_048_576);
+        assert!(config.blocklist.allow_redirects);
+        assert_eq!(config.blocklist.retries, 1);
+        assert_eq!(config.blocklist.sources.len(), 1);
+        assert_eq!(
+            config.blocklist.sources[0].format,
+            SourceFormatSetting::Hosts
+        );
+        assert_eq!(config.blocklist.urls.len(), 1);
+        assert_eq!(config.blocklist.remote_sources().len(), 2);
         assert_eq!(config.overrides.len(), 2);
         assert_eq!(config.overrides[1].cname.as_deref(), Some("router.home."));
         let rate_limit = config.rate_limit.as_ref().expect("rate limit");
@@ -2665,5 +2920,43 @@ control_cpu_affinity = "5-2"
             ..Overrides::default()
         });
         assert_eq!(config.control_cpu_affinity, vec![1, 3]);
+    }
+
+    #[test]
+    fn blocklist_remote_defaults_and_validation() {
+        let setting = BlocklistSetting::default();
+        assert_eq!(setting.refresh_secs, pulse_resolver::DEFAULT_REFRESH_SECS);
+        assert_eq!(setting.max_bytes, pulse_resolver::DEFAULT_MAX_BYTES);
+        assert_eq!(setting.retries, pulse_resolver::DEFAULT_RETRIES);
+        assert!(!setting.allow_redirects);
+        assert!(setting.sources.is_empty());
+        assert_eq!(setting.urls, Vec::<String>::new());
+
+        let mut config = Config {
+            listen_udp: Some("127.0.0.1:0".parse().expect("addr")),
+            forwarders: vec!["1.1.1.1:53".parse().expect("upstream")],
+            ..Config::default()
+        };
+        config.blocklist.urls = vec!["http://example.com/hosts".to_owned()];
+        assert!(config.validate().is_err(), "http must be rejected");
+
+        config.blocklist.urls = vec!["https://example.com/hosts".to_owned()];
+        assert!(config.validate().is_ok());
+
+        config.blocklist.max_bytes = 0;
+        assert!(config.validate().is_err());
+        config.blocklist.max_bytes = pulse_resolver::DEFAULT_MAX_BYTES;
+        config.blocklist.retries = 11;
+        assert!(config.validate().is_err());
+        config.blocklist.retries = 0;
+        config.blocklist.allow_hosts = vec!["bad host".to_owned()];
+        assert!(config.validate().is_err());
+        config.blocklist.allow_hosts.clear();
+        config.blocklist.sources = vec![BlocklistSourceSetting {
+            url: "https://example.com/hosts".to_owned(),
+            refresh_secs: Some(604_801),
+            format: SourceFormatSetting::Auto,
+        }];
+        assert!(config.validate().is_err());
     }
 }

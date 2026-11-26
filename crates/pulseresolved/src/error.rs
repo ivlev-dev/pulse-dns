@@ -119,6 +119,9 @@ pub enum ServerError {
     /// Не удалось запустить фоновый reload blocklist.
     #[error("cannot start blocklist reloader: {0}")]
     Reload(#[source] io::Error),
+    /// Не удалось инициализировать удалённые blocklist-источники.
+    #[error("cannot initialize remote blocklist: {0}")]
+    BlocklistRemote(String),
     /// Не удалось запустить TLS/QUIC-транспорт.
     #[error("cannot start {transport} listener {addr}: {source}")]
     SecureStart {

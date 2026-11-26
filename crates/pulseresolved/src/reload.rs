@@ -1,14 +1,18 @@
-//! Перечитывание blocklist по SIGHUP и по расписанию.
+//! Фоновый worker blocklist: локальные файлы и удалённые HTTPS-источники.
+//!
+//! Интервал пробуждения вычисляется сервисом: ближайший из `reload_secs`
+//! локальных файлов и `refresh_secs` удалённых источников. Для удалённых
+//! источников сроки дополнительно размываются jitter'ом внутри
+//! `pulse-resolver`, чтобы не бить по серверу синхронно.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use pulse_resolver::{BlocklistStats, Resolver, ResolverError};
+use crate::blocklist::BlocklistService;
 
-use crate::logging;
-use crate::stats::Stats;
+const MAX_IDLE_WAIT: Duration = Duration::from_secs(3600);
 
 /// Фоновый перезагрузчик blocklist.
 pub(crate) struct Reloader {
@@ -17,18 +21,18 @@ pub(crate) struct Reloader {
 }
 
 impl Reloader {
-    pub(crate) fn start(
-        resolver: Resolver,
-        stats: Arc<Stats>,
-        interval: Duration,
-    ) -> std::io::Result<Self> {
+    pub(crate) fn start(service: Arc<BlocklistService>) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&shutdown);
         let handle = thread::Builder::new()
-            .name("pulseresolved-reload".to_owned())
+            .name("pulseresolved-blocklist".to_owned())
             .spawn(move || {
-                while !wait_for(&flag, interval) {
-                    let _ = reload_now(&resolver, &stats);
+                loop {
+                    let delay = service.next_delay().unwrap_or(MAX_IDLE_WAIT);
+                    if wait_for(&flag, delay) {
+                        break;
+                    }
+                    service.tick();
                 }
             })?;
         Ok(Self {
@@ -63,30 +67,5 @@ fn wait_for(shutdown: &AtomicBool, interval: Duration) -> bool {
             return false;
         }
         thread::sleep((deadline - now).min(Duration::from_millis(100)));
-    }
-}
-
-/// Перечитывает все файлы blocklist и логирует результат.
-pub(crate) fn reload_now(
-    resolver: &Resolver,
-    stats: &Stats,
-) -> Result<BlocklistStats, ResolverError> {
-    match resolver.reload_blocklists() {
-        Ok(stats_loaded) => {
-            stats.reload_ok();
-            logging::info(
-                "blocklist",
-                &format!(
-                    "reloaded: blocked={} allowed={} skipped={}",
-                    stats_loaded.blocked, stats_loaded.allowed, stats_loaded.skipped
-                ),
-            );
-            Ok(stats_loaded)
-        }
-        Err(error) => {
-            stats.reload_failed();
-            logging::error("blocklist", &format!("reload failed: {error}"));
-            Err(error)
-        }
     }
 }
