@@ -78,6 +78,16 @@ pub(crate) fn run() -> ExitCode {
             .copied(),
         response_cache_max_bytes: matches.get_one::<u64>("response-cache-max-bytes").copied(),
         response_cache_shards: matches.get_one::<usize>("response-cache-shards").copied(),
+        update_enabled: matches.get_one::<bool>("update").copied(),
+        update_require_tsig: matches.get_one::<bool>("update-require-tsig").copied(),
+        update_allow_from: matches
+            .get_many::<String>("update-allow-from")
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default(),
+        update_zones: matches
+            .get_many::<String>("update-zone")
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default(),
     };
 
     let mut config = match Config::from_path(&config_path) {
@@ -1201,6 +1211,34 @@ fn command() -> Command {
                 .value_name("N")
                 .value_parser(value_parser!(usize))
                 .help("Number of response cache shards (1..=256)"),
+        )
+        .arg(
+            Arg::new("update")
+                .long("update")
+                .value_name("BOOL")
+                .value_parser(value_parser!(bool))
+                .help("Enable RFC 2136 DNS UPDATE: true or false (default false)"),
+        )
+        .arg(
+            Arg::new("update-require-tsig")
+                .long("update-require-tsig")
+                .value_name("BOOL")
+                .value_parser(value_parser!(bool))
+                .help("Require a valid TSIG for DNS UPDATE (default true)"),
+        )
+        .arg(
+            Arg::new("update-allow-from")
+                .long("update-allow-from")
+                .value_name("CIDR")
+                .action(ArgAction::Append)
+                .help("Source IP/CIDR allowlist for DNS UPDATE; repeatable"),
+        )
+        .arg(
+            Arg::new("update-zone")
+                .long("update-zone")
+                .value_name("ORIGIN")
+                .action(ArgAction::Append)
+                .help("Zone allowlist for DNS UPDATE (repeatable; empty = all primary zones)"),
         )
         .arg(
             Arg::new("dnssec-key")

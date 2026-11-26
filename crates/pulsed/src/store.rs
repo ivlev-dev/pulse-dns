@@ -17,7 +17,8 @@ use pulse_api::{
     TransferResult, WriteOutcome, ZoneAdmin, ZoneAllow, ZoneFileMetrics, ZoneKind, ZoneMetaInput,
     ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, next_serial,
 };
-use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype, Serial, Ttl};
+use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype, Serial, Ttl, UpdateError, UpdateRequest};
+use pulse_server::update::{UpdateOutcome, UpdateTarget};
 use pulse_server::{
     DenialKind, QueryEngine, QueryStats, ResponseCache, ResponseCacheMetrics,
     ZoneState as ServerZoneState, ZoneView,
@@ -42,6 +43,17 @@ use crate::zonefile::{
 #[error("zone snapshot cannot be served: {0}")]
 pub(crate) struct StoreError(String);
 
+/// Состояние зоны для политики DNS UPDATE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UpdateZoneState {
+    /// Вид зоны.
+    pub kind: ZoneKind,
+    /// Класс зоны.
+    pub class: Rclass,
+    /// Зона отдаётся авторитетно (не expired/tombstone).
+    pub serving: bool,
+}
+
 /// Общий администратор: zonefile, DNS-движок, transfer и secondary.
 pub(crate) struct SharedZoneAdmin {
     store: Option<Arc<ZoneStore>>,
@@ -59,6 +71,7 @@ pub(crate) struct SharedZoneAdmin {
     dnssec: DnssecSigners,
     transfer: TransferState,
     secondary: SecondaryManager,
+    update: crate::update::UpdateService,
 }
 
 impl SharedZoneAdmin {
@@ -121,6 +134,7 @@ impl SharedZoneAdmin {
             versions.insert(entry.origin.clone(), entry.version);
         }
         let engine = build_engine(&views, &query_stats, &response_cache);
+        let update = crate::update::UpdateService::new(config).map_err(StoreError)?;
         Ok(Self {
             store,
             views: RwLock::new(views),
@@ -133,7 +147,24 @@ impl SharedZoneAdmin {
             dnssec,
             transfer,
             secondary,
+            update,
         })
+    }
+
+    /// Обрабатывает пакет UPDATE, если opcode совпадает.
+    ///
+    /// `None` — это не UPDATE; иначе готовый wire-ответ (включая TSIG).
+    pub(crate) fn handle_dns_update(
+        &self,
+        raw: &[u8],
+        source: std::net::IpAddr,
+        now: u64,
+    ) -> Option<Vec<u8>> {
+        self.update.handle(self, raw, source, now)
+    }
+
+    pub(crate) fn update_metrics(&self) -> Arc<crate::update::UpdateMetrics> {
+        self.update.metrics()
     }
 
     /// Текущий движок. Read-lock удерживается только на клонирование `Arc`.
@@ -606,6 +637,148 @@ impl SharedZoneAdmin {
             return None;
         }
         store.zone_snapshot(origin).ok().flatten()
+    }
+
+    /// Состояние зоны для политики UPDATE.
+    ///
+    /// # Errors
+    ///
+    /// Строка с ошибкой чтения каталога/головы зоны.
+    pub(crate) fn update_zone_state(
+        &self,
+        origin: &Name,
+    ) -> Result<Option<UpdateZoneState>, String> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let Some(entry) = store.zone_entry(origin)? else {
+            return Ok(None);
+        };
+        let expired = self.secondary.expired_origins();
+        Ok(Some(UpdateZoneState {
+            kind: kind_from_flags(entry.flags),
+            class: Rclass::IN,
+            serving: server_state(&entry, &expired) == ServerZoneState::Serving,
+        }))
+    }
+
+    /// Применяет разобранный UPDATE одной транзакцией writer'а.
+    ///
+    /// Prerequisites проверяются движком на незакоммиченном дереве до первой
+    /// записи; любая ошибка оставляет writer без commit, поэтому частичных
+    /// изменений нет. После коммита обновляются IXFR-история/NOTIFY и view
+    /// движка.
+    ///
+    /// # Errors
+    ///
+    /// [`UpdateError`] с кодом RFC 2136; ошибки хранилища маппятся в
+    /// `SERVFAIL`.
+    pub(crate) fn apply_zone_update(
+        &self,
+        request: &UpdateRequest,
+    ) -> Result<UpdateOutcome, UpdateError> {
+        let store = self.store.as_ref().ok_or(UpdateError::Refused {
+            reason: "zonefile is not configured",
+        })?;
+        let Some(entry) = store.zone_entry(request.zone()).map_err(servfail)? else {
+            return Err(UpdateError::NotAuthoritative {
+                zone: request.zone().to_string(),
+            });
+        };
+        if kind_from_flags(entry.flags) != ZoneKind::Primary {
+            return Err(UpdateError::Refused {
+                reason: "only primary zones accept UPDATE",
+            });
+        }
+        let expired = self.secondary.expired_origins();
+        if server_state(&entry, &expired) != ServerZoneState::Serving {
+            return Err(UpdateError::Refused {
+                reason: "zone is not serving",
+            });
+        }
+        let previous = {
+            let mut writer = store.open_writer(request.zone()).map_err(servfail)?;
+            let previous = self.previous_snapshot(request.zone(), store);
+            let outcome = {
+                let mut target = StoreUpdateTarget {
+                    writer: &mut writer,
+                    origin: request.zone().clone(),
+                    class: Rclass::IN,
+                };
+                pulse_server::update::apply_update(&mut target, request)?
+            };
+            writer.set_soa_serial(outcome.serial.as_u32());
+            store.commit_writer(&mut writer).map_err(servfail)?;
+            (outcome, previous)
+        };
+        self.after_commit(request.zone(), previous.1.as_ref());
+        Ok(previous.0)
+    }
+}
+
+fn servfail(error: impl std::fmt::Display) -> UpdateError {
+    UpdateError::ServFail {
+        reason: error.to_string(),
+    }
+}
+
+/// Адаптер [`UpdateTarget`] поверх незакоммиченного `ParallelZone`.
+struct StoreUpdateTarget<'a, 'z> {
+    writer: &'a mut ParallelZone<'z>,
+    origin: Name,
+    class: Rclass,
+}
+
+impl UpdateTarget for StoreUpdateTarget<'_, '_> {
+    fn origin(&self) -> &Name {
+        &self.origin
+    }
+
+    fn zone_class(&self) -> Rclass {
+        self.class
+    }
+
+    fn rrset(&mut self, name: &Name, rr_type: Rtype) -> Result<Option<Rrset>, UpdateError> {
+        let owner = name_to_rle(name).map_err(servfail)?;
+        let Some(record) = self
+            .writer
+            .lookup(&owner, rr_type.as_u16(), 0)
+            .map_err(servfail)?
+        else {
+            return Ok(None);
+        };
+        let view = pulse_zonefile::RrsetView {
+            ttl: record.ttl,
+            flags: record.flags,
+            rdata: record.rdata,
+        };
+        crate::zonefile::rrset_from_stored(name, rr_type, &view)
+            .map(Some)
+            .map_err(servfail)
+    }
+
+    fn types_at(&mut self, name: &Name) -> Result<Vec<Rtype>, UpdateError> {
+        let owner = name_to_rle(name).map_err(servfail)?;
+        let records = self.writer.owner_rrsets(&owner).map_err(servfail)?;
+        let mut types: Vec<Rtype> = records
+            .iter()
+            .map(|record| Rtype::from_u16(record.rr_type))
+            .collect();
+        types.sort();
+        types.dedup();
+        Ok(types)
+    }
+
+    fn put_rrset(&mut self, rrset: &Rrset) -> Result<(), UpdateError> {
+        write_rrset(self.writer, rrset).map_err(servfail)
+    }
+
+    fn delete_rrset(&mut self, name: &Name, rr_type: Rtype) -> Result<(), UpdateError> {
+        let owner = name_to_rle(name).map_err(servfail)?;
+        self.writer
+            .delete_rrset(&owner, rr_type.as_u16(), 0)
+            .map(|_| ())
+            .map_err(servfail)
     }
 }
 

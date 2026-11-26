@@ -530,6 +530,130 @@ impl TransferSettings {
     }
 }
 
+/// Настройки входящих DNS UPDATE (RFC 2136).
+///
+/// По умолчанию UPDATE **выключен**: сервер отвечает `REFUSED`. При
+/// включении TSIG обязателен (`require_tsig = true`), source ACL и allowlist
+/// зон ограничивают доступ, а `tsig_keys` сужает набор ключей до перечисленных
+/// в глобальной секции `tsig_keys` (пусто — любой объявленный ключ).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateSettings {
+    /// Обслуживать opcode UPDATE.
+    pub enabled: bool,
+    /// Требовать валидный TSIG; `false` допустим только для доверенной сети.
+    pub require_tsig: bool,
+    /// IP/CIDR allowlist источника (`"192.0.2.0/24"`, `"::1/128"`, `"10.0.0.1"`).
+    pub allow_from: Vec<String>,
+    /// Зоны, доступные для UPDATE; пусто — все primary-зоны.
+    pub allow_zones: Vec<String>,
+    /// Имена ключей из глобальной секции `tsig_keys`; пусто — любой ключ.
+    pub tsig_keys: Vec<String>,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_tsig: true,
+            allow_from: Vec::new(),
+            allow_zones: Vec::new(),
+            tsig_keys: Vec::new(),
+        }
+    }
+}
+
+/// Политика UPDATE: то же, что [`UpdateSettings`], под именем из RFC 2136.
+///
+/// `allow_zones` — это `allow_update` per-zone: пустой список разрешает все
+/// primary-зоны, непустой — только перечисленные.
+pub type UpdatePolicy = UpdateSettings;
+
+impl UpdateSettings {
+    /// Проверяет CIDR, имена зон и ссылки на TSIG-ключи.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] при некорректном CIDR/имени или ссылке на
+    /// необъявленный ключ; включённый UPDATE без `zonefile` тоже ошибка.
+    pub fn validate(&self, key_names: &std::collections::HashSet<Name>) -> Result<(), ConfigError> {
+        if self.enabled && self.tsig_keys.is_empty() && key_names.is_empty() && self.require_tsig {
+            return Err(ConfigError::Invalid(
+                "update.require_tsig requires at least one key in tsig_keys".to_owned(),
+            ));
+        }
+        for cidr in &self.allow_from {
+            validate_cidr(cidr).map_err(|reason| {
+                ConfigError::Invalid(format!(
+                    "update.allow_from: invalid CIDR {cidr:?}: {reason}"
+                ))
+            })?;
+        }
+        let mut zones = std::collections::HashSet::with_capacity(self.allow_zones.len());
+        for origin in &self.allow_zones {
+            let name = Name::parse(origin.trim()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "update.allow_zones: invalid origin {origin:?}: {error}"
+                ))
+            })?;
+            if name == Name::root() || name.labels().any(|label| label == b"*") {
+                return Err(ConfigError::Invalid(format!(
+                    "update.allow_zones: origin {origin:?} must be a non-root name without wildcards"
+                )));
+            }
+            if !zones.insert(name) {
+                return Err(ConfigError::Invalid(format!(
+                    "update.allow_zones: duplicate origin {origin:?}"
+                )));
+            }
+        }
+        let mut keys = std::collections::HashSet::with_capacity(self.tsig_keys.len());
+        for key in &self.tsig_keys {
+            let name = Name::parse(key.trim()).map_err(|error| {
+                ConfigError::Invalid(format!("update.tsig_keys: invalid name {key:?}: {error}"))
+            })?;
+            if name == Name::root() || name.labels().any(|label| label == b"*") {
+                return Err(ConfigError::Invalid(format!(
+                    "update.tsig_keys: name {key:?} must be a non-root name without wildcards"
+                )));
+            }
+            if !key_names.contains(&name) {
+                return Err(ConfigError::Invalid(format!(
+                    "update.tsig_keys: key {name} is not declared in tsig_keys"
+                )));
+            }
+            if !keys.insert(name) {
+                return Err(ConfigError::Invalid(format!(
+                    "update.tsig_keys: duplicate key {key:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Проверяет IP или CIDR (`addr/prefix`).
+pub(crate) fn validate_cidr(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    let (address, prefix) = match value.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (value, None),
+    };
+    let address: IpAddr = address
+        .parse()
+        .map_err(|error| format!("invalid IP address: {error}"))?;
+    if let Some(prefix) = prefix {
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|error| format!("invalid prefix length: {error}"))?;
+        let max = if address.is_ipv4() { 32 } else { 128 };
+        if prefix > max {
+            return Err(format!("prefix /{prefix} exceeds /{max}"));
+        }
+    }
+    Ok(())
+}
+
 /// Разбирает строку алгоритма TSIG.
 ///
 /// # Errors
@@ -941,6 +1065,9 @@ pub struct Config {
     /// Настройки AXFR/IXFR и NOTIFY.
     #[serde(default)]
     pub transfer: TransferSettings,
+    /// Настройки входящих DNS UPDATE (RFC 2136).
+    #[serde(default)]
+    pub update: UpdateSettings,
     /// Кеш готовых ответов для статичных зон.
     #[serde(default)]
     pub response_cache: ResponseCacheSettings,
@@ -1012,6 +1139,7 @@ impl Default for Config {
             secondary_zones: Vec::new(),
             tsig_keys: Vec::new(),
             transfer: TransferSettings::default(),
+            update: UpdateSettings::default(),
             response_cache: ResponseCacheSettings::default(),
         }
     }
@@ -1292,6 +1420,12 @@ impl Config {
                     "tsig_keys: key {name} secret must not be empty"
                 )));
             }
+        }
+        self.update.validate(&key_names)?;
+        if self.update.enabled && self.zonefile.is_none() {
+            return Err(ConfigError::Invalid(
+                "update.enabled requires a zonefile; pass --data <file>".to_owned(),
+            ));
         }
         for origin in &self.transfer.allow_zones {
             let name = Name::parse(origin.trim()).map_err(|error| {
@@ -1703,6 +1837,7 @@ impl Config {
     }
 
     /// Применяет CLI-overrides поверх файла.
+    #[allow(clippy::too_many_lines)]
     pub fn apply_overrides(&mut self, overrides: &Overrides) {
         if let Some(addr) = overrides.listen_udp {
             self.listen_udp = Some(addr);
@@ -1795,6 +1930,20 @@ impl Config {
             self.map_size = map_size;
         }
         self.apply_response_cache_overrides(overrides);
+        if let Some(enabled) = overrides.update_enabled {
+            self.update.enabled = enabled;
+        }
+        if let Some(require) = overrides.update_require_tsig {
+            self.update.require_tsig = require;
+        }
+        if !overrides.update_allow_from.is_empty() {
+            self.update
+                .allow_from
+                .clone_from(&overrides.update_allow_from);
+        }
+        if !overrides.update_zones.is_empty() {
+            self.update.allow_zones.clone_from(&overrides.update_zones);
+        }
     }
 
     fn apply_response_cache_overrides(&mut self, overrides: &Overrides) {
@@ -1884,6 +2033,14 @@ pub struct Overrides {
     pub response_cache_max_bytes: Option<u64>,
     /// Число шардов кеша ответов.
     pub response_cache_shards: Option<usize>,
+    /// Включить/выключить DNS UPDATE.
+    pub update_enabled: Option<bool>,
+    /// Требовать TSIG для UPDATE.
+    pub update_require_tsig: Option<bool>,
+    /// IP/CIDR allowlist UPDATE.
+    pub update_allow_from: Vec<String>,
+    /// Allowlist зон UPDATE.
+    pub update_zones: Vec<String>,
 }
 
 /// Причина ошибки разбора конфигурационного файла.
@@ -2033,6 +2190,10 @@ mod tests {
             response_cache_max_entries: Some(1024),
             response_cache_max_bytes: Some(2 * 1024 * 1024),
             response_cache_shards: Some(4),
+            update_enabled: None,
+            update_require_tsig: None,
+            update_allow_from: Vec::new(),
+            update_zones: Vec::new(),
         });
         assert_eq!(config.listen_udp, Some(addr));
         assert_eq!(config.workers, 3);
@@ -2662,6 +2823,10 @@ tick_secs = 300
             response_cache_max_entries: Some(1024),
             response_cache_max_bytes: Some(2 * 1024 * 1024),
             response_cache_shards: Some(4),
+            update_enabled: None,
+            update_require_tsig: None,
+            update_allow_from: Vec::new(),
+            update_zones: Vec::new(),
         });
         assert_eq!(
             config.listen_udp,
@@ -2885,6 +3050,76 @@ api_cpu_affinity = "4-5"
         assert!(base(vec![MAX_CPU], Vec::new()).validate().is_err());
         // Непересекающиеся наборы валидны.
         base(vec![0, 1], vec![2, 3]).validate().expect("disjoint");
+    }
+
+    #[test]
+    fn update_settings_parse_and_validate() {
+        let config = Config::from_toml_str(
+            r#"
+listen_udp = "127.0.0.1:0"
+zonefile = "/tmp/update-config.pulse"
+
+[[tsig_keys]]
+name = "update-key.example."
+algorithm = "hmac-sha256"
+secret = "c2VjcmV0"
+
+[update]
+enabled = true
+require_tsig = true
+allow_from = ["127.0.0.1/32", "::1/128"]
+allow_zones = ["example.com."]
+tsig_keys = ["update-key.example."]
+"#,
+        )
+        .expect("parse");
+        assert!(config.update.enabled);
+        assert_eq!(config.update.allow_from.len(), 2);
+        config.validate().expect("valid update config");
+
+        let bad_cidr = Config::from_toml_str(
+            r#"
+zonefile = "/tmp/update-config.pulse"
+[update]
+enabled = true
+require_tsig = false
+allow_from = ["192.0.2.0/33"]
+"#,
+        )
+        .expect("parse");
+        assert!(bad_cidr.validate().is_err());
+
+        let unknown_key = Config::from_toml_str(
+            r#"
+zonefile = "/tmp/update-config.pulse"
+[update]
+enabled = true
+require_tsig = false
+tsig_keys = ["missing-key.example."]
+"#,
+        )
+        .expect("parse");
+        assert!(unknown_key.validate().is_err());
+
+        let without_zonefile = Config::from_toml_str(
+            r#"
+listen_udp = "127.0.0.1:0"
+[update]
+enabled = true
+require_tsig = false
+"#,
+        )
+        .expect("parse");
+        assert!(without_zonefile.validate().is_err());
+
+        let example = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/pulsed-update.toml"),
+        )
+        .expect("read update example");
+        Config::from_toml_str(&example)
+            .expect("parse update example")
+            .validate()
+            .expect("valid update example");
     }
 
     #[test]

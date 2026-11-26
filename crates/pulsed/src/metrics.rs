@@ -357,6 +357,66 @@ fn append_counter(out: &mut String, name: &str, help: &str, value: u64) {
 }
 
 /// Рендерит метрики кеша готовых ответов (`pulsed_response_cache_*`).
+pub(crate) fn render_update_metrics(metrics: &crate::update::UpdateMetrics) -> String {
+    let snapshot = metrics.snapshot();
+    let mut out = String::new();
+    append_counter(
+        &mut out,
+        "pulsed_update_requests_total",
+        "DNS UPDATE requests received.",
+        snapshot.requests,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_update_success_total",
+        "DNS UPDATE transactions answered with NOERROR.",
+        snapshot.success,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_update_changed_total",
+        "DNS UPDATE transactions that changed zone data.",
+        snapshot.changed,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_update_refused_total",
+        "DNS UPDATE transactions refused by policy.",
+        snapshot.refused,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_update_notauth_total",
+        "DNS UPDATE transactions rejected as not authoritative or unauthenticated.",
+        snapshot.notauth,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_update_formerr_total",
+        "DNS UPDATE transactions rejected with FORMERR/NOTZONE.",
+        snapshot.formerr,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_update_errors_total",
+        "DNS UPDATE transactions failed for another reason (SERVFAIL/NXDOMAIN/...).",
+        snapshot.other_errors,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_update_tsig_failures_total",
+        "DNS UPDATE requests rejected by TSIG verification.",
+        snapshot.tsig_failures,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_update_replay_total",
+        "DNS UPDATE requests rejected as TSIG replays.",
+        snapshot.replay,
+    );
+    out
+}
+
 pub(crate) fn render_response_cache(metrics: &pulse_server::ResponseCacheMetrics) -> String {
     let mut out = String::new();
     append_counter(

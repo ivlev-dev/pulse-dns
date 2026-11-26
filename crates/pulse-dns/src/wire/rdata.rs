@@ -140,5 +140,6 @@ pub(crate) fn write_rdata<O: RdataOut + ?Sized>(rdata: &Rdata, out: &mut O) {
             }
         }
         Rdata::Unknown { rdata, .. } => out.bytes(rdata),
+        Rdata::Empty(_) => {}
     }
 }

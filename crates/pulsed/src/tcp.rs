@@ -201,6 +201,12 @@ async fn serve(
             None => {}
         }
 
+        if let Some(response) = admin.handle_dns_update(request_buffer.as_slice(), peer.ip(), now) {
+            write_frame(&mut stream, &response, idle_timeout).await?;
+            stats.response();
+            continue;
+        }
+
         if is_transfer_request(request_buffer.as_slice()) {
             let request = request_buffer.take_vec(length);
             let stream = stream.into_std()?;

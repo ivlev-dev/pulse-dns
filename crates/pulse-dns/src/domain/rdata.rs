@@ -1152,6 +1152,12 @@ pub enum Rdata {
         /// RDATA байт-в-байт.
         rdata: Vec<u8>,
     },
+    /// Пустая RDATA метазаписи DNS UPDATE (`CLASS=ANY/NONE`, RFC 2136).
+    ///
+    /// Вариант существует, чтобы кодировать/декодировать delete-записи с
+    /// `RDLENGTH=0` без нарушения инварианта «известный тип не бывает
+    /// `Unknown`». В зону такие записи не попадают.
+    Empty(Rtype),
 }
 
 impl Rdata {
@@ -1169,6 +1175,18 @@ impl Rdata {
             return Err(RdataError::TooLong { len: rdata.len() });
         }
         Ok(Self::Unknown { rr_type, rdata })
+    }
+
+    /// Пустая RDATA метазаписи DNS UPDATE (RFC 2136 §2.4/§2.5).
+    ///
+    /// В секциях Prerequisite/Update классы `ANY` и `NONE` переопределяют
+    /// смысл записи, а `RDLENGTH` обязан быть нулём. Для известного типа
+    /// обычный [`Rdata::unknown`] запрещён, поэтому метазапись представляется
+    /// пустым `Unknown`: такая RDATA не попадает в зону и не проходит
+    /// [`Rdata::validate`], но корректно кодируется обратно в wire-формат.
+    #[must_use]
+    pub const fn empty_metavalue(rr_type: Rtype) -> Self {
+        Self::Empty(rr_type)
     }
 
     /// Детерминированное отображение варианта в тип записи.
@@ -1195,7 +1213,7 @@ impl Rdata {
             Self::Tlsa(_) => Rtype::TLSA,
             Self::Svcb(_) => Rtype::SVCB,
             Self::Https(_) => Rtype::HTTPS,
-            Self::Unknown { rr_type, .. } => *rr_type,
+            Self::Unknown { rr_type, .. } | Self::Empty(rr_type) => *rr_type,
         }
     }
 
@@ -1294,6 +1312,7 @@ const fn sort_rank(rdata: &Rdata) -> u8 {
         Rdata::Svcb(_) => 18,
         Rdata::Https(_) => 19,
         Rdata::Unknown { .. } => 20,
+        Rdata::Empty(_) => 21,
     }
 }
 

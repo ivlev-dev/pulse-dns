@@ -140,7 +140,12 @@ impl TlsTransports {
             .ok_or_else(|| TlsError::Config("tls_key is not configured".to_owned()))?;
         crate::perms::ensure_private(key_path, "tls_key").map_err(TlsError::Config)?;
         let acl = build_acl(&config.tls_allow_from)?;
-        let handler: DnsHandler = Arc::new(move |request: &[u8], _peer| {
+        let handler: DnsHandler = Arc::new(move |request: &[u8], peer| {
+            if let Some(response) =
+                admin.handle_dns_update(request, peer.ip(), crate::transfer::now_unix())
+            {
+                return Some(response);
+            }
             let engine = admin.engine();
             dns::respond(request, Transport::Tcp, &engine, &stats)
         });

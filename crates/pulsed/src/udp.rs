@@ -59,6 +59,17 @@ impl UdpService {
                 }
                 None => {}
             }
+            if let Some(response) =
+                admin.handle_dns_update(request, peer.ip(), crate::transfer::now_unix())
+            {
+                if response.len() > out.len() {
+                    stats.drop_response();
+                    return Reply::Drop;
+                }
+                out[..response.len()].copy_from_slice(&response);
+                stats.response();
+                return Reply::Send(response.len());
+            }
             let engine = admin.engine();
             let Some(len) = dns::respond_into(request, Transport::Udp, &engine, &stats, out) else {
                 return Reply::Drop;

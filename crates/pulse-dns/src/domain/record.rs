@@ -78,6 +78,22 @@ impl Record {
         })
     }
 
+    /// Создаёт метазапись DNS UPDATE с пустой RDATA (RFC 2136 §2.4/§2.5).
+    ///
+    /// Используется в Prerequisite/Update секциях с классом `ANY`/`NONE`
+    /// (удаление, проверки существования). TTL всегда `0`; такая запись не
+    /// предназначена для хранения в зоне и не проходит [`Record::validate`].
+    #[must_use]
+    pub fn update_metavalue(owner: Name, rr_type: Rtype, class: Rclass) -> Self {
+        Self::from_parts_unchecked(
+            owner,
+            rr_type,
+            class,
+            Ttl::ZERO,
+            Rdata::empty_metavalue(rr_type),
+        )
+    }
+
     /// Создаёт запись без проверки типа, для wire-декодера.
     ///
     /// Декодер сам гарантирует соответствие через диспетчеризацию по типу.

@@ -1295,6 +1295,33 @@ impl<'a> ParallelZone<'a> {
             .map_err(|error| self.io.take_error().unwrap_or(error))
     }
 
+    /// Все `RRset` конкретного владельца (без `T_NODE`/`T_ZONE_ENTRY`).
+    ///
+    /// Читает только ключи имени, а не всю зону: используется движком
+    /// DNS UPDATE, которому нужны типы и значения owner'а в незакоммиченной
+    /// транзакции (`read-your-writes`).
+    ///
+    /// # Errors
+    ///
+    /// `Corrupt`/`Io`.
+    pub fn owner_rrsets(&self, name: &NameRle) -> Result<Vec<RrsetRecord>, ParallelError> {
+        let version = self.version_for_reads();
+        let keys = self
+            .tree
+            .collect_owner_keys(&self.io, version, name)
+            .map_err(|error| writer_error(&self.io, error))?;
+        let mut rrsets = Vec::new();
+        for key in keys {
+            if matches!(key.rr_type(), T_NODE | T_ZONE_ENTRY) {
+                continue;
+            }
+            if let Some(rrset) = self.lookup(name, key.rr_type(), key.subtype())? {
+                rrsets.push(rrset);
+            }
+        }
+        Ok(rrsets)
+    }
+
     /// Полностью заменяет дерево зоны bulk-загрузкой (без COW на каждый
     /// `RRset`).
     ///

@@ -3018,7 +3018,7 @@ impl ZoneTree {
         Ok(items)
     }
 
-    fn collect_owner_keys<P: PageIo + ?Sized>(
+    pub(crate) fn collect_owner_keys<P: PageIo + ?Sized>(
         &self,
         io: &P,
         txn: u64,

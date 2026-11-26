@@ -145,7 +145,16 @@ impl<'a> Decoder<'a> {
                     }
                     edns = Some(self.parse_opt(class, ttl_raw, position, rdata_end)?);
                 } else {
-                    let rdata = self.parse_rdata(rr_type, position, rdata_end)?;
+                    // DNS UPDATE (RFC 2136 §2.4/§2.5): в Prerequisite/Update
+                    // секциях классы ANY/NONE с RDLENGTH=0 несут метазначение,
+                    // а не RDATA конкретного типа. Обычный парсер отверг бы
+                    // пустую RDATA для A/NS/SOA и т.п., поэтому запись
+                    // сохраняется как пустой `Unknown` без разбора полей.
+                    let rdata = if rdlength == 0 && matches!(class, Rclass::ANY | Rclass::NONE) {
+                        Rdata::empty_metavalue(rr_type)
+                    } else {
+                        self.parse_rdata(rr_type, position, rdata_end)?
+                    };
                     let record = Record::from_parts_unchecked(
                         owner,
                         rr_type,

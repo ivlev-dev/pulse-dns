@@ -317,6 +317,9 @@ impl Server {
                         text.push_str(&crate::metrics::render_response_cache(
                             &admin.response_cache_metrics(),
                         ));
+                        text.push_str(&crate::metrics::render_update_metrics(
+                            &admin.update_metrics(),
+                        ));
                         text
                     })
                 };
@@ -512,6 +515,9 @@ impl Server {
         let mut text = self.metrics.render();
         text.push_str(&crate::metrics::render_response_cache(
             &self.admin.response_cache_metrics(),
+        ));
+        text.push_str(&crate::metrics::render_update_metrics(
+            &self.admin.update_metrics(),
         ));
         text
     }

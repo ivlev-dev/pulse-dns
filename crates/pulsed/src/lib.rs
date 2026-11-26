@@ -29,6 +29,8 @@
 //! - `dnssec` — загрузка ключей и DNSSEC-подпись зон в zonefile.
 //! - [`rotation`] — RFC 7583 ротация KSK/ZSK с персистентным состоянием.
 //! - `transfer` — AXFR/IXFR-out из zonefile, TSIG/ACL, IXFR-история и NOTIFY.
+//! - `update` — RFC 2136 DNS UPDATE: TSIG/ACL/allowlist, atomic writer, SOA
+//!   serial и NOTIFY-out после изменения.
 //! - `tls` — DoT/DoH/1.1/DoH/2/DoH/3/DoQ-серверы и hot-reload сертификата.
 //! - `dnscrypt` — DNSCrypt UDP, загрузка ключей и `dnscrypt-gencert`.
 //! - [`server`] — запуск и остановка DNS/API.
@@ -71,6 +73,7 @@ mod tcp;
 mod tls;
 mod transfer;
 mod udp;
+mod update;
 mod zonefile;
 
 pub mod config;

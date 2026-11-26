@@ -17,6 +17,8 @@
 //!   `DO`/`CD`/`RD`, EDNS payload и транспорту; значение с `ID = 0`, при выдаче
 //!   патчатся два байта `ID`, `TTL` не декрементируются.
 //! - [`dnssec`] — подпись зоны (DNSKEY/NSEC/RRSIG) и NSEC-цепочка.
+//! - [`update`] — движок DNS UPDATE (RFC 2136): prerequisites, add/delete
+//!   RR/RRset/name, CNAME/apex-инварианты и SOA serial.
 //! - `testkit` — in-memory зона (feature `testkit`, включена по умолчанию).
 //!
 //! # Политики
@@ -60,9 +62,9 @@
 //!   класса зоны (кроме `QCLASS = ANY`), и зона не в `Serving` — тоже
 //!   `REFUSED`.
 //! - **Трансферы** — `AXFR`/`IXFR`/`TSIG`/`TKEY`/`OPT` в `QTYPE` получают
-//!   `NOTIMP`: транспорт и zone transfer вне этого этапа; динамические
-//!   обновления (`UPDATE`) и `NOTIFY` — тоже `NOTIMP` до реализации
-//!   репликации.
+//!   `NOTIMP`: транспорт и zone transfer вне этого этапа. `NOTIFY` и
+//!   `UPDATE` перехватываются транспортом `pulsed` до `QueryEngine`; сам
+//!   движок запросов на любой opcode, кроме `QUERY`, отвечает `NOTIMP`.
 //!
 //! # Пример
 //!
@@ -116,6 +118,7 @@ pub mod dnssec;
 pub mod domain;
 #[cfg(feature = "testkit")]
 pub mod testkit;
+pub mod update;
 
 pub use application::{
     CachedOutcome, DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES, DEFAULT_SHARDS, EncodedResponse,
@@ -126,3 +129,4 @@ pub use application::{
 pub use domain::{
     DenialKind, LookupOutcome, LookupOutcomeRef, RdataRef, Rdatas, RefLookup, RrsetRef, ZoneState,
 };
+pub use update::{UpdateOutcome, UpdateTarget, apply_update, is_managed_type};

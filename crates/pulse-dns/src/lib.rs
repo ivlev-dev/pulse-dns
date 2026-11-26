@@ -9,6 +9,7 @@
 //!
 //! - [`domain`] — `Name`, `Rtype`, `Rclass`, `Ttl`, `Serial`, `Rdata`,
 //!   `Record`, `Rrset`, `Question`, `Message`.
+//! - [`update`] — разбор/валидация DNS UPDATE (RFC 2136) и ответ.
 //! - [`wire`] — кодирование/декодирование пакетов, EDNS0 (OPT) и лимиты.
 //! - [`canonical`] — каноническая форма для DNSSEC (RFC 4034 §6).
 //!
@@ -48,6 +49,7 @@
 
 pub mod canonical;
 pub mod domain;
+pub mod update;
 pub mod wire;
 
 pub use domain::{
@@ -56,6 +58,10 @@ pub use domain::{
     NameRef, Nsec3Data, Nsec3ParamData, NsecData, Opcode, Question, Rclass, Rcode, Rdata,
     RdataError, Record, RecordError, RrType, Rrset, RrsetError, RrsigData, Rtype, Serial, SoaData,
     SvcParam, SvcbData, TTL_MAX, TlsaData, Ttl, TtlError, TxtData, TypeBitmap, name_cmp,
+};
+pub use update::{
+    MAX_UPDATE_RECORDS, Prerequisite, UpdateError, UpdateOp, UpdateRequest, UpdateResponse,
+    error_response, is_query_meta_type,
 };
 pub use wire::{
     Checkpoint, DecodeError, DecodeLimits, EDNS_DEFAULT_PAYLOAD, EDNS_MAX_PAYLOAD, EdnsRef,

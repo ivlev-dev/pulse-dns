@@ -457,10 +457,15 @@ impl DnscryptService {
         let serial = certificate.serial();
         let valid_until = certificate.ts_end();
 
-        let handler = move |packet: &[u8], _peer: SocketAddr, out: &mut [u8]| -> Reply {
+        let handler = move |packet: &[u8], peer: SocketAddr, out: &mut [u8]| -> Reply {
             metrics.dnscrypt_packet();
             let engine = admin.engine();
             let inner = |query: &[u8]| -> Result<Vec<u8>, NoResponse> {
+                if let Some(response) =
+                    admin.handle_dns_update(query, peer.ip(), crate::transfer::now_unix())
+                {
+                    return Ok(response);
+                }
                 dns::respond(query, Transport::Udp, &engine, &stats).ok_or(NoResponse)
             };
             let Ok(response) = dnscrypt.handle_udp(packet, &inner) else {
@@ -844,6 +849,7 @@ fn handle_tcp_connection(
     stream.set_read_timeout(Some(idle_timeout))?;
     stream.set_write_timeout(Some(idle_timeout))?;
     stream.set_nodelay(true)?;
+    let source = stream.peer_addr().ok().map(|peer| peer.ip());
     loop {
         if shutdown.load(Ordering::Acquire) {
             return Ok(());
@@ -853,6 +859,12 @@ fn handle_tcp_connection(
         };
         let engine = admin.engine();
         let handler = |query: &[u8]| -> Result<Vec<u8>, NoResponse> {
+            if let Some(source) = source
+                && let Some(response) =
+                    admin.handle_dns_update(query, source, crate::transfer::now_unix())
+            {
+                return Ok(response);
+            }
             dns::respond(query, Transport::Tcp, &engine, stats).ok_or(NoResponse)
         };
         let response = match dnscrypt.handle_tcp_frame(&frame, &handler) {
