@@ -206,7 +206,39 @@ fn check_validity_window(rrsig: &RrsigData, now: u32) -> Result<(), VerifyError>
     Ok(())
 }
 
-fn verify_raw(
+/// Проверяет «сырую» подпись сообщения публичным DNSKEY.
+///
+/// Используется SIG(0) (RFC 2931), где подписывается не RRset, а сообщение
+/// целиком. Проверяются политика алгоритма, протокол/алгоритм ключа и сама
+/// подпись; формат `message` задаёт вызывающий.
+///
+/// # Errors
+///
+/// [`VerifyError`] при недопустимом алгоритме, ключе или подписи.
+pub fn verify_message_signature(
+    algorithm: crate::algorithm::Algorithm,
+    dnskey: &DnskeyData,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), VerifyError> {
+    if !algorithm.is_verify_supported() {
+        return Err(VerifyError::AlgorithmNotAllowed { algorithm });
+    }
+    if dnskey.protocol() != 3 {
+        return Err(VerifyError::DnskeyProtocol {
+            protocol: dnskey.protocol(),
+        });
+    }
+    if dnskey.algorithm() != algorithm.as_u8() {
+        return Err(VerifyError::AlgorithmMismatch {
+            rrsig: algorithm.as_u8(),
+            dnskey: dnskey.algorithm(),
+        });
+    }
+    verify_raw(algorithm, dnskey, message, signature)
+}
+
+pub(crate) fn verify_raw(
     algorithm: crate::algorithm::Algorithm,
     dnskey: &DnskeyData,
     message: &[u8],

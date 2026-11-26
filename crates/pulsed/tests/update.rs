@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use pulse_dns::{
     DecodeLimits, EncodeOptions, Flags, Message, Name, Opcode, Question, Rclass, Rcode, Rdata,
     Record, Rtype, Ttl,
@@ -696,6 +697,381 @@ fn prerequisite_yxdomain_and_yxrrset() {
     unknown_zone.add_question(Question::new(name("unknown.test."), Rtype::SOA, Rclass::IN));
     let (response, _) = send_udp(udp, &unknown_zone, None);
     assert_eq!(response.rcode(), Rcode::NOTAUTH);
+
+    server.shutdown().expect("shutdown");
+}
+
+fn policy_rule(
+    principal: pulsed::config::UpdatePrincipal,
+    name: pulsed::config::UpdateName,
+    types: pulsed::config::UpdateTypes,
+    action: pulsed::config::UpdateAction,
+) -> pulsed::config::UpdatePolicyRule {
+    pulsed::config::UpdatePolicyRule {
+        principal,
+        zone: pulsed::config::UpdateName::Exact(ORIGIN.to_owned()),
+        name,
+        types,
+        action,
+    }
+}
+
+fn signed_add(owner: &str, rr_type: Rtype, rdata: Rdata) -> Message {
+    let mut message = update_message(70);
+    add_record(&mut message, owner, rr_type, 300, rdata);
+    message
+}
+
+#[test]
+fn per_name_policy_checks_principal_name_and_type() {
+    let (_zone, mut server) = start(|config| {
+        config.update.require_tsig = true;
+        config.tsig_keys.push(tsig_config());
+        config.update.policy = vec![policy_rule(
+            pulsed::config::UpdatePrincipal::TsigKey(KEY_NAME.to_owned()),
+            pulsed::config::UpdateName::Exact("host.example.com.".to_owned()),
+            pulsed::config::UpdateTypes::List(vec!["A".to_owned()]),
+            pulsed::config::UpdateAction::Grant,
+        )];
+    });
+    let udp = server.udp_addr().expect("udp");
+    let key = key();
+
+    // Разрешено: тот principal, имя и тип.
+    let response = send_udp(
+        udp,
+        &signed_add(
+            "host.example.com",
+            Rtype::A,
+            Rdata::A("192.0.2.80".parse().unwrap()),
+        ),
+        Some(&key),
+    )
+    .0;
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+
+    // Другой тип — REFUSED (политика непустая, правило не совпало).
+    let response = send_udp(
+        udp,
+        &signed_add(
+            "host.example.com",
+            Rtype::AAAA,
+            Rdata::Aaaa("2001:db8::80".parse().unwrap()),
+        ),
+        Some(&key),
+    )
+    .0;
+    assert_eq!(response.rcode(), Rcode::REFUSED);
+
+    // Другое имя — REFUSED.
+    let response = send_udp(
+        udp,
+        &signed_add(
+            "other.example.com",
+            Rtype::A,
+            Rdata::A("192.0.2.81".parse().unwrap()),
+        ),
+        Some(&key),
+    )
+    .0;
+    assert_eq!(response.rcode(), Rcode::REFUSED);
+
+    // Без TSIG при require_tsig — NOTAUTH до политики.
+    let response = send_udp(
+        udp,
+        &signed_add(
+            "host.example.com",
+            Rtype::A,
+            Rdata::A("192.0.2.82".parse().unwrap()),
+        ),
+        None,
+    )
+    .0;
+    assert_eq!(response.rcode(), Rcode::NOTAUTH);
+
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn per_name_policy_wildcard_and_first_match_deny() {
+    let (_zone, mut server) = start(|config| {
+        config.update.require_tsig = false;
+        config.update.policy = vec![
+            policy_rule(
+                pulsed::config::UpdatePrincipal::Any,
+                pulsed::config::UpdateName::Exact("blocked.example.com.".to_owned()),
+                pulsed::config::UpdateTypes::List(vec!["A".to_owned()]),
+                pulsed::config::UpdateAction::Deny,
+            ),
+            policy_rule(
+                pulsed::config::UpdatePrincipal::Any,
+                pulsed::config::UpdateName::Wildcard("*.example.com.".to_owned()),
+                pulsed::config::UpdateTypes::Any,
+                pulsed::config::UpdateAction::Grant,
+            ),
+        ];
+    });
+    let udp = server.udp_addr().expect("udp");
+
+    // Первое совпадение — deny для blocked/A.
+    let response = send_udp(
+        udp,
+        &signed_add(
+            "blocked.example.com",
+            Rtype::A,
+            Rdata::A("192.0.2.90".parse().unwrap()),
+        ),
+        None,
+    )
+    .0;
+    assert_eq!(response.rcode(), Rcode::REFUSED);
+
+    // Другой тип того же имени проходит по wildcard-правилу.
+    let response = send_udp(
+        udp,
+        &signed_add(
+            "blocked.example.com",
+            Rtype::AAAA,
+            Rdata::Aaaa("2001:db8::90".parse().unwrap()),
+        ),
+        None,
+    )
+    .0;
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+
+    // Поддомен проходит, apex — нет (wildcard не совпадает с suffix).
+    let response = send_udp(
+        udp,
+        &signed_add(
+            "sub.blocked.example.com",
+            Rtype::A,
+            Rdata::A("192.0.2.91".parse().unwrap()),
+        ),
+        None,
+    )
+    .0;
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    let response = send_udp(
+        udp,
+        &signed_add(ORIGIN, Rtype::A, Rdata::A("192.0.2.92".parse().unwrap())),
+        None,
+    )
+    .0;
+    assert_eq!(response.rcode(), Rcode::REFUSED);
+
+    server.shutdown().expect("shutdown");
+}
+
+const SIG0_PRINCIPAL: &str = "host.example.com.";
+
+struct Sig0Fixture {
+    _directory: tempfile::TempDir,
+    key: pulse_dnssec::PrivateKey,
+    dnskey: pulse_dns::DnskeyData,
+    config: pulsed::config::Sig0KeyConfig,
+}
+
+fn sig0_fixture() -> Sig0Fixture {
+    use pulse_dnssec::{Algorithm, NoopAudit, PrivateKey, key_tag, write_key_pair};
+    let directory = tempfile::tempdir().expect("tempdir");
+    let key = PrivateKey::generate(Algorithm::ED25519).expect("key");
+    let dnskey = key.dnskey(256).expect("dnskey");
+    let key_dir = directory.path().join("keys");
+    pulse_dnssec::ensure_private_directory(&key_dir).expect("key dir");
+    let paths =
+        write_key_pair(&key_dir, &name("example.com."), &key, 256, &NoopAudit).expect("write key");
+    let public_key = base64::engine::general_purpose::STANDARD.encode(dnskey.public_key());
+    let tag = key_tag(&dnskey);
+    Sig0Fixture {
+        _directory: directory,
+        key,
+        dnskey,
+        config: pulsed::config::Sig0KeyConfig {
+            name: SIG0_PRINCIPAL.to_owned(),
+            algorithm: "ed25519".to_owned(),
+            public_key,
+            key_tag: Some(tag),
+            private_key: Some(paths.private),
+        },
+    }
+}
+
+fn sig0_request(
+    message: &Message,
+    fixture: &Sig0Fixture,
+    inception: u32,
+    expiration: u32,
+) -> Vec<u8> {
+    use pulse_dnssec::key_tag;
+    use pulse_dnssec::sig0::Sig0Signature;
+    let base = message
+        .encode(&EncodeOptions::compressed())
+        .expect("encode");
+    let mut signature = Sig0Signature::new(
+        fixture.dnskey.algorithm(),
+        0,
+        expiration,
+        inception,
+        key_tag(&fixture.dnskey),
+        name(SIG0_PRINCIPAL),
+    );
+    let mut data = signature.rdata_without_signature();
+    data.extend_from_slice(&base);
+    signature.signature = fixture.key.sign_message(&data).expect("sign");
+    let mut signed = message.clone();
+    signed.add_additional(signature.to_record().expect("record"));
+    signed
+        .encode(&EncodeOptions::compressed())
+        .expect("encode signed")
+}
+
+fn send_raw_udp(address: SocketAddr, raw: &[u8]) -> Vec<u8> {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("client");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    common::udp_send_to(&socket, raw, address).expect("send");
+    let mut buffer = vec![0_u8; 65_535];
+    let (length, _) = common::udp_recv_from(&socket, &mut buffer).expect("response");
+    buffer.get(..length).expect("len").to_vec()
+}
+
+fn send_raw_tcp(address: SocketAddr, raw: &[u8]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let length = u16::try_from(raw.len()).expect("length");
+    stream.write_all(&length.to_be_bytes()).expect("prefix");
+    stream.write_all(raw).expect("write");
+    let mut prefix = [0_u8; 2];
+    stream.read_exact(&mut prefix).expect("read prefix");
+    let length = usize::from(u16::from_be_bytes(prefix));
+    let mut buffer = vec![0_u8; length];
+    stream.read_exact(&mut buffer).expect("read response");
+    buffer
+}
+
+fn decode(raw: &[u8]) -> Message {
+    Message::decode(raw, &DecodeLimits::default()).expect("decode")
+}
+
+#[test]
+fn sig0_valid_udp_tcp_and_signed_response() {
+    let fixture = sig0_fixture();
+    let (_zone, mut server) = start(|config| {
+        config.update.require_tsig = true;
+        config.update.sig0_keys.push(fixture.config.clone());
+        config.update.policy = vec![policy_rule(
+            pulsed::config::UpdatePrincipal::Sig0Key(SIG0_PRINCIPAL.to_owned()),
+            pulsed::config::UpdateName::Exact("sig0.example.com.".to_owned()),
+            pulsed::config::UpdateTypes::List(vec!["A".to_owned()]),
+            pulsed::config::UpdateAction::Grant,
+        )];
+    });
+    let now = now();
+    let now32 = u32::try_from(now).expect("now");
+    let message = signed_add(
+        "sig0.example.com",
+        Rtype::A,
+        Rdata::A("192.0.2.100".parse().unwrap()),
+    );
+    let raw = sig0_request(&message, &fixture, now32 - 5, now32 + 300);
+
+    let response_raw = send_raw_udp(server.udp_addr().expect("udp"), &raw);
+    let response = decode(&response_raw);
+    assert_eq!(response.rcode(), Rcode::NOERROR);
+    pulse_dnssec::verify_sig0_response(&raw, &response_raw, &fixture.dnskey, now32, 600)
+        .expect("signed response");
+
+    // Повтор того же запроса — replay.
+    let replay = decode(&send_raw_udp(server.udp_addr().expect("udp"), &raw));
+    assert_eq!(replay.rcode(), Rcode::NOTAUTH);
+
+    // TCP с тем же ключом (новый запрос, чтобы не попасть в replay).
+    let message = signed_add(
+        "sig0.example.com",
+        Rtype::A,
+        Rdata::A("192.0.2.101".parse().unwrap()),
+    );
+    let raw = sig0_request(&message, &fixture, now32 - 5, now32 + 300);
+    let response_raw = send_raw_tcp(server.tcp_addr().expect("tcp"), &raw);
+    assert_eq!(decode(&response_raw).rcode(), Rcode::NOERROR);
+    pulse_dnssec::verify_sig0_response(&raw, &response_raw, &fixture.dnskey, now32, 600)
+        .expect("signed TCP response");
+
+    // Политика по SIG(0)-principal: другое имя запрещено.
+    let message = signed_add(
+        "other.example.com",
+        Rtype::A,
+        Rdata::A("192.0.2.102".parse().unwrap()),
+    );
+    let raw = sig0_request(&message, &fixture, now32 - 5, now32 + 300);
+    assert_eq!(
+        decode(&send_raw_udp(server.udp_addr().expect("udp"), &raw)).rcode(),
+        Rcode::REFUSED
+    );
+
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn sig0_rejects_bad_signature_time_and_unknown_key() {
+    let fixture = sig0_fixture();
+    let (_zone, mut server) = start(|config| {
+        config.update.require_tsig = true;
+        config.update.sig0_keys.push(fixture.config.clone());
+    });
+    let now = now();
+    let now32 = u32::try_from(now).expect("now");
+    let udp = server.udp_addr().expect("udp");
+
+    // Неверная подпись.
+    let message = signed_add(
+        "sig0.example.com",
+        Rtype::A,
+        Rdata::A("192.0.2.110".parse().unwrap()),
+    );
+    let mut raw = sig0_request(&message, &fixture, now32 - 5, now32 + 300);
+    let last = raw.last_mut().expect("signature byte");
+    *last ^= 0xFF;
+    assert_eq!(decode(&send_raw_udp(udp, &raw)).rcode(), Rcode::NOTAUTH);
+
+    // Просроченная подпись.
+    let message = signed_add(
+        "sig0.example.com",
+        Rtype::A,
+        Rdata::A("192.0.2.111".parse().unwrap()),
+    );
+    let raw = sig0_request(&message, &fixture, now32 - 900, now32 - 600);
+    assert_eq!(decode(&send_raw_udp(udp, &raw)).rcode(), Rcode::NOTAUTH);
+
+    // Неизвестный ключ с тем же principal.
+    let other = pulse_dnssec::PrivateKey::generate(pulse_dnssec::Algorithm::ED25519).expect("key");
+    let other_dnskey = other.dnskey(256).expect("dnskey");
+    let message = signed_add(
+        "sig0.example.com",
+        Rtype::A,
+        Rdata::A("192.0.2.112".parse().unwrap()),
+    );
+    let base = message
+        .encode(&EncodeOptions::compressed())
+        .expect("encode");
+    let mut signature = pulse_dnssec::sig0::Sig0Signature::new(
+        other_dnskey.algorithm(),
+        0,
+        now32 + 300,
+        now32 - 5,
+        pulse_dnssec::key_tag(&other_dnskey),
+        name(SIG0_PRINCIPAL),
+    );
+    let mut data = signature.rdata_without_signature();
+    data.extend_from_slice(&base);
+    signature.signature = other.sign_message(&data).expect("sign");
+    let mut signed = message.clone();
+    signed.add_additional(signature.to_record().expect("record"));
+    let raw = signed.encode(&EncodeOptions::compressed()).expect("encode");
+    assert_eq!(decode(&send_raw_udp(udp, &raw)).rcode(), Rcode::NOTAUTH);
 
     server.shutdown().expect("shutdown");
 }

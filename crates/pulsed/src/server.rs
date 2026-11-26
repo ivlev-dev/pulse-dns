@@ -576,6 +576,15 @@ impl Server {
         self.admin.secondary_last_error(origin)
     }
 
+    /// Перечитывает state-файл управляемых TSIG-ключей (SIGHUP).
+    ///
+    /// # Errors
+    ///
+    /// Строка с причиной: ошибка чтения/разбора/прав state-файла.
+    pub fn reload_tsig_keys(&self) -> Result<usize, String> {
+        self.admin.reload_tsig_keys()
+    }
+
     /// Останавливает API, транспорты и дожидается завершения потоков.
     ///
     /// API останавливается первым, чтобы во время shutdown не появлялись новые

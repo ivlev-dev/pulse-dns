@@ -115,6 +115,7 @@
 
 pub mod application;
 pub mod dnssec;
+pub mod dnssec_incremental;
 pub mod domain;
 #[cfg(feature = "testkit")]
 pub mod testkit;

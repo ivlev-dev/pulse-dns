@@ -57,8 +57,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use pulse_dns::{
-    DnskeyData, Name, Nsec3Data, Nsec3ParamData, NsecData, Rclass, Rdata, Rrset, Rtype, Ttl,
-    TtlError, TypeBitmap,
+    DnskeyData, Name, Nsec3Data, Nsec3ParamData, NsecData, Rclass, Rdata, Rrset, RrsigData, Rtype,
+    Ttl, TtlError, TypeBitmap,
 };
 use pulse_dnssec::denial::{MAX_NSEC3_ITERATIONS, nsec3_owner_name};
 use pulse_dnssec::rdata_util::nsec3_hash;
@@ -448,6 +448,41 @@ impl ZoneSigner {
     ) -> Result<SignedZone, SignZoneError> {
         sign_zone_with(origin, rrsets, self, now, denial)
     }
+
+    /// Подписывает один RRset данных текущими ZSK/CSK.
+    ///
+    /// Используется инкрементальной переподписью после DNS UPDATE: меняется
+    /// только затронутый набор, остальные `RRSIG` зоны сохраняются.
+    ///
+    /// # Errors
+    ///
+    /// [`SignZoneError::Sign`] при ошибке ключа/подписи.
+    pub fn sign_data_rrset(
+        &self,
+        origin: &Name,
+        rrset: &Rrset,
+        now: u32,
+    ) -> Result<Vec<RrsigData>, SignZoneError> {
+        let mut signatures = Vec::with_capacity(self.data_signers.len());
+        for index in &self.data_signers {
+            let Some(key) = self.keys.get(*index) else {
+                continue;
+            };
+            let options = SignOptions::new(origin.clone(), now, self.validity)
+                .with_skew(self.inception_skew)
+                .with_original_ttl(rrset.ttl().as_u32())
+                .with_dnskey_flags(key.flags());
+            let signature =
+                sign_rrset(&key.key, rrset, &options).map_err(|error| SignZoneError::Sign {
+                    zone: origin.clone(),
+                    owner: rrset.owner().clone(),
+                    rr_type: rrset.rr_type(),
+                    source: error,
+                })?;
+            signatures.push(signature);
+        }
+        Ok(signatures)
+    }
 }
 
 /// Результат подписи зоны.
@@ -559,6 +594,24 @@ pub enum SignZoneError {
         /// Причина.
         #[source]
         source: SignError,
+    },
+    /// Ошибка чтения/записи транзакционного порта.
+    #[error("zone {zone}: {reason}")]
+    Edit {
+        /// Origin зоны.
+        zone: Name,
+        /// Причина.
+        reason: String,
+    },
+    /// Коллизия SHA-1 хешей NSEC3 у разных имён.
+    #[error("zone {zone}: NSEC3 hash collision for {first} and {second}")]
+    Nsec3Collision {
+        /// Origin зоны.
+        zone: Name,
+        /// Первое имя.
+        first: Name,
+        /// Второе имя.
+        second: Name,
     },
 }
 

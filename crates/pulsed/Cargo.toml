@@ -67,5 +67,9 @@ harness = false
 name = "response_cache"
 harness = false
 
+[[bench]]
+name = "update_signed"
+harness = false
+
 [lints]
 workspace = true

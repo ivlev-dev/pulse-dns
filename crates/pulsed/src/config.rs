@@ -541,7 +541,7 @@ impl TransferSettings {
 pub struct UpdateSettings {
     /// Обслуживать opcode UPDATE.
     pub enabled: bool,
-    /// Требовать валидный TSIG; `false` допустим только для доверенной сети.
+    /// Требовать аутентификацию запроса: валидный TSIG **или** SIG(0).
     pub require_tsig: bool,
     /// IP/CIDR allowlist источника (`"192.0.2.0/24"`, `"::1/128"`, `"10.0.0.1"`).
     pub allow_from: Vec<String>,
@@ -549,6 +549,20 @@ pub struct UpdateSettings {
     pub allow_zones: Vec<String>,
     /// Имена ключей из глобальной секции `tsig_keys`; пусто — любой ключ.
     pub tsig_keys: Vec<String>,
+    /// Per-name правила; пусто — действует только грубый ACL выше.
+    ///
+    /// Правила проверяются по порядку, побеждает **первое совпавшее**.
+    /// `deny` не имеет автоматического приоритета над `grant`.
+    pub policy: Vec<UpdatePolicyRule>,
+    /// Доверенные SIG(0)-ключи.
+    #[serde(default)]
+    pub sig0_keys: Vec<Sig0KeyConfig>,
+    /// Максимальная ширина окна inception..expiration SIG(0), секунды.
+    pub sig0_max_validity: u32,
+    /// Допустимое расхождение часов для ответной подписи (inception назад).
+    pub sig0_inception_skew: u32,
+    /// Срок действия ответной SIG(0)-подписи, секунды.
+    pub sig0_response_validity: u32,
 }
 
 impl Default for UpdateSettings {
@@ -559,8 +573,406 @@ impl Default for UpdateSettings {
             allow_from: Vec::new(),
             allow_zones: Vec::new(),
             tsig_keys: Vec::new(),
+            policy: Vec::new(),
+            sig0_keys: Vec::new(),
+            sig0_max_validity: 600,
+            sig0_inception_skew: 300,
+            sig0_response_validity: 300,
         }
     }
+}
+
+/// Действие правила [`UpdatePolicyRule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateAction {
+    /// Разрешить обновление.
+    Grant,
+    /// Запретить обновление.
+    Deny,
+}
+
+/// Principal правила UPDATE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdatePrincipal {
+    /// Любой запрос (включая неаутентифицированный).
+    Any,
+    /// Конкретный TSIG-ключ (имя из `tsig_keys` или управляемого хранилища).
+    TsigKey(String),
+    /// Конкретный SIG(0)-principal (имя из `sig0_keys`).
+    Sig0Key(String),
+    /// Источник из подсети/CIDR.
+    Subnet(String),
+}
+
+impl UpdatePrincipal {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Any => Ok(()),
+            Self::TsigKey(name) | Self::Sig0Key(name) => {
+                let parsed = Name::parse(name.trim())
+                    .map_err(|error| format!("invalid principal name {name:?}: {error}"))?;
+                if parsed == Name::root() || parsed.labels().any(|label| label == b"*") {
+                    return Err(format!(
+                        "principal {name:?} must be a non-root name without wildcards"
+                    ));
+                }
+                Ok(())
+            }
+            Self::Subnet(cidr) => {
+                validate_cidr(cidr).map_err(|reason| format!("invalid subnet {cidr:?}: {reason}"))
+            }
+        }
+    }
+}
+
+impl Serialize for UpdatePrincipal {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Any => map.serialize_entry("any", &true)?,
+            Self::TsigKey(name) => map.serialize_entry("tsig_key", name)?,
+            Self::Sig0Key(name) => map.serialize_entry("sig0_key", name)?,
+            Self::Subnet(cidr) => map.serialize_entry("subnet", cidr)?,
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for UpdatePrincipal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Text(String),
+            Map(MapRepr),
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct MapRepr {
+            #[serde(default)]
+            tsig_key: Option<String>,
+            #[serde(default)]
+            sig0_key: Option<String>,
+            #[serde(default)]
+            subnet: Option<String>,
+            #[serde(default)]
+            any: Option<bool>,
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Text(text) if text.eq_ignore_ascii_case("any") => Ok(Self::Any),
+            Repr::Text(text) => Err(D::Error::custom(format!(
+                "principal must be \"any\" or a map, got {text:?}"
+            ))),
+            Repr::Map(map) => {
+                let mut values = Vec::new();
+                if let Some(value) = map.tsig_key {
+                    values.push(Self::TsigKey(value));
+                }
+                if let Some(value) = map.sig0_key {
+                    values.push(Self::Sig0Key(value));
+                }
+                if let Some(value) = map.subnet {
+                    values.push(Self::Subnet(value));
+                }
+                if map.any == Some(true) {
+                    values.push(Self::Any);
+                }
+                match values.len() {
+                    1 => Ok(values.remove(0)),
+                    _ => Err(D::Error::custom(
+                        "principal must set exactly one of tsig_key, sig0_key, subnet, any",
+                    )),
+                }
+            }
+        }
+    }
+}
+
+/// Сопоставление имени в правиле UPDATE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateName {
+    /// Любое имя.
+    Any,
+    /// Точное совпадение.
+    Exact(String),
+    /// Имя и все его поддомены.
+    Suffix(String),
+    /// Поддомены под `*.suffix` (сам suffix не совпадает).
+    Wildcard(String),
+}
+
+impl UpdateName {
+    fn validate(&self, field: &str) -> Result<(), String> {
+        match self {
+            Self::Any => Ok(()),
+            Self::Exact(name) | Self::Suffix(name) => {
+                let parsed = Name::parse(name.trim())
+                    .map_err(|error| format!("{field}: invalid name {name:?}: {error}"))?;
+                if parsed == Name::root() {
+                    return Err(format!("{field}: name must not be root"));
+                }
+                Ok(())
+            }
+            Self::Wildcard(name) => {
+                let parsed = Name::parse(name.trim())
+                    .map_err(|error| format!("{field}: invalid name {name:?}: {error}"))?;
+                if !parsed.is_wildcard_owner() {
+                    return Err(format!(
+                        "{field}: wildcard {name:?} must start with '*.' and have one '*' label"
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Serialize for UpdateName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            Self::Any => serializer.serialize_str("any"),
+            Self::Exact(name) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("exact", name)?;
+                map.end()
+            }
+            Self::Suffix(name) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("suffix", name)?;
+                map.end()
+            }
+            Self::Wildcard(name) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("wildcard", name)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UpdateName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Text(String),
+            Map(MapRepr),
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct MapRepr {
+            #[serde(default)]
+            exact: Option<String>,
+            #[serde(default)]
+            suffix: Option<String>,
+            #[serde(default)]
+            wildcard: Option<String>,
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Text(text) if text.eq_ignore_ascii_case("any") => Ok(Self::Any),
+            Repr::Text(text) => Err(D::Error::custom(format!(
+                "name must be \"any\" or a map, got {text:?}"
+            ))),
+            Repr::Map(map) => {
+                let mut values = Vec::new();
+                if let Some(value) = map.exact {
+                    values.push(Self::Exact(value));
+                }
+                if let Some(value) = map.suffix {
+                    values.push(Self::Suffix(value));
+                }
+                if let Some(value) = map.wildcard {
+                    values.push(Self::Wildcard(value));
+                }
+                match values.len() {
+                    1 => Ok(values.remove(0)),
+                    _ => Err(D::Error::custom(
+                        "name must set exactly one of exact, suffix, wildcard",
+                    )),
+                }
+            }
+        }
+    }
+}
+
+/// Типы записей в правиле UPDATE: `"any"` или список мнемоник.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateTypes {
+    /// Любой тип.
+    Any,
+    /// Перечисленные типы.
+    List(Vec<String>),
+}
+
+impl UpdateTypes {
+    fn validate(&self) -> Result<(), String> {
+        if let Self::List(types) = self {
+            if types.is_empty() {
+                return Err("types must not be empty; use \"any\"".to_owned());
+            }
+            for rr_type in types {
+                parse_update_rtype(rr_type)
+                    .ok_or_else(|| format!("types: unknown record type {rr_type:?}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for UpdateTypes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Any => serializer.serialize_str("any"),
+            Self::List(types) => types.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UpdateTypes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Text(String),
+            List(Vec<String>),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Text(text) if text.eq_ignore_ascii_case("any") => Ok(Self::Any),
+            Repr::Text(text) => Err(D::Error::custom(format!(
+                "types must be \"any\" or a list, got {text:?}"
+            ))),
+            Repr::List(list) => Ok(Self::List(list)),
+        }
+    }
+}
+
+/// Одно правило per-name политики UPDATE.
+///
+/// Правила проверяются по порядку, побеждает первое совпавшее. При непустом
+/// `update.policy` операция без совпавшего `grant` запрещена. `deny` не имеет
+/// автоматического приоритета: чтобы запрет сработал раньше, он должен стоять
+/// выше. `DeleteName` (`CLASS=ANY`, `TYPE=ANY`) затрагивает все типы, поэтому
+/// совпадает только с правилом `types = "any"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePolicyRule {
+    /// Кто выполняет обновление.
+    pub principal: UpdatePrincipal,
+    /// Зона: точное имя или `"any"`.
+    pub zone: UpdateName,
+    /// Имя записи внутри зоны.
+    pub name: UpdateName,
+    /// Типы записей.
+    #[serde(default = "UpdateTypes::any")]
+    pub types: UpdateTypes,
+    /// Разрешить или запретить.
+    pub action: UpdateAction,
+}
+
+impl UpdateTypes {
+    fn any() -> Self {
+        Self::Any
+    }
+}
+
+impl UpdatePolicyRule {
+    fn validate(&self, index: usize) -> Result<(), String> {
+        self.principal
+            .validate()
+            .map_err(|reason| format!("update.policy[{index}].principal: {reason}"))?;
+        match &self.zone {
+            UpdateName::Any => {}
+            UpdateName::Exact(zone) => {
+                let name = Name::parse(zone.trim()).map_err(|error| {
+                    format!("update.policy[{index}].zone: invalid name {zone:?}: {error}")
+                })?;
+                if name == Name::root() || name.labels().any(|label| label == b"*") {
+                    return Err(format!(
+                        "update.policy[{index}].zone: must be a non-root name without wildcards"
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "update.policy[{index}].zone: only exact name or \"any\" is allowed, got {other:?}"
+                ));
+            }
+        }
+        self.name
+            .validate(&format!("update.policy[{index}].name"))?;
+        self.types
+            .validate()
+            .map_err(|reason| format!("update.policy[{index}]: {reason}"))?;
+        Ok(())
+    }
+}
+
+/// Доверенный SIG(0)-ключ.
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sig0KeyConfig {
+    /// Principal name (signer).
+    pub name: String,
+    /// Алгоритм: `ed25519` (15), `ecdsa-p256` (13), `rsa-sha256` (8).
+    pub algorithm: String,
+    /// Публичный ключ DNSKEY в base64.
+    pub public_key: String,
+    /// Ожидаемый key tag; проверяется против DNSKEY.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_tag: Option<u16>,
+    /// PKCS#8/BIND private key для подписи ответов; без него ответ не подписывается.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<PathBuf>,
+}
+
+impl fmt::Debug for Sig0KeyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sig0KeyConfig")
+            .field("name", &self.name)
+            .field("algorithm", &self.algorithm)
+            .field("public_key", &"***")
+            .field("key_tag", &self.key_tag)
+            .field("private_key", &self.private_key)
+            .finish()
+    }
+}
+
+pub(crate) fn parse_update_rtype(value: &str) -> Option<pulse_dns::Rtype> {
+    let upper = value.trim().to_ascii_uppercase();
+    let known = match upper.as_str() {
+        "A" => pulse_dns::Rtype::A,
+        "AAAA" => pulse_dns::Rtype::AAAA,
+        "NS" => pulse_dns::Rtype::NS,
+        "CNAME" => pulse_dns::Rtype::CNAME,
+        "SOA" => pulse_dns::Rtype::SOA,
+        "PTR" => pulse_dns::Rtype::PTR,
+        "MX" => pulse_dns::Rtype::MX,
+        "TXT" => pulse_dns::Rtype::TXT,
+        "SRV" => pulse_dns::Rtype::SRV,
+        "CAA" => pulse_dns::Rtype::CAA,
+        "DNAME" => pulse_dns::Rtype::DNAME,
+        "DS" => pulse_dns::Rtype::DS,
+        "DNSKEY" => pulse_dns::Rtype::DNSKEY,
+        "RRSIG" => pulse_dns::Rtype::RRSIG,
+        "NSEC" => pulse_dns::Rtype::NSEC,
+        "NSEC3" => pulse_dns::Rtype::NSEC3,
+        "NSEC3PARAM" => pulse_dns::Rtype::NSEC3PARAM,
+        "TLSA" => pulse_dns::Rtype::TLSA,
+        "SVCB" => pulse_dns::Rtype::SVCB,
+        "HTTPS" => pulse_dns::Rtype::HTTPS,
+        "ANY" => pulse_dns::Rtype::ANY,
+        other => {
+            let number = other.strip_prefix("TYPE")?;
+            pulse_dns::Rtype::from_u16(number.parse().ok()?)
+        }
+    };
+    Some(known)
 }
 
 /// Политика UPDATE: то же, что [`UpdateSettings`], под именем из RFC 2136.
@@ -576,11 +988,67 @@ impl UpdateSettings {
     ///
     /// [`ConfigError::Invalid`] при некорректном CIDR/имени или ссылке на
     /// необъявленный ключ; включённый UPDATE без `zonefile` тоже ошибка.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self, key_names: &std::collections::HashSet<Name>) -> Result<(), ConfigError> {
-        if self.enabled && self.tsig_keys.is_empty() && key_names.is_empty() && self.require_tsig {
+        for (index, rule) in self.policy.iter().enumerate() {
+            rule.validate(index).map_err(ConfigError::Invalid)?;
+        }
+        let mut sig0 = std::collections::HashSet::with_capacity(self.sig0_keys.len());
+        for key in &self.sig0_keys {
+            let principal = Name::parse(key.name.trim()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "update.sig0_keys: invalid principal {:?}: {error}",
+                    key.name
+                ))
+            })?;
+            if principal == Name::root() || principal.labels().any(|label| label == b"*") {
+                return Err(ConfigError::Invalid(format!(
+                    "update.sig0_keys: principal {:?} must be a non-root name without wildcards",
+                    key.name
+                )));
+            }
+            if !sig0.insert(principal) {
+                return Err(ConfigError::Invalid(format!(
+                    "update.sig0_keys: duplicate principal {:?}",
+                    key.name
+                )));
+            }
+            sig0_algorithm(&key.algorithm)?;
+            STANDARD.decode(key.public_key.trim()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "update.sig0_keys: principal {:?} public_key is not base64: {error}",
+                    key.name
+                ))
+            })?;
+        }
+        if self.sig0_max_validity == 0 || self.sig0_max_validity > 86_400 {
             return Err(ConfigError::Invalid(
-                "update.require_tsig requires at least one key in tsig_keys".to_owned(),
+                "update.sig0_max_validity must be in 1..=86400".to_owned(),
             ));
+        }
+        if self.sig0_response_validity == 0 || self.sig0_response_validity > 86_400 {
+            return Err(ConfigError::Invalid(
+                "update.sig0_response_validity must be in 1..=86400".to_owned(),
+            ));
+        }
+        if self.sig0_inception_skew > 86_400 {
+            return Err(ConfigError::Invalid(
+                "update.sig0_inception_skew must be at most 86400".to_owned(),
+            ));
+        }
+        for (index, rule) in self.policy.iter().enumerate() {
+            if let UpdatePrincipal::Sig0Key(name) = &rule.principal {
+                let principal = Name::parse(name.trim()).map_err(|error| {
+                    ConfigError::Invalid(format!(
+                        "update.policy[{index}].principal: invalid name {name:?}: {error}"
+                    ))
+                })?;
+                if !sig0.contains(&principal) {
+                    return Err(ConfigError::Invalid(format!(
+                        "update.policy[{index}].principal: SIG(0) key {principal} is not declared in update.sig0_keys"
+                    )));
+                }
+            }
         }
         for cidr in &self.allow_from {
             validate_cidr(cidr).map_err(|reason| {
@@ -674,6 +1142,46 @@ pub fn parse_tsig_algorithm(value: &str) -> Result<TsigAlgorithm, ConfigError> {
         }
     };
     Ok(algorithm)
+}
+
+/// Разбирает алгоритм SIG(0)-ключа.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] для неподдерживаемого алгоритма.
+pub(crate) fn sig0_algorithm(value: &str) -> Result<Sig0Algorithm, ConfigError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "rsa-sha256" | "rsa" | "8" => Ok(Sig0Algorithm::RsaSha256),
+        "ecdsa-p256" | "ecdsa" | "13" => Ok(Sig0Algorithm::EcdsaP256),
+        "ed25519" | "ed" | "15" => Ok(Sig0Algorithm::Ed25519),
+        other => Err(ConfigError::Invalid(format!(
+            "unknown SIG(0) algorithm {other:?}; expected rsa-sha256, ecdsa-p256 or ed25519"
+        ))),
+    }
+}
+
+/// Алгоритм SIG(0), допустимый для подписи и проверки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sig0Algorithm {
+    /// RSA/SHA-256 (DNSSEC alg 8).
+    RsaSha256,
+    /// ECDSA P-256/SHA-256 (13).
+    EcdsaP256,
+    /// Ed25519 (15).
+    Ed25519,
+}
+
+impl Sig0Algorithm {
+    /// Номер DNSSEC-алгоритма.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::RsaSha256 => 8,
+            Self::EcdsaP256 => 13,
+            Self::Ed25519 => 15,
+        }
+    }
 }
 
 /// Запись зоны в конфигурации.
@@ -1062,6 +1570,13 @@ pub struct Config {
     /// TSIG-ключи для transfer и NOTIFY.
     #[serde(default)]
     pub tsig_keys: Vec<TsigKeyConfig>,
+    /// Файл управляемых TSIG-ключей (JSON, режим `0600`).
+    ///
+    /// Ключи из `tsig_keys` неизменяемы и загружаются из конфигурации; ключи,
+    /// созданные через REST, хранятся здесь. `null` — управление только в
+    /// памяти процесса.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tsig_state_file: Option<PathBuf>,
     /// Настройки AXFR/IXFR и NOTIFY.
     #[serde(default)]
     pub transfer: TransferSettings,
@@ -1138,6 +1653,7 @@ impl Default for Config {
             dnssec: BTreeMap::new(),
             secondary_zones: Vec::new(),
             tsig_keys: Vec::new(),
+            tsig_state_file: None,
             transfer: TransferSettings::default(),
             update: UpdateSettings::default(),
             response_cache: ResponseCacheSettings::default(),
@@ -1391,6 +1907,15 @@ impl Config {
                     self.journal_max_bytes
                 )));
             }
+        }
+        if self
+            .tsig_state_file
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "tsig_state_file must not be empty".to_owned(),
+            ));
         }
         self.transfer.validate()?;
         let mut key_names = std::collections::HashSet::with_capacity(self.tsig_keys.len());
@@ -3120,6 +3645,81 @@ require_tsig = false
             .expect("parse update example")
             .validate()
             .expect("valid update example");
+    }
+
+    #[test]
+    fn update_policy_and_sig0_parse() {
+        let config = Config::from_toml_str(
+            r#"
+listen_udp = "127.0.0.1:0"
+zonefile = "/tmp/update-policy.pulse"
+
+[update]
+enabled = true
+require_tsig = true
+allow_from = ["127.0.0.1/32"]
+
+[[update.policy]]
+principal = { tsig_key = "update-key.example." }
+zone = { exact = "example.com." }
+name = { suffix = "example.com." }
+types = ["A", "AAAA"]
+action = "grant"
+
+[[update.policy]]
+principal = { subnet = "192.0.2.0/24" }
+zone = "any"
+name = { wildcard = "*.example.com." }
+types = "any"
+action = "deny"
+
+[[update.sig0_keys]]
+name = "host.example.com."
+algorithm = "ed25519"
+public_key = "AAAA"
+key_tag = 1234
+"#,
+        )
+        .expect("parse policy");
+        assert_eq!(config.update.policy.len(), 2);
+        assert_eq!(
+            config.update.policy[0].name,
+            UpdateName::Suffix("example.com.".to_owned())
+        );
+        config.validate().expect("valid policy");
+
+        let bad_wildcard = Config::from_toml_str(
+            r#"
+zonefile = "/tmp/update-policy.pulse"
+[update]
+enabled = true
+require_tsig = false
+[[update.policy]]
+principal = "any"
+zone = { exact = "example.com." }
+name = { wildcard = "example.com." }
+types = "any"
+action = "grant"
+"#,
+        )
+        .expect("parse");
+        assert!(bad_wildcard.validate().is_err());
+
+        let bad_sig0_ref = Config::from_toml_str(
+            r#"
+zonefile = "/tmp/update-policy.pulse"
+[update]
+enabled = true
+require_tsig = false
+[[update.policy]]
+principal = { sig0_key = "unknown.example." }
+zone = { exact = "example.com." }
+name = "any"
+action = "grant"
+"#,
+        )
+        .expect("parse");
+        assert!(bad_sig0_ref.validate().is_err());
     }
 
     #[test]

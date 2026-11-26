@@ -256,7 +256,19 @@ pub(crate) fn run() -> ExitCode {
         let mut terminate = false;
         for signal in signals.pending() {
             match signal {
-                SIGHUP => reload_tls(&server, "SIGHUP"),
+                SIGHUP => {
+                    reload_tls(&server, "SIGHUP");
+                    match server.reload_tsig_keys() {
+                        Ok(count) => logging::info(
+                            "tsig",
+                            &format!("SIGHUP: reloaded {count} managed TSIG key(s)"),
+                        ),
+                        Err(error) => logging::error(
+                            "tsig",
+                            &format!("SIGHUP: TSIG key reload failed: {error}"),
+                        ),
+                    }
+                }
                 SIGINT | SIGTERM => {
                     logging::warn(
                         "signal",
@@ -1224,7 +1236,7 @@ fn command() -> Command {
                 .long("update-require-tsig")
                 .value_name("BOOL")
                 .value_parser(value_parser!(bool))
-                .help("Require a valid TSIG for DNS UPDATE (default true)"),
+                .help("Require TSIG or SIG(0) authentication for DNS UPDATE (default true)"),
         )
         .arg(
             Arg::new("update-allow-from")

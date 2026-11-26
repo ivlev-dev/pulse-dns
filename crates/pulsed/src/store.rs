@@ -18,6 +18,7 @@ use pulse_api::{
     ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, next_serial,
 };
 use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype, Serial, Ttl, UpdateError, UpdateRequest};
+use pulse_server::dnssec_incremental::{SignNode, UpdateChanges, ZoneEdit};
 use pulse_server::update::{UpdateOutcome, UpdateTarget};
 use pulse_server::{
     DenialKind, QueryEngine, QueryStats, ResponseCache, ResponseCacheMetrics,
@@ -72,6 +73,7 @@ pub(crate) struct SharedZoneAdmin {
     transfer: TransferState,
     secondary: SecondaryManager,
     update: crate::update::UpdateService,
+    tsig_keys: Arc<crate::tsigkeys::TsigKeyStore>,
 }
 
 impl SharedZoneAdmin {
@@ -86,6 +88,10 @@ impl SharedZoneAdmin {
         let file_stats = store
             .as_ref()
             .map_or_else(|| Arc::new(ZoneFileStats::default()), |store| store.stats());
+        let tsig_keys = Arc::new(
+            crate::tsigkeys::TsigKeyStore::load(&config.tsig_keys, config.tsig_state_file.clone())
+                .map_err(|error| StoreError(format!("cannot load TSIG keys: {error}")))?,
+        );
         let zones = match &store {
             Some(store) => store.list_zones().map_err(StoreError)?,
             None => Vec::new(),
@@ -102,7 +108,7 @@ impl SharedZoneAdmin {
             .collect();
         let transfer = TransferState::from_config(
             &config.transfer,
-            &config.tsig_keys,
+            Arc::clone(&tsig_keys),
             &config.secondary_zones,
             zones_meta,
             store.clone(),
@@ -134,7 +140,8 @@ impl SharedZoneAdmin {
             versions.insert(entry.origin.clone(), entry.version);
         }
         let engine = build_engine(&views, &query_stats, &response_cache);
-        let update = crate::update::UpdateService::new(config).map_err(StoreError)?;
+        let update = crate::update::UpdateService::new(config, Arc::clone(&tsig_keys))
+            .map_err(StoreError)?;
         Ok(Self {
             store,
             views: RwLock::new(views),
@@ -148,6 +155,7 @@ impl SharedZoneAdmin {
             transfer,
             secondary,
             update,
+            tsig_keys,
         })
     }
 
@@ -165,6 +173,11 @@ impl SharedZoneAdmin {
 
     pub(crate) fn update_metrics(&self) -> Arc<crate::update::UpdateMetrics> {
         self.update.metrics()
+    }
+
+    /// Перечитывает state-файл управляемых ключей.
+    pub(crate) fn reload_tsig_keys(&self) -> Result<usize, String> {
+        self.tsig_keys.reload().map_err(|error| error.to_string())
     }
 
     /// Текущий движок. Read-lock удерживается только на клонирование `Arc`.
@@ -698,17 +711,39 @@ impl SharedZoneAdmin {
         }
         let previous = {
             let mut writer = store.open_writer(request.zone()).map_err(servfail)?;
+            let base_version = writer.version();
             let previous = self.previous_snapshot(request.zone(), store);
-            let outcome = {
+            let (outcome, changes) = {
                 let mut target = StoreUpdateTarget {
                     writer: &mut writer,
                     origin: request.zone().clone(),
                     class: Rclass::IN,
+                    initial: HashMap::new(),
+                    cut_before: HashMap::new(),
                 };
-                pulse_server::update::apply_update(&mut target, request)?
+                let outcome = pulse_server::update::apply_update(&mut target, request)?;
+                let changes = target.finish()?;
+                (outcome, changes)
             };
             writer.set_soa_serial(outcome.serial.as_u32());
-            store.commit_writer(&mut writer).map_err(servfail)?;
+
+            // Переподпись идёт в той же незакоммиченной транзакции: ошибка
+            // ключа/подписи оставляет writer без commit, читатель не видит
+            // зону с устаревшими RRSIG/NSEC.
+            let mut zone_update = self.dnssec.zone_update(request.zone());
+            if let Some(update) = zone_update.as_mut() {
+                let mut edit = WriterEdit {
+                    writer: &mut writer,
+                    origin: request.zone().clone(),
+                };
+                update
+                    .resign(&mut edit, &changes, base_version, crate::dnssec::now_unix())
+                    .map_err(servfail)?;
+            }
+            let committed = store.commit_writer(&mut writer).map_err(servfail)?;
+            if let Some(update) = zone_update.as_mut() {
+                update.committed(committed.version);
+            }
             (outcome, previous)
         };
         self.after_commit(request.zone(), previous.1.as_ref());
@@ -727,21 +762,20 @@ struct StoreUpdateTarget<'a, 'z> {
     writer: &'a mut ParallelZone<'z>,
     origin: Name,
     class: Rclass,
+    /// Значение RRset до первой правки: по нему считается фактический diff.
+    initial: HashMap<(Name, Rtype), Option<Rrset>>,
+    /// Статус zone cut до первой правки NS.
+    cut_before: HashMap<Name, bool>,
 }
 
-impl UpdateTarget for StoreUpdateTarget<'_, '_> {
-    fn origin(&self) -> &Name {
-        &self.origin
-    }
-
-    fn zone_class(&self) -> Rclass {
-        self.class
-    }
-
-    fn rrset(&mut self, name: &Name, rr_type: Rtype) -> Result<Option<Rrset>, UpdateError> {
+impl StoreUpdateTarget<'_, '_> {
+    fn read_rrset(
+        writer: &ParallelZone<'_>,
+        name: &Name,
+        rr_type: Rtype,
+    ) -> Result<Option<Rrset>, UpdateError> {
         let owner = name_to_rle(name).map_err(servfail)?;
-        let Some(record) = self
-            .writer
+        let Some(record) = writer
             .lookup(&owner, rr_type.as_u16(), 0)
             .map_err(servfail)?
         else {
@@ -757,6 +791,76 @@ impl UpdateTarget for StoreUpdateTarget<'_, '_> {
             .map_err(servfail)
     }
 
+    fn record_initial(&mut self, name: &Name, rr_type: Rtype) -> Result<(), UpdateError> {
+        let key = (name.clone(), rr_type);
+        if self.initial.contains_key(&key) {
+            return Ok(());
+        }
+        let before = Self::read_rrset(self.writer, name, rr_type)?;
+        self.initial.insert(key, before);
+        Ok(())
+    }
+
+    fn record_cut(&mut self, name: &Name) -> Result<(), UpdateError> {
+        if self.cut_before.contains_key(name) {
+            return Ok(());
+        }
+        let owner = name_to_rle(name).map_err(servfail)?;
+        let cut = self
+            .writer
+            .node(&owner)
+            .map(|node| node.is_zone_cut)
+            .map_err(servfail)?;
+        self.cut_before.insert(name.clone(), cut);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<UpdateChanges, UpdateError> {
+        let mut rrsets = Vec::new();
+        for ((name, rr_type), before) in &self.initial {
+            let after = Self::read_rrset(self.writer, name, *rr_type)?;
+            if after.as_ref() != before.as_ref() {
+                rrsets.push((name.clone(), *rr_type));
+            }
+        }
+        rrsets.sort_by(|left, right| {
+            left.0
+                .cmp_canonical(&right.0)
+                .then_with(|| left.1.as_u16().cmp(&right.1.as_u16()))
+        });
+        let mut cut_changes = Vec::new();
+        for (name, before) in &self.cut_before {
+            let owner = name_to_rle(name).map_err(servfail)?;
+            let after = self
+                .writer
+                .node(&owner)
+                .map(|node| node.is_zone_cut)
+                .map_err(servfail)?;
+            if after != *before {
+                cut_changes.push(name.clone());
+            }
+        }
+        cut_changes.sort_by(Name::cmp_canonical);
+        Ok(UpdateChanges {
+            rrsets,
+            cut_changes,
+        })
+    }
+}
+
+impl UpdateTarget for StoreUpdateTarget<'_, '_> {
+    fn origin(&self) -> &Name {
+        &self.origin
+    }
+
+    fn zone_class(&self) -> Rclass {
+        self.class
+    }
+
+    fn rrset(&mut self, name: &Name, rr_type: Rtype) -> Result<Option<Rrset>, UpdateError> {
+        Self::read_rrset(self.writer, name, rr_type)
+    }
+
     fn types_at(&mut self, name: &Name) -> Result<Vec<Rtype>, UpdateError> {
         let owner = name_to_rle(name).map_err(servfail)?;
         let records = self.writer.owner_rrsets(&owner).map_err(servfail)?;
@@ -770,15 +874,168 @@ impl UpdateTarget for StoreUpdateTarget<'_, '_> {
     }
 
     fn put_rrset(&mut self, rrset: &Rrset) -> Result<(), UpdateError> {
+        self.record_initial(rrset.owner(), rrset.rr_type())?;
+        if rrset.rr_type() == Rtype::NS {
+            self.record_cut(rrset.owner())?;
+        }
         write_rrset(self.writer, rrset).map_err(servfail)
     }
 
     fn delete_rrset(&mut self, name: &Name, rr_type: Rtype) -> Result<(), UpdateError> {
+        self.record_initial(name, rr_type)?;
+        if rr_type == Rtype::NS {
+            self.record_cut(name)?;
+        }
         let owner = name_to_rle(name).map_err(servfail)?;
         self.writer
             .delete_rrset(&owner, rr_type.as_u16(), 0)
             .map(|_| ())
             .map_err(servfail)
+    }
+}
+
+/// Адаптер [`ZoneEdit`] поверх незакоммиченного writer'а.
+struct WriterEdit<'a, 'z> {
+    writer: &'a mut ParallelZone<'z>,
+    origin: Name,
+}
+
+impl WriterEdit<'_, '_> {
+    fn error(&self, error: impl std::fmt::Display) -> pulse_server::dnssec::SignZoneError {
+        pulse_server::dnssec::SignZoneError::Edit {
+            zone: self.origin.clone(),
+            reason: error.to_string(),
+        }
+    }
+
+    fn owners_of(
+        &mut self,
+        rr_type: Rtype,
+    ) -> Result<Vec<Name>, pulse_server::dnssec::SignZoneError> {
+        let mut owners = Vec::new();
+        let origin = self.origin.clone();
+        self.writer
+            .for_each_owner(rr_type.as_u16(), |owner| owners.push(*owner))
+            .map_err(|error| pulse_server::dnssec::SignZoneError::Edit {
+                zone: origin,
+                reason: error.to_string(),
+            })?;
+        owners
+            .into_iter()
+            .map(|owner| name_from_rle(&owner).map_err(|error| self.error(error)))
+            .collect()
+    }
+}
+
+impl ZoneEdit for WriterEdit<'_, '_> {
+    fn rrset(
+        &mut self,
+        name: &Name,
+        rr_type: Rtype,
+    ) -> Result<Option<Rrset>, pulse_server::dnssec::SignZoneError> {
+        StoreUpdateTarget::read_rrset(self.writer, name, rr_type).map_err(|error| self.error(error))
+    }
+
+    fn node(&mut self, name: &Name) -> Result<SignNode, pulse_server::dnssec::SignZoneError> {
+        let owner = name_to_rle(name).map_err(|error| self.error(error))?;
+        let node = self
+            .writer
+            .node(&owner)
+            .map_err(|error| self.error(error))?;
+        Ok(SignNode {
+            exists: node.exists,
+            is_zone_cut: node.is_zone_cut,
+            has_children: node.has_children,
+        })
+    }
+
+    fn owner_types(
+        &mut self,
+        name: &Name,
+    ) -> Result<Vec<Rtype>, pulse_server::dnssec::SignZoneError> {
+        let owner = name_to_rle(name).map_err(|error| self.error(error))?;
+        let records = self
+            .writer
+            .owner_rrsets(&owner)
+            .map_err(|error| self.error(error))?;
+        let mut types: Vec<Rtype> = records
+            .iter()
+            .map(|record| Rtype::from_u16(record.rr_type))
+            .collect();
+        types.sort();
+        types.dedup();
+        Ok(types)
+    }
+
+    fn rrsig_subtypes(
+        &mut self,
+        name: &Name,
+    ) -> Result<Vec<Rtype>, pulse_server::dnssec::SignZoneError> {
+        let owner = name_to_rle(name).map_err(|error| self.error(error))?;
+        let records = self
+            .writer
+            .owner_rrsets(&owner)
+            .map_err(|error| self.error(error))?;
+        let mut covered: Vec<Rtype> = records
+            .iter()
+            .filter(|record| record.rr_type == Rtype::RRSIG.as_u16())
+            .map(|record| Rtype::from_u16(record.subtype))
+            .collect();
+        covered.sort();
+        covered.dedup();
+        Ok(covered)
+    }
+
+    fn put_rrset(&mut self, rrset: &Rrset) -> Result<(), pulse_server::dnssec::SignZoneError> {
+        write_rrset(self.writer, rrset).map_err(|error| self.error(error))
+    }
+
+    fn delete_rrset(
+        &mut self,
+        name: &Name,
+        rr_type: Rtype,
+    ) -> Result<(), pulse_server::dnssec::SignZoneError> {
+        let owner = name_to_rle(name).map_err(|error| self.error(error))?;
+        self.writer
+            .delete_rrset(&owner, rr_type.as_u16(), 0)
+            .map(|_| ())
+            .map_err(|error| self.error(error))
+    }
+
+    fn delete_rrsig(
+        &mut self,
+        name: &Name,
+        covered: Rtype,
+    ) -> Result<(), pulse_server::dnssec::SignZoneError> {
+        let owner = name_to_rle(name).map_err(|error| self.error(error))?;
+        self.writer
+            .delete_rrset(&owner, Rtype::RRSIG.as_u16(), covered.as_u16())
+            .map(|_| ())
+            .map_err(|error| self.error(error))
+    }
+
+    fn nsec_owners(&mut self) -> Result<Vec<Name>, pulse_server::dnssec::SignZoneError> {
+        self.owners_of(Rtype::NSEC)
+    }
+
+    fn nsec3_owners(&mut self) -> Result<Vec<Name>, pulse_server::dnssec::SignZoneError> {
+        self.owners_of(Rtype::NSEC3)
+    }
+
+    fn next_name(
+        &mut self,
+        after: Option<&Name>,
+    ) -> Result<Option<Name>, pulse_server::dnssec::SignZoneError> {
+        let after = after
+            .map(name_to_rle)
+            .transpose()
+            .map_err(|error| self.error(error))?;
+        let next = self
+            .writer
+            .next_name(after.as_ref())
+            .map_err(|error| self.error(error))?;
+        next.map(|name| name_from_rle(&name).map_err(|error| self.error(error)))
+            .transpose()
     }
 }
 
@@ -849,6 +1106,9 @@ pub(crate) fn sign_configured_zones(
             &signed_zone.rrsets,
             &[],
         )?;
+        if let Some(entry) = store.zone_entry(origin)? {
+            dnssec.set_denial_index(origin, entry.version, &signed_zone.rrsets);
+        }
         signed_count = signed_count.saturating_add(1);
         logging::info(
             "dnssec",
@@ -893,13 +1153,14 @@ pub(crate) fn import_loaded_zone(
             loaded.origin
         ));
     }
-    let (rrsets, denial) = if dnssec.is_configured(&loaded.origin) {
+    let (rrsets, denial, signed) = if dnssec.is_configured(&loaded.origin) {
         let signed_zone = dnssec
             .sign(&loaded.origin, &loaded.rrsets, dnssec::now_unix())
             .map_err(|error| format!("cannot sign zone {}: {error}", loaded.origin))?;
-        (signed_zone.rrsets, denial_from_kind(signed_zone.denial))
+        let denial = denial_from_kind(signed_zone.denial);
+        (signed_zone.rrsets, denial, true)
     } else {
-        (loaded.rrsets.clone(), Denial::Nsec)
+        (loaded.rrsets.clone(), Denial::Nsec, false)
     };
     replace_zone_in_file(
         store,
@@ -910,6 +1171,9 @@ pub(crate) fn import_loaded_zone(
         &rrsets,
         &[],
     )?;
+    if signed && let Some(entry) = store.zone_entry(&loaded.origin)? {
+        dnssec.set_denial_index(&loaded.origin, entry.version, &rrsets);
+    }
     store.sync().map_err(|error| error.to_string())
 }
 
@@ -1460,6 +1724,11 @@ impl ZoneAdmin for SharedZoneAdmin {
         let default_ttl = loaded.default_ttl;
         replace_zone_in_file(store, origin, kind, default_ttl, denial, &rrsets, &[])
             .map_err(AdminError::Storage)?;
+        if self.dnssec.is_configured(origin)
+            && let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)?
+        {
+            self.dnssec.set_denial_index(origin, entry.version, &rrsets);
+        }
         self.after_commit(origin, None);
         Ok(ImportReport {
             zone: origin.clone(),
@@ -2022,6 +2291,10 @@ impl ZoneAdmin for SharedZoneAdmin {
             &[],
         )
         .map_err(AdminError::Storage)?;
+        if let Some(entry) = store.zone_entry(origin).map_err(AdminError::Storage)? {
+            self.dnssec
+                .set_denial_index(origin, entry.version, &signed_zone.rrsets);
+        }
         self.after_commit(origin, previous.as_ref());
         zone_view(store, origin)
     }
@@ -2044,6 +2317,60 @@ impl ZoneAdmin for SharedZoneAdmin {
                     })
                     .collect(),
             }))
+    }
+
+    fn list_tsig_keys(&self) -> Result<Vec<pulse_api::TsigKeyView>, AdminError> {
+        Ok(self
+            .tsig_keys
+            .list()
+            .into_iter()
+            .map(|view| pulse_api::TsigKeyView {
+                name: view.name,
+                algorithm: view.algorithm,
+                created_at: view.created_at,
+                last_used: view.last_used,
+                configured: view.configured,
+            })
+            .collect())
+    }
+
+    fn create_tsig_key(
+        &self,
+        input: &pulse_api::TsigKeyInput,
+    ) -> Result<pulse_api::TsigKeyView, AdminError> {
+        self.tsig_keys
+            .create(&input.name.to_string(), &input.algorithm, &input.secret)
+            .map(|view| pulse_api::TsigKeyView {
+                name: view.name,
+                algorithm: view.algorithm,
+                created_at: view.created_at,
+                last_used: view.last_used,
+                configured: view.configured,
+            })
+            .map_err(tsig_store_error)
+    }
+
+    fn delete_tsig_key(&self, name: &Name) -> Result<(), AdminError> {
+        self.tsig_keys.delete(name).map_err(tsig_store_error)
+    }
+
+    fn reload_tsig_keys(&self) -> Result<usize, AdminError> {
+        self.tsig_keys
+            .reload()
+            .map_err(|error| AdminError::Storage(error.to_string()))
+    }
+}
+
+fn tsig_store_error(error: crate::tsigkeys::TsigKeyStoreError) -> AdminError {
+    use crate::tsigkeys::TsigKeyStoreError;
+    match error {
+        TsigKeyStoreError::Exists { .. } => AdminError::Conflict(Conflict::TsigKeyExists),
+        TsigKeyStoreError::NotFound { .. } => AdminError::NotFound(pulse_api::NotFound::TsigKey),
+        TsigKeyStoreError::Immutable { .. } => AdminError::Conflict(Conflict::TsigKeyImmutable),
+        TsigKeyStoreError::Invalid { reason } => {
+            AdminError::invariant("/", "invalid-tsig-key", reason)
+        }
+        TsigKeyStoreError::State { reason, .. } => AdminError::Storage(reason),
     }
 }
 

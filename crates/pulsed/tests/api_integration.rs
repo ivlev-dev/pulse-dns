@@ -632,3 +632,208 @@ fn response_cache_hits_and_invalidates_on_rest_mutations() {
 
     server.shutdown().expect("shutdown");
 }
+
+const MANAGED_KEY: &str = "managed-key.test.";
+const MANAGED_SECRET: &[u8] = b"managed-secret";
+
+fn managed_zone() -> (common::TempZone, Config) {
+    let (directory, path) = common::write_text(
+        "api-managed-zone",
+        "zone",
+        "$ORIGIN example.com.\n$TTL 3600\n\
+         @ IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 300\n\
+         @ IN NS ns1.example.com.\n\
+         ns1 IN A 192.0.2.53\n",
+    );
+    let zone = common::TempZone::with_import("api-managed", "example.com.", &path);
+    drop(directory);
+    let mut config = common::base_config(zone.path());
+    config.update.enabled = true;
+    config.update.require_tsig = true;
+    config.update.allow_from = vec!["127.0.0.1/32".to_owned(), "::1/128".to_owned()];
+    config.update.allow_zones = vec!["example.com.".to_owned()];
+    (zone, config)
+}
+
+fn managed_update(owner: &str, address: &str, id: u16, key: &pulse_transfer::TsigKey) -> Vec<u8> {
+    use pulse_dns::{EncodeOptions, Flags, Opcode, Record, Ttl};
+    let mut message = Message::new(id, Flags::new().with_opcode(Opcode::UPDATE));
+    message.add_question(Question::new(
+        Name::parse("example.com.").unwrap(),
+        Rtype::SOA,
+        Rclass::IN,
+    ));
+    message.add_authority(
+        Record::new(
+            Name::parse(owner).unwrap(),
+            Rtype::A,
+            Rclass::IN,
+            Ttl::new(300).unwrap(),
+            Rdata::A(address.parse().unwrap()),
+        )
+        .unwrap(),
+    );
+    let base = message.encode(&EncodeOptions::compressed()).unwrap();
+    let record = key.sign_request(&base, message.id(), common_now()).unwrap();
+    pulse_transfer::append_tsig(base, &record).unwrap()
+}
+
+fn common_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn send_managed_update(server: &Server, raw: &[u8]) -> Rcode {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("client");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    socket
+        .send_to(raw, server.udp_addr().expect("udp"))
+        .expect("send");
+    let mut buffer = [0_u8; 4096];
+    let (length, _) = recv_from(&socket, &mut buffer).expect("recv");
+    Message::decode(buffer.get(..length).expect("len"), &DecodeLimits::default())
+        .expect("decode")
+        .rcode()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn managed_tsig_keys_crud_scopes_and_dynamic_update() {
+    use base64::Engine as _;
+    use pulse_transfer::{TsigAlgorithm, TsigKey};
+
+    let (_zone, config) = managed_zone();
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = state_dir.path().join("tsig-keys.json");
+    let mut config = config;
+    config.tsig_state_file = Some(state_path.clone());
+    // Политика ссылается на ключ, которого ещё нет в конфигурации: он
+    // появится через REST и заработает без рестарта.
+    config.update.policy = vec![pulsed::config::UpdatePolicyRule {
+        principal: pulsed::config::UpdatePrincipal::TsigKey(MANAGED_KEY.to_owned()),
+        zone: pulsed::config::UpdateName::Exact("example.com.".to_owned()),
+        name: pulsed::config::UpdateName::Any,
+        types: pulsed::config::UpdateTypes::Any,
+        action: pulsed::config::UpdateAction::Grant,
+    }];
+    let mut server = Server::start_with_api(
+        &config,
+        Some(ApiOptions {
+            listen: "127.0.0.1:0".parse().expect("api"),
+            token: TOKEN.to_owned(),
+            scopes: Vec::new(),
+        }),
+    )
+    .expect("start");
+    let api = server.api_addr().expect("api");
+    let bearer = auth();
+
+    let secret = base64::engine::general_purpose::STANDARD.encode(MANAGED_SECRET);
+    let body =
+        format!(r#"{{"name":"{MANAGED_KEY}","algorithm":"hmac-sha256","secret":"{secret}"}}"#);
+    let created = request(
+        api,
+        "POST",
+        "/api/v1/tsig-keys",
+        &[("Authorization", &bearer)],
+        Some(body.as_bytes()),
+    );
+    assert_eq!(
+        created.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&created.body)
+    );
+    let json = created.json();
+    assert_eq!(json["name"], MANAGED_KEY);
+    assert_eq!(json["algorithm"], "hmac-sha256");
+    assert!(!String::from_utf8_lossy(&created.body).contains(&secret));
+
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&state_path)
+            .expect("state")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode, 0o600);
+
+    let listed = request(
+        api,
+        "GET",
+        "/api/v1/tsig-keys",
+        &[("Authorization", &bearer)],
+        None,
+    );
+    assert_eq!(listed.status, 200);
+    assert!(!String::from_utf8_lossy(&listed.body).contains(&secret));
+    assert_eq!(listed.json()["items"].as_array().expect("items").len(), 1);
+
+    // Дубликат — 409.
+    let duplicate = request(
+        api,
+        "POST",
+        "/api/v1/tsig-keys",
+        &[("Authorization", &bearer)],
+        Some(body.as_bytes()),
+    );
+    assert_eq!(duplicate.status, 409);
+    assert_eq!(duplicate.problem_code(), "tsig-key-exists");
+
+    // Ключ работает без перезапуска.
+    let key = TsigKey::new(
+        Name::parse(MANAGED_KEY).unwrap(),
+        TsigAlgorithm::HmacSha256,
+        MANAGED_SECRET.to_vec(),
+    )
+    .expect("key");
+    let raw = managed_update("dynamic.example.com.", "192.0.2.200", 90, &key);
+    assert_eq!(send_managed_update(&server, &raw), Rcode::NOERROR);
+    let listed = request(
+        api,
+        "GET",
+        "/api/v1/tsig-keys",
+        &[("Authorization", &bearer)],
+        None,
+    );
+    assert!(
+        !listed.json()["items"][0]["last_used"].is_null(),
+        "{}",
+        String::from_utf8_lossy(&listed.body)
+    );
+
+    // Удаление запрещает новые UPDATE.
+    let deleted = request(
+        api,
+        "DELETE",
+        &format!("/api/v1/tsig-keys/{MANAGED_KEY}"),
+        &[("Authorization", &bearer)],
+        None,
+    );
+    assert_eq!(deleted.status, 204);
+    assert!(
+        !state_path.exists() || {
+            let text = std::fs::read_to_string(&state_path).unwrap_or_default();
+            !text.contains(MANAGED_KEY)
+        }
+    );
+    let missing = request(
+        api,
+        "DELETE",
+        &format!("/api/v1/tsig-keys/{MANAGED_KEY}"),
+        &[("Authorization", &bearer)],
+        None,
+    );
+    assert_eq!(missing.status, 404);
+    assert_eq!(missing.problem_code(), "tsig-key-not-found");
+
+    let raw = managed_update("dynamic.example.com.", "192.0.2.201", 91, &key);
+    assert_eq!(send_managed_update(&server, &raw), Rcode::NOTAUTH);
+
+    server.shutdown().expect("shutdown");
+}

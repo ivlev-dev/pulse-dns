@@ -20,6 +20,7 @@ use pulse_server::dnssec::{
     DenialPolicy, KeyRole, Nsec3Config, Nsec3ConfigError, SignZoneError, SignedZone, ZoneSigner,
     ZoneSignerError, ZoneSigningKey,
 };
+use pulse_server::dnssec_incremental::{DenialIndex, UpdateChanges, ZoneEdit, sign_zone_update};
 use thiserror::Error;
 
 use crate::config::{Config, DnssecDenial, DnssecKeyConfig, DnssecKeyRole, DnssecRotationConfig};
@@ -34,6 +35,8 @@ struct ConfiguredZone {
 struct ZoneInner {
     signer: ZoneSigner,
     rotation: Option<RotationEngine>,
+    /// Индекс denial-цепочки для инкрементальной переподписи UPDATE.
+    denial_index: Option<DenialIndex>,
 }
 
 /// Подписанты зон, загруженные при старте.
@@ -74,7 +77,7 @@ impl DnssecSigners {
                 })
             })?;
         }
-        inner
+        let signed = inner
             .signer
             .sign_zone_with(origin, rrsets, now, &zone.denial)
             .map_err(|source| {
@@ -82,7 +85,40 @@ impl DnssecSigners {
                     zone: origin.to_string(),
                     source: Box::new(source),
                 })
-            })
+            })?;
+        // Версию зоны знает вызывающий; до её установки индекс пересоберётся
+        // из zonefile при первом UPDATE.
+        inner.denial_index = Some(DenialIndex::from_rrsets(0, &zone.denial, &signed.rrsets));
+        Ok(signed)
+    }
+
+    /// Устанавливает индекс denial-записей для опубликованной версии зоны.
+    pub(crate) fn set_denial_index(
+        &self,
+        origin: &Name,
+        version: u64,
+        rrsets: &[pulse_dns::Rrset],
+    ) {
+        let Some(zone) = self.zones.get(origin) else {
+            return;
+        };
+        let mut inner = zone.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        inner.denial_index = Some(DenialIndex::from_rrsets(version, &zone.denial, rrsets));
+    }
+
+    /// Открывает подписант зоны для инкрементальной переподписи UPDATE.
+    ///
+    /// `None` — у зоны нет DNSSEC-ключей: UPDATE применяется без подписи.
+    #[must_use]
+    pub(crate) fn zone_update(&self, origin: &Name) -> Option<ZoneUpdate<'_>> {
+        let zone = self.zones.get(origin)?;
+        let inner = zone.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(ZoneUpdate {
+            origin: origin.clone(),
+            denial: &zone.denial,
+            inner,
+            pending: None,
+        })
     }
 
     /// Продвигает ротацию всех зон; возвращает зоны, где состояние изменилось.
@@ -263,6 +299,7 @@ pub(crate) fn load(config: &Config) -> Result<DnssecSigners, DnssecError> {
                 ZoneInner {
                     signer,
                     rotation: Some(engine),
+                    denial_index: None,
                 }
             }
             Some(_) => {
@@ -281,6 +318,7 @@ pub(crate) fn load(config: &Config) -> Result<DnssecSigners, DnssecError> {
                 ZoneInner {
                     signer,
                     rotation: None,
+                    denial_index: None,
                 }
             }
         };
@@ -581,6 +619,67 @@ fn check_private_permissions(path: &Path) -> Result<(), DnssecError> {
         });
     }
     Ok(())
+}
+
+/// Подписант зоны, удерживаемый на время транзакции UPDATE.
+///
+/// Индекс denial-записей изымается из [`ZoneInner`] на время переподписи и
+/// возвращается только после успешного commit; при ошибке/откате он остаётся
+/// пустым и будет пересобран из zonefile.
+pub(crate) struct ZoneUpdate<'a> {
+    origin: Name,
+    denial: &'a DenialPolicy,
+    inner: std::sync::MutexGuard<'a, ZoneInner>,
+    pending: Option<DenialIndex>,
+}
+
+impl ZoneUpdate<'_> {
+    /// Переподписывает затронутую часть зоны в незакоммиченном дереве.
+    ///
+    /// # Errors
+    ///
+    /// [`DnssecError::Sign`] при отсутствии `SOA`, ошибке хранилища, ключа
+    /// или подписи. Вызывающий обязан не коммитить writer.
+    pub(crate) fn resign(
+        &mut self,
+        edit: &mut dyn ZoneEdit,
+        changes: &UpdateChanges,
+        base_version: u64,
+        now: u32,
+    ) -> Result<(), Box<DnssecError>> {
+        let mut index = self.inner.denial_index.take();
+        match sign_zone_update(
+            &self.origin,
+            &self.inner.signer,
+            self.denial,
+            edit,
+            changes,
+            &mut index,
+            base_version,
+            now,
+        ) {
+            Ok(()) => {
+                self.pending = index;
+                Ok(())
+            }
+            Err(source) => {
+                self.pending = None;
+                Err(Box::new(DnssecError::Sign {
+                    zone: self.origin.to_string(),
+                    source: Box::new(source),
+                }))
+            }
+        }
+    }
+
+    /// Фиксирует индекс denial-записей после успешного commit зоны.
+    pub(crate) fn committed(&mut self, version: u64) {
+        let Some(mut index) = self.pending.take() else {
+            return;
+        };
+        index.set_version(version);
+        self.inner.denial_index = Some(index);
+    }
 }
 
 /// Ошибка загрузки DNSSEC-ключей/конфигурации.

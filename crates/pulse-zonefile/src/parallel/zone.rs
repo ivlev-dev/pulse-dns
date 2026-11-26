@@ -1272,6 +1272,40 @@ impl<'a> ParallelZone<'a> {
             .map_err(|error| self.io.take_error().unwrap_or(error))
     }
 
+    /// Следующее имя в каноническом порядке (включая незакоммиченные правки).
+    ///
+    /// Спуск/шаг по B+tree без обхода зоны; используется инкрементальной
+    /// переподписью DNSSEC для поиска потомков cut.
+    ///
+    /// # Errors
+    ///
+    /// `Tree`/`Corrupt`/`Io`.
+    pub fn next_name(&self, after: Option<&NameRle>) -> Result<Option<NameRle>, ParallelError> {
+        let version = self.version_for_reads();
+        self.tree
+            .next_name(&self.io, version, after)
+            .map_err(|error| writer_error(&self.io, error))
+    }
+
+    /// Обходит владельцев `RRset` заданного типа в каноническом порядке.
+    ///
+    /// Читаются только ключи (без RDATA/overflow). Нужен для пересборки
+    /// in-memory индекса denial-записей.
+    ///
+    /// # Errors
+    ///
+    /// `Tree`/`Corrupt`/`Io`.
+    pub fn for_each_owner(
+        &self,
+        rr_type: u16,
+        mut visit: impl FnMut(&NameRle),
+    ) -> Result<(), ParallelError> {
+        let version = self.version_for_reads();
+        self.tree
+            .for_each_owner(&self.io, version, rr_type, &mut visit)
+            .map_err(|error| writer_error(&self.io, error))
+    }
+
     /// Состояние имени (`T_NODE`, ENT/cut, флаги).
     ///
     /// # Errors

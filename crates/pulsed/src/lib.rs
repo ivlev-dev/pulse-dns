@@ -72,6 +72,7 @@ mod store;
 mod tcp;
 mod tls;
 mod transfer;
+mod tsigkeys;
 mod udp;
 mod update;
 mod zonefile;

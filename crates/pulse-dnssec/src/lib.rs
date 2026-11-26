@@ -96,6 +96,7 @@ pub mod key;
 pub mod keyfile;
 pub mod rdata_util;
 pub mod secret;
+pub mod sig0;
 pub mod sign;
 pub mod trust_anchor;
 pub mod trust_update;
@@ -116,13 +117,19 @@ pub use keyfile::{
 };
 pub use rdata_util::key_tag;
 pub use secret::SecretRef;
+pub use sig0::{
+    Sig0Error, Sig0Signature, find_sig0, sign_response as sign_sig0_response,
+    verify_request as verify_sig0_request, verify_response as verify_sig0_response,
+};
 pub use sign::{SignOptions, sign_rrset};
 pub use trust_anchor::{RFC_5011_SUPPORTED, TrustAnchor, TrustAnchorSet, builtin_root_anchors};
 pub use trust_update::{
     AnchorStatus, SharedTrustAnchors, TrustAnchorPolicy, TrustAnchorProvider, TrustAnchorSnapshot,
     TrustAnchorStore, TrustUpdateError, UpdateReport,
 };
-pub use verify::{VerifyOptions, verify_rrset_with_dnskeys, verify_rrsig};
+pub use verify::{
+    VerifyOptions, verify_message_signature, verify_rrset_with_dnskeys, verify_rrsig,
+};
 
 /// Псевдоним RRSIG RDATA в терминах RFC.
 pub type Rrsig = pulse_dns::RrsigData;

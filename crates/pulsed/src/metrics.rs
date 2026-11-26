@@ -410,6 +410,18 @@ pub(crate) fn render_update_metrics(metrics: &crate::update::UpdateMetrics) -> S
     );
     append_counter(
         &mut out,
+        "pulsed_update_sig0_failures_total",
+        "DNS UPDATE requests rejected by SIG(0) verification.",
+        snapshot.sig0_failures,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_update_policy_denied_total",
+        "DNS UPDATE requests refused by per-name update policy.",
+        snapshot.policy_denied,
+    );
+    append_counter(
+        &mut out,
         "pulsed_update_replay_total",
         "DNS UPDATE requests rejected as TSIG replays.",
         snapshot.replay,

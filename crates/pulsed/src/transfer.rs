@@ -97,7 +97,7 @@ struct ZoneTransfer {
 pub(crate) struct TransferState {
     settings: TransferSettings,
     config: TransferConfig,
-    keys: HashMap<Name, Arc<TsigKey>>,
+    keys: Arc<crate::tsigkeys::TsigKeyStore>,
     allow_from: HashSet<IpAddr>,
     allow_zones: HashSet<Name>,
     notify_sources: HashMap<Name, Vec<IpAddr>>,
@@ -116,14 +116,13 @@ impl TransferState {
     /// после мутаций.
     pub(crate) fn from_config(
         settings: &TransferSettings,
-        keys: &[TsigKeyConfig],
+        keys: Arc<crate::tsigkeys::TsigKeyStore>,
         secondary: &[crate::config::SecondaryZoneConfig],
         zones_meta: Vec<(Name, ZoneKind, Option<Serial>)>,
         source: Option<Arc<crate::zonefile::ZoneStore>>,
         notify: Option<Arc<NotifyDispatcher>>,
     ) -> Result<Self, TransferSetupError> {
         let config = build_transfer_config(settings)?;
-        let key_map = build_keys(keys)?;
         let allow_from: HashSet<IpAddr> = settings.allow_from.iter().copied().collect();
         let allow_zones = settings
             .allow_zones
@@ -169,7 +168,7 @@ impl TransferState {
         Ok(Self {
             settings: settings.clone(),
             config,
-            keys: key_map,
+            keys,
             allow_from,
             allow_zones,
             notify_sources,
@@ -273,7 +272,7 @@ impl TransferState {
 
     /// TSIG-ключ по имени (для secondary AXFR/IXFR-in).
     pub(crate) fn key(&self, name: &Name) -> Option<Arc<TsigKey>> {
-        self.keys.get(name).cloned()
+        self.keys.key(name)
     }
 
     /// Лимиты transfer-операций.
@@ -411,7 +410,7 @@ impl TransferState {
         match parse_tsig(raw) {
             Ok(None) => Ok(None),
             Ok(Some(envelope)) => {
-                let Some(key) = self.keys.get(envelope.record().key_name()).cloned() else {
+                let Some(key) = self.keys.key(envelope.record().key_name()) else {
                     logging::warn(
                         "transfer_tsig",
                         &format!(
@@ -431,6 +430,7 @@ impl TransferState {
                     send_tsig_error(stream, request, &envelope, Some(key.as_ref()), now, code)?;
                     return Err(TransferError::Tsig(error));
                 }
+                self.keys.mark_used(key.name(), now);
                 {
                     let mut replay = self.replay.lock().unwrap_or_else(PoisonError::into_inner);
                     if !replay.check_and_record(key.name(), envelope.record().mac(), Instant::now())
@@ -488,7 +488,7 @@ impl TransferState {
         }
         let key = match parse_tsig(raw) {
             Ok(Some(envelope)) => {
-                if let Some(key) = self.keys.get(envelope.record().key_name()).cloned() {
+                if let Some(key) = self.keys.key(envelope.record().key_name()) {
                     Some(key)
                 } else {
                     let response = build_tsig_error_response(
