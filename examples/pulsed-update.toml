@@ -26,3 +26,30 @@ require_tsig = true
 allow_from = ["127.0.0.1/32", "::1/128"]
 allow_zones = ["example.com."]
 tsig_keys = ["update-key.example."]
+
+# Управляемые ключи (REST /api/v1/tsig-keys): состояние 0600, SIGHUP reload.
+# tsig_state_file = "/var/lib/pulsed/tsig-keys.json"
+
+# Per-name политика: первое совпадение побеждает; при непустом списке
+# операция без grant запрещена.
+# [[update.policy]]
+# principal = { tsig_key = "update-key.example." }
+# zone = { exact = "example.com." }
+# name = { suffix = "example.com." }
+# types = ["A", "AAAA"]
+# action = "grant"
+#
+# [[update.policy]]
+# principal = { subnet = "192.0.2.0/24" }
+# zone = "any"
+# name = { wildcard = "*.example.com." }
+# types = "any"
+# action = "deny"
+
+# SIG(0) как альтернатива TSIG (RFC 2931).
+# [[update.sig0_keys]]
+# name = "host.example.com."
+# algorithm = "ed25519"
+# public_key = "BASE64_DNSKEY_PUBLIC_KEY"
+# key_tag = 12345
+# private_key = "/etc/pulsed/sig0.private"

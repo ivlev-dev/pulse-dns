@@ -38,7 +38,7 @@
 | `pulse-transfer` | TSIG, AXFR/IXFR, NOTIFY |
 | `pulse-zonefile` | v2 `ParallelStore`: lock-free аллокатор страниц, ring-головы версий A/B, per-zone пулы/GC, in-process пины читателей, per-zone commit, group commit (2 fsync на группу), PageCache, recovery, полный `fsck --verify` и `--repair`, `compact_zone`, `sync`; **межпроцессная запись v2** (ADR 0007): sidecar-координатор `<file>.pulsecoord`, CAS-курсор в shared mmap, `fcntl` per-zone leases + fencing (pid/starttime/generation), общая reader table, `LOCK_SH`; **межпроцессный group commit** (sidecar v4, очередь `RootEntry`, лидер по commit-lease, одна пара `fdatasync` на всех, fault-tolerant ack); 2/4/8 процессов сгруппированы, kill -9 координатора в фазах 1/2, 10k коммитов в 2 процессах; ~20k zone-commit/s; group commit v4: 8 процессов 6.0× (1385 vs 231 commits/s, fsync 2 мс), p99 5.6 мс vs 34–84 мс direct; bulk-load 1M RRset за 2.5–2.8 с; order-key memcmp; каталог 1000 зон за 83 мс (исправлен self-deadlock); v1 читается для `pulsed convert` |
 | `pulse-runtime` | io_uring UDP (ring на ядро, multishot recv + provided buffers, `REGISTER_FILES`, `COOP/DEFER_TASKRUN`, опции SQPOLL/`SO_BUSY_POLL`, IP_PKTINFO, NODROP-проверка, backpressure, graceful shutdown, изоляция паник) + epoll-фолбэк |
-| `pulse-server` | авторитетный движок: NXDOMAIN/NODATA/ENT, wildcard/closest encloser, CNAME/DNAME, делегация/glue/DS, EDNS/BADVERS, TC, ANY по RFC 8482, детерминированный additional; zero-copy ответ (`respond_ref_into`), NSEC/NSEC3 индексы для быстрого NXDOMAIN; движок DNS UPDATE (RFC 2136): prerequisites, add/delete RR/RRset/name, CNAME/apex-инварианты, атомарность, SOA serial RFC 1982 |
+| `pulse-server` | авторитетный движок: NXDOMAIN/NODATA/ENT, wildcard/closest encloser, CNAME/DNAME, делегация/glue/DS, EDNS/BADVERS, TC, ANY по RFC 8482, детерминированный additional; zero-copy ответ (`respond_ref_into`), NSEC/NSEC3 индексы для быстрого NXDOMAIN; движок DNS UPDATE (RFC 2136): prerequisites, add/delete RR/RRset/name, CNAME/apex-инварианты, атомарность, SOA serial RFC 1982; инкрементальная переподпись подписанной зоны (RRSIG/NSEC/NSEC3, Opt-Out) в той же транзакции |
 | `pulse-resolver` | library: forward/iterative, кеш + negative caching, blocklist/allowlist/overrides, HTTPS blocklist-источники (стриминг, лимит 64 MiB, conditional 304, атомарный кэш 0600, SSRF-guard), DNSSEC AD/BOGUS→SERVFAIL, UDP/TCP + upstream DoT/DoH с failover/cooldown, пул keep-alive соединений (`pool_size`, default 4, in-flight лимит, reconnect backoff), смешанные upstream |
 | `pulseresolved` | binary резолвер: TOML-конфиг (JSON — совместимость), UDP/TCP, серверные DoT/DoH/1.1/DoH/2/DoH/3/DoQ/DNSCrypt v2 (UDP+TCP), ACL клиентов (default loopback, отдельный `tls_allow_from`), per-source rate limit, полный RRL (`noerror`/`nxdomain`/`referral`/`error`, per-source + per-name, slip, refused/drop/truncate; только UDP), пул DoT/DoH, смешанные upstream (UDP/TCP/DoT/DoH), кеш, blocklist (файлы + HTTPS URL с периодическим обновлением/кэшем/304), overrides, DNSSEC, SIGHUP (blocklist + TLS-пара), `/metrics` по транспортам, `/healthz`, control-plane REST API (`control_listen`, bearer-token, cache/purge, blocklist reload, upstreams, trust anchors, RRL patch, config, RFC 9457 problem+json, `X-Request-Id`, rate limit на токен, graceful shutdown) |
 | `pulse-tls` | DoT (RFC 7858), DoH/1.1 (RFC 8484), DoH/2 (`http2`), DoH/3 (`http3`, RFC 9114) и DoQ (`doq`) на rustls/quinn/h3: серверы и клиенты (webpki-roots/CA, ALPN, keep-alive) |
@@ -88,6 +88,11 @@
   double-sign → active → retire) с персистентным состоянием и фоновым tick;
   `/keys` отдаёт стадии ключей; RFC 5011 add/revoke hold-down, откат
   кандидатов и `0600`-состояние; secondary AXFR-in → ответы из mmap → рестарт.
+- UPDATE подписанной зоны: add/delete RR/RRset/name, apex, wildcard,
+  delegation/glue и NSEC3 Opt-Out; RRSIG/NSEC/NSEC3 и SOA переподписываются
+  атомарно с данными (SIGKILL/reopen, NOTIFY, конкурентные запросы);
+  валидация ответов и denial-доказательств через `pulse-dnssec`; бенч
+  100k NSEC/NSEC3 — p99 ≤ 50 мс (`cargo bench -p pulsed --bench update_signed`).
 - Защищённые транспорты: реальные клиенты получают A-ответ по DoT, DoH POST/GET
   (HTTP/1.1, HTTP/2 и HTTP/3), DoQ и DNSCrypt UDP/TCP; транспорты работают
   параллельно на разных портах; неверный provider-ключ и испорченный
@@ -208,8 +213,12 @@
   API доступен только на loopback (без TLS).
 - DNS UPDATE: primary/Serving только; secondary/forward → `REFUSED`;
   авторизация — TSIG-ключи + IP/CIDR + allowlist зон (без per-name policy);
-  DNSSEC-записи управляются сигнатором; отдельного UPDATE-journal нет —
-  durability даёт общий commit `pulse-zonefile`.
+  DNSSEC-записи управляются сигнатором; для подписанных зон изменение
+  RRSIG/NSEC/NSEC3 входит в тот же commit, отдельного UPDATE-journal нет —
+  durability даёт общий commit `pulse-zonefile`. При включённом
+  AXFR/IXFR-out снапшот для истории IXFR материализуется целиком (вне
+  DNSSEC-пути); смена SOA TTL/`MINIMUM` через UPDATE вызывает полную
+  переподпись denial-цепочки.
 - RRset warm 842 нс при 1M (было 1.57 µs); цель 500 нс не достигнута.
 - Signed/DO/ANY/referral/DNAME/циклы/wildcard-CNAME/oversized — zero-copy; fallback только для multi-page `OVERFLOW`.
 - Bulk-load требует отсортированный вход; `Memory` incremental не реклеймит (bulk рекомендуется).

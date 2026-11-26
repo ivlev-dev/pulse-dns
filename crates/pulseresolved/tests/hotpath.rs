@@ -5,8 +5,8 @@ mod support;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use pulse_dns::{DecodeLimits, EncodeOptions, Message, Record, Rtype, Ttl};
@@ -296,9 +296,8 @@ fn udp_exchange_retry(
     label: &str,
     deadline: Instant,
 ) -> Result<Vec<u8>, String> {
-    let socket = UdpSocket::bind("127.0.0.1:0").map_err(|error| {
-        format!("{label}: bind UDP-клиента: {error} ({:?})", error.kind())
-    })?;
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .map_err(|error| format!("{label}: bind UDP-клиента: {error} ({:?})", error.kind()))?;
     let mut backoff = RETRY_BACKOFF_START;
     let mut last = "попыток не было".to_owned();
     for attempt in 1..=UDP_ATTEMPTS {
@@ -356,9 +355,7 @@ fn reference_bytes(config: &Config, request: &Message) -> Vec<u8> {
         pulse_dns::Rcode::NOERROR,
         "эталонный cache hit должен быть положительным"
     );
-    let length = cached
-        .encode_into(&mut out)
-        .expect("encode reference");
+    let length = cached.encode_into(&mut out).expect("encode reference");
     out[..length].to_vec()
 }
 
@@ -489,19 +486,22 @@ fn concurrent_udp_queries_are_consistent() {
     // Прогрев: под нагрузкой первый ответ upstream может не уложиться в
     // per-query таймаут, поэтому ждём положительный ответ, а не любой.
     let warmup_deadline = Instant::now() + CONSISTENCY_DEADLINE;
-    retry("warmup concurrent", || server_diagnostics(&server), || {
-        let response =
-            udp_exchange_retry(udp, &wire, "warmup concurrent", warmup_deadline)
+    retry(
+        "warmup concurrent",
+        || server_diagnostics(&server),
+        || {
+            let response = udp_exchange_retry(udp, &wire, "warmup concurrent", warmup_deadline)
                 .inspect_err(|error| last_error.record(error.clone()))?;
-        let actual = semantic_view(&response, "warmup");
-        if actual == expected {
-            Ok(())
-        } else {
-            let message = format!("прогрев вернул неожиданный ответ: {actual:?}");
-            last_error.record(message.clone());
-            Err(message)
-        }
-    });
+            let actual = semantic_view(&response, "warmup");
+            if actual == expected {
+                Ok(())
+            } else {
+                let message = format!("прогрев вернул неожиданный ответ: {actual:?}");
+                last_error.record(message.clone());
+                Err(message)
+            }
+        },
+    );
 
     // Число доставленных ответов не фиксировано: UDP под нагрузкой может
     // теряться. Проверяем инвариант — все успешные ответы согласованы.
@@ -520,16 +520,15 @@ fn concurrent_udp_queries_are_consistent() {
                     if Instant::now() >= deadline {
                         break;
                     }
-                    let response =
-                        match udp_exchange_retry(udp, wire, "concurrent UDP", deadline) {
-                            Ok(response) => response,
-                            // Потеря под нагрузкой не ломает инвариант:
-                            // запрос не учитывается, поток завершает работу.
-                            Err(error) => {
-                                last_error.record(error);
-                                break;
-                            }
-                        };
+                    let response = match udp_exchange_retry(udp, wire, "concurrent UDP", deadline) {
+                        Ok(response) => response,
+                        // Потеря под нагрузкой не ломает инвариант:
+                        // запрос не учитывается, поток завершает работу.
+                        Err(error) => {
+                            last_error.record(error);
+                            break;
+                        }
+                    };
                     let actual = semantic_view(&response, "concurrent");
                     if actual != *expected {
                         last_error.record(format!(

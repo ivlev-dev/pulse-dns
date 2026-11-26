@@ -61,7 +61,8 @@ upstream по UDP, TCP, DoT и DoH/1.1 (пул keep-alive, backoff). Остат�
 - DNS UPDATE (RFC 2136) на UDP/TCP/DoT/DoH/DoQ/DNSCrypt: `opcode 5`, Zone/
   Prerequisite/Update секции, prerequisites (`YXDOMAIN`/`NXRRSET`/…),
   add/delete RR, RRset и name, CNAME/apex-инварианты, атомарный writer +
-  один commit, автоинкремент SOA serial (RFC 1982), NOTIFY-out после
+  один commit, автоинкремент SOA serial (RFC 1982), инкрементальная
+  переподпись DNSSEC в том же commit, NOTIFY-out после
   изменения. Политика `[update]`: выключено по умолчанию, `allow_from`
   IP/CIDR, `allow_zones`, список `tsig_keys`, обязательный TSIG, replay-кэш;
   secondary/forward → `REFUSED`, неизвестная зона → `NOTAUTH`; метрики
@@ -219,8 +220,59 @@ send
 DNS
 ```
 
-Политика: `[update] enabled`, `require_tsig`, `allow_from` (IP/CIDR),
-`allow_zones`, `tsig_keys` (имена из `[[tsig_keys]]`). Без настроек сервер
+Политика: `[update] enabled`, `require_tsig` (TSIG **или** SIG(0)),
+`allow_from` (IP/CIDR), `allow_zones`, `tsig_keys` (имена из `[[tsig_keys]]`).
+Грубый ACL проверяется первым; затем — упорядоченные правила
+`[[update.policy]]` (первое совпадение побеждает, при непустом списке
+операция без совпавшего `grant` запрещена). Правило задаёт
+`principal` (`{ tsig_key = "…" }`, `{ sig0_key = "…" }`, `{ subnet = "…" }`
+или `"any"`), `zone`, `name` (`{ exact = "…" }`/`{ suffix = "…" }`/
+`{ wildcard = "*.…" }`/`"any"`), `types` (`"any"` или список) и
+`action` (`grant`/`deny`). Проверка идёт до применения; отказ — `REFUSED`,
+метрика `pulsed_update_policy_denied_total`.
+
+SIG(0) (RFC 2931) настраивается в `[[update.sig0_keys]]` (`name`,
+`algorithm` — `ed25519`/`ecdsa-p256`/`rsa-sha256`, `public_key` base64,
+опциональные `key_tag` и `private_key`). Валидный SIG(0)-запрос
+аутентифицирует UPDATE как альтернатива TSIG; ответ подписывается SIG(0),
+если для ключа задан `private_key`. Окно `inception..expiration`
+ограничено `sig0_max_validity`, replay отвергается.
+
+#### UPDATE подписанной зоны
+
+Если для primary-зоны настроены DNSSEC-ключи, UPDATE **инкрементально**
+переподписывает только затронутое и коммитит данные вместе с
+`RRSIG`/`NSEC`/`NSEC3` в одной транзакции `pulse-zonefile`:
+
+- изменённые/добавленные RRset подписываются текущими ZSK/CSK
+  (`DNSKEY` UPDATE не меняет, KSK остаётся для `DNSKEY`);
+- у удалённых RRset удаляется `RRSIG`; у неизменённых наборов подписи
+  сохраняются;
+- `NSEC`/`NSEC3` обновляются для затронутых имён, их предшественников и
+  пустых non-terminals; apex, wildcard, делегирования и Opt-Out
+  поддерживаются;
+- индекс цепочки (множество NSEC-владельцев или hash-карта NSEC3) живёт в
+  памяти и обновляется после commit: поиск соседа — `O(log n)`, полной
+  переподписи нет;
+- ошибка ключа/подписи/хранилища откатывает весь UPDATE (`SERVFAIL`),
+  читатель не видит зону с устаревшими подписями.
+
+`O(zone)` остаётся только на холодном индексе (первый UPDATE после внешней
+записи другим процессом), при изменении SOA TTL/`MINIMUM` и при
+появлении/снятии zone cut (нужно обойти поддерево). Материализация
+снапшота для IXFR-out (`transfer.enabled`, включён по умолчанию) —
+существующая отдельная стоимость, не связанная с DNSSEC; для замера
+латентности UPDATE в `benches/update_signed.rs` transfer отключён.
+Бенч: `cargo bench -p pulsed --bench update_signed` (100k NSEC/NSEC3,
+p99 ≤ 50 мс на add+delete).
+
+Управляемые TSIG-ключи: `POST/GET/DELETE /api/v1/tsig-keys` (scopes
+`keys:read`/`keys:write`). Секрет write-only и никогда не возвращается.
+Состояние — `tsig_state_file` (JSON `0600`, атомарная запись); `SIGHUP`
+перечитывает файл, созданный/удалённый ключ действует без рестарта.
+Ключи из `[[tsig_keys]]` неизменяемы через API.
+
+Без настроек сервер
 отвечает `REFUSED`; неизвестная зона — `NOTAUTH`; secondary/forward —
 `REFUSED`. Изменение коммитится одной транзакцией `pulse-zonefile`, serial
 SOA растёт, после успеха уходит NOTIFY-out. Метрики — `pulsed_update_*`.
@@ -561,12 +613,15 @@ cargo deny check
 - REST — MVP-подмножество спецификации (jobs/transfers/audit/serial/keys
   реализованы); API доступен только на loopback (без TLS).
 - DNS UPDATE: только primary-зоны в состоянии `Serving` (secondary/forward →
-  `REFUSED`); авторизация — статические TSIG-ключи + IP/CIDR + allowlist зон,
-  без per-name update-policy; DNSSEC-записи (`RRSIG`/`NSEC`/`NSEC3`/
+  `REFUSED`); авторизация — статические/управляемые TSIG-ключи, SIG(0)
+  (RFC 2931) и IP/CIDR; per-name update-policy (`[[update.policy]]`);
+  DNSSEC-записи (`RRSIG`/`NSEC`/`NSEC3`/
   `NSEC3PARAM`/`DNSKEY`) управляются сигнатором и UPDATE не меняются;
-  SIG(0) (RFC 3007) не поддерживается — авторизация только TSIG (RFC 8945);
-  персистентность — общий commit `pulse-zonefile` (отдельного UPDATE-journal
-  нет).
+  для подписанных зон UPDATE инкрементально переподписывает затронутые
+  RRset и denial-цепочку в том же commit; персистентность — общий commit
+  `pulse-zonefile` (отдельного UPDATE-journal нет). При включённом
+  AXFR/IXFR-out `after_commit` по-прежнему материализует снапшот зоны для
+  истории IXFR — это не часть DNSSEC-пути.
 - DNSSEC: NSEC и NSEC3 (SHA-1, Opt-Out включается `nsec3_opt_out`),
   автоматическая ротация KSK/ZSK по RFC 7583 (`rotation`: pre-publish →
   double-sign → active → retire, состояние в `0600`-файле), RFC 5011 для
