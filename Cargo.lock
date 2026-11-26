@@ -1522,8 +1522,10 @@ dependencies = [
  "pulse-dnssec",
  "pulse-tls",
  "rcgen",
+ "rustls",
  "tempfile",
  "thiserror",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1558,6 +1560,7 @@ dependencies = [
  "h3-quinn",
  "http",
  "httparse",
+ "libc",
  "pulse-dns",
  "quinn",
  "rcgen",

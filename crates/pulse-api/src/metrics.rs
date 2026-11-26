@@ -182,6 +182,36 @@ fn append_v2(out: &mut String, zonefile: &crate::port::ZoneFileMetrics) {
             "gauge",
             zonefile.v2_pins,
         ),
+        (
+            "zonefile_v2_freeze_epoch",
+            "Active shared/local freeze epoch (0 = none).",
+            "gauge",
+            zonefile.v2_freeze_epoch,
+        ),
+        (
+            "zonefile_v2_sweep_runs_total",
+            "Online leak sweep runs.",
+            "counter",
+            zonefile.v2_sweep_runs,
+        ),
+        (
+            "zonefile_v2_sweep_scanned_pages_total",
+            "Pages scanned by online leak sweep.",
+            "counter",
+            zonefile.v2_sweep_scanned_pages,
+        ),
+        (
+            "zonefile_v2_sweep_reclaimed_pages_total",
+            "Pages returned to the pool by online leak sweep.",
+            "counter",
+            zonefile.v2_sweep_reclaimed_pages,
+        ),
+        (
+            "zonefile_v2_pending_pages",
+            "Absolute pending reservation floor (0 = none).",
+            "gauge",
+            zonefile.v2_pending_pages,
+        ),
     ] {
         out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
         out.push_str(&format!("{name} {value}\n"));

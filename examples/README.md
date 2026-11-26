@@ -52,6 +52,23 @@ cargo run -p pulsed -- --config examples/pulsed-api.toml
 рестарта. Второй `all` на занятом файле завершается с `busy`. Подробности —
 `docs/process-roles.md`.
 
+## Тюнинг TCP/DoT
+
+Все TCP-транспорты (`listen_tcp`, `dot_listen`, DoH/1.1) используют общий tokio
+event-loop. `tcp_nodelay` и `busy_poll_us` применяются к DoT и plain TCP;
+`request_timeout_ms` — к DoT:
+
+```toml
+tcp_workers = 0          # 0 — по числу CPU; иначе число worker-потоков
+tcp_nodelay = true       # TCP_NODELAY на accepted-сокетах
+busy_poll_us = 0         # SO_BUSY_POLL, микросекунды; 0 — выключено
+request_timeout_ms = 10000  # тело DoT-сообщения и запись ответа
+```
+
+`SO_BUSY_POLL` — опция латентности, а не корректности: `EPERM`/`ENOPROTOOPT`
+игнорируются. `tcp_workers` фиксируется один раз на процесс; менять его на
+лету нельзя.
+
 ## Импорт зон из master-файлов (.zone)
 
 В рантайме master-файлы не читаются: их импортирует отдельная команда

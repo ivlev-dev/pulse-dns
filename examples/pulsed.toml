@@ -21,3 +21,13 @@ journal = true
 # journal_path = "/tmp/pulse-dns.zonefile.journal"
 journal_max_bytes = 8388608
 journal_fsync = true
+
+# Кеш готовых wire-ответов для статичных зон. Ключ включает версию зоны, QNAME
+# в исходном регистре (0x20), QTYPE/QCLASS, DO/CD/RD, EDNS payload и транспорт.
+# TTL остаются авторскими (не декрементируются), ID патчится при выдаче.
+# REST-правка/удаление зоны немедленно инвалидирует связанные записи.
+[response_cache]
+enabled = true
+max_entries = 100000
+max_bytes = 67108864
+shards = 16

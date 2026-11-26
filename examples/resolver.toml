@@ -17,6 +17,20 @@ paths = ["examples/resolver-blocklist.txt"]
 allowlist = ["safe.ads.example"]
 response = "nxdomain"
 reload_secs = 0
+# Удалённые HTTPS-источники: скачиваются в фоне, кэшируются и дают NXDOMAIN.
+urls = ["https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"]
+refresh_secs = 86400
+cache_dir = "cache/blocklist"
+max_bytes = 67108864
+allow_redirects = false
+timeout_ms = 30000
+retries = 2
+backoff_ms = 1000
+# Форма с индивидуальным интервалом и форматом:
+# [[blocklist.sources]]
+# url = "https://example.com/hosts.txt"
+# refresh_secs = 3600
+# format = "hosts"
 
 [[overrides]]
 name = "router.home"

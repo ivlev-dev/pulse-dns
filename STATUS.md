@@ -39,8 +39,8 @@
 | `pulse-zonefile` | v2 `ParallelStore`: lock-free аллокатор страниц, ring-головы версий A/B, per-zone пулы/GC, in-process пины читателей, per-zone commit, group commit (2 fsync на группу), PageCache, recovery, полный `fsck --verify` и `--repair`, `compact_zone`, `sync`; **межпроцессная запись v2** (ADR 0007): sidecar-координатор `<file>.pulsecoord`, CAS-курсор в shared mmap, `fcntl` per-zone leases + fencing (pid/starttime/generation), общая reader table, `LOCK_SH`; **межпроцессный group commit** (sidecar v4, очередь `RootEntry`, лидер по commit-lease, одна пара `fdatasync` на всех, fault-tolerant ack); 2/4/8 процессов сгруппированы, kill -9 координатора в фазах 1/2, 10k коммитов в 2 процессах; ~20k zone-commit/s; group commit v4: 8 процессов 6.0× (1385 vs 231 commits/s, fsync 2 мс), p99 5.6 мс vs 34–84 мс direct; bulk-load 1M RRset за 2.5–2.8 с; order-key memcmp; каталог 1000 зон за 83 мс (исправлен self-deadlock); v1 читается для `pulsed convert` |
 | `pulse-runtime` | io_uring UDP (ring на ядро, multishot recv + provided buffers, `REGISTER_FILES`, `COOP/DEFER_TASKRUN`, опции SQPOLL/`SO_BUSY_POLL`, IP_PKTINFO, NODROP-проверка, backpressure, graceful shutdown, изоляция паник) + epoll-фолбэк |
 | `pulse-server` | авторитетный движок: NXDOMAIN/NODATA/ENT, wildcard/closest encloser, CNAME/DNAME, делегация/glue/DS, EDNS/BADVERS, TC, ANY по RFC 8482, детерминированный additional; zero-copy ответ (`respond_ref_into`), NSEC/NSEC3 индексы для быстрого NXDOMAIN |
-| `pulse-resolver` | library: forward/iterative, кеш + negative caching, blocklist/allowlist/overrides, DNSSEC AD/BOGUS→SERVFAIL, UDP/TCP + upstream DoT/DoH с failover/cooldown, пул keep-alive соединений (`pool_size`, default 4, in-flight лимит, reconnect backoff), смешанные upstream |
-| `pulseresolved` | binary резолвер: TOML-конфиг (JSON — совместимость), UDP/TCP, серверные DoT/DoH/1.1/DoH/2/DoH/3/DoQ/DNSCrypt v2 (UDP+TCP), ACL клиентов (default loopback, отдельный `tls_allow_from`), per-source rate limit, полный RRL (`noerror`/`nxdomain`/`referral`/`error`, per-source + per-name, slip, refused/drop/truncate; только UDP), пул DoT/DoH, смешанные upstream (UDP/TCP/DoT/DoH), кеш, blocklist, overrides, DNSSEC, SIGHUP (blocklist + TLS-пара), `/metrics` по транспортам, `/healthz`, control-plane REST API (`control_listen`, bearer-token, cache/purge, blocklist reload, upstreams, trust anchors, RRL patch, config, RFC 9457 problem+json, `X-Request-Id`, rate limit на токен, graceful shutdown) |
+| `pulse-resolver` | library: forward/iterative, кеш + negative caching, blocklist/allowlist/overrides, HTTPS blocklist-источники (стриминг, лимит 64 MiB, conditional 304, атомарный кэш 0600, SSRF-guard), DNSSEC AD/BOGUS→SERVFAIL, UDP/TCP + upstream DoT/DoH с failover/cooldown, пул keep-alive соединений (`pool_size`, default 4, in-flight лимит, reconnect backoff), смешанные upstream |
+| `pulseresolved` | binary резолвер: TOML-конфиг (JSON — совместимость), UDP/TCP, серверные DoT/DoH/1.1/DoH/2/DoH/3/DoQ/DNSCrypt v2 (UDP+TCP), ACL клиентов (default loopback, отдельный `tls_allow_from`), per-source rate limit, полный RRL (`noerror`/`nxdomain`/`referral`/`error`, per-source + per-name, slip, refused/drop/truncate; только UDP), пул DoT/DoH, смешанные upstream (UDP/TCP/DoT/DoH), кеш, blocklist (файлы + HTTPS URL с периодическим обновлением/кэшем/304), overrides, DNSSEC, SIGHUP (blocklist + TLS-пара), `/metrics` по транспортам, `/healthz`, control-plane REST API (`control_listen`, bearer-token, cache/purge, blocklist reload, upstreams, trust anchors, RRL patch, config, RFC 9457 problem+json, `X-Request-Id`, rate limit на токен, graceful shutdown) |
 | `pulse-tls` | DoT (RFC 7858), DoH/1.1 (RFC 8484), DoH/2 (`http2`), DoH/3 (`http3`, RFC 9114) и DoQ (`doq`) на rustls/quinn/h3: серверы и клиенты (webpki-roots/CA, ALPN, keep-alive) |
 | `pulse-api` | REST доведён: health/ready/metrics/OpenAPI, zones CRUD, RRset CRUD/PATCH, settings, serial, transfers/jobs, import, audit, confirm_origin, keys rollover/status, async `Prefer: respond-async`, bearer-auth + scopes + per-zone allowlist, ETag/If-Match, RFC 9457 problem+json, Idempotency-Key, пагинация, лимиты; write-ahead journal (outbox) мутаций: CRC/seq, fsync, crash-recovery, compaction, `journal_*` метрики |
 | `pulsed` | binary: TOML-конфиг (JSON — совместимость) с CLI-overrides, UDP+TCP+DoT+DoH/1.1+DoH/2+DoH/3+DoQ+DNSCrypt v2 (UDP/TCP)+REST, зоны только в `pulse-zonefile` v2 (`--data`), DNS отвечает из mmap, импорт `.zone`, `convert` v1→v2, per-zone/group commit, AXFR/IXFR-out, NOTIFY, secondary-зоны, DNSSEC-подпись NSEC/NSEC3, автоматическая ротация ключей, journal REST-мутаций с recovery на старте (`journal = true` по умолчанию), graceful shutdown, Dockerfile |
@@ -60,7 +60,7 @@
 - **io_uring**: RSS 4.7/10.2/17.5 МБ на 1/4/8 workers (было 12.7/40.6/104.9); p99 8 workers 650→440 µs; SQPOLL на этом ядре медленнее (выкл), registered files вкл.
 - **Каталог 1000 зон**: исправлено зависание (выделенный lease-шард каталога); 1000 зон за 83 мс, 4096 за 651 мс. В multi каталог пишут все процессы под catalog lease (4 × 250 зон), `zone_seq` переиспользуется через общую очередь sidecar.
 - **Affinity/THP**: маски DNS/API/control проверены; THP на ext4 file-backed — no-op, на RX-арене удваляет RSS без выигрыша (auto best-effort).
-- **TCP/DoT/DoH/plain TCP**: переведены на tokio event-loop; 10k idle-соединений, ~11 КБ/соединение (было 59–67 КБ), qps −8–10%, p99 без изменений.
+- **TCP/DoT/DoH/plain TCP**: tokio event-loop после горячего пути (буферы без повторного зануления, один TLS-рекорд на ответ, два таймера на запрос, ленивый буфер только после префикса): 10k idle-соединений, ~11 КБ/соединение (было 59–67 КБ); qps +16–23% против thread-per-conn, p50 0.89–0.95 мс в общем loopback-тесте (0.11 мс при изоляции server/client), p99 не хуже baseline; RSS не вырос.
 - **Multi-process каталог и reclaim**: create/delete/meta из любого процесса; `high_water` стабилизируется (3636→5428 после 10k циклов); 8 процессов — 13.4k zone-commit/s.
 - **Межпроцессный group commit (sidecar v4)**: писатели кладут готовые `RootEntry` в общую очередь,
   лидер (любой процесс под `fcntl`-lease) делает одну пару `fdatasync` на всех. На модели fsync 2 мс:
@@ -119,6 +119,13 @@
   на мусор, upstream DoT/DoH против self-signed `DotServer`/`DohServer`
   (включая keep-alive и отказ при неверном CA), failover между upstream,
   ACL (`refused_acl_total`) и rate limit с изоляцией по source IP.
+  Удалённые blocklist-источники: self-signed HTTPS mock, скачивание hosts →
+  NXDOMAIN через реальный UDP (apex/поддомены/wildcard, allowlist важнее),
+  периодическое обновление по `refresh_secs`, SIGHUP и
+  `POST /api/v1/blocklist/reload`, перезапуск из кэша без сети, ошибка сети/
+  размера/редиректа оставляет старый снимок, ETag → 304, кэш `0600`,
+  метрики `blocklist_fetch_total{result=...}`, `blocklist_entries`,
+  `blocklist_last_success_ts`; SSRF-guard (https-only, приватные адреса).
   Пул DoT/DoH: 100 параллельных запросов через self-signed upstream при
   `pool_size = 4` без потерь (DoT и DoH), последовательный трафик держит одно
   соединение, обрыв → reconnect (`discards`/`reconnects`), `pool_size = 2`
@@ -167,7 +174,11 @@
   окно 1 — 89 036 qps, p50 35 µs, p99 182 µs; zone lookup 156–268 нс; insert ~10 000/s;
   alloc reserve ~50M/s; per-zone commit 49k zone-commit/s; group commit 2 fsync/группу (2.4×/3.36×);
   PageCache 418 нс warm single-page; полный lookup ~1.06 µs; DoT ~10.4k; DoH h2 ~8.2k; DoH3 ~13.6–14.9k; DoQ ~5.25k.
-  TCP/DoT/DoH/plain TCP — tokio event-loop: 10k idle-соединений, ~11 КБ/соединение (было 59–67 КБ), qps −8–10%, p99 без изменений; 10k соединений там, где thread-per-conn упирался в лимиты.
+  TCP/DoT/DoH/plain TCP — tokio event-loop: 10k idle-соединений, ~11 КБ/соединение (было 59–67 КБ); 10k соединений там, где thread-per-conn упирался в лимиты.
+  DoT async после hot-path оптимизаций (64 активных + 100/1k/10k idle, 5 пар прогонов): 52.1k/56.3k/53.9k qps, p50 0.92/0.89/0.95 мс, p99 2.85/2.86/3.05 мс; baseline thread-per-conn в том же harness — 44.9k/45.6k/44.4k qps, p50 1.18/1.14/1.17 мс, p99 3.01/3.05/3.50 мс.
+  Изолированный стенд (server на CPU 0-3, client 4-7), 10 прогонов, медианы: DoT 1000 соединений/окно 1 — 39.7k qps, p50 120 µs, p99 489 µs, p999 1011 µs против thread-per-conn 26.2k qps, p50 149 µs, p99 612 µs; окно 64 — 98.9k qps, p50 1.90 мс, p99 4.81 мс против 87.4k qps, p50 1.78 мс, p99 5.98 мс.
+  Plain TCP event-loop (тот же изолированный стенд): 1000 соединений/окно 1 — p50 96 µs, p99 313 µs; 100/окно 64 — 120k qps, p99 6.74 мс.
+  Настройки: `tcp_workers` (0 — по CPU), `tcp_nodelay` (true), `busy_poll_us` (0), `request_timeout_ms` (10000); `SO_BUSY_POLL` применяется к listener и accepted-сокетам, ошибка опции игнорируется.
   DoT async (64 активных + 100/1k/10k idle): 48.4k/49.5k/49.0k qps, p99 2.73/2.84/3.15 мс; серверный RSS idle ~11 KiB/conn (10k соединений, 115 MiB);
   baseline thread-per-conn: 52.5k/54.5k qps при 100/1k, но 59–67 KiB/conn.
 - Fuzz/CI: `fuzz/` (cargo-fuzz, nightly) — 5 таргетов (`dns_wire`,
@@ -201,7 +212,7 @@
 - В режиме `all` REST под 8 UDP workers делит CPU с DNS; для разделения есть роли `--role dns|api` на одном v2-файле (multi-process, ADR 0007), см. `docs/process-roles.md`.
 - Замеры на loopback + SMT: клиент и сервер делят 8 vCPU, абсолютные qps занижены.
 - perf record заблокирован (paranoid=2), flamegraph не снят; call-graph (dwarf) запрещён, только плоский cycles:u.
-- TCP event-loop даёт −8–10% qps против thread-per-conn при меньшей памяти.
+- TCP event-loop после hot-path оптимизаций обгоняет thread-per-conn по qps (+16–23%) и p50 при меньшей памяти; выигрыш зависит от нагрузки и ядра.
 - THP file-backed ограничен shmem/tmpfs; на RX-арене удваивает RSS без выигрыша (auto best-effort).
 - Изолированный стенд: server/client на разных SMT-ядрах, 14 сценариев, perf stat + плоские флеймграфы; отчёт `docs/bench/isolated.md`. Хост шумный, цифры — нижняя оценка.
 - Loom отсутствует (fuzz и Miri есть); Miri — continue-on-error.
@@ -212,7 +223,7 @@
   (`pulsed`) нет.
 - THP file-backed ограничен shmem/tmpfs (ext4 file-backed — no-op; на RX-арене удваивает RSS без выигрыша).
 - perf call-graph (dwarf) запрещён paranoid=2; только плоский cycles:u.
-- TCP event-loop даёт −8–10% qps против thread-per-conn при меньшей памяти.
+- TCP event-loop после hot-path оптимизаций обгоняет thread-per-conn по qps (+16–23%) и p50 при меньшей памяти; выигрыш зависит от нагрузки и ядра.
 - Loopback/SMT/шумный хост; для SLA — отдельный стенд.
 
 ## Как проверить за 5 минут
@@ -246,7 +257,7 @@ dig @127.0.0.1 -p 5353 example.com. A +norecurse
 - В режиме `all` REST под 8 UDP workers делит CPU с DNS; для разделения есть роли `--role dns|api` на одном v2-файле (multi-process, ADR 0007), см. `docs/process-roles.md`.
 - Замеры на loopback + SMT: клиент и сервер делят 8 vCPU, абсолютные qps занижены.
 - perf record заблокирован (paranoid=2), flamegraph не снят; call-graph (dwarf) запрещён, только плоский cycles:u.
-- TCP event-loop даёт −8–10% qps против thread-per-conn при меньшей памяти.
+- TCP event-loop после hot-path оптимизаций обгоняет thread-per-conn по qps (+16–23%) и p50 при меньшей памяти; выигрыш зависит от нагрузки и ядра.
 - THP file-backed ограничен shmem/tmpfs; на RX-арене удваивает RSS без выигрыша (auto best-effort).
 - Изолированный стенд: server/client на разных SMT-ядрах, 14 сценариев, perf stat + плоские флеймграфы; отчёт `docs/bench/isolated.md`. Хост шумный, цифры — нижняя оценка.
 - API доступен только на loopback, TLS отсутствует.

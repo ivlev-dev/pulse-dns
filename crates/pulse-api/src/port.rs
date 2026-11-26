@@ -414,6 +414,16 @@ pub struct ZoneFileMetrics {
     pub v2_group_fsyncs: u64,
     /// Активных пинов на момент сбора метрик.
     pub v2_pins: u64,
+    /// Действующий `freeze_epoch` (`0` — нет).
+    pub v2_freeze_epoch: u64,
+    /// Прогонов онлайн-sweep утечек.
+    pub v2_sweep_runs: u64,
+    /// Просмотрено страниц онлайн-sweep.
+    pub v2_sweep_scanned_pages: u64,
+    /// Возвращено страниц онлайн-sweep.
+    pub v2_sweep_reclaimed_pages: u64,
+    /// Незакоммиченные резервации (`0` — нет).
+    pub v2_pending_pages: u64,
 }
 
 /// Состояние одного ключа ротации (RFC 7583) для `/keys`.

@@ -11,7 +11,15 @@
     "paths": ["examples/resolver-blocklist.txt"],
     "allowlist": ["safe.ads.example"],
     "response": "nxdomain",
-    "reload_secs": 0
+    "reload_secs": 0,
+    "urls": ["https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"],
+    "refresh_secs": 86400,
+    "cache_dir": "cache/blocklist",
+    "max_bytes": 67108864,
+    "allow_redirects": false,
+    "timeout_ms": 30000,
+    "retries": 2,
+    "backoff_ms": 1000
   },
   "overrides": [
     { "name": "router.home", "ttl": 60, "a": ["192.168.1.1"] },

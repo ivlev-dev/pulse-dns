@@ -27,6 +27,11 @@ upstream по UDP, TCP, DoT и DoH/1.1 (пул keep-alive, backoff). Остат�
   RFC 8482, детерминированный additional; zero-copy ответ (`respond_ref_into`),
   0 аллокаций на ответ (unsigned/signed/referral/ANY/EDNS); NSEC/NSEC3 индексы
   для быстрого NXDOMAIN.
+- Кеш готовых ответов (`response_cache`): wire-байты с `ID=0` по ключу
+  `(zone_seq, zone_version, QNAME в исходном регистре, QTYPE/QCLASS, DO/CD/RD,
+  EDNS payload, транспорт)`, патч ID при выдаче, авторские TTL, инвалидация по
+  версии зоны (REST-правка/удаление — немедленно), шарды + приближённый LRU,
+  лимиты `max_entries`/`max_bytes`, метрики hit/miss/evict; `--response-cache*`.
 - Рантайм (`pulse-runtime`): io_uring UDP (ring на ядро, multishot recv +
   provided buffers, `REGISTER_FILES`, `COOP/DEFER_TASKRUN`, опции SQPOLL/
   `SO_BUSY_POLL`, IP_PKTINFO, проверка NODROP, backpressure, graceful
@@ -84,7 +89,9 @@ upstream по UDP, TCP, DoT и DoH/1.1 (пул keep-alive, backoff). Остат�
   hot-reload TLS-пары по SIGHUP, метрики
   `dot_*`/`doh_*`/`doh_http2_*`/`doq_*`/`dnscrypt_*`.
 - TCP/DoT/DoH/plain TCP на tokio event-loop: ~11 КБ/соединение, 10k idle-соединений
-  (было 59–67 КБ); qps −8–10%, p99 без изменений.
+  (было 59–67 КБ); qps +16–23% против thread-per-conn, p99 не хуже, p50 0.89–0.95 мс
+  в общем loopback-тесте и ~0.12 мс при изоляции клиента и сервера. Тюнинг:
+  `tcp_workers`, `tcp_nodelay`, `busy_poll_us`, `request_timeout_ms`.
 - Multi-process каталог/reclaim: create/delete/meta из любого процесса;
   `high_water` стабилизируется (3636→5428 после 10k циклов); 8 процессов — 13.4k zone-commit/s;
   в multi Page/node-кеши включены (общая генерация страниц в sidecar, кеш-ключ `(page_no, generation)`), `freeze()` process-local, fsck repair — quiescent.
@@ -108,7 +115,9 @@ Page/node-кеши включены (ключ `(page_no, generation)` из sidec
 `fsck --repair`/возврат `[DP,cursor)` — quiescent; multi кеш-ключ включает
 generation, sidecar +~1 МиБ на дефолтной геометрии.
 TCP/DoT/DoH/plain TCP — tokio event-loop: 10k idle-соединений, ~11 КБ/соединение
-(было 59–67 КБ), qps −8–10%, p99 без изменений.
+(было 59–67 КБ); qps +16–23% против thread-per-conn, p99 не хуже, p50
+0.89–0.95 мс в общем loopback-тесте и ~0.12 мс при изоляции.
+Тюнинг: `tcp_workers`, `tcp_nodelay`, `busy_poll_us`, `request_timeout_ms`.
 THP на ext4 file-backed — no-op, на RX-арене удваивает RSS без выигрыша
 (auto best-effort; file-backed ограничен shmem/tmpfs).
 perf call-graph (dwarf) запрещён paranoid=2; только плоский cycles:u.
@@ -148,7 +157,7 @@ workers по-прежнему делит CPU с DNS в режиме `all`; дл�
 | `pulse-tls` | DNS over TLS (RFC 7858), DoH/1.1 (RFC 8484), DoH/2 (`http2`), DoH/3 (`http3`, RFC 9114) и DoQ (`doq`): серверы и клиенты для upstream |
 | `pulse-dnscrypt` | DNSCrypt v2: сертификаты, сервер, клиент |
 | `pulse-api` | REST API управления зонами |
-| `pulse-resolver` | Кеширующий резолвер: forward/iterative, кеш, blocklist, overrides, DNSSEC |
+| `pulse-resolver` | Кеширующий резолвер: forward/iterative, кеш, blocklist (файлы + HTTPS-источники с кэшем и 304), overrides, DNSSEC |
 | `pulsed` | Бинарник сервера (UDP+TCP+DoT+DoH/1.1-2-3+DoQ+DNSCrypt+REST) |
 | `pulseresolved` | Бинарник резолвера (UDP+TCP+DoT+DoH/1.1+DoH/2+DoQ+DNSCrypt+метрики+control-plane API) |
 
@@ -264,6 +273,39 @@ curl -sS http://127.0.0.1:9153/healthz
 curl -sS http://127.0.0.1:9153/metrics | head
 # После правки blocklist: kill -HUP <pid> (или blocklist.reload_secs > 0)
 ```
+
+Удалённые blocklist-источники (например, StevenBlack hosts):
+
+```toml
+[blocklist]
+urls = ["https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"]
+refresh_secs = 86400          # 0 — только SIGHUP/API
+cache_dir = "cache/blocklist" # по умолчанию $XDG_CACHE_HOME/pulseresolved/blocklist
+max_bytes = 67108864          # 64 MiB, стриминговый лимит
+allow_redirects = false       # true — один редирект на тот же хост
+timeout_ms = 30000
+retries = 2
+backoff_ms = 1000
+# allow_hosts = ["raw.githubusercontent.com"]  # SSRF allowlist (пусто — любой публичный хост)
+# ca_file = "private-ca.pem"                   # дополнительный PEM-CA
+
+[[blocklist.sources]]
+url = "https://example.com/hosts.txt"
+refresh_secs = 3600
+format = "hosts"              # auto | hosts | domains
+```
+
+Загрузчик использует только HTTPS и rustls (`webpki-roots` + опциональный
+CA), проверяет TLS и запрещает приватные адреса для хостов вне `allow_hosts`.
+Скачивание идёт в фоне с `If-None-Match`/`If-Modified-Since` (304 не
+пересобирает снимок), а тело читается потоково и обрывается при превышении
+`max_bytes`. Снимок пишется атомарно в `cache_dir/<hash>.list` (0600), рядом
+— метаданные `ETag`/`Last-Modified`; при старте сначала применяется кэш, затем
+сеть. Ошибка сети, размера или редиректа оставляет старый снимок. SIGHUP и
+`POST /api/v1/blocklist/reload` запускают немедленное обновление; метрики —
+`pulseresolved_blocklist_fetch_total{result="updated|not_modified|failed"}`,
+`..._fetch_bytes_total`, `..._last_success_ts`, `..._entries`. Содержимое
+списков не логируется.
 
 Control-plane API резолвера (`examples/resolver-control.toml`): отдельный
 loopback-listener, bearer-token и без TLS. Токен задаётся `control_token` или,
@@ -459,8 +501,9 @@ cargo deny check
 | Group commit (fsync на группу) | 2 fsync/группу; ускорение 2.4× (btrfs), 3.36× (эмуляция fsync 2 мс) |
 | PageCache warm single-page | 418 нс; полный lookup ~1.06 µs |
 | DoT (qps, одно keep-alive соединение) | ~10.4k |
-| DoT async, 64 активных + 100/1k/10k idle | 48.4k/49.5k/49.0k qps, p99 2.73/2.84/3.15 мс |
-| DoT/TCP/DoH idle RSS (event-loop) | ~11 KiB/соединение (было 59–67 KiB); 10k соединений |
+| DoT async, 64 активных + 100/1k/10k idle | 52.1k/56.3k/53.9k qps, p50 0.92/0.89/0.95 мс, p99 2.85/2.86/3.05 мс (thread-per-conn: 44.9k/45.6k/44.4k qps, p50 1.18/1.14/1.17 мс) |
+| DoT изолированно, 1000 соединений, окно 1 | event-loop p50 120 µs / p99 489 µs / 39.7k qps; thread-per-conn p50 149 µs / p99 612 µs / 26.2k qps |
+| DoT/TCP/DoH idle RSS (event-loop) | ~11 KiB/соединение (было 59–67 KiB); 10k соединений, RSS не вырос |
 | DoH HTTP/2 (DNS/s) | ~8.2k |
 | DoH HTTP/3 (qps) | ~13.6–14.9k |
 | DoQ (qps) | ~5.25k |
