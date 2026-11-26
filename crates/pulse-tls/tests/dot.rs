@@ -274,6 +274,89 @@ fn slowloris_prefix_does_not_block_other_clients() {
 }
 
 #[test]
+fn pipelined_requests_are_answered_in_order() {
+    let cert = test_cert();
+    let mut server = dot_server(&cert, |_| {});
+    let addr = server.local_addr();
+    let mut client = TlsClient::connect(addr, &cert.cert_der, Some(b"dot")).expect("client");
+
+    let queries: Vec<Vec<u8>> = [21_u16, 22, 23, 24]
+        .into_iter()
+        .map(|id| {
+            let query = dns_query(id);
+            let mut frame = Vec::with_capacity(query.len() + 2);
+            frame.extend_from_slice(
+                &u16::try_from(query.len())
+                    .expect("query fits u16")
+                    .to_be_bytes(),
+            );
+            frame.extend_from_slice(&query);
+            frame
+        })
+        .collect();
+    let mut batch = Vec::new();
+    for frame in &queries {
+        batch.extend_from_slice(frame);
+    }
+    client.send(&batch).expect("send pipelined batch");
+    for (id, expected) in [21_u16, 22, 23, 24].into_iter().zip(queries.iter()) {
+        let response = client.read_dot().expect("read pipelined response");
+        assert_eq!(&response, expected.get(2..).expect("frame body"), "id {id}");
+    }
+    assert_eq!(server.stats().queries, 4);
+    assert_eq!(server.stats().responses, 4);
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn slowloris_body_is_closed_by_request_timeout() {
+    let cert = test_cert();
+    let mut server = dot_server(&cert, |config| {
+        config.idle_timeout = Duration::from_secs(5);
+        config.request_timeout = Duration::from_millis(150);
+    });
+    let addr = server.local_addr();
+    let mut slow = TlsClient::connect(addr, &cert.cert_der, Some(b"dot")).expect("slow client");
+    slow.send(&16_u16.to_be_bytes()).expect("prefix");
+    slow.send(&[0_u8]).expect("one body byte");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut closed = false;
+    while Instant::now() < deadline {
+        if slow.read_dot().is_err() {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed, "slow body must be closed by request_timeout");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while server.stats().timeouts == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(server.stats().timeouts >= 1);
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+fn ten_request_cycles_are_stable() {
+    let cert = test_cert();
+    let mut server = dot_server(&cert, |_| {});
+    let addr = server.local_addr();
+    let mut client = TlsClient::connect(addr, &cert.cert_der, Some(b"dot")).expect("client");
+    for cycle in 0..10_u16 {
+        for step in 0..100_u16 {
+            let query = dns_query(cycle.wrapping_mul(100).wrapping_add(step));
+            client.send_dot(&query).expect("send");
+            assert_eq!(client.read_dot().expect("read"), query);
+        }
+    }
+    assert_eq!(server.stats().queries, 1000);
+    assert_eq!(server.stats().responses, 1000);
+    assert_eq!(server.stats().errors, 0);
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
 fn connection_limit_rejects_excess_and_keeps_existing() {
     let cert = test_cert();
     let mut server = dot_server(&cert, |config| {

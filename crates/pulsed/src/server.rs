@@ -95,6 +95,11 @@ impl Server {
     #[allow(clippy::too_many_lines)]
     pub fn start_with_api(config: &Config, api: Option<ApiOptions>) -> Result<Self, ServerError> {
         config.validate()?;
+        pulse_tls::net::configure_runtime(pulse_tls::net::RuntimeSettings {
+            worker_threads: (config.tcp_workers > 0).then_some(config.tcp_workers),
+            ..pulse_tls::net::RuntimeSettings::default()
+        })
+        .map_err(|error| ServerError::Runtime(error.to_string()))?;
         let role = config.role;
         // Пересечение с `sched_getaffinity`/cpuset проверяется до открытия
         // zonefile и сокетов: пустое пересечение — ошибка старта, а не тихий
@@ -267,6 +272,8 @@ impl Server {
                     config.tcp.idle_timeout(),
                     &admin,
                     Arc::clone(&stats),
+                    config.tcp_nodelay,
+                    (config.busy_poll_us > 0).then_some(config.busy_poll_us),
                 )
                 .map_err(|source| ServerError::TcpStart { addr, source })?,
             ),
@@ -304,7 +311,14 @@ impl Server {
                 api_config.cpu_affinity.clone_from(&api_affinity);
                 let metric_source = {
                     let metrics = Arc::clone(&metrics);
-                    Arc::new(move || metrics.render())
+                    let admin = Arc::clone(&admin);
+                    Arc::new(move || {
+                        let mut text = metrics.render();
+                        text.push_str(&crate::metrics::render_response_cache(
+                            &admin.response_cache_metrics(),
+                        ));
+                        text
+                    })
                 };
                 Some(serve_with_journal(
                     api_config,
@@ -495,7 +509,17 @@ impl Server {
     /// Те же строки добавляются к `GET /metrics` встроенного REST API.
     #[must_use]
     pub fn transport_metrics(&self) -> String {
-        self.metrics.render()
+        let mut text = self.metrics.render();
+        text.push_str(&crate::metrics::render_response_cache(
+            &self.admin.response_cache_metrics(),
+        ));
+        text
+    }
+
+    /// Снимок метрик кеша готовых ответов.
+    #[must_use]
+    pub fn response_cache_metrics(&self) -> pulse_server::ResponseCacheMetrics {
+        self.admin.response_cache_metrics()
     }
 
     /// Фактический адрес API (полезен при `port = 0`).
@@ -767,6 +791,9 @@ pub enum ServerError {
     /// Ошибка UDP-рантайма.
     #[error(transparent)]
     Udp(#[from] pulse_runtime::RuntimeError),
+    /// Не удалось настроить общий tokio runtime TCP/DoT/DoH.
+    #[error("cannot configure TCP runtime: {0}")]
+    Runtime(String),
     /// Не удалось запустить фоновый NOTIFY-воркер.
     #[error("cannot start NOTIFY worker: {0}")]
     Notify(#[source] io::Error),

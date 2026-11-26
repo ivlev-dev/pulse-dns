@@ -150,6 +150,9 @@ impl TlsTransports {
                 let tls = dot_tls_config(cert_path, key_path)?;
                 let mut dot_config = DotConfig::new(addr, tls);
                 dot_config.max_connections = config.dot_max_connections;
+                dot_config.request_timeout = Duration::from_millis(config.request_timeout_ms);
+                dot_config.nodelay = config.tcp_nodelay;
+                dot_config.busy_poll_us = (config.busy_poll_us > 0).then_some(config.busy_poll_us);
                 dot_config.acl.clone_from(&acl);
                 Some(
                     DotServer::bind_shared(dot_config, Arc::clone(&handler), metrics.dot_stats())

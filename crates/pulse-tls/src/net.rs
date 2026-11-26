@@ -70,6 +70,107 @@ use tokio::task::JoinSet;
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const ABORT_GRACE: Duration = Duration::from_millis(100);
+const MIN_WORKER_STACK: usize = 64 * 1024;
+
+/// Параметры общего tokio runtime.
+///
+/// Настройки применяются один раз: до первого [`TcpServer::start`]. Значения
+/// `None` означают дефолты tokio, поэтому [`RuntimeSettings::default`] не
+/// меняет поведение существующих процессов.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeSettings {
+    /// Число worker-потоков (`None` — по числу CPU).
+    pub worker_threads: Option<usize>,
+    /// Размер стека worker-потока в байтах (`None` — дефолт tokio).
+    pub thread_stack_size: Option<usize>,
+    /// Время жизни простаивающего blocking-потока.
+    pub thread_keep_alive: Option<Duration>,
+    /// Сколько задач worker выполняет за один проход event-loop.
+    ///
+    /// Меньше значение — ниже хвостовая латентность под нагрузкой, выше
+    /// значение — меньше накладных расходов на опрос I/O.
+    pub event_interval: Option<u32>,
+}
+
+impl RuntimeSettings {
+    fn validate(self) -> io::Result<Self> {
+        if self.worker_threads.is_some_and(|workers| workers == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker_threads must be positive",
+            ));
+        }
+        if self
+            .thread_stack_size
+            .is_some_and(|bytes| bytes < MIN_WORKER_STACK)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "thread_stack_size must be at least 64 KiB",
+            ));
+        }
+        if self.event_interval.is_some_and(|interval| interval == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "event_interval must be positive",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// Настройки сокета, применяемые при accept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketOptions {
+    /// Включить `TCP_NODELAY` (по умолчанию `true`).
+    pub nodelay: bool,
+    /// `SO_BUSY_POLL` в микросекундах; `None`/`0` — выключено.
+    pub busy_poll_us: Option<u32>,
+}
+
+impl Default for SocketOptions {
+    fn default() -> Self {
+        Self {
+            nodelay: true,
+            busy_poll_us: None,
+        }
+    }
+}
+
+static RUNTIME_SETTINGS: OnceLock<RuntimeSettings> = OnceLock::new();
+
+/// Задаёт параметры общего runtime до его создания.
+///
+/// Повторный вызов с теми же значениями разрешён (idempotent), с другими —
+/// ошибка: runtime создаётся один раз на процесс.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::InvalidInput`] для некорректных значений,
+/// [`io::ErrorKind::AlreadyExists`] при попытке изменить уже зафиксированные
+/// настройки.
+pub fn configure_runtime(settings: RuntimeSettings) -> io::Result<()> {
+    let settings = settings.validate()?;
+    if RUNTIME.get().is_some() {
+        let current = RUNTIME_SETTINGS.get().copied().unwrap_or_default();
+        return if current == settings {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "tokio runtime settings are already fixed for this process",
+            ))
+        };
+    }
+    let stored = RUNTIME_SETTINGS.get_or_init(|| settings);
+    if *stored == settings {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "tokio runtime settings are already fixed for this process",
+    ))
+}
 
 /// Будущее одного соединения. Соединение закрывается, когда future
 /// завершается или когда runtime отменяет задачу при shutdown.
@@ -161,7 +262,39 @@ impl TcpServer {
         hooks: ServerHooks,
         handler: ConnectionHandler,
     ) -> io::Result<Self> {
+        Self::start_with_options(
+            name,
+            listener,
+            max_connections,
+            shutdown_timeout,
+            hooks,
+            SocketOptions::default(),
+            handler,
+        )
+    }
+
+    /// Запускает accept-loop с явными настройками сокета.
+    ///
+    /// `TCP_NODELAY` и `SO_BUSY_POLL` применяются к listener'у и к каждому
+    /// принятому соединению до первого чтения, поэтому первый ответ не ждёт
+    /// алгоритма Нейгла. Ошибка `TCP_NODELAY` считается ошибкой accept'а и
+    /// учитывается через [`ServerHooks::on_error`].
+    ///
+    /// # Errors
+    ///
+    /// Ошибка настройки listener, инициализации runtime или создания
+    /// служебного канала.
+    pub fn start_with_options(
+        name: &str,
+        listener: std::net::TcpListener,
+        max_connections: usize,
+        shutdown_timeout: Duration,
+        hooks: ServerHooks,
+        options: SocketOptions,
+        handler: ConnectionHandler,
+    ) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
+        apply_busy_poll(&listener, options.busy_poll_us);
         let local_addr = listener.local_addr()?;
         let runtime = shared_runtime()?;
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -174,6 +307,7 @@ impl TcpServer {
                 shutdown_timeout,
                 hooks,
                 handler,
+                options,
                 shutdown_rx,
                 done_tx,
             )
@@ -229,12 +363,14 @@ impl Drop for TcpServer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_accept_loop(
     listener: std::net::TcpListener,
     max_connections: usize,
     shutdown_timeout: Duration,
     hooks: ServerHooks,
     handler: ConnectionHandler,
+    options: SocketOptions,
     mut shutdown: watch::Receiver<bool>,
     done: std::sync::mpsc::Sender<()>,
 ) {
@@ -267,6 +403,14 @@ async fn run_accept_loop(
                     tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                     continue;
                 };
+                if options.nodelay
+                    && let Err(_error) = stream.set_nodelay(true)
+                {
+                    hooks.error();
+                    drop(stream);
+                    continue;
+                }
+                apply_busy_poll(&stream, options.busy_poll_us);
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                     hooks.reject();
                     drop(stream);
@@ -312,9 +456,22 @@ static RUNTIME: OnceLock<Result<Arc<Runtime>, String>> = OnceLock::new();
 /// Ошибка создания tokio runtime (нехватка ресурсов).
 pub(crate) fn shared_runtime() -> io::Result<Arc<Runtime>> {
     let entry = RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("pulse-net")
+        let settings = RUNTIME_SETTINGS.get().copied().unwrap_or_default();
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all().thread_name("pulse-net");
+        if let Some(workers) = settings.worker_threads {
+            builder.worker_threads(workers);
+        }
+        if let Some(bytes) = settings.thread_stack_size {
+            builder.thread_stack_size(bytes);
+        }
+        if let Some(keep_alive) = settings.thread_keep_alive {
+            builder.thread_keep_alive(keep_alive);
+        }
+        if let Some(interval) = settings.event_interval {
+            builder.event_interval(interval);
+        }
+        builder
             .build()
             .map(Arc::new)
             .map_err(|error| error.to_string())
@@ -324,6 +481,38 @@ pub(crate) fn shared_runtime() -> io::Result<Arc<Runtime>> {
         Err(message) => Err(io::Error::other(message.clone())),
     }
 }
+
+/// `SO_BUSY_POLL`: ядро крутит poll на сокете `microseconds` вместо
+/// немедленного засыпания. Опция необязательная: `EPERM`/`ENOPROTOOPT`
+/// молча игнорируются, чтобы не ломать запуск на неподдерживаемом ядре.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn apply_busy_poll<Fd>(socket: &Fd, microseconds: Option<u32>)
+where
+    Fd: std::os::fd::AsRawFd,
+{
+    let Some(microseconds) = microseconds.filter(|value| *value > 0) else {
+        return;
+    };
+    let value = match i32::try_from(microseconds) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    // SAFETY: `socket` живёт на протяжении вызова, `value` — инициализированный
+    // c_int; ошибка setsockopt намеренно игнорируется.
+    let _ = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            (&raw const value).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_busy_poll<Fd>(_socket: &Fd, _microseconds: Option<u32>) {}
 
 /// Пул переиспользуемых буферов фиксированного размера.
 ///
@@ -355,6 +544,10 @@ impl BufferPool {
     }
 
     /// Берёт буфер из пула или выделяет новый.
+    ///
+    /// Длина буфера не сбрасывается: следующий [`PooledBuffer::prepare`] с тем
+    /// же размером не зануляет память повторно. Вызывающий обязан вызвать
+    /// `prepare` перед использованием среза.
     #[must_use]
     pub fn acquire(self: &Arc<Self>) -> PooledBuffer {
         let buffer = self
@@ -363,14 +556,10 @@ impl BufferPool {
             .unwrap_or_else(PoisonError::into_inner)
             .pop();
         match buffer {
-            Some(mut buffer) => {
-                buffer.clear();
-                buffer.resize(self.chunk, 0);
-                PooledBuffer {
-                    buffer: Some(buffer),
-                    pool: Arc::clone(self),
-                }
-            }
+            Some(buffer) => PooledBuffer {
+                buffer: Some(buffer),
+                pool: Arc::clone(self),
+            },
             None => {
                 self.allocated.fetch_add(1, Ordering::Relaxed);
                 PooledBuffer {
@@ -390,10 +579,23 @@ pub struct PooledBuffer {
 }
 
 impl PooledBuffer {
+    /// Текущее содержимое буфера (длина задана последним [`PooledBuffer::prepare`]).
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        self.buffer.as_deref().unwrap_or_default()
+    }
+
     /// Гарантирует, что буфер содержит ровно `len` байт, и возвращает срез.
+    ///
+    /// Уменьшение длины не трогает память; рост зануляет только новый хвост
+    /// (безопасная граница для `read_exact`).
     pub fn prepare(&mut self, len: usize) -> &mut [u8] {
         if let Some(buffer) = &mut self.buffer {
-            buffer.resize(len, 0);
+            if buffer.len() < len {
+                buffer.resize(len, 0);
+            } else {
+                buffer.truncate(len);
+            }
             buffer.as_mut_slice()
         } else {
             &mut []
@@ -426,13 +628,12 @@ impl DerefMut for PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        let Some(mut buffer) = self.buffer.take() else {
+        let Some(buffer) = self.buffer.take() else {
             return;
         };
         if buffer.capacity() > self.pool.chunk {
             return;
         }
-        buffer.clear();
         let mut free = self
             .pool
             .free

@@ -356,6 +356,57 @@ fn append_counter(out: &mut String, name: &str, help: &str, value: u64) {
     );
 }
 
+/// Рендерит метрики кеша готовых ответов (`pulsed_response_cache_*`).
+pub(crate) fn render_response_cache(metrics: &pulse_server::ResponseCacheMetrics) -> String {
+    let mut out = String::new();
+    append_counter(
+        &mut out,
+        "pulsed_response_cache_hits_total",
+        "DNS responses served from the response cache.",
+        metrics.hits,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_response_cache_misses_total",
+        "DNS responses that missed the response cache.",
+        metrics.misses,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_response_cache_inserts_total",
+        "DNS responses stored in the response cache.",
+        metrics.inserts,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_response_cache_evictions_total",
+        "DNS responses evicted by the response cache memory bound.",
+        metrics.evictions,
+    );
+    append_counter(
+        &mut out,
+        "pulsed_response_cache_invalidations_total",
+        "DNS responses removed after a zone or catalog version change.",
+        metrics.invalidations,
+    );
+    let _ = write!(
+        out,
+        "# HELP pulsed_response_cache_entries Cached DNS responses.\n\
+         # TYPE pulsed_response_cache_entries gauge\n\
+         pulsed_response_cache_entries {}\n\
+         # HELP pulsed_response_cache_bytes Memory held by the response cache.\n\
+         # TYPE pulsed_response_cache_bytes gauge\n\
+         pulsed_response_cache_bytes {}\n\
+         # HELP pulsed_response_cache_hit_rate Response cache hit ratio.\n\
+         # TYPE pulsed_response_cache_hit_rate gauge\n\
+         pulsed_response_cache_hit_rate {:.6}\n",
+        metrics.entries,
+        metrics.bytes,
+        metrics.hit_rate()
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

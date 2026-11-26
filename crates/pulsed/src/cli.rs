@@ -28,6 +28,7 @@ pub(crate) fn run() -> ExitCode {
         Some(("import", matches)) => return import_zone(matches),
         Some(("convert", matches)) => return convert_zonefile(matches),
         Some(("fsck", matches)) => return fsck_zonefile(matches),
+        Some(("freeze", matches)) => return freeze_zonefile(matches),
         Some(("dnscrypt-gencert", matches)) => return dnscrypt_gencert(matches),
         _ => {}
     }
@@ -71,6 +72,12 @@ pub(crate) fn run() -> ExitCode {
         durability: matches.get_one::<Durability>("durability").copied(),
         commit_mode: matches.get_one::<CommitMode>("commit-mode").copied(),
         map_size: matches.get_one::<u64>("map-size").copied(),
+        response_cache: matches.get_one::<bool>("response-cache").copied(),
+        response_cache_max_entries: matches
+            .get_one::<usize>("response-cache-max-entries")
+            .copied(),
+        response_cache_max_bytes: matches.get_one::<u64>("response-cache-max-bytes").copied(),
+        response_cache_shards: matches.get_one::<usize>("response-cache-shards").copied(),
     };
 
     let mut config = match Config::from_path(&config_path) {
@@ -578,6 +585,34 @@ fn fsck_zonefile(matches: &ArgMatches) -> ExitCode {
         return ExitCode::from(2);
     };
     if matches.get_flag("repair") {
+        if matches.get_flag("online") {
+            return match pulse_zonefile::parallel::fsck_repair_online(&data) {
+                Ok(report) => {
+                    println!(
+                        "fsck --repair --online {}: repaired={} remaining_aborted={} quarantined={:?} ok={} scanned={} elapsed_ms={}",
+                        data.display(),
+                        report.repaired_pages,
+                        report.remaining_leaks,
+                        report.quarantined_zones,
+                        report.ok,
+                        report.sweep.scanned_pages,
+                        report.sweep.elapsed_ms
+                    );
+                    for issue in report.issues.iter().chain(report.sweep.issues.iter()) {
+                        println!("  issue: {issue}");
+                    }
+                    if report.ok {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(1)
+                    }
+                }
+                Err(error) => {
+                    logging::error("fsck", &format!("{}: {error}", data.display()));
+                    ExitCode::from(1)
+                }
+            };
+        }
         return match pulse_zonefile::parallel::fsck_repair(&data) {
             Ok(report) => {
                 println!(
@@ -666,6 +701,63 @@ fn fsck_zonefile(matches: &ArgMatches) -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+fn freeze_zonefile(matches: &ArgMatches) -> ExitCode {
+    logging::init(LogLevel::Info);
+    let Some(data) = matches.get_one::<PathBuf>("data").cloned() else {
+        logging::error("freeze", "--data is required");
+        return ExitCode::from(2);
+    };
+    let status_only = matches.get_flag("status");
+    let release = matches.get_flag("release");
+    let read_only = status_only && !release;
+    let store = match pulse_zonefile::parallel::ParallelStore::open(
+        &data,
+        pulse_zonefile::parallel::OpenConfigV2 {
+            read_only,
+            writer_lock: false,
+            multi_process: true,
+            ..pulse_zonefile::parallel::OpenConfigV2::default()
+        },
+    ) {
+        Ok(store) => store,
+        Err(error) => {
+            logging::error("freeze", &format!("{}: {error}", data.display()));
+            return ExitCode::from(1);
+        }
+    };
+    if release {
+        let was = store.unfreeze();
+        println!("freeze {}: released={was}", data.display());
+        return ExitCode::SUCCESS;
+    }
+    if !status_only {
+        let ttl = std::time::Duration::from_secs(
+            matches.get_one::<u64>("ttl-secs").copied().unwrap_or(30),
+        );
+        match store.freeze_persist(ttl) {
+            Ok(epoch) => println!("freeze {}: set epoch={epoch} ttl={ttl:?}", data.display()),
+            Err(error) => {
+                logging::error("freeze", &format!("{}: {error}", data.display()));
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let status = store.freeze_status();
+    println!(
+        "freeze {}: active={} expired={} epoch={} local={} shared={} owner={}:{} ttl_ns={}",
+        data.display(),
+        status.active,
+        status.expired,
+        status.epoch,
+        status.local_epoch,
+        status.shared_epoch,
+        status.owner_pid,
+        status.owner_starttime,
+        status.ttl_ns
+    );
+    ExitCode::SUCCESS
 }
 
 fn dnscrypt_gencert(matches: &ArgMatches) -> ExitCode {
@@ -843,6 +935,7 @@ fn server_exit_code(error: &ServerError) -> ExitCode {
         },
         ServerError::TcpStart { .. }
         | ServerError::Tcp(_)
+        | ServerError::Runtime(_)
         | ServerError::Udp(_)
         | ServerError::Notify(_)
         | ServerError::Secondary(_)
@@ -1082,6 +1175,34 @@ fn command() -> Command {
                 .help("Zonefile map size in bytes (default 4 GiB, sparse)"),
         )
         .arg(
+            Arg::new("response-cache")
+                .long("response-cache")
+                .value_name("BOOL")
+                .value_parser(value_parser!(bool))
+                .help("Cache ready DNS responses for static zones: true or false"),
+        )
+        .arg(
+            Arg::new("response-cache-max-entries")
+                .long("response-cache-max-entries")
+                .value_name("N")
+                .value_parser(value_parser!(usize))
+                .help("Maximum number of cached DNS responses"),
+        )
+        .arg(
+            Arg::new("response-cache-max-bytes")
+                .long("response-cache-max-bytes")
+                .value_name("BYTES")
+                .value_parser(value_parser!(u64))
+                .help("Maximum memory for cached DNS responses in bytes"),
+        )
+        .arg(
+            Arg::new("response-cache-shards")
+                .long("response-cache-shards")
+                .value_name("N")
+                .value_parser(value_parser!(usize))
+                .help("Number of response cache shards (1..=256)"),
+        )
+        .arg(
             Arg::new("dnssec-key")
                 .long("dnssec-key")
                 .value_name("ZONE=PATH")
@@ -1165,6 +1286,43 @@ fn command() -> Command {
                         .long("repair")
                         .action(ArgAction::SetTrue)
                         .help("Return safe leaked pages to the free pool and quarantine damaged zones"),
+                )
+                .arg(
+                    Arg::new("online")
+                        .long("online")
+                        .action(ArgAction::SetTrue)
+                        .help("Repair without LOCK_EX: batch leak sweep + quarantine under per-zone leases (full graph verify stays offline)"),
+                ),
+        )
+        .subcommand(
+            Command::new("freeze")
+                .about("Inspect, set or clear the shared retention barrier of a v2 file")
+                .arg(
+                    Arg::new("data")
+                        .long("data")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(PathBuf))
+                        .help("Zonefile v2 path"),
+                )
+                .arg(
+                    Arg::new("status")
+                        .long("status")
+                        .action(ArgAction::SetTrue)
+                        .help("Print barrier status and exit"),
+                )
+                .arg(
+                    Arg::new("release")
+                        .long("release")
+                        .action(ArgAction::SetTrue)
+                        .help("Clear the barrier (works from any process)"),
+                )
+                .arg(
+                    Arg::new("ttl-secs")
+                        .long("ttl-secs")
+                        .value_name("SECS")
+                        .value_parser(value_parser!(u64))
+                        .help("TTL of the barrier in seconds (default 30)"),
                 ),
         )
         .subcommand(

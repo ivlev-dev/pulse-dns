@@ -18,7 +18,10 @@ use pulse_api::{
     ZonePage, ZoneSettings, ZoneSettingsPatch, ZoneSettingsView, next_serial,
 };
 use pulse_dns::{Name, Rclass, Rdata, Rrset, Rtype, Serial, Ttl};
-use pulse_server::{DenialKind, QueryEngine, QueryStats, ZoneState as ServerZoneState, ZoneView};
+use pulse_server::{
+    DenialKind, QueryEngine, QueryStats, ResponseCache, ResponseCacheMetrics,
+    ZoneState as ServerZoneState, ZoneView,
+};
 use pulse_transfer::ZoneSnapshot;
 use pulse_zonefile::parallel::{ParallelZone, RootState};
 use sha2::{Digest, Sha256};
@@ -48,6 +51,8 @@ pub(crate) struct SharedZoneAdmin {
     view_versions: RwLock<HashMap<Name, u64>>,
     engine: RwLock<Arc<QueryEngine>>,
     query_stats: Arc<QueryStats>,
+    /// Кеш готовых ответов, общий для всех поколений движка.
+    response_cache: Arc<ResponseCache>,
     file_stats: Arc<ZoneFileStats>,
     /// Сериализует операции с каталогом (create/delete/replace), не RRset-правки.
     catalog: Mutex<()>,
@@ -64,6 +69,7 @@ impl SharedZoneAdmin {
         notify: Option<Arc<NotifyDispatcher>>,
     ) -> Result<Self, StoreError> {
         let query_stats = Arc::new(QueryStats::new());
+        let response_cache = Arc::new(ResponseCache::new(config.response_cache.to_engine_config()));
         let file_stats = store
             .as_ref()
             .map_or_else(|| Arc::new(ZoneFileStats::default()), |store| store.stats());
@@ -114,13 +120,14 @@ impl SharedZoneAdmin {
             views.insert(entry.origin.clone(), Arc::new(view));
             versions.insert(entry.origin.clone(), entry.version);
         }
-        let engine = build_engine(&views, &query_stats);
+        let engine = build_engine(&views, &query_stats, &response_cache);
         Ok(Self {
             store,
             views: RwLock::new(views),
             view_versions: RwLock::new(versions),
             engine: RwLock::new(engine),
             query_stats,
+            response_cache,
             file_stats,
             catalog: Mutex::new(()),
             dnssec,
@@ -136,6 +143,11 @@ impl SharedZoneAdmin {
 
     pub(crate) fn query_stats(&self) -> Arc<QueryStats> {
         Arc::clone(&self.query_stats)
+    }
+
+    /// Снимок метрик кеша готовых ответов.
+    pub(crate) fn response_cache_metrics(&self) -> ResponseCacheMetrics {
+        self.response_cache.metrics()
     }
 
     /// Интервал фоновой ротации ключей, если она настроена.
@@ -447,6 +459,10 @@ impl SharedZoneAdmin {
             .view_versions
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        let invalidated = entry.as_ref().map_or_else(
+            || views.get(origin).map(|view| u64::from(view.zone_seq())),
+            |entry| Some(u64::from(entry.zone_seq)),
+        );
         if let Some(entry) = entry {
             let view = FileZoneView::new(Arc::clone(store), &entry, server_state(&entry, &expired))
                 .map_err(|error| {
@@ -459,8 +475,11 @@ impl SharedZoneAdmin {
             views.remove(origin);
             versions.remove(origin);
         }
-        let engine = build_engine(&views, &self.query_stats);
+        let engine = build_engine(&views, &self.query_stats, &self.response_cache);
         *self.engine.write().unwrap_or_else(PoisonError::into_inner) = engine;
+        if let Some(seq) = invalidated {
+            self.response_cache.invalidate_zone(seq);
+        }
         Ok(())
     }
 
@@ -486,6 +505,7 @@ impl SharedZoneAdmin {
         let zones = store.list_zones()?;
         let expired = self.secondary.expired_origins();
         let mut changed = 0_usize;
+        let mut invalidated = Vec::new();
         {
             let mut views = self.views.write().unwrap_or_else(PoisonError::into_inner);
             let mut versions = self
@@ -503,6 +523,7 @@ impl SharedZoneAdmin {
                         .map_err(|error| format!("zone {}: {error}", entry.origin))?;
                 views.insert(entry.origin.clone(), Arc::new(view));
                 versions.insert(entry.origin.clone(), entry.version);
+                invalidated.push(u64::from(entry.zone_seq));
                 changed = changed.saturating_add(1);
             }
             let present: HashSet<Name> = zones.iter().map(|entry| entry.origin.clone()).collect();
@@ -512,14 +533,19 @@ impl SharedZoneAdmin {
                 if store.zone_entry(origin).ok().flatten().is_some() {
                     continue;
                 }
-                views.remove(origin);
+                if let Some(view) = views.remove(origin) {
+                    invalidated.push(u64::from(view.zone_seq()));
+                }
                 versions.remove(origin);
                 changed = changed.saturating_add(1);
             }
         }
+        for seq in invalidated {
+            self.response_cache.invalidate_zone(seq);
+        }
         if changed > 0 {
             let views = self.views.read().unwrap_or_else(PoisonError::into_inner);
-            let engine = build_engine(&views, &self.query_stats);
+            let engine = build_engine(&views, &self.query_stats, &self.response_cache);
             *self.engine.write().unwrap_or_else(PoisonError::into_inner) = engine;
         }
         Ok(changed)
@@ -529,6 +555,7 @@ impl SharedZoneAdmin {
         let Some(store) = &self.store else {
             let empty = QueryEngine::with_stats(Vec::new(), Arc::clone(&self.query_stats));
             *self.engine.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(empty);
+            self.response_cache.invalidate_all();
             return Ok(());
         };
         let zones = store.list_zones().map_err(AdminError::Storage)?;
@@ -544,13 +571,14 @@ impl SharedZoneAdmin {
             views.insert(entry.origin.clone(), Arc::new(view));
             versions.insert(entry.origin.clone(), entry.version);
         }
-        let engine = build_engine(&views, &self.query_stats);
+        let engine = build_engine(&views, &self.query_stats, &self.response_cache);
         *self.views.write().unwrap_or_else(PoisonError::into_inner) = views;
         *self
             .view_versions
             .write()
             .unwrap_or_else(PoisonError::into_inner) = versions;
         *self.engine.write().unwrap_or_else(PoisonError::into_inner) = engine;
+        self.response_cache.invalidate_all();
         Ok(())
     }
 
@@ -584,12 +612,18 @@ impl SharedZoneAdmin {
 fn build_engine(
     views: &HashMap<Name, Arc<FileZoneView>>,
     query_stats: &Arc<QueryStats>,
+    response_cache: &Arc<ResponseCache>,
 ) -> Arc<QueryEngine> {
     let views: Vec<Arc<dyn ZoneView>> = views
         .values()
         .map(|view| Arc::clone(view) as Arc<dyn ZoneView>)
         .collect();
-    Arc::new(QueryEngine::with_stats(views, Arc::clone(query_stats)))
+    Arc::new(QueryEngine::with_cache(
+        views,
+        Arc::clone(query_stats),
+        pulse_server::EngineConfig::default(),
+        Arc::clone(response_cache),
+    ))
 }
 
 fn denial_from_kind(kind: DenialKind) -> Denial {

@@ -90,6 +90,17 @@ impl ZoneFileStats {
             v2_pins: store.map_or(0, |store| {
                 u64::try_from(store.active_pins()).unwrap_or(u64::MAX)
             }),
+            v2_freeze_epoch: store_stats.map_or(0, |stats| stats.freeze_epoch),
+            v2_sweep_runs: store_stats.map_or(0, |stats| stats.sweep_runs),
+            v2_sweep_scanned_pages: store_stats.map_or(0, |stats| stats.sweep_scanned_pages),
+            v2_sweep_reclaimed_pages: store_stats.map_or(0, |stats| stats.sweep_reclaimed_pages),
+            v2_pending_pages: store_stats.map_or(0, |stats| {
+                if stats.pending_floor == u64::MAX {
+                    0
+                } else {
+                    stats.pending_floor
+                }
+            }),
         }
     }
 
@@ -441,6 +452,18 @@ impl ZoneStore {
             .entries
             .get(origin)
             .map(|entry| (entry.apex, entry.zone_seq))
+    }
+
+    /// Живая опубликованная версия зоны по слоту (для ключа кеша ответов).
+    ///
+    /// Возвращает `None` для пустого/удаляемого слота: такие зоны не
+    /// кешируются.
+    pub(crate) fn cache_version(&self, zone_seq: u32) -> Option<u64> {
+        let head = self.stable_head(zone_seq)?;
+        if head.is_tombstone() || head.state != RootState::Serving {
+            return None;
+        }
+        Some(head.version)
     }
 
     /// Открывает writer зоны (lease удерживается до `Drop`).
@@ -1279,6 +1302,8 @@ pub(crate) fn write_rrset(writer: &mut ParallelZone<'_>, rrset: &Rrset) -> Resul
 pub(crate) struct FileZoneView {
     store: Arc<ZoneStore>,
     origin: Name,
+    /// Слот зоны; версия для ключа кеша читается из головы живьём.
+    zone_seq: u32,
     soa: Option<Rrset>,
     ns: Option<Rrset>,
     state: ServerZoneState,
@@ -1313,11 +1338,17 @@ impl FileZoneView {
         Ok(Self {
             store,
             origin: entry.origin.clone(),
+            zone_seq: entry.zone_seq,
             soa,
             ns,
             state,
             denial_index: Mutex::new(None),
         })
+    }
+
+    /// Слот зоны (для инвалидации кеша ответов).
+    pub(crate) fn zone_seq(&self) -> u32 {
+        self.zone_seq
     }
 
     fn lookup_stored(&self, name: &Name, rr_type: Rtype) -> Option<Rrset> {
@@ -1668,6 +1699,15 @@ impl ZoneView for FileZoneView {
 
     fn state(&self) -> ServerZoneState {
         self.state
+    }
+
+    fn cache_identity(&self) -> Option<pulse_server::ZoneIdentity> {
+        self.store
+            .cache_version(self.zone_seq)
+            .map(|version| pulse_server::ZoneIdentity {
+                zone_seq: u64::from(self.zone_seq),
+                zone_version: version,
+            })
     }
 
     fn lookup(&self, name: &Name, rr_type: Rtype) -> LookupOutcome {

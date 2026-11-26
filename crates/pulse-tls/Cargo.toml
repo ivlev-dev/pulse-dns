@@ -28,6 +28,7 @@ doh3 = ["http3"]
 [dependencies]
 base64 = "0.22"
 httparse = "1.10"
+libc = "0.2"
 pulse-dns = { path = "../pulse-dns" }
 rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 rustls-pki-types = { version = "1.16", default-features = false, features = ["std"] }

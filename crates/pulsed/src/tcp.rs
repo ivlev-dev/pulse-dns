@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use pulse_dns::{DecodeLimits, Message, Opcode, Rtype};
 use pulse_server::Transport;
-use pulse_tls::net::{BufferPool, ConnectionHandler, ServerHooks, TcpServer};
+use pulse_tls::net::{BufferPool, ConnectionHandler, ServerHooks, SocketOptions, TcpServer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::time::timeout;
@@ -41,11 +41,16 @@ impl TcpService {
         idle_timeout: Duration,
         admin: &Arc<SharedZoneAdmin>,
         stats: Arc<Stats>,
+        nodelay: bool,
+        busy_poll_us: Option<u32>,
     ) -> io::Result<Self> {
         let admin = Arc::clone(admin);
         let listener = TcpListener::bind(addr)?;
         let requests = Arc::new(BufferPool::new(REQUEST_BUFFER_CHUNK, REQUEST_BUFFER_POOL));
-        let responses = Arc::new(BufferPool::new(pulse_dns::MAX_MESSAGE_LEN, RESPONSE_POOL));
+        let responses = Arc::new(BufferPool::new(
+            pulse_dns::MAX_MESSAGE_LEN + 2,
+            RESPONSE_POOL,
+        ));
         let handler: ConnectionHandler = {
             let admin = Arc::clone(&admin);
             let stats = Arc::clone(&stats);
@@ -89,12 +94,16 @@ impl TcpService {
             }),
         );
         let shutdown_timeout = idle_timeout + Duration::from_millis(500);
-        let tcp = TcpServer::start(
+        let tcp = TcpServer::start_with_options(
             "pulse-tcp",
             listener,
             max_connections,
             shutdown_timeout,
             hooks,
+            SocketOptions {
+                nodelay,
+                busy_poll_us,
+            },
             handler,
         )?;
         Ok(Self { tcp, stats })
@@ -136,7 +145,7 @@ impl Drop for ConnectionGuard {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn serve(
     mut stream: tokio::net::TcpStream,
     peer: SocketAddr,
@@ -147,7 +156,6 @@ async fn serve(
     requests: &Arc<BufferPool>,
     responses: &Arc<BufferPool>,
 ) -> io::Result<()> {
-    stream.set_nodelay(true)?;
     loop {
         if *shutdown.borrow() {
             return Ok(());
@@ -163,18 +171,21 @@ async fn serve(
         if length == 0 {
             return Ok(());
         }
+        let length = usize::from(length);
         let mut request_buffer = requests.acquire();
-        let buffer = request_buffer.prepare(usize::from(length));
+        let buffer = request_buffer.prepare(length);
         match timeout(idle_timeout, stream.read_exact(buffer)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Ok(Err(error)) => return Err(error),
             Err(_) => return Ok(()),
         }
-        let request = request_buffer.take_vec(usize::from(length));
 
         let now = crate::transfer::now_unix();
-        match admin.transfer().handle_notify_in(&request, peer.ip(), now) {
+        match admin
+            .transfer()
+            .handle_notify_in(request_buffer.as_slice(), peer.ip(), now)
+        {
             Some(crate::transfer::NotifyAction::Reply(response)) => {
                 write_frame(&mut stream, &response, idle_timeout).await?;
                 stats.response();
@@ -190,7 +201,8 @@ async fn serve(
             None => {}
         }
 
-        if is_transfer_request(&request) {
+        if is_transfer_request(request_buffer.as_slice()) {
+            let request = request_buffer.take_vec(length);
             let stream = stream.into_std()?;
             stream.set_nonblocking(false)?;
             stream.set_read_timeout(Some(idle_timeout))?;
@@ -228,18 +240,31 @@ async fn serve(
         }
 
         let engine = admin.engine();
-        {
-            let mut response_buffer = responses.acquire();
-            let buffer = response_buffer.prepare(pulse_dns::MAX_MESSAGE_LEN);
-            let Some(len) = dns::respond_into(&request, Transport::Tcp, &engine, stats, buffer)
-            else {
-                continue;
-            };
-            let Some(frame) = buffer.get(..len) else {
-                continue;
-            };
-            write_frame(&mut stream, frame, idle_timeout).await?;
-        }
+        let mut response_buffer = responses.acquire();
+        let buffer = response_buffer.prepare(pulse_dns::MAX_MESSAGE_LEN + 2);
+        let Some(body) = buffer.get_mut(2..2 + pulse_dns::MAX_MESSAGE_LEN) else {
+            continue;
+        };
+        let Some(len) = dns::respond_into(
+            request_buffer.as_slice(),
+            Transport::Tcp,
+            &engine,
+            stats,
+            body,
+        ) else {
+            continue;
+        };
+        let Ok(length_prefix) = u16::try_from(len) else {
+            continue;
+        };
+        let Some(prefix) = buffer.get_mut(..2) else {
+            continue;
+        };
+        prefix.copy_from_slice(&length_prefix.to_be_bytes());
+        let Some(frame) = buffer.get(..len + 2) else {
+            continue;
+        };
+        write_raw_frame(&mut stream, frame, idle_timeout).await?;
     }
 }
 
@@ -252,6 +277,24 @@ fn is_transfer_request(raw: &[u8]) -> bool {
             .questions()
             .first()
             .is_some_and(|question| matches!(question.qtype(), Rtype::AXFR | Rtype::IXFR))
+}
+
+async fn write_raw_frame(
+    stream: &mut tokio::net::TcpStream,
+    frame: &[u8],
+    deadline: Duration,
+) -> io::Result<()> {
+    let write = async {
+        stream.write_all(frame).await?;
+        stream.flush().await
+    };
+    match timeout(deadline, write).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "TCP write timed out",
+        )),
+    }
 }
 
 async fn write_frame(

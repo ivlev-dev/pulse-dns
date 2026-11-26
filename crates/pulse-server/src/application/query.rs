@@ -13,6 +13,7 @@ use pulse_dnssec::rdata_util::{NSEC3_SHA1_LEN, nsec3_hash_into};
 use pulse_dnssec::{DenialLimits, Nsec3Params};
 use thiserror::Error;
 
+use super::cache::{CachedOutcome, ResponseCache, ResponseCacheKey};
 use super::port::{ZoneSnapshot, ZoneView};
 use super::stats::QueryStats;
 use crate::domain::{
@@ -177,6 +178,8 @@ pub struct QueryEngine {
     zone_index: HashMap<Vec<u8>, usize>,
     stats: Arc<QueryStats>,
     config: EngineConfig,
+    /// Кеш готовых ответов; `None` — выключен.
+    cache: Option<Arc<ResponseCache>>,
 }
 
 impl QueryEngine {
@@ -184,19 +187,24 @@ impl QueryEngine {
     /// конфигурацией.
     #[must_use]
     pub fn new(zones: Vec<Arc<dyn ZoneView>>) -> Self {
-        Self::build(zones, Arc::new(QueryStats::new()), EngineConfig::default())
+        Self::build(
+            zones,
+            Arc::new(QueryStats::new()),
+            EngineConfig::default(),
+            None,
+        )
     }
 
     /// Создаёт движок с разделяемыми счётчиками и дефолтной конфигурацией.
     #[must_use]
     pub fn with_stats(zones: Vec<Arc<dyn ZoneView>>, stats: Arc<QueryStats>) -> Self {
-        Self::build(zones, stats, EngineConfig::default())
+        Self::build(zones, stats, EngineConfig::default(), None)
     }
 
     /// Создаёт движок с явной конфигурацией и новыми счётчиками.
     #[must_use]
     pub fn with_config(zones: Vec<Arc<dyn ZoneView>>, config: EngineConfig) -> Self {
-        Self::build(zones, Arc::new(QueryStats::new()), config)
+        Self::build(zones, Arc::new(QueryStats::new()), config, None)
     }
 
     /// Создаёт движок с явной конфигурацией и разделяемыми счётчиками.
@@ -206,10 +214,26 @@ impl QueryEngine {
         config: EngineConfig,
         stats: Arc<QueryStats>,
     ) -> Self {
-        Self::build(zones, stats, config)
+        Self::build(zones, stats, config, None)
     }
 
-    fn build(zones: Vec<Arc<dyn ZoneView>>, stats: Arc<QueryStats>, config: EngineConfig) -> Self {
+    /// Создаёт движок с кешем готовых ответов.
+    #[must_use]
+    pub fn with_cache(
+        zones: Vec<Arc<dyn ZoneView>>,
+        stats: Arc<QueryStats>,
+        config: EngineConfig,
+        cache: Arc<ResponseCache>,
+    ) -> Self {
+        Self::build(zones, stats, config, Some(cache))
+    }
+
+    fn build(
+        zones: Vec<Arc<dyn ZoneView>>,
+        stats: Arc<QueryStats>,
+        config: EngineConfig,
+        cache: Option<Arc<ResponseCache>>,
+    ) -> Self {
         let mut zone_index = HashMap::with_capacity(zones.len());
         for (position, zone) in zones.iter().enumerate() {
             zone_index.insert(zone.origin().as_wire().to_vec(), position);
@@ -219,6 +243,7 @@ impl QueryEngine {
             zone_index,
             stats,
             config,
+            cache,
         }
     }
 
@@ -425,6 +450,19 @@ impl QueryEngine {
                 .with_version(0)
                 .with_dnssec_ok(edns.dnssec_ok())
         });
+        let cache = self.cache.as_ref().filter(|cache| cache.enabled());
+        let cache_key = cache.and_then(|_| Self::cache_key(request, zone, transport));
+        if let (Some(cache), Some(key)) = (cache, cache_key.as_ref())
+            && let Some(hit) = cache.lookup(key, request.id(), out)
+        {
+            self.stats.record_query();
+            match hit.outcome {
+                CachedOutcome::NxDomain => self.stats.record_nxdomain(),
+                CachedOutcome::NoData => self.stats.record_nodata(),
+                CachedOutcome::Answer | CachedOutcome::Referral | CachedOutcome::YxDomain => {}
+            }
+            return Some(hit.len);
+        }
 
         let mut encoded = None;
         let available = zone.with_snapshot(&mut |snapshot| {
@@ -452,7 +490,44 @@ impl QueryEngine {
         if response.truncated {
             self.stats.record_truncated();
         }
+        if let (Some(cache), Some(key), Some(outcome)) =
+            (cache, cache_key, cache_outcome(response.status))
+            && !response.truncated
+            && let Some(bytes) = out.get(..response.len)
+        {
+            cache.insert(key, bytes, outcome);
+        }
         Some(response.len)
+    }
+
+    /// Собирает ключ кеша для простого запроса.
+    ///
+    /// Запросы с EDNS-опциями не кешируются: `COOKIE`/`ECS` влияют на
+    /// семантику, а быстрый путь их не сохраняет.
+    fn cache_key(
+        request: &MessageRef<'_>,
+        zone: &dyn ZoneView,
+        transport: Transport,
+    ) -> Option<ResponseCacheKey> {
+        if request.edns().is_some_and(pulse_dns::EdnsRef::has_options) {
+            return None;
+        }
+        let identity = zone.cache_identity()?;
+        let qname = request.raw_qname()?;
+        let edns_payload = request
+            .edns()
+            .map(|edns| negotiated_payload_size(edns.udp_payload_size()));
+        ResponseCacheKey::new(
+            identity,
+            qname,
+            request.qtype().as_u16(),
+            request.qclass().as_u16(),
+            request.edns().is_some_and(pulse_dns::EdnsRef::dnssec_ok),
+            request.flags().cd(),
+            request.flags().rd(),
+            edns_payload,
+            transport,
+        )
     }
 
     /// Собирает и кодирует ответ по заимствованному снимку зоны.
@@ -3992,6 +4067,18 @@ fn is_transfer_meta_qtype(qtype: Rtype) -> bool {
         qtype,
         Rtype::AXFR | Rtype::IXFR | Rtype::TKEY | Rtype::TSIG | Rtype::OPT
     )
+}
+
+/// Итог ответа для кеша; `None` — ответ не кешируется (`SERVFAIL`).
+const fn cache_outcome(status: FastStatus) -> Option<CachedOutcome> {
+    match status {
+        FastStatus::Answer => Some(CachedOutcome::Answer),
+        FastStatus::NoData => Some(CachedOutcome::NoData),
+        FastStatus::NxDomain => Some(CachedOutcome::NxDomain),
+        FastStatus::Referral => Some(CachedOutcome::Referral),
+        FastStatus::YxDomain => Some(CachedOutcome::YxDomain),
+        FastStatus::ServFail => None,
+    }
 }
 
 fn referral_for(

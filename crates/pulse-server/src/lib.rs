@@ -12,6 +12,10 @@
 //!   [`domain::ZoneState`].
 //! - [`application`] — порт [`application::ZoneView`], движок
 //!   [`application::QueryEngine`] и счётчики [`application::QueryStats`].
+//! - [`application::ResponseCache`] — кеш готовых wire-ответов для статичных
+//!   зон: ключ по версии зоны, исходному регистру `QNAME`, `QTYPE`/`QCLASS`,
+//!   `DO`/`CD`/`RD`, EDNS payload и транспорту; значение с `ID = 0`, при выдаче
+//!   патчатся два байта `ID`, `TTL` не декрементируются.
 //! - [`dnssec`] — подпись зоны (DNSKEY/NSEC/RRSIG) и NSEC-цепочка.
 //! - `testkit` — in-memory зона (feature `testkit`, включена по умолчанию).
 //!
@@ -44,6 +48,10 @@
 //!   zone cut, цепочка останавливается на уже собранном ответе: клиент или
 //!   резолвер получит referral отдельным запросом.
 //! - **Negative TTL** — `min(SOA.ttl, SOA.minimum, 10800)` (INV-14).
+//! - **Кеш ответов** — кешируются только детерминированные успешные ответы
+//!   (`A`/`AAAA`/`MX`/`TXT`/`CNAME`/`NXDOMAIN`/`NODATA`/referral/`ANY`, в том
+//!   числе подписанные при `DO = 1`) с эхо OPT; `SERVFAIL`, `TC`, `TSIG` и
+//!   запросы с EDNS-опциями (`COOKIE`/`ECS`) не кешируются.
 //! - **EDNS** — `OPT` эхо-ится с payload `min(max(client, 512), 1232)`
 //!   (значения ниже 512 трактуются как 512 по RFC 6891 §6.2.5); версия ≠ 0 →
 //!   `BADVERS`; неизвестные опции безопасно игнорируются (SEC-DNS-007).
@@ -110,8 +118,10 @@ pub mod domain;
 pub mod testkit;
 
 pub use application::{
-    EncodedResponse, EngineConfig, NEGATIVE_TTL_CAP, QueryEngine, QueryError, QueryStats, Scratch,
-    StatsSnapshot, Transport, ZoneSnapshot, ZoneView,
+    CachedOutcome, DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES, DEFAULT_SHARDS, EncodedResponse,
+    EngineConfig, MAX_SHARDS, NEGATIVE_TTL_CAP, QueryEngine, QueryError, QueryStats, ResponseCache,
+    ResponseCacheConfig, ResponseCacheKey, ResponseCacheMetrics, Scratch, StatsSnapshot, Transport,
+    ZoneIdentity, ZoneSnapshot, ZoneView,
 };
 pub use domain::{
     DenialKind, LookupOutcome, LookupOutcomeRef, RdataRef, Rdatas, RefLookup, RrsetRef, ZoneState,

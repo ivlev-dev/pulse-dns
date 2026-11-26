@@ -137,3 +137,43 @@ fn verify_reports_damaged_zone_and_repair_quarantines_it() {
     assert!(text.contains("quarantined=["), "{text}");
     assert!(text.contains("ok=true"), "{text}");
 }
+
+#[test]
+fn online_repair_via_cli_with_live_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("online.v2");
+    let _root = build(&path);
+    let live = ParallelStore::open(
+        &path,
+        OpenConfigV2 {
+            read_only: false,
+            writer_lock: false,
+            multi_process: true,
+            ..OpenConfigV2::default()
+        },
+    )
+    .unwrap();
+    leak(&live, 8);
+
+    let mut command = common::pulsed();
+    command
+        .args(["fsck", "--data"])
+        .arg(&path)
+        .arg("--repair")
+        .arg("--online");
+    let repair = common::run_cli(
+        "pulsed fsck --repair --online",
+        &mut command,
+        common::CLI_TIMEOUT,
+    );
+    assert!(
+        repair.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&repair.stdout),
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    let text = String::from_utf8_lossy(&repair.stdout);
+    assert!(text.contains("repaired="), "{text}");
+    assert!(text.contains("ok=true"), "{text}");
+    assert!(live.fsck_graph().unwrap().ok);
+}

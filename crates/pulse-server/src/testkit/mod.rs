@@ -7,12 +7,18 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use pulse_dns::{Name, NameRef, Rclass, Rdata, Rrset, Rtype};
 use thiserror::Error;
 
-use crate::application::{ZoneSnapshot, ZoneView};
+use crate::application::{ZoneIdentity, ZoneSnapshot, ZoneView};
 use crate::domain::{DenialKind, LookupOutcome, LookupOutcomeRef, RefLookup, RrsetRef, ZoneState};
+
+/// Уникальный слот для in-memory зон: ключ кеша не должен сталкиваться у
+/// разных зон одного процесса.
+static NEXT_ZONE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Ошибка наполнения in-memory зоны.
 #[derive(Debug, Error)]
@@ -74,6 +80,10 @@ pub struct InMemoryZone {
     nsec: Vec<(Name, Rrset)>,
     /// NSEC3-наборы по hashed-владельцу (декодированный hash, возрастание).
     nsec3: Vec<(Vec<u8>, Rrset)>,
+    /// Слот зоны для ключа кеша.
+    cache_seq: u64,
+    /// Версия данных зоны (растёт на каждой вставке/изменении).
+    cache_version: Arc<AtomicU64>,
 }
 
 impl InMemoryZone {
@@ -94,7 +104,20 @@ impl InMemoryZone {
             ns: None,
             nsec: Vec::new(),
             nsec3: Vec::new(),
+            cache_seq: NEXT_ZONE_SEQ.fetch_add(1, AtomicOrdering::Relaxed),
+            cache_version: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Текущая версия данных зоны для кеша.
+    #[must_use]
+    pub fn cache_version(&self) -> u64 {
+        self.cache_version.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Принудительно задаёт версию зоны (тесты инвалидации кеша).
+    pub fn set_cache_version(&self, version: u64) {
+        self.cache_version.store(version, AtomicOrdering::Relaxed);
     }
 
     /// Задаёт состояние зоны.
@@ -186,6 +209,7 @@ impl InMemoryZone {
                 hash.as_slice().cmp(other.as_slice())
             });
         }
+        self.cache_version.fetch_add(1, AtomicOrdering::Relaxed);
         Ok(())
     }
 
@@ -272,6 +296,13 @@ impl ZoneView for InMemoryZone {
 
     fn state(&self) -> ZoneState {
         self.state
+    }
+
+    fn cache_identity(&self) -> Option<ZoneIdentity> {
+        Some(ZoneIdentity {
+            zone_seq: self.cache_seq,
+            zone_version: self.cache_version(),
+        })
     }
 
     fn lookup(&self, name: &Name, rtype: Rtype) -> LookupOutcome {

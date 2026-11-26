@@ -726,8 +726,46 @@ pub struct DnssecRotationConfig {
     pub tick_secs: Option<u32>,
 }
 
-/// Полная конфигурация процесса.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+/// Кеш готовых DNS-ответов для статичных зон.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ResponseCacheSettings {
+    /// Включён ли кеш ответов.
+    pub enabled: bool,
+    /// Максимум записей.
+    pub max_entries: usize,
+    /// Максимум памяти под записи в байтах.
+    pub max_bytes: u64,
+    /// Число шардов (1..=256).
+    pub shards: usize,
+}
+
+impl Default for ResponseCacheSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_entries: pulse_server::DEFAULT_MAX_ENTRIES,
+            max_bytes: pulse_server::DEFAULT_MAX_BYTES as u64,
+            shards: pulse_server::DEFAULT_SHARDS,
+        }
+    }
+}
+
+impl ResponseCacheSettings {
+    /// Преобразует настройки в конфигурацию движка.
+    #[must_use]
+    pub fn to_engine_config(self) -> pulse_server::ResponseCacheConfig {
+        pulse_server::ResponseCacheConfig {
+            enabled: self.enabled,
+            max_entries: self.max_entries,
+            max_bytes: usize::try_from(self.max_bytes).unwrap_or(usize::MAX),
+            shards: self.shards,
+        }
+    }
+}
+
+/// Конфигурация сервера.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Адрес UDP-транспорта; `null` отключает UDP.
@@ -855,6 +893,15 @@ pub struct Config {
     pub zone_poll_ms: u64,
     /// Уровень логирования.
     pub log_level: LogLevel,
+    /// Число worker-потоков общего tokio event-loop TCP/DoT/DoH;
+    /// `0` — по числу доступных CPU.
+    pub tcp_workers: usize,
+    /// Включать `TCP_NODELAY` на принятых TCP/DoT-соединениях.
+    pub tcp_nodelay: bool,
+    /// `SO_BUSY_POLL` для TCP/DoT-сокетов в микросекундах; `0` — выключено.
+    pub busy_poll_us: u32,
+    /// Таймаут чтения тела DoT-сообщения и записи ответа, миллисекунды.
+    pub request_timeout_ms: u64,
     /// Параметры TCP.
     pub tcp: TcpConfig,
     /// Файл persistence `pulse-zonefile`; `null`/отсутствие — без persistence.
@@ -894,6 +941,9 @@ pub struct Config {
     /// Настройки AXFR/IXFR и NOTIFY.
     #[serde(default)]
     pub transfer: TransferSettings,
+    /// Кеш готовых ответов для статичных зон.
+    #[serde(default)]
+    pub response_cache: ResponseCacheSettings,
 }
 
 impl Default for Config {
@@ -943,6 +993,10 @@ impl Default for Config {
             api_rate_limit_per_sec: pulse_api::config::DEFAULT_RATE_LIMIT_PER_SEC,
             zone_poll_ms: 250,
             log_level: LogLevel::Info,
+            tcp_workers: 0,
+            tcp_nodelay: true,
+            busy_poll_us: 0,
+            request_timeout_ms: 10_000,
             tcp: TcpConfig::default(),
             zonefile: None,
             durability: Durability::Flush,
@@ -958,6 +1012,7 @@ impl Default for Config {
             secondary_zones: Vec::new(),
             tsig_keys: Vec::new(),
             transfer: TransferSettings::default(),
+            response_cache: ResponseCacheSettings::default(),
         }
     }
 }
@@ -1098,6 +1153,24 @@ impl Config {
                 self.workers
             )));
         }
+        if self.tcp_workers > 1024 {
+            return Err(ConfigError::Invalid(format!(
+                "tcp_workers must be in 0..=1024, got {}",
+                self.tcp_workers
+            )));
+        }
+        if self.busy_poll_us > 1_000_000 {
+            return Err(ConfigError::Invalid(format!(
+                "busy_poll_us must be in 0..=1000000, got {}",
+                self.busy_poll_us
+            )));
+        }
+        if self.request_timeout_ms == 0 || self.request_timeout_ms > 600_000 {
+            return Err(ConfigError::Invalid(format!(
+                "request_timeout_ms must be in 1..=600000, got {}",
+                self.request_timeout_ms
+            )));
+        }
         if self.dns_workers.is_some_and(|workers| workers > 1024) {
             return Err(ConfigError::Invalid(format!(
                 "dns_workers must be in 0..=1024, got {}",
@@ -1122,6 +1195,26 @@ impl Config {
                 "zone_poll_ms must be in 0..=60000, got {}",
                 self.zone_poll_ms
             )));
+        }
+        if self.response_cache.enabled {
+            if self.response_cache.max_entries == 0 {
+                return Err(ConfigError::Invalid(
+                    "response_cache.max_entries must be greater than zero".to_owned(),
+                ));
+            }
+            if self.response_cache.max_bytes < 4096 {
+                return Err(ConfigError::Invalid(format!(
+                    "response_cache.max_bytes must be at least 4096, got {}",
+                    self.response_cache.max_bytes
+                )));
+            }
+            if !(1..=pulse_server::MAX_SHARDS).contains(&self.response_cache.shards) {
+                return Err(ConfigError::Invalid(format!(
+                    "response_cache.shards must be in 1..={}, got {}",
+                    pulse_server::MAX_SHARDS,
+                    self.response_cache.shards
+                )));
+            }
         }
         if self.tcp.max_connections == 0 || self.tcp.max_connections > 65_535 {
             return Err(ConfigError::Invalid(format!(
@@ -1701,6 +1794,22 @@ impl Config {
         if let Some(map_size) = overrides.map_size {
             self.map_size = map_size;
         }
+        self.apply_response_cache_overrides(overrides);
+    }
+
+    fn apply_response_cache_overrides(&mut self, overrides: &Overrides) {
+        if let Some(enabled) = overrides.response_cache {
+            self.response_cache.enabled = enabled;
+        }
+        if let Some(entries) = overrides.response_cache_max_entries {
+            self.response_cache.max_entries = entries;
+        }
+        if let Some(bytes) = overrides.response_cache_max_bytes {
+            self.response_cache.max_bytes = bytes;
+        }
+        if let Some(shards) = overrides.response_cache_shards {
+            self.response_cache.shards = shards;
+        }
     }
 }
 
@@ -1767,6 +1876,14 @@ pub struct Overrides {
     pub commit_mode: Option<CommitMode>,
     /// Размер map zonefile.
     pub map_size: Option<u64>,
+    /// Включить/выключить кеш ответов.
+    pub response_cache: Option<bool>,
+    /// Максимум записей кеша ответов.
+    pub response_cache_max_entries: Option<usize>,
+    /// Максимум памяти кеша ответов.
+    pub response_cache_max_bytes: Option<u64>,
+    /// Число шардов кеша ответов.
+    pub response_cache_shards: Option<usize>,
 }
 
 /// Причина ошибки разбора конфигурационного файла.
@@ -1840,7 +1957,33 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.workers, 0);
         assert_eq!(config.tcp.max_connections, 1024);
+        assert_eq!(config.tcp_workers, 0);
+        assert!(config.tcp_nodelay);
+        assert_eq!(config.busy_poll_us, 0);
+        assert_eq!(config.request_timeout_ms, 10_000);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn tcp_tuning_fields_roundtrip_and_validate() {
+        let config = Config::from_toml_str(
+            "listen_udp = \"127.0.0.1:0\"\n\
+             tcp_workers = 4\n\
+             tcp_nodelay = false\n\
+             busy_poll_us = 50\n\
+             request_timeout_ms = 2500\n",
+        )
+        .expect("tuning parses");
+        assert_eq!(config.tcp_workers, 4);
+        assert!(!config.tcp_nodelay);
+        assert_eq!(config.busy_poll_us, 50);
+        assert_eq!(config.request_timeout_ms, 2500);
+        assert!(config.validate().is_ok());
+
+        let invalid =
+            Config::from_toml_str("listen_udp = \"127.0.0.1:0\"\nrequest_timeout_ms = 0\n")
+                .expect("parse without validation");
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
@@ -1886,6 +2029,10 @@ mod tests {
             durability: Some(Durability::Sync),
             commit_mode: Some(CommitMode::Group),
             map_size: Some(64 * 1024 * 1024),
+            response_cache: Some(false),
+            response_cache_max_entries: Some(1024),
+            response_cache_max_bytes: Some(2 * 1024 * 1024),
+            response_cache_shards: Some(4),
         });
         assert_eq!(config.listen_udp, Some(addr));
         assert_eq!(config.workers, 3);
@@ -2511,6 +2658,10 @@ tick_secs = 300
             durability: Some(Durability::Memory),
             commit_mode: Some(CommitMode::Group),
             map_size: Some(64 * 1024 * 1024),
+            response_cache: Some(false),
+            response_cache_max_entries: Some(1024),
+            response_cache_max_bytes: Some(2 * 1024 * 1024),
+            response_cache_shards: Some(4),
         });
         assert_eq!(
             config.listen_udp,

@@ -156,6 +156,14 @@ fn ten_thousand_idle_connections_memory() {
 #[test]
 #[ignore = "нагрузочная матрица 100/1k/10k; запускать в release"]
 fn connection_scale_qps_and_p99() {
+    if let Ok(workers) = std::env::var("PULSE_SCALE_TCP_WORKERS")
+        && let Ok(workers) = workers.parse::<usize>()
+    {
+        let _ = pulse_tls::net::configure_runtime(pulse_tls::net::RuntimeSettings {
+            worker_threads: (workers > 0).then_some(workers),
+            ..pulse_tls::net::RuntimeSettings::default()
+        });
+    }
     for connections in [100_usize, 1000, 10_000] {
         let cert = test_cert();
         let mut server = dot_server(&cert, connections + 1024, Duration::from_secs(120));

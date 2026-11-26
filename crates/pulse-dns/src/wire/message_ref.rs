@@ -26,6 +26,8 @@ pub struct EdnsRef {
     extended_rcode: u8,
     version: u8,
     flags: u16,
+    /// Есть ли в OPT хотя бы одна опция (RDATA непустая).
+    has_options: bool,
 }
 
 impl EdnsRef {
@@ -51,6 +53,16 @@ impl EdnsRef {
     #[must_use]
     pub const fn dnssec_ok(self) -> bool {
         self.flags & 0x8000 != 0
+    }
+
+    /// Содержит ли запрос EDNS-опции (`COOKIE`, `ECS`, неизвестные и т.п.).
+    ///
+    /// Быстрый путь опции не отражает и отвечает пустым OPT; вызывающий может
+    /// использовать этот признак, чтобы не кешировать ответ на запрос с
+    /// опциями, влияющими на семантику (например, `COOKIE`/`ECS`).
+    #[must_use]
+    pub const fn has_options(self) -> bool {
+        self.has_options
     }
 }
 
@@ -213,6 +225,27 @@ impl<'a> MessageRef<'a> {
             .map(NameRef::from_validated)
     }
 
+    /// Исходная (не канонизированная) wire-форма `QNAME` из пакета.
+    ///
+    /// Возвращает байты ровно в том регистре, в каком их прислал клиент
+    /// (0x20-кодирование). `None` возможен только для пакета, который не прошёл
+    /// [`MessageRef::decode_simple`].
+    #[must_use]
+    pub fn raw_qname(&self) -> Option<&'a [u8]> {
+        let mut position = 12_usize;
+        loop {
+            let length = usize::from(*self.source.get(position)?);
+            position = position.checked_add(1)?;
+            if length == 0 {
+                break;
+            }
+            let end = position.checked_add(length)?;
+            self.source.get(position..end)?;
+            position = end;
+        }
+        self.source.get(12..position)
+    }
+
     /// Тип вопроса.
     #[must_use]
     pub const fn qtype(self) -> Rtype {
@@ -273,6 +306,7 @@ fn parse_opt(source: &[u8], start: usize) -> Option<(EdnsRef, usize)> {
         extended_rcode: u8::try_from(ttl >> 24).ok()?,
         version: u8::try_from((ttl >> 16) & 0xFF).ok()?,
         flags: u16::try_from(ttl & 0xFFFF).ok()?,
+        has_options: rdata_len != 0,
     };
     Some((edns, end))
 }
@@ -396,5 +430,59 @@ mod tests {
         let mut bytes = query_bytes("www.example.com", Rtype::A);
         bytes[2] |= 0x80;
         assert!(MessageRef::decode_simple(&bytes).is_none());
+    }
+
+    #[test]
+    fn raw_qname_preserves_case() {
+        let mut bytes = query_bytes("www.example.com", Rtype::A);
+        let question_len = bytes.len() - 12 - 4;
+        for byte in bytes.iter_mut().skip(12).take(question_len) {
+            if byte.is_ascii_lowercase() {
+                *byte = byte.to_ascii_uppercase();
+            }
+        }
+        let parsed = MessageRef::decode_simple(&bytes).unwrap();
+        assert_eq!(
+            parsed.raw_qname().unwrap(),
+            b"\x03WWW\x07EXAMPLE\x03COM\x00"
+        );
+        assert_eq!(
+            parsed.qname().unwrap().as_wire(),
+            b"\x03www\x07example\x03com\x00"
+        );
+    }
+
+    #[test]
+    fn edns_options_are_reported() {
+        let mut message = Message::query(
+            0x5555,
+            Question::new(
+                Name::parse("www.example.com").unwrap(),
+                Rtype::A,
+                Rclass::IN,
+            ),
+        );
+        message.set_edns(Some(crate::domain::Edns::new(1232)));
+        let bytes = message.encode(&EncodeOptions::compressed()).unwrap();
+        assert!(
+            !MessageRef::decode_simple_edns(&bytes)
+                .unwrap()
+                .edns()
+                .unwrap()
+                .has_options()
+        );
+
+        let mut edns = crate::domain::Edns::new(1232);
+        edns.push_option(crate::domain::EdnsOption::new(10, vec![1, 2, 3, 4]).unwrap())
+            .unwrap();
+        message.set_edns(Some(edns));
+        let bytes = message.encode(&EncodeOptions::compressed()).unwrap();
+        assert!(
+            MessageRef::decode_simple_edns(&bytes)
+                .unwrap()
+                .edns()
+                .unwrap()
+                .has_options()
+        );
     }
 }

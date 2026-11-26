@@ -132,7 +132,9 @@
 //! # }
 //! ```
 
-#![forbid(unsafe_code)]
+// `SO_BUSY_POLL` в `net` — единственный точечный `unsafe` (setsockopt);
+// остальной крейт остаётся безопасным.
+#![deny(unsafe_code)]
 #![cfg_attr(
     not(test),
     deny(

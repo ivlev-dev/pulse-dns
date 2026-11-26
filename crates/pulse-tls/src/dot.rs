@@ -13,7 +13,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
@@ -21,7 +21,9 @@ use tokio_rustls::server::TlsStream;
 
 use crate::acl::Acl;
 use crate::error::Error;
-use crate::net::{BufferPool, ConnectionHandler, ServerHooks, TcpServer};
+use crate::net::{
+    BufferPool, ConnectionHandler, PooledBuffer, ServerHooks, SocketOptions, TcpServer,
+};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::stats::{Stats, StatsSnapshot};
 use crate::tls::TlsConfig;
@@ -60,6 +62,13 @@ pub struct DotConfig {
     pub max_message_size: usize,
     /// Максимум сообщений на одно TCP-соединение.
     pub max_messages_per_connection: usize,
+    /// Включить `TCP_NODELAY` на принятом соединении.
+    ///
+    /// По умолчанию включено: DNS-ответы маленькие, и ожидание алгоритма
+    /// Нейгла добавляет единицы миллисекунд к p99.
+    pub nodelay: bool,
+    /// `SO_BUSY_POLL` в микросекундах; `None` — выключено.
+    pub busy_poll_us: Option<u32>,
     /// Опциональный ACL по IP.
     pub acl: Option<Acl>,
     /// Опциональный per-IP rate limit.
@@ -80,6 +89,8 @@ impl DotConfig {
             shutdown_timeout: Duration::from_secs(5),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_messages_per_connection: DEFAULT_MAX_MESSAGES,
+            nodelay: true,
+            busy_poll_us: None,
             acl: None,
             rate_limit: None,
         }
@@ -199,12 +210,16 @@ impl DotServer {
                 Arc::new(move || stats.error())
             }),
         );
-        let tcp = TcpServer::start(
+        let tcp = TcpServer::start_with_options(
             "pulse-dot",
             listener,
             config.max_connections,
             config.shutdown_timeout,
             hooks,
+            SocketOptions {
+                nodelay: config.nodelay,
+                busy_poll_us: config.busy_poll_us,
+            },
             connection_handler,
         )?;
         Ok(Self {
@@ -303,10 +318,6 @@ async fn handle_connection(
     shared: &Shared,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Error> {
-    if let Err(error) = stream.set_nodelay(true) {
-        shared.stats.handshake_failed();
-        return Err(Error::Io(error));
-    }
     let acceptor = TlsAcceptor::from(shared.config.tls.server_config());
     let handshake = tokio::select! {
         biased;
@@ -330,6 +341,10 @@ async fn handle_connection(
     shared.config.tls.verify_alpn(tls.get_ref().1)?;
 
     let mut messages = 0_usize;
+    // Один буфер кадра на соединение: prefix и тело уходят в TLS одним
+    // `write_all`, то есть одним TLS-рекордом вместо двух. Вектор растёт
+    // лениво: idle-соединение не платит за него.
+    let mut frame = Vec::new();
     while messages < shared.config.max_messages_per_connection {
         if *shutdown.borrow() {
             break;
@@ -339,10 +354,11 @@ async fn handle_connection(
             _ = shutdown.changed() => break,
             message = read_message(&mut tls, shared) => message?,
         };
-        let Some(request) = message else {
+        let Some((buffer, length)) = message else {
             break;
         };
-        shared.stats.read_bytes(request.len());
+        let request = buffer.as_slice();
+        shared.stats.read_bytes(length);
         shared.stats.query();
 
         if let Some(limiter) = &shared.limiter
@@ -352,7 +368,7 @@ async fn handle_connection(
             return Err(Error::RateLimited);
         }
 
-        let outcome = catch_unwind(AssertUnwindSafe(|| (shared.handler)(&request, peer)))
+        let outcome = catch_unwind(AssertUnwindSafe(|| (shared.handler)(request, peer)))
             .map_err(|_| Error::HandlerPanic)?;
         let Some(response) = outcome else {
             return Err(Error::Closed);
@@ -371,9 +387,11 @@ async fn handle_connection(
                 limit: usize::from(u16::MAX),
             })?;
         shared.stats.response();
+        frame.clear();
+        frame.extend_from_slice(&response_length.to_be_bytes());
+        frame.extend_from_slice(&response);
         let write = async {
-            tls.write_all(&response_length.to_be_bytes()).await?;
-            tls.write_all(&response).await?;
+            tls.write_all(&frame).await?;
             tls.flush().await?;
             Ok::<(), std::io::Error>(())
         };
@@ -384,63 +402,61 @@ async fn handle_connection(
         }
         shared.stats.written_bytes(response.len() + 2);
         messages += 1;
+        if frame.capacity() > MAX_RETAINED_FRAME {
+            frame = Vec::with_capacity(512);
+        }
     }
     let _ = timeout(shared.config.request_timeout, tls.shutdown()).await;
     Ok(())
 }
 
+const MAX_RETAINED_FRAME: usize = 8 * 1024;
+
+/// Читает одно DNS-сообщение в переиспользуемый буфер.
+///
+/// Первый байт префикса ограничен `idle_timeout` (keep-alive), остальные байты
+/// префикса и тело — одним `request_timeout`: на запрос приходится два таймера
+/// вместо трёх, а slowloris после первого байта закрывается по
+/// `request_timeout`.
 async fn read_message(
     tls: &mut TlsStream<tokio::net::TcpStream>,
     shared: &Shared,
-) -> Result<Option<Vec<u8>>, Error> {
-    let Some(length) = read_prefix(tls, shared).await? else {
-        return Ok(None);
+) -> Result<Option<(PooledBuffer, usize)>, Error> {
+    let mut first = [0_u8; 1];
+    match timeout(shared.config.idle_timeout, tls.read_exact(&mut first)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Ok(Err(error)) => return Err(Error::Io(error)),
+        Err(_) => return Err(Error::Timeout),
+    }
+    let mut second = [0_u8; 1];
+    let read = async {
+        match tls.read_exact(&mut second).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(Error::Closed);
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
+        let [high] = first;
+        let [low] = second;
+        let length = usize::from(u16::from_be_bytes([high, low]));
+        if length == 0 {
+            return Err(Error::Http("zero-length DNS/TCP frame".to_owned()));
+        }
+        if length > shared.config.max_message_size {
+            return Err(Error::MessageTooLarge {
+                limit: shared.config.max_message_size,
+            });
+        }
+        // Буфер берётся только после префикса: idle-соединение и
+        // slowloris с одним байтом не занимают 4 KiB пула.
+        let mut buffer = shared.buffers.acquire();
+        tls.read_exact(buffer.prepare(length)).await?;
+        Ok((buffer, length))
     };
-    if length == 0 {
-        return Err(Error::Http("zero-length DNS/TCP frame".to_owned()));
-    }
-    let length = usize::from(length);
-    if length > shared.config.max_message_size {
-        return Err(Error::MessageTooLarge {
-            limit: shared.config.max_message_size,
-        });
-    }
-    let mut buffer = shared.buffers.acquire();
-    let request = buffer.prepare(length);
-    match timeout(shared.config.request_timeout, tls.read_exact(request)).await {
-        Ok(Ok(_)) => Ok(Some(buffer.take_vec(length))),
-        Ok(Err(error)) => Err(Error::Io(error)),
-        Err(_) => Err(Error::Timeout),
-    }
-}
-
-async fn read_prefix(
-    tls: &mut TlsStream<tokio::net::TcpStream>,
-    shared: &Shared,
-) -> Result<Option<u16>, Error> {
-    let mut prefix = [0_u8; 2];
-    let (first, second) = prefix.split_at_mut(1);
-    if !read_exact_deadline(tls, first, shared.config.idle_timeout).await? {
-        return Ok(None);
-    }
-    if !read_exact_deadline(tls, second, shared.config.request_timeout).await? {
-        return Err(Error::Closed);
-    }
-    Ok(Some(u16::from_be_bytes(prefix)))
-}
-
-async fn read_exact_deadline<S>(
-    stream: &mut S,
-    buffer: &mut [u8],
-    deadline: Duration,
-) -> Result<bool, Error>
-where
-    S: AsyncRead + Unpin,
-{
-    match timeout(deadline, stream.read_exact(buffer)).await {
-        Ok(Ok(_)) => Ok(true),
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
-        Ok(Err(error)) => Err(Error::Io(error)),
+    match timeout(shared.config.request_timeout, read).await {
+        Ok(result) => result.map(Some),
         Err(_) => Err(Error::Timeout),
     }
 }

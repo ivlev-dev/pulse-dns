@@ -2,6 +2,7 @@
 
 use pulse_dns::{MAX_NAME_WIRE_LEN, Name, NameRef, Rclass, Rrset, Rtype};
 
+use super::cache::ZoneIdentity;
 use crate::domain::{DenialKind, LookupOutcome, LookupOutcomeRef, RefLookup, RrsetRef, ZoneState};
 
 /// Заимствованный снимок зоны, живущий не дольше пина читателя.
@@ -165,6 +166,16 @@ pub trait ZoneView: Send + Sync {
 
     /// Состояние зоны. Для `Initializing`/`Tombstone` движок отвечает `REFUSED`.
     fn state(&self) -> ZoneState;
+
+    /// Идентичность версии зоны для кеша готовых ответов.
+    ///
+    /// `None` — адаптер не поддерживает кеширование (например, отвечает на
+    /// запросы из нестабильного источника). Значение обязано меняться при
+    /// каждом изменении данных зоны; смена версии немедленно делает старые
+    /// записи кеша недостижимыми.
+    fn cache_identity(&self) -> Option<ZoneIdentity> {
+        None
+    }
 
     /// Точный поиск `(name, rtype)` без композиции.
     ///

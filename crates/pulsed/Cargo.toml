@@ -63,5 +63,9 @@ harness = false
 name = "role_split"
 harness = false
 
+[[bench]]
+name = "response_cache"
+harness = false
+
 [lints]
 workspace = true

@@ -128,12 +128,16 @@ fn recv_from(socket: &UdpSocket, buffer: &mut [u8]) -> std::io::Result<(usize, S
 }
 
 fn dns_query(server: &Server, qname: &str, qtype: Rtype) -> Message {
+    dns_query_id(server, qname, qtype, 0x7711)
+}
+
+fn dns_query_id(server: &Server, qname: &str, qtype: Rtype, id: u16) -> Message {
     let socket = UdpSocket::bind("127.0.0.1:0").expect("client socket");
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("read timeout");
     let query = Message::query(
-        0x7711,
+        id,
         Question::new(Name::parse(qname).expect("valid qname"), qtype, Rclass::IN),
     )
     .encode(&EncodeOptions::compressed())
@@ -494,6 +498,136 @@ fn api_post_serial_import_and_audit() {
         audit.json()["items"]
             .as_array()
             .is_some_and(|items| !items.is_empty())
+    );
+
+    server.shutdown().expect("shutdown");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn response_cache_hits_and_invalidates_on_rest_mutations() {
+    let (_zone, config) = test_config();
+    assert!(config.response_cache.enabled, "cache enabled by default");
+    let mut server = Server::start_with_api(
+        &config,
+        Some(ApiOptions {
+            listen: "127.0.0.1:0".parse().expect("api"),
+            token: TOKEN.to_owned(),
+            scopes: vec![ORIGIN.to_owned()],
+        }),
+    )
+    .expect("start DNS+API");
+    let api = server.api_addr().expect("api enabled");
+    let bearer = auth();
+
+    let created = request(
+        api,
+        "PUT",
+        ZONE_PATH,
+        &[("Authorization", &bearer), ("If-None-Match", "*")],
+        Some(br#"{"kind":"primary","default_ttl":3600}"#),
+    );
+    assert_eq!(created.status, 201);
+    let soa = "ns1.dynamic.test. hostmaster.dynamic.test. 1 3600 600 604800 300";
+    for (owner, rr_type, body) in [
+        (
+            ORIGIN,
+            "SOA",
+            format!(r#"{{"ttl":3600,"records":["{soa}"]}}"#),
+        ),
+        (
+            ORIGIN,
+            "NS",
+            r#"{"ttl":3600,"records":["ns1.dynamic.test."]}"#.to_owned(),
+        ),
+        (
+            "www.dynamic.test.",
+            "A",
+            r#"{"ttl":300,"records":["192.0.2.55"]}"#.to_owned(),
+        ),
+    ] {
+        let response = request(
+            api,
+            "PUT",
+            &rrset_path(owner, rr_type),
+            &[("Authorization", &bearer)],
+            Some(body.as_bytes()),
+        );
+        assert_eq!(
+            response.status,
+            201,
+            "{owner}/{rr_type}: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+    }
+    let etag = request(
+        api,
+        "GET",
+        &rrset_path("www.dynamic.test.", "A"),
+        &[("Authorization", &bearer)],
+        None,
+    )
+    .header("etag")
+    .expect("rrset etag")
+    .to_owned();
+
+    // Первый ответ — промах, второй с другим ID — попадание в кеш.
+    let first = dns_query_id(&server, "www.dynamic.test.", Rtype::A, 0x1000);
+    let second = dns_query_id(&server, "www.dynamic.test.", Rtype::A, 0x1001);
+    assert_eq!(
+        first.answers().first().map(pulse_dns::Record::rdata),
+        second.answers().first().map(pulse_dns::Record::rdata)
+    );
+    let metrics = server.response_cache_metrics();
+    assert!(metrics.entries >= 1, "{metrics:?}");
+    assert!(metrics.hits >= 1, "{metrics:?}");
+
+    // REST-правка поднимает версию зоны: следующий ответ обязан быть свежим.
+    let patched = request(
+        api,
+        "PATCH",
+        &rrset_path("www.dynamic.test.", "A"),
+        &[("Authorization", &bearer), ("If-Match", &etag)],
+        Some(br#"{"ttl":300,"add":["192.0.2.66"],"remove":["192.0.2.55"]}"#),
+    );
+    assert_eq!(
+        patched.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&patched.body)
+    );
+    let hits_before = server.response_cache_metrics().hits;
+    assert_a(&server, "192.0.2.66");
+    assert_eq!(
+        server.response_cache_metrics().hits,
+        hits_before,
+        "REST edit must invalidate the cached response immediately"
+    );
+    // Повтор после инвалидации снова попадает в кеш.
+    assert_a(&server, "192.0.2.66");
+    assert!(server.response_cache_metrics().hits > hits_before);
+
+    // Удаление зоны: ответ больше не обслуживается, записи кеша недостижимы.
+    let zone = request(api, "GET", ZONE_PATH, &[("Authorization", &bearer)], None);
+    let zone_etag = zone.header("etag").expect("zone etag").to_owned();
+    let deleted = request(
+        api,
+        "DELETE",
+        &format!("{ZONE_PATH}?confirm_origin={ORIGIN}"),
+        &[("Authorization", &bearer), ("If-Match", &zone_etag)],
+        None,
+    );
+    assert_eq!(deleted.status, 204);
+    let response = dns_query(&server, "www.dynamic.test.", Rtype::A);
+    assert_eq!(response.rcode(), Rcode::REFUSED);
+
+    let rendered = request(api, "GET", "/metrics", &[("Authorization", &bearer)], None);
+    assert_eq!(rendered.status, 200);
+    let body = String::from_utf8_lossy(&rendered.body);
+    assert!(body.contains("pulsed_response_cache_hits_total "), "{body}");
+    assert!(
+        body.contains("pulsed_response_cache_bytes "),
+        "cache memory gauge must be exported: {body}"
     );
 
     server.shutdown().expect("shutdown");
