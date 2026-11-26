@@ -76,6 +76,9 @@ fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(200_000);
+    // `PULSE_LATENCY_ONLY=wire` измеряет только горячий wire-путь: удобно для
+    // `perf stat`, где Message-путь (медленный, аллоцирующий) даёт шум.
+    let only = std::env::var("PULSE_LATENCY_ONLY").unwrap_or_default();
     let handler: RawHandler = Arc::new(|request, _tcp| {
         let mut reply = response(request, Rcode::NOERROR);
         reply.add_answer(a("bench.example", 3600, [192, 0, 2, 1]));
@@ -97,37 +100,41 @@ fn main() {
     }
 
     let batches = iterations.saturating_div(BATCH).max(1);
-    let mut message_samples = Vec::with_capacity(batches);
-    let started = Instant::now();
-    for _ in 0..batches {
-        let begin = Instant::now();
-        for _ in 0..BATCH {
-            black_box(resolver.resolve(black_box(&query)));
+    if only != "wire" {
+        let mut message_samples = Vec::with_capacity(batches);
+        let started = Instant::now();
+        for _ in 0..batches {
+            let begin = Instant::now();
+            for _ in 0..BATCH {
+                black_box(resolver.resolve(black_box(&query)));
+            }
+            let per_op = begin.elapsed().as_nanos().saturating_div(BATCH as u128);
+            message_samples.push(u64::try_from(per_op).unwrap_or(u64::MAX));
         }
-        let per_op = begin.elapsed().as_nanos().saturating_div(BATCH as u128);
-        message_samples.push(u64::try_from(per_op).unwrap_or(u64::MAX));
+        let message_total = started.elapsed();
+        report("resolve", message_samples, message_total, BATCH);
     }
-    let message_total = started.elapsed();
-    report("resolve", message_samples, message_total, BATCH);
 
-    let mut out = [0_u8; 512];
-    for _ in 0..100 {
-        black_box(resolver.resolve_into(&query, &mut out).expect("encode"));
-    }
-    let mut wire_samples = Vec::with_capacity(batches);
-    let started = Instant::now();
-    for _ in 0..batches {
-        let begin = Instant::now();
-        for _ in 0..BATCH {
-            let length = resolver
-                .resolve_into(black_box(&query), &mut out)
-                .expect("encode");
-            black_box(length);
+    if only != "message" {
+        let mut out = [0_u8; 512];
+        for _ in 0..100 {
+            black_box(resolver.resolve_into(&query, &mut out).expect("encode"));
         }
-        let per_op = begin.elapsed().as_nanos().saturating_div(BATCH as u128);
-        wire_samples.push(u64::try_from(per_op).unwrap_or(u64::MAX));
+        let mut wire_samples = Vec::with_capacity(batches);
+        let started = Instant::now();
+        for _ in 0..batches {
+            let begin = Instant::now();
+            for _ in 0..BATCH {
+                let length = resolver
+                    .resolve_into(black_box(&query), &mut out)
+                    .expect("encode");
+                black_box(length);
+            }
+            let per_op = begin.elapsed().as_nanos().saturating_div(BATCH as u128);
+            wire_samples.push(u64::try_from(per_op).unwrap_or(u64::MAX));
+        }
+        let wire_total = started.elapsed();
+        report("resolve_into", wire_samples, wire_total, BATCH);
+        eprintln!("cache stats: {:?}", resolver.stats().cache);
     }
-    let wire_total = started.elapsed();
-    report("resolve_into", wire_samples, wire_total, BATCH);
-    eprintln!("cache stats: {:?}", resolver.stats().cache);
 }

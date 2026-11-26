@@ -20,7 +20,7 @@ use pulse_tls::client::{DohClient, DotClient};
 use pulse_tls::{PoolConfig, PoolStats};
 
 use crate::blocklist::{Blocklist, BlocklistStats};
-use crate::cache::{Cache, CacheSnapshot, SecurityState, wire_rrs};
+use crate::cache::{Cache, CacheSnapshot, SecurityState};
 use crate::config::{BlockResponse, Mode, ResolverConfig, TrustAnchorConfig, UpstreamConfig};
 use crate::dnssec::{self, Security, ValidationCache};
 use crate::error::ResolverError;
@@ -1069,10 +1069,8 @@ impl Resolver {
         if let Err(error) = encoder.write_question_wire(qname, qtype, qclass) {
             return Some(Err(error));
         }
-        let stored = usize::from(hit.records());
-        let mut answers = if negative { 0 } else { stored };
-        let authority = if negative { stored } else { 0 };
-        for rr in wire_rrs(hit.rrset()) {
+        let mut stored = 0_usize;
+        for rr in hit.rrs() {
             if let Err(error) = encoder.write_rr_raw(
                 rr.owner,
                 rr.rr_type,
@@ -1082,8 +1080,11 @@ impl Resolver {
             ) {
                 return Some(Err(error));
             }
+            stored = stored.saturating_add(1);
         }
         drop(hit);
+        let mut answers = if negative { 0 } else { stored };
+        let authority = if negative { stored } else { 0 };
 
         if !negative
             && qtype != Rtype::RRSIG
@@ -1091,7 +1092,7 @@ impl Resolver {
             && let Some(signatures) =
                 cache.peek_wire(qname, Rtype::RRSIG, Rclass::IN, accept_unvalidated)
         {
-            for rr in wire_rrs(signatures.rrset()) {
+            for rr in signatures.rrs() {
                 if let Err(error) = encoder.write_rr_raw(
                     rr.owner,
                     rr.rr_type,

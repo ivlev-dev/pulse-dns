@@ -87,7 +87,7 @@ upstream по UDP, TCP, DoT и DoH/1.1 (пул keep-alive, backoff). Остат�
   (было 59–67 КБ); qps −8–10%, p99 без изменений.
 - Multi-process каталог/reclaim: create/delete/meta из любого процесса;
   `high_water` стабилизируется (3636→5428 после 10k циклов); 8 процессов — 13.4k zone-commit/s;
-  в multi отключены Page/node-кеши, `freeze()` process-local, fsck repair — quiescent.
+  в multi Page/node-кеши включены (общая генерация страниц в sidecar), `freeze()` process-local, fsck repair — quiescent.
 - Zero-copy fallback: DNAME/циклы/wildcard-CNAME/single-page overflow — 0 allocs;
   multi-page overflow — fallback.
 - Изолированный стенд: server/client на разных SMT-ядрах, 14 сценариев, perf stat +
@@ -100,7 +100,7 @@ upstream по UDP, TCP, DoT и DoH/1.1 (пул keep-alive, backoff). Остат�
 meta) — любой процесс под catalog lease + commit-lock; durable-пулы в multi
 переиспользуются под lease зоны при `drop_txn < min(D_z, MP всех процессов,
 freeze)`, `high_water` стабилизируется (3636→5428 после 10k циклов); в multi
-отключены Page/node-кеши; `freeze()` process-local; fsck repair — quiescent.
+Page/node-кеши включены (ключ `(page_no, generation)` из sidecar); `freeze()` process-local; fsck repair — quiescent.
 8 процессов — 13.4k zone-commit/s. Водарк-баг `WatermarkRegression` при DELETE
 исправлен (20/20 ролей).
 TCP/DoT/DoH/plain TCP — tokio event-loop: 10k idle-соединений, ~11 КБ/соединение
@@ -442,8 +442,8 @@ cargo deny check
 | io_uring RSS (1/4/8 workers) | 4.7/10.2/17.5 МБ (было 12.7/40.6/104.9) |
 | io_uring p99 (8 workers) | 650 → 440 µs; SQPOLL медленнее (выкл), registered files вкл |
 | Каталог зон | 1000 зон за 83 мс, 4096 за 651 мс |
-| Кеш резолвера | 113.8 B/entry на 1M |
-| Резолвер (библиотека) cache hit | p50 0.396 µs, p99 0.572 µs, 0 allocs, ~2.3M qps/поток |
+| Кеш резолвера | 65.9 B/entry на 1M (было 113.8); фактически ~74 МБ с bucket-массивом (было ~126 МБ) |
+| Резолвер (библиотека) cache hit | p50 0.396 µs (не хуже после компактной раскладки), p99 0.572 µs, 0 allocs, ~2.3M qps/поток |
 | pulseresolved hot path | p50 578 нс, p99 750 нс, 0 allocs; 200k qps без таймаутов |
 | UDP echo, 4 worker / 4 клиента, окно 16 | 220 117 qps |
 | epoll, те же условия | 230 352 qps |
