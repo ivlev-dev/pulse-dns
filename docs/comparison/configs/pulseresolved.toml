@@ -1,0 +1,23 @@
+listen_udp = "127.0.0.1:5401"
+listen_tcp = "127.0.0.1:5401"
+workers = 4
+mode = "forward"
+forwarders = ["127.0.0.1:5301"]
+dnssec_validate = false
+log_level = "warn"
+
+[cache]
+max_entries = 131072
+max_bytes = 67108864
+min_ttl = 0
+max_ttl = 86400
+shards = 16
+
+[tcp]
+max_connections = 1024
+idle_timeout_ms = 5000
+
+[timeouts]
+per_query_ms = 2000
+tcp_ms = 3000
+total_ms = 6000

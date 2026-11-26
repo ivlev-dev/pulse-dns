@@ -1,0 +1,2136 @@
+{
+  "meta": {
+    "title": "Функциональное сравнение pulse-dns с BIND 9, Unbound и PowerDNS",
+    "date": "2026-11-26",
+    "scope": "authoritative + recursive, standard DNS features and pulse-dns differentiators",
+    "excluded": "raw performance numbers (separate report)",
+    "versions": {
+      "pulse-dns": "current working tree (STATUS.md/README.md/code)",
+      "bind": "9.20.15",
+      "unbound": "1.22.0",
+      "pdns_auth": "5.1.7",
+      "pdns_rec": "5.5.0"
+    },
+    "legend": {
+      "yes": "да",
+      "partial": "частично",
+      "no": "нет",
+      "na": "н/п",
+      "unknown": "не удалось подтвердить"
+    }
+  },
+  "features": [
+    {
+      "id": "auth.zone.primary",
+      "category": "zones",
+      "name": "Primary-зоны",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Зона хранится в v2-файле, состояние Serving, DNS отвечает из mmap.",
+          "ref": "crates/pulsed/src/store.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "type primary; штатный авторитетный режим.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-type"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "auth-zone отдаёт локальные данные вниз и вверх, но это не полноценное ведение primary-зоны.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#authority-zone-options"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "Режимы native и primary; зона ведётся в backend.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "partial",
+          "note": "auth-zones — локальная авторитетная копия для резолвера, без ведения зоны.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.zone.secondary",
+      "category": "zones",
+      "name": "Secondary-зоны (AXFR/IXFR-in, refresh/expire)",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "secondary_zones: bootstrap, SOA-refresh, expire → SERVFAIL, AXFR/IXFR-in, TSIG.",
+          "ref": "crates/pulsed/src/secondary.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "type secondary, primaries, журнал, NOTIFY.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-type"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "auth-zone обновляется через AXFR/IXFR/SOA-таймеры, но исходящий NOTIFY не шлёт.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#authority-zone-options"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "Secondary-режим, autoprimary, IXFR-in; IXFR-out не отдаёт.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Рекурсор не является secondary.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.zone.reverse",
+      "category": "zones",
+      "name": "Reverse-зоны (in-addr.arpa / ip6.arpa)",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Обычная зона с reverse-именем; отдельной синхронизации PTR нет.",
+          "ref": "crates/pulse-zonefile/src/zonefile.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "Обычные зоны; reverse — это просто имя зоны.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-type"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "Обычные auth-zone/local-zone с reverse-именем.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#authority-zone-options"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "Обычная зона в backend.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "Разрешает reverse-имена как резолвер; auth-zones тоже возможны.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.zone.forward",
+      "category": "zones",
+      "name": "Forward-зоны",
+      "cells": {
+        "pulse": {
+          "status": "partial",
+          "note": "kind=forward есть в модели/API и формате, но forward_upstreams не используются в пути ответа.",
+          "ref": "crates/pulse-zonefile/src/zone_meta.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "type forward с forwarders, в т.ч. per-zone.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-type"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "forward-zone с forward-addr/host и TLS-апстримом.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#forward-zone-options"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Такого типа зоны нет; forwarding — задача резолвера/dnsdist.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "forward-zones — штатный режим (в т.ч. per-zone).",
+          "ref": "https://doc.powerdns.com/recursor/settings.html#forward-zones"
+        }
+      }
+    },
+    {
+      "id": "auth.zone.stub",
+      "category": "zones",
+      "name": "Stub / static-stub зоны",
+      "cells": {
+        "pulse": {
+          "status": "no",
+          "note": "Нет stub-зон.",
+          "ref": "STATUS.md"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "type stub и static-stub.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-type"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "stub-zone (stub-addr/stub-host, TLS/TCP).",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#stub-zone-options"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет stub-зон, только forward-zones.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html#forward-zones"
+        }
+      }
+    },
+    {
+      "id": "auth.zone.catalog",
+      "category": "zones",
+      "name": "Catalog zones (RFC 9432)",
+      "cells": {
+        "pulse": {
+          "status": "no",
+          "note": "Нет; внутренний каталог зон в zonefile — не RFC 9432.",
+          "ref": "crates/pulse-zonefile/src/zonefile.rs"
+        },
+        "bind": {
+          "status": "partial",
+          "note": "Только consumer: schema v1/v2, custom properties, coo; producer в ARM 9.20 не описан.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter6.html#catalog-zones"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "В unbound.conf 1.22 опций catalog нет.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "Producer и consumer v2; v1 — только consumer; требует поддержки backend.",
+          "ref": "https://doc.powerdns.com/authoritative/catalog.html#supported-catalog-versions"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.zone.views",
+      "category": "zones",
+      "name": "Views / split-horizon",
+      "cells": {
+        "pulse": {
+          "status": "no",
+          "note": "Нет views; один набор зон для всех клиентов.",
+          "ref": "crates/pulsed/src/config.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "view-блоки, отдельные зоны/forwarders/ACL.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-view"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "view: + access-control-view/interface-view.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-view"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "Views с 5.0, экспериментально; нужен zone cache и LMDB/Postgres.",
+          "ref": "https://doc.powerdns.com/authoritative/views.html#requirements"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет views.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.zone.acl",
+      "category": "zones",
+      "name": "Per-zone ACL (allow-query)",
+      "cells": {
+        "pulse": {
+          "status": "partial",
+          "note": "Есть allow_zones для transfer/update и общий TLS-ACL; per-zone query ACL для UDP/TCP нет.",
+          "ref": "crates/pulsed/src/config.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "allow-query в zone/view переопределяет глобальный.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-allow-query"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "access-control — по клиенту, не по зоне; per-zone allow-query нет.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "partial",
+          "note": "ALLOW-AXFR-FROM / ALLOW-DNSUPDATE-FROM / TSIG-метаданные; ACL на обычные запросы нет.",
+          "ref": "https://doc.powerdns.com/authoritative/domainmetadata.html#allow-axfr-from"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Только глобальный allow-from по клиенту; per-zone ACL нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html#allow-from"
+        }
+      }
+    },
+    {
+      "id": "auth.dnssec.sign",
+      "category": "dnssec",
+      "name": "Подпись зон",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Подпись при старте, по job/API и после ротации ключей; NSEC/NSEC3.",
+          "ref": "crates/pulsed/src/store.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "KASP/dnssec-policy, автоматическое сопровождение.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter5.html#fully-automated-key-and-signing-policy"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Unbound только валидирует, не подписывает.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "Online signing и pre-signed зоны.",
+          "ref": "https://doc.powerdns.com/authoritative/dnssec/index.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Рекурсор не подписывает.",
+          "ref": "https://doc.powerdns.com/recursor/dnssec.html"
+        }
+      }
+    },
+    {
+      "id": "auth.dnssec.algorithms",
+      "category": "dnssec",
+      "name": "Алгоритмы подписи (RSA/ECDSA/Ed25519/Ed448)",
+      "cells": {
+        "pulse": {
+          "status": "partial",
+          "note": "Подпись: 8/13/15. Валидация: 8/10/13/14/15 (+legacy 5/7 opt-in); Ed448 и подпись 10/14 нет.",
+          "ref": "crates/pulse-dnssec/src/algorithm.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "RSASHA1/256/512, ECDSA P-256/P-384, Ed25519, Ed448 (по crypto-lib).",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-keys"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Подписи нет; валидация — RSA/ECDSA/Ed25519/Ed448.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "5/7/8/10/13/14/15/16 (зависит от сборки).",
+          "ref": "https://doc.powerdns.com/authoritative/dnssec/profile.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Подписи нет.",
+          "ref": "https://doc.powerdns.com/recursor/dnssec.html"
+        }
+      }
+    },
+    {
+      "id": "auth.dnssec.denial",
+      "category": "dnssec",
+      "name": "NSEC / NSEC3 / opt-out",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "NSEC и NSEC3 (salt/iterations, closest encloser, wildcard, opt-out); для secondary NSEC3 не генерируется.",
+          "ref": "crates/pulse-dnssec/src/denial/mod.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "NSEC/NSEC3, nsec3param, opt-out, narrow.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-nsec3param"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Только валидация denial-доказательств.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "NSEC/NSEC3, NSEC3PARAM, NSEC3NARROW, opt-out.",
+          "ref": "https://doc.powerdns.com/authoritative/domainmetadata.html#nsec3narrow"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Только валидация.",
+          "ref": "https://doc.powerdns.com/recursor/dnssec.html"
+        }
+      }
+    },
+    {
+      "id": "auth.dnssec.rollover",
+      "category": "dnssec",
+      "name": "Key rollover",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Автоматическая ротация KSK/ZSK: pre-publish → double-sign → active → retire, состояние на диске.",
+          "ref": "crates/pulsed/src/rotation.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "KASP: ZSK автоматически, KSK с checkds/parental-agents.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter5.html#fully-automated-key-and-signing-policy"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет управления ключами.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "Signature rollover и key maintenance управляются PowerDNS.",
+          "ref": "https://doc.powerdns.com/authoritative/dnssec/index.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/dnssec.html"
+        }
+      }
+    },
+    {
+      "id": "auth.dnssec.inline",
+      "category": "dnssec",
+      "name": "Inline signing",
+      "cells": {
+        "pulse": {
+          "status": "partial",
+          "note": "Подпись при старте/по job/после ротации; непрерывного re-sign при изменениях и истечении подписей нет.",
+          "ref": "crates/pulsed/src/store.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "inline-signing включён по умолчанию для dnssec-policy.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-inline-signing"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "Online signing: подписи генерируются при ответе/изменении.",
+          "ref": "https://doc.powerdns.com/authoritative/dnssec/index.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/dnssec.html"
+        }
+      }
+    },
+    {
+      "id": "auth.dnssec.validate",
+      "category": "dnssec",
+      "name": "DNSSEC-валидация (в составе продукта)",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Валидирует pulseresolved (AD/BOGUS→SERVFAIL); сам pulsed — нет.",
+          "ref": "crates/pulse-resolver/src/dnssec.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "Встроенный резолвер валидирует по умолчанию.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter5.html#dnssec-validation"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "Validator по умолчанию.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Валидации нет (только подпись/serving).",
+          "ref": "https://doc.powerdns.com/authoritative/dnssec/index.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "Валидирует как резолвер (режимы process/validate); авторитетного режима нет.",
+          "ref": "https://doc.powerdns.com/recursor/dnssec.html"
+        }
+      }
+    },
+    {
+      "id": "auth.xfr.axfr",
+      "category": "transfers",
+      "name": "AXFR (out/in)",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "AXFR-out по TCP с TSIG/ACL; AXFR-in для secondary.",
+          "ref": "crates/pulse-transfer/src/lib.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "AXFR-out и AXFR-in.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter6.html#incremental-zone-transfers-ixfr"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "AXFR-in через auth-zone; AXFR-out не отдаёт (мануал прямо это оговаривает).",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#authority-zone-options"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "AXFR-out; AXFR-in для secondary.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.xfr.ixfr",
+      "category": "transfers",
+      "name": "IXFR (out/in)",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "IXFR-out из истории коммитов (history_deltas) и IXFR-in для secondary.",
+          "ref": "crates/pulsed/src/transfer.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "IXFR-out/in, max-ixfr-ratio, request-ixfr.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter6.html#incremental-zone-transfers-ixfr"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "IXFR-in через auth-zone; IXFR-out не отдаёт.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#authority-zone-options"
+        },
+        "pdns_auth": {
+          "status": "partial",
+          "note": "IXFR только получает; «cannot serve IXFR updates» (официально).",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html#ixfr-incremental-zone-transfers"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.xfr.tsig",
+      "category": "transfers",
+      "name": "TSIG и алгоритмы",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "hmac-sha1/224/256/384/512, replay-защита, подпись каждого N-го сообщения.",
+          "ref": "crates/pulse-transfer/src/tsig.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "hmac-md5/sha1/224/256/384/512.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter7.html#tsig"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "TSIG в unbound.conf 1.22 отсутствует.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "hmac-md5/sha1/224/256/384/512 + GSS-TSIG.",
+          "ref": "https://doc.powerdns.com/authoritative/tsig.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.xfr.notify",
+      "category": "transfers",
+      "name": "NOTIFY (in/out)",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "NOTIFY-out после изменений, NOTIFY-in для secondary, TSIG/ACL/retry.",
+          "ref": "crates/pulsed/src/transfer.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "notify/also-notify, приём NOTIFY.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter6.html#notify"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "allow-notify для auth-zone; исходящий NOTIFY не отправляет.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#authority-zone-options"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "NOTIFY in/out, also-notify, autoprimary.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.xfr.ixfr_diff",
+      "category": "transfers",
+      "name": "IXFR-from-differences",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Аналог: дельты строятся из истории коммитов зоны, без внешнего diff-файла.",
+          "ref": "crates/pulse-zonefile/src/zonefile.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "ixfr-from-differences (yes/primary/secondary).",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-ixfr-from-differences"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет; IXFR-out вообще не поддерживается.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html#ixfr-incremental-zone-transfers"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.update.rfc2136",
+      "category": "update",
+      "name": "RFC 2136 UPDATE",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "opcode 5 на UDP/TCP/DoT/DoH/DoQ/DNSCrypt, атомарный commit, SOA serial RFC 1982.",
+          "ref": "crates/pulse-server/src/update.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "allow-update/update-policy, journal.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter6.html#dynamic-update"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Динамических обновлений нет.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "dnsupdate=yes, backend-операции, SOA-EDIT-DNSUPDATE.",
+          "ref": "https://doc.powerdns.com/authoritative/dnsupdate.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Рекурсор UPDATE не принимает.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.update.prereq",
+      "category": "update",
+      "name": "Prerequisites",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "YXDOMAIN/NXRRSET/YXRRSET/NXDOMAIN, проверка на одном снапшоте до записи.",
+          "ref": "crates/pulse-server/src/update.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "Полный набор prerequisites RFC 2136.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter6.html#dynamic-update"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет UPDATE.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "Prerequisites поддерживаются (RFC 2136).",
+          "ref": "https://doc.powerdns.com/authoritative/dnsupdate.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет UPDATE.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.update.policy",
+      "category": "update",
+      "name": "Policy per-name",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "update.policy: zone/name (exact/suffix/wildcard) + types + principal (TSIG/SIG0/subnet/any); первое совпадение, default deny. В рабочем дереве, не в последнем коммите.",
+          "ref": "crates/pulsed/src/update.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "update-policy: grant/deny по name/type/principal.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#dynamic-update-policies"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет UPDATE.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "partial",
+          "note": "Статически — только IP/TSIG на зону; произвольная политика — Lua-скрипт updatepolicy.",
+          "ref": "https://doc.powerdns.com/authoritative/dnsupdate.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет UPDATE.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.update.sig0",
+      "category": "update",
+      "name": "SIG(0)",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Проверка SIG(0) (RFC 2931/3007), доверенные ключи, replay-кэш, подпись ответа. В рабочем дереве, не в последнем коммите.",
+          "ref": "crates/pulse-dnssec/src/sig0.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "SIG(0)-подписанные запросы, квоты проверок.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter7.html#sig-0"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет; только TSIG/GSS-TSIG.",
+          "ref": "https://doc.powerdns.com/authoritative/tsig.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.update.tsig",
+      "category": "update",
+      "name": "TSIG для UPDATE",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "TSIG обязателен по умолчанию, replay-кэш, allow_from/allow_zones.",
+          "ref": "crates/pulsed/src/update.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "TSIG-подпись обновлений.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter7.html#tsig"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "TSIG-ALLOW-DNSUPDATE, dnsupdate-require-tsig, GSS-TSIG.",
+          "ref": "https://doc.powerdns.com/authoritative/domainmetadata.html#allow-dnsupdate-from-forward-dnsupdate-notify-dnsupdate-soa-edit-dnsupdate"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.transport.udp_tcp",
+      "category": "transports",
+      "name": "UDP/TCP",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "UDP на io_uring, TCP на tokio event-loop, EDNS/TC.",
+          "ref": "crates/pulsed/src/dns.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "UDP/TCP.",
+          "ref": "https://kb.isc.org/docs/proxyv2-support-in-bind-9"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "UDP/TCP.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "UDP/TCP.",
+          "ref": "https://doc.powerdns.com/authoritative/settings.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "UDP/TCP.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.transport.dot",
+      "category": "transports",
+      "name": "DoT",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Серверный DoT (RFC 7858), TLS hot-reload.",
+          "ref": "crates/pulse-tls/src/dot.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "tls-port + tls-блок.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-tls-port"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "tls-port + tls-service-key/pem.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Встроенного DoT нет; ставится dnsdist.",
+          "ref": "https://doc.powerdns.com/authoritative/settings.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Встроенного DoT-листенера нет; ставится dnsdist.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.transport.doh12",
+      "category": "transports",
+      "name": "DoH 1.1 / 2",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "DoH/1.1 и DoH/2 (h2), GET/POST.",
+          "ref": "crates/pulse-tls/src/doh.rs"
+        },
+        "bind": {
+          "status": "partial",
+          "note": "DoH через https-port/http-*; в ARM заявлен HTTP/2, HTTP/1.1 не заявлен.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-https-port"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "DoH только HTTP/2 (сборка с libnghttp2); HTTP/1.1 в manual не заявлен.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-https-port"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/authoritative/settings.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.transport.doh3",
+      "category": "transports",
+      "name": "DoH 3",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "DoH/3 на quinn/h3, отдельный листенер.",
+          "ref": "crates/pulse-tls/src/doh3.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "В 9.20 нет; транспорты BIND — Do53/DoT/DoH.",
+          "ref": "https://kb.isc.org/docs/proxyv2-support-in-bind-9"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "DoH только HTTP/2 (libnghttp2).",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-https-port"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/authoritative/settings.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.transport.doq",
+      "category": "transports",
+      "name": "DoQ",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "DoQ (RFC 9250) на quinn.",
+          "ref": "crates/pulse-tls/src/doq.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "DoQ в 9.20 не реализован (Do53/DoT/DoH).",
+          "ref": "https://kb.isc.org/docs/proxyv2-support-in-bind-9"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "quic-port/quic-size с 1.22.0 (сборка с libngtcp2).",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-quic-port"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/authoritative/settings.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.transport.dnscrypt",
+      "category": "transports",
+      "name": "DNSCrypt",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "DNSCrypt v2 UDP+TCP: сертификаты, сервер, клиент, метрики.",
+          "ref": "crates/pulse-dnscrypt/src/lib.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://kb.isc.org/docs/proxyv2-support-in-bind-9"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "dnscrypt:-блок (опциональная сборка).",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-dnscrypt"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет; DNSCrypt — отдельный wrapper/dnsdist-сосед.",
+          "ref": "https://doc.powerdns.com/authoritative/settings.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.api.rest",
+      "category": "api",
+      "name": "REST API",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Zones/RRset CRUD, transfers, jobs, keys, import, audit, settings.",
+          "ref": "crates/pulse-api/src/handler.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "Только rndc (TSIG-канал) и statistics-channels.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/manpages.html#rndc"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Только unbound-control (TLS-канал).",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound-control.html"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "REST /api/v1, зоны/метаданные/трансферы.",
+          "ref": "https://doc.powerdns.com/authoritative/http-api/index.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "REST /api/v1 (зоны, статистика, кеш, RPZ, трассировка).",
+          "ref": "https://doc.powerdns.com/recursor/http-api/index.html"
+        }
+      }
+    },
+    {
+      "id": "auth.api.openapi",
+      "category": "api",
+      "name": "OpenAPI",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "OpenAPI 3.1, статическая схема + /api/v1/openapi.json.",
+          "ref": "crates/pulse-api/src/openapi.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#bind-9-statistics"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound-control.html"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "OpenAPI 3.1, доступен с работающего сервера.",
+          "ref": "https://doc.powerdns.com/authoritative/http-api/index.html"
+        },
+        "pdns_rec": {
+          "status": "unknown",
+          "note": "В документации API OpenAPI-спека не найдена; отсутствие не подтверждено.",
+          "ref": "https://doc.powerdns.com/recursor/http-api/index.html"
+        }
+      }
+    },
+    {
+      "id": "auth.api.auth",
+      "category": "api",
+      "name": "Аутентификация API и scopes",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Bearer-токены, scopes (admin/group:*/точечные), per-zone allowlist, Idempotency-Key.",
+          "ref": "crates/pulse-api/src/auth.rs"
+        },
+        "bind": {
+          "status": "partial",
+          "note": "rndc-key/ACL, без HTTP API и scopes.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/manpages.html#rndc"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "TLS-ключи unbound-control, без scopes.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound-control.html"
+        },
+        "pdns_auth": {
+          "status": "partial",
+          "note": "Статический X-API-Key, без scopes/ролей.",
+          "ref": "https://doc.powerdns.com/authoritative/settings.html#api-key"
+        },
+        "pdns_rec": {
+          "status": "partial",
+          "note": "API key/password, без scopes; allow_from.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html#api-key"
+        }
+      }
+    },
+    {
+      "id": "auth.api.jobs",
+      "category": "api",
+      "name": "Jobs",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Асинхронные операции, Prefer: respond-async, TTL 24 ч, в памяти.",
+          "ref": "crates/pulse-api/src/jobs.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/manpages.html#rndc"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound-control.html"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет API-задач.",
+          "ref": "https://doc.powerdns.com/authoritative/http-api/index.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/http-api/index.html"
+        }
+      }
+    },
+    {
+      "id": "auth.api.audit",
+      "category": "api",
+      "name": "Audit",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Аудит мутаций, ring 4096, в памяти (не персистентный).",
+          "ref": "crates/pulse-api/src/audit.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "Нет отдельного audit API (только логи).",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#bind-9-statistics"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound-control.html"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет audit API.",
+          "ref": "https://doc.powerdns.com/authoritative/http-api/index.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/http-api/index.html"
+        }
+      }
+    },
+    {
+      "id": "auth.api.metrics",
+      "category": "api",
+      "name": "Metrics",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Prometheus /metrics: DNS, transports, cache, journal, jobs.",
+          "ref": "crates/pulse-api/src/metrics.rs"
+        },
+        "bind": {
+          "status": "partial",
+          "note": "statistics-channels (JSON/XML), Prometheus-экспорттера нет.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#bind-9-statistics"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "stats через unbound-control/SNMP, HTTP-Prometheus нет.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound-control.html"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "Prometheus /metrics + Carbon.",
+          "ref": "https://doc.powerdns.com/authoritative/performance.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "Prometheus /metrics (pdns_recursor_*).",
+          "ref": "https://doc.powerdns.com/recursor/metrics.html"
+        }
+      }
+    },
+    {
+      "id": "auth.store.mmap",
+      "category": "storage",
+      "name": "mmap single-file",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Один mmap-файл, версии/транзакции, PageCache; зоны не копируются в heap.",
+          "ref": "crates/pulse-zonefile/src/zonefile.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "NZD/LMDB (mmap) хранит только конфигурацию зон rndc addzone; данные зон — zone file + journal.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-lmdb-mapsize"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Zonefile/AXFR/Redis-cache; единого mmap-хранилища нет.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "partial",
+          "note": "LMDB-backend — mmap B+tree, но это один из backend'ов и с одним writer'ом.",
+          "ref": "https://doc.powerdns.com/authoritative/backends/index.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.store.multiwriter",
+      "category": "storage",
+      "name": "Multi-writer",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Несколько процессов пишут разные зоны в один файл: sidecar-координатор, leases, fencing, общий group commit.",
+          "ref": "docs/adr/0007-multiprocess-writers.md"
+        },
+        "bind": {
+          "status": "no",
+          "note": "Один named-процесс; изменения через rndc.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/manpages.html#rndc"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Один процесс (плюс unbound-control).",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound-control.html"
+        },
+        "pdns_auth": {
+          "status": "partial",
+          "note": "Несколько инстансов могут работать с общей SQL-БД (native replication), но файлового multi-writer нет.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Один процесс, многопоточность внутри.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.store.sql",
+      "category": "storage",
+      "name": "SQL/backends",
+      "cells": {
+        "pulse": {
+          "status": "no",
+          "note": "Только встроенный v2-файл; SQL/внешних backend'ов нет.",
+          "ref": "crates/pulse-zonefile/src/lib.rs"
+        },
+        "bind": {
+          "status": "partial",
+          "note": "DLZ/DynDB существуют, но DLZ не рекомендуется и не для нагрузки.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter6.html#dynamically-loadable-zones-dlz"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "cachedb Redis — кеш, не хранилище зон.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-cachedb"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "gmysql/gpgsql/gsqlite3/godbc/lmdb/bind/pipe/remote и др.",
+          "ref": "https://doc.powerdns.com/authoritative/backends/index.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет хранилища зон.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.store.reload",
+      "category": "storage",
+      "name": "Hot reload",
+      "cells": {
+        "pulse": {
+          "status": "partial",
+          "note": "REST-правки видны сразу (новая версия mmap); SIGHUP — TLS/blocklist; смена конфига — рестарт.",
+          "ref": "STATUS.md"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "rndc reload/reconfig, dynamic zones.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/manpages.html#rndc"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "SIGHUP перечитывает конфиг (интерфейсы — рестарт).",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "pdns_control reload, API, zone cache.",
+          "ref": "https://doc.powerdns.com/authoritative/settings.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "SIGHUP, reload-zones, wipe-cache.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.store.bulk",
+      "category": "storage",
+      "name": "Bulk-load",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "pulsed import: master-файлы, bulk-запись, отсортированный вход.",
+          "ref": "crates/pulsed/src/master.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "Загрузка zone-файлов, named-compilezone.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-type"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "auth-zone из zonefile/URL; отдельного bulk-инструмента нет.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#authority-zone-options"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "pdnsutil zone load, SQL-bulk, backend-импорт.",
+          "ref": "https://doc.powerdns.com/authoritative/backends/index.html"
+        },
+        "pdns_rec": {
+          "status": "na",
+          "note": "Рекурсор не хранит зоны.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.perf.io_uring",
+      "category": "perf",
+      "name": "io_uring",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "UDP-рантайм: ring на ядро, multishot recv, provided buffers, REGISTER_FILES, SQPOLL-опция, epoll-фолбэк.",
+          "ref": "crates/pulse-runtime/src/backend"
+        },
+        "bind": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#bind-9-statistics"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/authoritative/performance.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "auth.perf.zerocopy",
+      "category": "perf",
+      "name": "Zero-copy ответа",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "respond_ref_into: ответ из заимствованных RRset прямо в TX-буфер, 0 аллокаций на горячем пути.",
+          "ref": "crates/pulse-server/src/lib.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "Не заявлено.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#bind-9-statistics"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Не заявлено.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не заявлено.",
+          "ref": "https://doc.powerdns.com/authoritative/performance.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Не заявлено.",
+          "ref": "https://doc.powerdns.com/recursor/metrics.html"
+        }
+      }
+    },
+    {
+      "id": "auth.perf.cache",
+      "category": "perf",
+      "name": "Response cache",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Кеш готовых wire-ответов, ключ по версии зоны/регистру QNAME/DO/CD/RD/EDNS/транспорту; в памяти, без decrement TTL.",
+          "ref": "crates/pulse-server/src/application/cache.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "У авторитетного BIND кеша ответов нет.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#bind-9-statistics"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "У auth-zone своего response-кеша нет.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#authority-zone-options"
+        },
+        "pdns_auth": {
+          "status": "yes",
+          "note": "Packet cache + query cache.",
+          "ref": "https://doc.powerdns.com/authoritative/performance.html#packet-cache"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "Record cache + packet cache (резолвер).",
+          "ref": "https://doc.powerdns.com/recursor/metrics.html"
+        }
+      }
+    },
+    {
+      "id": "auth.perf.groupcommit",
+      "category": "perf",
+      "name": "Group commit",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "2 fsync на группу зон; межпроцессный лидер по commit-lease, одна пара fdatasync на всех.",
+          "ref": "crates/pulse-zonefile/src/parallel/store.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "Нет (журнал/файлы, fsync по мере записи).",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter6.html#dynamic-update"
+        },
+        "unbound": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет; durability — на стороне SQL-backend.",
+          "ref": "https://doc.powerdns.com/authoritative/backends/index.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "res.recursion",
+      "category": "recursion",
+      "name": "Итеративная рекурсия",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "От root hints: делегирования, bailiwick, glue, CNAME-цепочки, лимиты глубины/бюджета.",
+          "ref": "crates/pulse-resolver/src/iterative.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "Полный рекурсор (BIND 9 может быть resolver).",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter3.html#resolver-caching-name-servers"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "Основной режим Unbound.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "Основной режим Recursor.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "res.forward",
+      "category": "recursion",
+      "name": "Forward",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Глобальный forward-режим со смешанными upstream и failover; per-zone forward нет.",
+          "ref": "crates/pulse-resolver/src/forward.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "forwarders, forward only/first, per-zone.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-forwarders"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "forward-zone (per-zone).",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#forward-zone-options"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "forward-zones (per-zone).",
+          "ref": "https://doc.powerdns.com/recursor/settings.html#forward-zones"
+        }
+      }
+    },
+    {
+      "id": "res.stub",
+      "category": "recursion",
+      "name": "Stub-зоны",
+      "cells": {
+        "pulse": {
+          "status": "no",
+          "note": "Нет: только forward-режим целиком.",
+          "ref": "crates/pulse-resolver/src/config.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "stub/static-stub зоны.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-type"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "stub-zone.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#stub-zone-options"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Нет stub-зон.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html#forward-zones"
+        }
+      }
+    },
+    {
+      "id": "res.qname_min",
+      "category": "recursion",
+      "name": "QNAME minimization",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Реализована, но по умолчанию выключена (qname_minimization=false).",
+          "ref": "crates/pulse-resolver/src/config.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "По умолчанию relaxed (RFC 9156/7816).",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-qname-minimization"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "По умолчанию включена; есть strict-режим.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-qname-minimisation"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "По умолчанию включена, relaxed RFC 9156.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html#qname-minimization"
+        }
+      }
+    },
+    {
+      "id": "res.0x20",
+      "category": "recursion",
+      "name": "0x20-рандомизация",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Для UDP-upstream включена по умолчанию (use_0x20=true); эхо регистра клиенту на авторитетном сервере — нет.",
+          "ref": "crates/pulse-resolver/src/config.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "BIND 0x20 не реализует.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-qname-minimization"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "use-caps-for-id, по умолчанию выключена.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-use-caps-for-id"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Опции 0x20 в 5.5 нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "res.prefetch",
+      "category": "recursion",
+      "name": "Prefetch",
+      "cells": {
+        "pulse": {
+          "status": "no",
+          "note": "Нет prefetch по TTL.",
+          "ref": "crates/pulse-resolver/src/cache.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "prefetch с trigger TTL (по умолчанию 2 с).",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-prefetch"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "prefetch (по умолчанию off).",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-prefetch"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "partial",
+          "note": "refresh-on-ttl-perc — обновление по остатку TTL, не классический prefetch.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "res.serve_stale",
+      "category": "recursion",
+      "name": "Serve-stale",
+      "cells": {
+        "pulse": {
+          "status": "no",
+          "note": "Нет.",
+          "ref": "crates/pulse-resolver/src/cache.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "stale-answer-enable/stale-answer-ttl.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-stale-answer-enable"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "serve-expired (TTL, client-timeout, EDE).",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-serve-expired"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "serve-stale-extensions (с 4.8).",
+          "ref": "https://doc.powerdns.com/recursor/settings.html#serve-stale-extensions"
+        }
+      }
+    },
+    {
+      "id": "res.cache",
+      "category": "cache",
+      "name": "Positive/negative cache + TTL",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Шардированный кеш, TTL как absolute deadline, RFC 2308 negative caching, лимиты записей/памяти.",
+          "ref": "crates/pulse-resolver/src/cache.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "RRset/message cache, negative TTL, min/max кеш-TTL.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-max-cache-size"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "msg/rrset/neg caches, TTL-границы.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "Record cache + negative cache, TTL-границы.",
+          "ref": "https://doc.powerdns.com/recursor/metrics.html"
+        }
+      }
+    },
+    {
+      "id": "res.cache_persist",
+      "category": "cache",
+      "name": "Персистентность кеша",
+      "cells": {
+        "pulse": {
+          "status": "no",
+          "note": "Кеш только в памяти, после рестарта пуст.",
+          "ref": "crates/pulse-resolver/src/cache.rs"
+        },
+        "bind": {
+          "status": "no",
+          "note": "Только rndc dumpdb для диагностики; автозагрузки кеша нет.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-dump-file"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "cachedb (Redis) или dump_cache/load_cache вручную.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-cachedb"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Кеш не персистится (кроме save-parent-ns-set).",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "res.dnssec",
+      "category": "dnssec",
+      "name": "DNSSEC-валидация и алгоритмы",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Цепочка DS→DNSKEY→RRSIG, AD/BOGUS→SERVFAIL; 8/10/13/14/15, legacy 5/7 opt-in, Ed448 нет.",
+          "ref": "crates/pulse-resolver/src/dnssec.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "Валидация по умолчанию, широкий набор алгоритмов.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter5.html#dnssec-validation"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "Validator, RSA/ECDSA/Ed25519/Ed448.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/dnssec/index.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "Валидация (process/validate), алгоритмы зависят от crypto-lib.",
+          "ref": "https://doc.powerdns.com/recursor/dnssec.html"
+        }
+      }
+    },
+    {
+      "id": "res.dnssec_nsec3",
+      "category": "dnssec",
+      "name": "NSEC3-валидация",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "NSEC/NSEC3 (SHA-1, salt/iterations), closest encloser, wildcard, opt-out.",
+          "ref": "crates/pulse-dnssec/src/denial/nsec3.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "NSEC/NSEC3.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-nsec3param"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "NSEC/NSEC3.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/dnssec/index.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "NSEC/NSEC3, лимиты итераций/хешей.",
+          "ref": "https://doc.powerdns.com/recursor/dnssec.html"
+        }
+      }
+    },
+    {
+      "id": "res.dnssec_ta",
+      "category": "dnssec",
+      "name": "Root trust anchor",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Встроенные IANA-anchors + конфигурируемые DS/ключа.",
+          "ref": "crates/pulse-dnssec/src/trust_anchor.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "Встроенный root TA, обновляется.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter5.html#dnssec-validation"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "root.key/auto-trust-anchor-file.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/dnssec/index.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "trustanchors/trustanchorfile.",
+          "ref": "https://doc.powerdns.com/recursor/dnssec.html"
+        }
+      }
+    },
+    {
+      "id": "res.dnssec_5011",
+      "category": "dnssec",
+      "name": "RFC 5011",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "TrustAnchorStore: add/revoke hold-down, кандидаты, состояние 0600.",
+          "ref": "crates/pulse-dnssec/src/trust_update.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "Dynamic Trust Anchor Management.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter5.html#dynamic-trust-anchor-management"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "auto-trust-anchor-file (RFC 5011).",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/dnssec/index.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Официально: RFC 5011 не поддерживается, изменённый root TA не персистится.",
+          "ref": "https://doc.powerdns.com/recursor/dnssec.html"
+        }
+      }
+    },
+    {
+      "id": "res.rpz",
+      "category": "policy",
+      "name": "RPZ / adblock / blocklist",
+      "cells": {
+        "pulse": {
+          "status": "partial",
+          "note": "Blocklist/allowlist (файлы + HTTPS-фиды, NXDOMAIN/null-IP) вместо RPZ; триггеров по IP/NS нет.",
+          "ref": "crates/pulse-resolver/src/blocklist.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "RPZ (QNAME/IP/NSIP/NSDNAME, 6 действий), до 64 зон.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/chapter6.html#dns-firewalls-and-response-policy-zones"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "RPZ через respip-модуль (QNAME/IP/nsdname/nsip/clientip).",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-rpz"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "RPZ через Lua-конфиг.",
+          "ref": "https://doc.powerdns.com/recursor/lua-config/rpz.html"
+        }
+      }
+    },
+    {
+      "id": "res.overrides",
+      "category": "policy",
+      "name": "Overrides / local zones",
+      "cells": {
+        "pulse": {
+          "status": "partial",
+          "note": "Overrides A/AAAA/CNAME (приоритетнее blocklist/upstream); полноценных local-zone нет.",
+          "ref": "crates/pulse-resolver/src/overrides.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "local-zones/local-data, RPZ.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-response-policy"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "local-zone/local-data.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-local-zone"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "auth-zones + Lua-хуки.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "res.rrl",
+      "category": "policy",
+      "name": "RRL / rate limit",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "RRL по классам noerror/nxdomain/referral/error, per-source + per-name, slip/drop/refused/truncate; только UDP + token bucket на TLS.",
+          "ref": "crates/pulseresolved/src/rrl.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "rate-limit (RRL) с credit/token bucket.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#rrl"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "ip-ratelimit по клиенту; RRL по именам нет.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-ip-ratelimit"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "RRL нет; обычно dnsdist.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "res.acl",
+      "category": "policy",
+      "name": "ACL клиентов",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "allow_from, по умолчанию loopback; отдельный tls_allow_from.",
+          "ref": "crates/pulseresolved/src/secure.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "allow-query/allow-recursion/allow-query-cache.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-allow-query"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "access-control allow/deny/refuse.",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "allow-from/allow-from-file.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html#allow-from"
+        }
+      }
+    },
+    {
+      "id": "res.cookies",
+      "category": "policy",
+      "name": "DNS Cookies",
+      "cells": {
+        "pulse": {
+          "status": "no",
+          "note": "Нет ни серверных, ни клиентских cookies.",
+          "ref": "STATUS.md"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "answer-cookie, require-cookie.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-answer-cookie"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "answer-cookie + cookie-secret, ip-ratelimit-cookie.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-answer-cookie"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "partial",
+          "note": "Только исходящие cookies с 5.4; входящие в документации не заявлены.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html#outgoing-cookies"
+        }
+      }
+    },
+    {
+      "id": "res.transport_down",
+      "category": "transports",
+      "name": "Транспорты вниз (клиент→резолвер)",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "UDP/TCP/DoT/DoH1.1/DoH2/DoQ/DNSCrypt v2; DoH3 нет.",
+          "ref": "crates/pulseresolved/src/lib.rs"
+        },
+        "bind": {
+          "status": "yes",
+          "note": "Do53/DoT/DoH (HTTP/2); DoQ/DNSCrypt/DoH3 нет.",
+          "ref": "https://kb.isc.org/docs/proxyv2-support-in-bind-9"
+        },
+        "unbound": {
+          "status": "yes",
+          "note": "UDP/TCP/DoT/DoH/DoQ/DNSCrypt (сборка).",
+          "ref": "https://github.com/NLnetLabs/unbound/blob/release-1.22.0/doc/unbound.conf.5.in"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "no",
+          "note": "Встроенных DoT/DoH/DoQ-листенеров нет; ставится dnsdist.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html"
+        }
+      }
+    },
+    {
+      "id": "res.transport_up",
+      "category": "transports",
+      "name": "Транспорты вверх (резолвер→upstream)",
+      "cells": {
+        "pulse": {
+          "status": "partial",
+          "note": "UDP/TCP/DoT/DoH1.1 с failover/cooldown/пулом; DoH2/3 и DoQ-апстрима нет.",
+          "ref": "crates/pulse-resolver/src/upstream.rs"
+        },
+        "bind": {
+          "status": "partial",
+          "note": "DoT к forwarders/primaries; DoH/DoQ-апстрима нет.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#namedconf-statement-forwarders"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "DoT (forward/stub-tls-upstream); DoH/DoQ-апстрима нет.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-tls-upstream"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "partial",
+          "note": "DoT (dot-to-auth-names, tls_configurations); DoH/DoQ-апстрима нет.",
+          "ref": "https://doc.powerdns.com/recursor/settings.html#dot-to-auth-names"
+        }
+      }
+    },
+    {
+      "id": "res.api_metrics",
+      "category": "api",
+      "name": "API / метрики",
+      "cells": {
+        "pulse": {
+          "status": "yes",
+          "note": "Prometheus /metrics, /healthz, control REST на loopback с bearer-токеном.",
+          "ref": "crates/pulseresolved/src/control.rs"
+        },
+        "bind": {
+          "status": "partial",
+          "note": "rndc/statistics-channels, HTTP REST API нет.",
+          "ref": "https://bind9.readthedocs.io/en/v9.20.15/reference.html#bind-9-statistics"
+        },
+        "unbound": {
+          "status": "partial",
+          "note": "unbound-control + stats; HTTP API нет.",
+          "ref": "https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound-control.html"
+        },
+        "pdns_auth": {
+          "status": "no",
+          "note": "Не резолвер.",
+          "ref": "https://doc.powerdns.com/authoritative/modes-of-operation.html"
+        },
+        "pdns_rec": {
+          "status": "yes",
+          "note": "REST API + Prometheus /metrics.",
+          "ref": "https://doc.powerdns.com/recursor/http-api/index.html"
+        }
+      }
+    }
+  ]
+}

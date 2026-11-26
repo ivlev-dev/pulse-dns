@@ -1,0 +1,59 @@
+{
+  "queries": [
+    "host000001.example.com. A",
+    "host050000.example.com. A",
+    "host100000.example.com. A",
+    "example.com. SOA",
+    "r0000000.z0.bench.test. A",
+    "r0000001.z0.bench.test. AAAA",
+    "r0000002.z0.bench.test. MX",
+    "r0000003.z0.bench.test. TXT",
+    "r0099999.z0.bench.test. TXT",
+    "z0.bench.test. SOA",
+    "nx0000001.z0.bench.test. A",
+    "absent.example.com. A",
+    "nx99999.z0.bench.test. A"
+  ],
+  "servers": {
+    "pulsed": {
+      "match": true,
+      "diffs": []
+    },
+    "bind": {
+      "match": true,
+      "diffs": []
+    },
+    "unbound": {
+      "match": true,
+      "diffs": []
+    },
+    "pdns": {
+      "match": true,
+      "diffs": []
+    },
+    "pulsed-cache": {
+      "match": true,
+      "diffs": []
+    },
+    "pdns-cache": {
+      "match": true,
+      "diffs": []
+    },
+    "pulseresolved": {
+      "match": true,
+      "diffs": []
+    },
+    "unbound-res": {
+      "match": true,
+      "diffs": []
+    },
+    "bind-res": {
+      "match": true,
+      "diffs": []
+    },
+    "pdns-rec": {
+      "match": true,
+      "diffs": []
+    }
+  }
+}

@@ -1,0 +1,11 @@
+listen_udp = "127.0.0.1:5301"
+listen_tcp = "127.0.0.1:5301"
+workers = 4
+log_level = "warn"
+zonefile = "/tmp/opencode/compare/run/pulsed/store.v2"
+durability = "flush"
+journal = false
+huge_pages = "auto"
+
+[response_cache]
+enabled = false
