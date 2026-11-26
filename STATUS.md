@@ -19,7 +19,7 @@
 
 ## Проверки (зелёные)
 
-- `cargo test --workspace --all-features` — **1558 тестов**, 0 failures.
+- `cargo test --workspace --all-features` — **1582 теста**, 0 failures.
 - `cargo fmt --check`.
 - `cargo clippy --workspace --all-targets -D warnings`.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
@@ -36,7 +36,7 @@
 | `pulse-dnscrypt` | DNSCrypt v2: сертификаты, сервер, клиент, UDP и TCP (framing, метрики) |
 | `pulse-master` | парсер/сериализатор RFC 1035 master-файлов |
 | `pulse-transfer` | TSIG, AXFR/IXFR, NOTIFY |
-| `pulse-zonefile` | v2 `ParallelStore`: lock-free аллокатор страниц, ring-головы версий A/B, per-zone пулы/GC, in-process пины читателей, per-zone commit, group commit (2 fsync на группу), PageCache, recovery, полный `fsck --verify` и `--repair`, `compact_zone`, `sync`; **межпроцессная запись v2** (ADR 0007): sidecar-координатор `<file>.pulsecoord`, CAS-курсор в shared mmap, `fcntl` per-zone leases + fencing (pid/starttime/generation), общая reader table, `LOCK_SH`; **межпроцессный group commit** (sidecar v4, очередь `RootEntry`, лидер по commit-lease, одна пара `fdatasync` на всех, fault-tolerant ack); 2/4/8 процессов сгруппированы, kill -9 координатора в фазах 1/2, 10k коммитов в 2 процессах; ~20k zone-commit/s; bulk-load 1M RRset за 2.5–2.8 с; order-key memcmp; каталог 1000 зон за 83 мс (исправлен self-deadlock); v1 читается для `pulsed convert` |
+| `pulse-zonefile` | v2 `ParallelStore`: lock-free аллокатор страниц, ring-головы версий A/B, per-zone пулы/GC, in-process пины читателей, per-zone commit, group commit (2 fsync на группу), PageCache, recovery, полный `fsck --verify` и `--repair`, `compact_zone`, `sync`; **межпроцессная запись v2** (ADR 0007): sidecar-координатор `<file>.pulsecoord`, CAS-курсор в shared mmap, `fcntl` per-zone leases + fencing (pid/starttime/generation), общая reader table, `LOCK_SH`; **межпроцессный group commit** (sidecar v4, очередь `RootEntry`, лидер по commit-lease, одна пара `fdatasync` на всех, fault-tolerant ack); 2/4/8 процессов сгруппированы, kill -9 координатора в фазах 1/2, 10k коммитов в 2 процессах; ~20k zone-commit/s; group commit v4: 8 процессов 6.0× (1385 vs 231 commits/s, fsync 2 мс), p99 5.6 мс vs 34–84 мс direct; bulk-load 1M RRset за 2.5–2.8 с; order-key memcmp; каталог 1000 зон за 83 мс (исправлен self-deadlock); v1 читается для `pulsed convert` |
 | `pulse-runtime` | io_uring UDP (ring на ядро, multishot recv + provided buffers, `REGISTER_FILES`, `COOP/DEFER_TASKRUN`, опции SQPOLL/`SO_BUSY_POLL`, IP_PKTINFO, NODROP-проверка, backpressure, graceful shutdown, изоляция паник) + epoll-фолбэк |
 | `pulse-server` | авторитетный движок: NXDOMAIN/NODATA/ENT, wildcard/closest encloser, CNAME/DNAME, делегация/glue/DS, EDNS/BADVERS, TC, ANY по RFC 8482, детерминированный additional; zero-copy ответ (`respond_ref_into`), NSEC/NSEC3 индексы для быстрого NXDOMAIN |
 | `pulse-resolver` | library: forward/iterative, кеш + negative caching, blocklist/allowlist/overrides, DNSSEC AD/BOGUS→SERVFAIL, UDP/TCP + upstream DoT/DoH с failover/cooldown, пул keep-alive соединений (`pool_size`, default 4, in-flight лимит, reconnect backoff), смешанные upstream |
@@ -55,7 +55,7 @@
 - **NSEC/NSEC3 индексы**: NXDOMAIN p99 на 100k signed с 367 мс → 0.71 мс; 1M in-memory p99 18 µs (цель <2 мс).
   Signed NXDOMAIN: NSEC3 p99 307 µs (было 38–47 мс), NSEC p99 343 µs.
 - **Bulk-load**: 1M RRset за 2.5–2.8 с (было 26 мин), пик RSS 91–103 МБ, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с.
-- **Память**: v2 чтение 1M RRset RssAnon 6.3 МБ (−41%, было ~9.6), soak 600 с без роста; сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов); кеш резолвера 65.9 B/entry на 1M (было 113.8; фактически ~74 МБ с bucket-массивом, было ~126 МБ).
+- **Память**: v2 чтение 1M RRset RssAnon 6.3 МБ (−41%, было ~9.6), soak 600 с без роста; сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов); кеш резолвера 65.9 B/entry (было 113.8); фактически 74.3 МБ на 1M (было 126.4), RSS probe −36%, 0 allocs сохранены.
 - **Чтение**: zone snapshot 87–92 нс; RRset warm 1M **842 нс** (было 1.57 µs), cold 1M 27.7–41.4 µs (было 83.6), 0 allocs; zone index ~113–122 нс; order-key memcmp; warm lookup 0 аллокаций; e2e A p50 **46.8 µs**. `Key::rebuild` убран.
 - **io_uring**: RSS 4.7/10.2/17.5 МБ на 1/4/8 workers (было 12.7/40.6/104.9); p99 8 workers 650→440 µs; SQPOLL на этом ядре медленнее (выкл), registered files вкл.
 - **Каталог 1000 зон**: исправлено зависание (выделенный lease-шард каталога); 1000 зон за 83 мс, 4096 за 651 мс. В multi каталог пишут все процессы под catalog lease (4 × 250 зон), `zone_seq` переиспользуется через общую очередь sidecar.
@@ -64,9 +64,9 @@
 - **Multi-process каталог и reclaim**: create/delete/meta из любого процесса; `high_water` стабилизируется (3636→5428 после 10k циклов); 8 процессов — 13.4k zone-commit/s.
 - **Межпроцессный group commit (sidecar v4)**: писатели кладут готовые `RootEntry` в общую очередь,
   лидер (любой процесс под `fcntl`-lease) делает одну пару `fdatasync` на всех. На модели fsync 2 мс:
-  8 процессов **233 → 1158 commits/s (5.0×)**, p50 34.0 → 4.85 мс, p99 36.1 → 10.0 мс; 4 процесса 233 → 716
-  (3.1×), 2 процесса 230 → 343 (1.5×); 1 процесс — без регрессии (локальный путь). Смерть лидера в фазе 1/2
-  и с ожидающими ack не теряет версии (`head.version == request.version` — идемпотентный повтор), `fsck` чист.
+  8 процессов **231 → 1385 commits/s (6.0×)**, p99 5.6 мс (против 34–84 мс direct); 1 процесс — без регрессии
+  (локальный путь). Смерть лидера в фазе 1/2 и с ожидающими ack не теряет версии
+  (`head.version == request.version` — идемпотентный повтор), `fsck` чист.
 - **Водарк-баг** `WatermarkRegression` при DELETE исправлен (порядок bucket-цепочек + DP по головам), 20/20 ролей.
 - **Zero-copy fallback**: DNAME/циклы/wildcard-CNAME/single-page overflow — 0 allocs; multi-page overflow — fallback.
 - **REST split**: ~381 PUT/s p50 22 мс против 62/118 мс; DNS 85–93k qps.
@@ -153,13 +153,13 @@
   NSEC/NSEC3: NXDOMAIN p99 на 100k signed 367 мс → 0.71 мс; 1M in-memory p99 18 µs.
   Zero-copy: allocs/query 52 → 0–0.01 (udp-e2e); 0 аллокаций на ответ (unsigned/signed/referral/ANY/EDNS).
   Память: v2 чтение 1M RRset RssAnon 6.3 МБ (−41%); soak 600 с без роста;
-  сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов); кеш резолвера 65.9 B/entry на 1M (было 113.8; фактически ~74 МБ с bucket-массивом, было ~126 МБ).
+  сервер на 1M RRset ~36 МБ RSS; PageCache 1024 страницы (~4 MiB образов); кеш резолвера 65.9 B/entry (было 113.8); фактически 74.3 МБ на 1M (было 126.4), RSS probe −36%, 0 allocs.
   Чтение: zone snapshot 87–92 нс; RRset warm 1M 842 нс (было 1.57 µs), cold 1M 27.7–41.4 µs (было 83.6), 0 allocs; zone index ~113–122 нс; order-key memcmp; warm lookup 0 аллокаций.
   io_uring: RSS 4.7/10.2/17.5 МБ на 1/4/8 workers (было 12.7/40.6/104.9); p99 8 workers 650→440 µs;
   SQPOLL медленнее (выкл), registered files вкл.
   Bulk-load: 1M RRset 2.5–2.8 с (было 26 мин), пик RSS 91–103 МБ, 91 МБ на диске (было 16 ГиБ); 100k — 0.25 с.
   Каталог: 1000 зон за 83 мс, 4096 за 651 мс (исправлен self-deadlock на 256-й зоне). Multi-process: create/delete/meta из любого процесса; high_water стабилизируется (3636→5428 после 10k циклов); 8 процессов — 13.4k zone-commit/s; в multi Page/node-кеши включены (общая генерация страниц в sidecar), freeze process-local, fsck repair — quiescent.
-  Multi-process read (4 процесса × 40k): warm lookup p50 0.51 µs (8 ключей) / 0.83 µs (200), ~1.09M qps; было 4.34/13.4 µs и ~199k qps. Single-process не изменился (0.44–1.09 µs).
+  Multi-process read (4 процесса × 40k): hot 0.51 µs, warm 0.83 µs p50 / 0.99 p99, ~1.09M qps; было 13.4 µs warm / ~199k qps. Single-process не изменился (0.44–1.09 µs).
   Резолвер: библиотека cache hit p50 0.396 µs, p99 0.572 µs, 0 allocs, ~2.3M qps/поток (было 6–7.6 µs);
   pulseresolved hot path p50 578 нс, p99 750 нс, 0 allocs; 200k qps без таймаутов (было захлёбывался на 150k).
   REST split: ~381 PUT/s p50 22 мс против 62/118 мс; DNS 85–93k qps.
@@ -182,6 +182,10 @@
   (catalog lease + commit-lock); durable-пулы переиспользуются под lease зоны при
   `drop_txn < min(D_z, MP всех процессов, freeze)`, `high_water` стабилизируется (3636→5428 после 10k циклов);
   в multi Page/node-кеши включены (общая генерация страниц в sidecar); `freeze()` process-local; fsck repair — quiescent.
+  Sidecar v4 несовместим с v3: живые процессы старой версии получают `Busy`, без живых держателей sidecar
+  пересоздаётся (данные не затрагиваются). Группа ограничена 256 зонами / 1 мс settle; режим `Memory` —
+  только публикация в памяти (fsync нет). Multi кеш-ключ включает generation страницы; sidecar занимает
+  +~1 МиБ на дефолтной геометрии. `fsck --repair` и возврат `[DP,cursor)` — quiescent (offline).
 - DoH3/DoQ — серверные; upstream-клиенты у резолвера остаются HTTP/1.1/DoT
   (h2/h3 upstream нет).
 - Jobs/audit в памяти (TTL 24 ч / ring 4096), import только `text/plain`.
@@ -248,7 +252,7 @@ dig @127.0.0.1 -p 5353 example.com. A +norecurse
 - API доступен только на loopback, TLS отсутствует.
 - Storage: параллельная запись по зонам внутри одного процесса (v2) и
   межпроцессная (v2, ADR 0007); каталог — multi-writer под lease, durable-пулы
-  рекламируются под lease, `freeze()` локальный, page-кеш в multi отключён.
+  рекламируются под lease, `freeze()` локальный, page-кеш в multi включён (ключ `(page_no, generation)` из sidecar).
 - Водарк-баг `WatermarkRegression` при DELETE исправлен (порядок bucket-цепочек + DP по головам), 20/20 ролей.
 - v2: до 4096 зон, страницы 4096; offline `pulsed fsck [--repair]` есть,
   file-fatal порча требует ручного разбора.

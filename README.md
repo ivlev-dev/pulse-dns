@@ -87,7 +87,7 @@ upstream по UDP, TCP, DoT и DoH/1.1 (пул keep-alive, backoff). Остат�
   (было 59–67 КБ); qps −8–10%, p99 без изменений.
 - Multi-process каталог/reclaim: create/delete/meta из любого процесса;
   `high_water` стабилизируется (3636→5428 после 10k циклов); 8 процессов — 13.4k zone-commit/s;
-  в multi Page/node-кеши включены (общая генерация страниц в sidecar), `freeze()` process-local, fsck repair — quiescent.
+  в multi Page/node-кеши включены (общая генерация страниц в sidecar, кеш-ключ `(page_no, generation)`), `freeze()` process-local, fsck repair — quiescent.
 - Zero-copy fallback: DNAME/циклы/wildcard-CNAME/single-page overflow — 0 allocs;
   multi-page overflow — fallback.
 - Изолированный стенд: server/client на разных SMT-ядрах, 14 сценариев, perf stat +
@@ -100,9 +100,13 @@ upstream по UDP, TCP, DoT и DoH/1.1 (пул keep-alive, backoff). Остат�
 meta) — любой процесс под catalog lease + commit-lock; durable-пулы в multi
 переиспользуются под lease зоны при `drop_txn < min(D_z, MP всех процессов,
 freeze)`, `high_water` стабилизируется (3636→5428 после 10k циклов); в multi
-Page/node-кеши включены (ключ `(page_no, generation)` из sidecar); `freeze()` process-local; fsck repair — quiescent.
+Page/node-кеши включены (ключ `(page_no, generation)` из sidecar); `freeze()` process-local; fsck repair — quiescent; sidecar +~1 МиБ на дефолтной геометрии.
 8 процессов — 13.4k zone-commit/s. Водарк-баг `WatermarkRegression` при DELETE
-исправлен (20/20 ролей).
+исправлен (20/20 ролей). Sidecar v4 несовместим с v3 (живые старые → `Busy`;
+без живых пересоздаётся); группа ≤256 зон / 1 мс settle; `Memory` — только
+публикация в памяти (fsync нет); `freeze()` в multi process-local;
+`fsck --repair`/возврат `[DP,cursor)` — quiescent; multi кеш-ключ включает
+generation, sidecar +~1 МиБ на дефолтной геометрии.
 TCP/DoT/DoH/plain TCP — tokio event-loop: 10k idle-соединений, ~11 КБ/соединение
 (было 59–67 КБ), qps −8–10%, p99 без изменений.
 THP на ext4 file-backed — no-op, на RX-арене удваивает RSS без выигрыша
@@ -406,7 +410,7 @@ curl -sS -X PUT "$API/api/v1/zones/dynamic.test." \
 cargo test --workspace
 ```
 
-Полный набор workspace-тестов (1558 тестов, включая doctests) проходит. Также проходят
+Полный набор workspace-тестов (1582 теста, включая doctests) проходит. Также проходят
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` и
 rustdoc без warnings.
 
@@ -442,7 +446,7 @@ cargo deny check
 | io_uring RSS (1/4/8 workers) | 4.7/10.2/17.5 МБ (было 12.7/40.6/104.9) |
 | io_uring p99 (8 workers) | 650 → 440 µs; SQPOLL медленнее (выкл), registered files вкл |
 | Каталог зон | 1000 зон за 83 мс, 4096 за 651 мс |
-| Кеш резолвера | 65.9 B/entry на 1M (было 113.8); фактически ~74 МБ с bucket-массивом (было ~126 МБ) |
+| Кеш резолвера | 65.9 B/entry (было 113.8); фактически 74.3 МБ на 1M (было 126.4), RSS probe −36%, 0 allocs |
 | Резолвер (библиотека) cache hit | p50 0.396 µs (не хуже после компактной раскладки), p99 0.572 µs, 0 allocs, ~2.3M qps/поток |
 | pulseresolved hot path | p50 578 нс, p99 750 нс, 0 allocs; 200k qps без таймаутов |
 | UDP echo, 4 worker / 4 клиента, окно 16 | 220 117 qps |
@@ -460,7 +464,7 @@ cargo deny check
 | DoH HTTP/2 (DNS/s) | ~8.2k |
 | DoH HTTP/3 (qps) | ~13.6–14.9k |
 | DoQ (qps) | ~5.25k |
-| Межпроцессная запись v2 | 4 процесса × 4 зоны без потерь; 10k коммитов в 2 процессах без пересечений; create 1.9k/1.3k/0.6k зон/с (2/4/8 процессов); commit ~11–14k zone-commit/s; 8 процессов — 13.4k zone-commit/s; `high_water` стабилизируется (3636→5428 после 10k циклов); 100k insert/delete: `high_water` 50→98 / 56→152 / 68→260 |
+| Межпроцессная запись v2 | 4 процесса × 4 зоны без потерь; 10k коммитов в 2 процессах без пересечений; create 1.9k/1.3k/0.6k зон/с (2/4/8 процессов); commit ~11–14k zone-commit/s; 8 процессов — 13.4k zone-commit/s; `high_water` стабилизируется (3636→5428 после 10k циклов); 100k insert/delete: `high_water` 50→98 / 56→152 / 68→260; group commit v4: 8 процессов 6.0× (1385 vs 231 commits/s, fsync 2 мс), p99 5.6 мс vs 34–84 мс direct |
 | Роли `dns`+`api` (8 DNS + 8 REST, 8 vCPU) | DNS 85–93k qps (p99 0.53–0.66 ms), REST 359–361 PUT/s (p99 29–30 ms); `all`: 98–106k qps (p99 0.36–0.41 ms), 381–385 PUT/s (p99 27–28 ms); REST split ~381 PUT/s p50 22 мс (против 62/118 мс) |
 
 ## Ограничения и roadmap
@@ -496,7 +500,11 @@ cargo deny check
   персистентный. Jobs/audit в памяти (TTL 24 ч / ring 4096); import только
   `text/plain`. Нет HSM/PKCS#11.
 - Roadmap: `docs/plan/roadmap.md` (M0–M6 выполнены; остаточные ограничения
-  выше).
+  выше). Sidecar v4: несовместим с v3 (живые старые → `Busy`; без живых
+  пересоздаётся); группа ≤256 зон / 1 мс settle; `Memory` — только публикация
+  в памяти (fsync нет); `freeze()` в multi process-local; `fsck --repair`/
+  возврат `[DP,cursor)` — quiescent; multi кеш-ключ включает generation,
+  sidecar +~1 МиБ.
 
 ## Лицензия
 
