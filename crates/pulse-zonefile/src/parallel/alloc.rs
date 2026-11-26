@@ -224,9 +224,21 @@ impl Allocator {
                 });
             }
             if self.cas_cursor(current, next) {
-                return ticket(current, pages);
+                let ticket = ticket(current, pages)?;
+                self.bump_generations(ticket.first_page, pages);
+                return Ok(ticket);
             }
             self.cas_retries.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Помечает выданный диапазон новой генерацией (multi-process).
+    ///
+    /// Генерация — часть ключа кеша страниц: страница, выданная заново после
+    /// освобождения, не должна попадать в кеш под старым ключом.
+    fn bump_generations(&self, first: u32, pages: u32) {
+        if let Some(coord) = &self.shared {
+            coord.bump_page_generations(first, pages);
         }
     }
 
@@ -368,10 +380,13 @@ impl AllocHandle<'_> {
         })?;
         self.pages_start.set(start + u64::from(pages));
         self.pages_len.set(self.pages_len.get() - pages);
-        Ok(AllocTicket {
+        let ticket = AllocTicket {
             first_page: first,
             pages,
-        })
+        };
+        self.allocator
+            .bump_generations(ticket.first_page, ticket.pages);
+        Ok(ticket)
     }
 
     /// Остаток локального кеша страниц.

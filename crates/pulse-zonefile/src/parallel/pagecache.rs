@@ -1,17 +1,21 @@
 //! Кеш валидированных страниц данных v2 (`PageCacheV2`, фаза B2a).
 //!
 //! Валидация страницы (CRC, `owner_zone`, `page.txn ≤ snapshot.version`,
-//! структура) выполняется **один раз** на пару `(page_no, txn)`. Кеш хранит
-//! нормализованный образ страницы (`owner_zone` обнулён — его ожидает
-//! v1-декодер), поэтому warm-чтение не делает ни syscall, ни CRC, ни
+//! структура) выполняется **один раз** на пару `(page_no, generation)`. В
+//! single-process генерация всегда `0`; в multi-process она читается из
+//! sidecar и возрастает при выдаче/освобождении/перезаписи страницы, поэтому
+//! переиспользованный номер не может отдать старый образ (ADR 0007 §7.4).
+//! Кеш хранит нормализованный образ страницы (`owner_zone` обнулён — его
+//! ожидает v1-декодер), поэтому warm-чтение не делает ни syscall, ни CRC, ни
 //! аллокаций: выдаётся `Arc<[u8]>` (клонирование — атомарный инкремент).
 //!
-//! Инвалидация — по `(page_no, txn)`: COW всегда пишет новую страницу, версия
-//! неизменяема. `PageCacheV2` не кеширует meta/reader table/root directory —
-//! сюда попадают только страницы, прочитанные через `ReaderIo`, то есть
-//! leaf/branch/overflow (и каталог-`B+tree`, который тоже является страницей
-//! данных). Метрики hit/miss/eviction доступны через
-//! [`PageCacheV2::stats`]; лимит задаётся [`PageCacheV2::with_capacity`].
+//! Инвалидация — по `(page_no, generation)`: COW/переиспользование всегда
+//! меняет генерацию, а в single-process — `txn` (страница пишется заново).
+//! `PageCacheV2` не кеширует meta/reader table/root directory — сюда попадают
+//! только страницы, прочитанные через `ReaderIo`, то есть leaf/branch/overflow
+//! (и каталог-`B+tree`, который тоже является страницей данных). Метрики
+//! hit/miss/eviction доступны через [`PageCacheV2::stats`]; лимит задаётся
+//! [`PageCacheV2::with_capacity`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -57,6 +61,7 @@ impl PageCacheV2Stats {
 struct Entry {
     page: u32,
     txn: u64,
+    generation: u32,
     owner: u32,
     data: Arc<[u8]>,
     used: AtomicU64,
@@ -166,22 +171,20 @@ impl PageCacheV2 {
         }
     }
 
-    /// Ищет валидированную страницу по номеру (версия — в заголовке образа).
+    /// Ищет валидированную страницу по номеру и генерации.
     ///
-    /// COW пишет страницу заново, поэтому в кеше всегда лежит актуальный образ
-    /// `page_no`; вызывающий проверяет `page.txn ≤ snapshot.version` по срезу
-    /// (8 байт заголовка, без syscall).
+    /// В single-process `generation` всегда `0`; в multi — значение из
+    /// sidecar на момент чтения. Промах по генерации означает, что номер
+    /// переиспользован и старый образ невалиден.
     #[must_use]
-    pub fn get(&self, page: u32, owner: u32) -> Option<Arc<[u8]>> {
+    pub fn get(&self, page: u32, generation: u32, owner: u32) -> Option<Arc<[u8]>> {
         let index = self.shard_index(page);
         let shard = self.shards.get(index)?;
         let sets = shard.read().ok()?;
         let set = sets.get(Self::set_index(page, sets.len()))?;
-        let entry = set
-            .ways
-            .iter()
-            .flatten()
-            .find(|entry| entry.page == page && entry.owner == owner);
+        let entry = set.ways.iter().flatten().find(|entry| {
+            entry.page == page && entry.generation == generation && entry.owner == owner
+        });
         let Some(entry) = entry else {
             drop(sets);
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -195,7 +198,8 @@ impl PageCacheV2 {
     }
 
     /// Кладёт валидированную страницу (заменяет образ `page_no`).
-    pub fn insert(&self, page: u32, txn: u64, owner: u32, data: Arc<[u8]>) {
+    #[allow(clippy::needless_pass_by_value)] // владение `Arc` сохраняет прежний API
+    pub fn insert(&self, page: u32, txn: u64, generation: u32, owner: u32, data: Arc<[u8]>) {
         if data.len() != PAGE_SIZE_V2 as usize {
             return;
         }
@@ -210,34 +214,30 @@ impl PageCacheV2 {
         let Some(set) = sets.get_mut(index) else {
             return;
         };
+        let make_entry = || {
+            let used = self.clock.fetch_add(1, Ordering::Relaxed);
+            Arc::new(Entry {
+                page,
+                txn,
+                generation,
+                owner,
+                data: Arc::clone(&data),
+                used: AtomicU64::new(used),
+            })
+        };
         for way in &mut set.ways {
             if let Some(existing) = way
                 && existing.page == page
             {
-                if existing.txn == txn {
+                if existing.generation == generation && existing.txn == txn {
                     return;
                 }
-                // COW: тот же номер, новая версия — заменяем образ.
-                let used = self.clock.fetch_add(1, Ordering::Relaxed);
-                let entry = Arc::new(Entry {
-                    page,
-                    txn,
-                    owner,
-                    data,
-                    used: AtomicU64::new(used),
-                });
-                *way = Some(entry);
+                // COW/переиспользование: тот же номер, новый образ — заменяем.
+                *way = Some(make_entry());
                 return;
             }
         }
-        let used = self.clock.fetch_add(1, Ordering::Relaxed);
-        let entry = Arc::new(Entry {
-            page,
-            txn,
-            owner,
-            data,
-            used: AtomicU64::new(used),
-        });
+        let entry = make_entry();
         for way in &mut set.ways {
             if way.is_none() {
                 *way = Some(entry);
@@ -305,14 +305,14 @@ mod tests {
     #[test]
     fn hit_miss_and_cow_replaces_version() {
         let cache = PageCacheV2::with_capacity(8);
-        assert!(cache.get(7, 1).is_none());
-        cache.insert(7, 3, 1, page(0xAA));
-        assert_eq!(cache.get(7, 1).map(|data| data[0]), Some(0xAA));
+        assert!(cache.get(7, 0, 1).is_none());
+        cache.insert(7, 3, 0, 1, page(0xAA));
+        assert_eq!(cache.get(7, 0, 1).map(|data| data[0]), Some(0xAA));
         // COW: тот же номер с новым txn заменяет образ.
-        cache.insert(7, 4, 1, page(0xBB));
-        assert_eq!(cache.get(7, 1).map(|data| data[0]), Some(0xBB));
+        cache.insert(7, 4, 0, 1, page(0xBB));
+        assert_eq!(cache.get(7, 0, 1).map(|data| data[0]), Some(0xBB));
         // Чужой владелец не получает страницу.
-        assert!(cache.get(7, 2).is_none());
+        assert!(cache.get(7, 0, 2).is_none());
         let stats = cache.stats();
         assert_eq!(stats.hits, 2);
         assert_eq!(stats.misses, 2);
@@ -320,17 +320,31 @@ mod tests {
     }
 
     #[test]
+    fn generation_mismatch_is_a_miss_and_new_generation_replaces_image() {
+        let cache = PageCacheV2::with_capacity(8);
+        cache.insert(7, 3, 5, 1, page(0xAA));
+        assert_eq!(cache.get(7, 5, 1).map(|data| data[0]), Some(0xAA));
+        // Номер переиспользован: другая генерация — промах.
+        assert!(cache.get(7, 6, 1).is_none());
+        // Новая генерация заменяет старый образ того же номера.
+        cache.insert(7, 9, 6, 1, page(0xBB));
+        assert!(cache.get(7, 5, 1).is_none());
+        assert_eq!(cache.get(7, 6, 1).map(|data| data[0]), Some(0xBB));
+        assert_eq!(cache.stats().entries, 1);
+    }
+
+    #[test]
     fn capacity_is_bounded_and_invalidate_drops_all_versions() {
         let cache = PageCacheV2::with_capacity(4);
         for index in 0..32_u32 {
-            cache.insert(index, 2, 1, page(u8::try_from(index).unwrap_or(0)));
+            cache.insert(index, 2, 0, 1, page(u8::try_from(index).unwrap_or(0)));
         }
         assert!(cache.stats().entries <= 4);
         assert_eq!(cache.stats().capacity, 4);
         assert!(cache.stats().evictions > 0);
-        cache.insert(5, 2, 1, page(1));
-        cache.insert(5, 3, 1, page(2));
+        cache.insert(5, 2, 0, 1, page(1));
+        cache.insert(5, 3, 0, 1, page(2));
         cache.invalidate(5);
-        assert!(cache.get(5, 1).is_none());
+        assert!(cache.get(5, 0, 1).is_none());
     }
 }

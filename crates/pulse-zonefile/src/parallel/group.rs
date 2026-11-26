@@ -16,6 +16,12 @@
 //! Ошибка ввода-вывода переводит файл в `CommitUncertain` (`write_locked`) и не
 //! публикует ни одной головы группы; `ReaderContended` — per-zone retryable.
 //!
+//! Этот модуль — **внутрипроцессный** батчер. В `multi_process`-сторе при
+//! нескольких живых процессах `ParallelStore::execute_group` уходит в общую
+//! очередь sidecar (`docs/spec/parallel-writes-v2.md` §7.5): лидер собирает
+//! запросы всех процессов и делает одну пару `fdatasync` на всех. Оба пути
+//! используют один и тот же код фаз (`prepare_publish` → `execute_group`).
+//!
 //! [`ParallelZone::commit_via`]: crate::parallel::zone::ParallelZone::commit_via
 
 use std::sync::atomic::{AtomicBool, Ordering};

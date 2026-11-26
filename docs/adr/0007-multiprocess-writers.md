@@ -49,7 +49,7 @@ M1 (ADR-0005) реализован и принят: один процесс, `LO
 
 **Имя/права.** `<file>.pulsecoord`, `O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW`, `0600`, `fstat` → regular file, `fchmod 0600`. Симлинк/каталог/FIFO отвергаются (`NotRegularFile`).
 
-**Раскладка sidecar.** Заголовок (магия `PULSCD01`, версия, `max_zones`, `reader_slots`, `page_count_max`, `page_size`, UUID инстанса); страница 1 — скаляры `cursor`, `txn`, `durable_pages`, `durable_txn`, `published`, `generation`, `alive_hint` (каждый на своей cache line); далее — lease-слоты `32 Б/зона`, `zone_write_seq u64/зона`, `D_z u64/зона`, reader-слоты `128 Б`. Все поля — выровненные атомики на фиксированных смещениях. Размер детерминирован геометрией, поэтому все процессы вычисляют одинаковые смещения.
+**Раскладка sidecar.** Заголовок (магия `PULSCD01`, версия, `max_zones`, `reader_slots`, `page_count_max`, `page_size`, UUID инстанса); страница 1 — скаляры `cursor`, `txn`, `durable_pages`, `durable_txn`, `published`, `generation`, `alive_hint`, `pending_seq`, счётчики межпроцессных групп/`fsync` и lease лидера (каждый на своей cache line); далее — lease-слоты `32 Б/зона`, `zone_write_seq u64/зона`, `D_z u64/зона`, reader-слоты `128 Б`, таблица генераций страниц и (v4) очередь group commit `CLIENT_SLOTS×3648 Б`. Все поля — выровненные атомики на фиксированных смещениях. Размер детерминирован геометрией, поэтому все процессы вычисляют одинаковые смещения. Версия 4 несовместима с v3: при отсутствии живых держателей sidecar пересоздаётся (данные не затрагиваются), живые процессы старой версии получают `Busy`. Протокол очереди — `docs/spec/parallel-writes-v2.md` §7.5.
 
 ## 3. Инициализация sidecar и `DP`/`txn` при открытии
 
@@ -213,11 +213,34 @@ starttime)`. `D_z` и reader table живут в sidecar; поэтому гей�
 
 ### 7.4. Кэш страниц в multi
 
-`PageCacheV2` и node-cache **отключены** в multi-режиме: номер страницы может
-быть переиспользован другим процессом, а общей генерации страницы в sidecar
-нет. Чтение идёт `pread` + CRC. Single-process путь сохраняет кэш без
-регрессий; инвалидация «при взятии lease» остаётся правилом для будущей
-общей генерации (v2.1).
+`PageCacheV2` и node-cache работают в multi-режиме. Sidecar (раскладка v3)
+хранит общую таблицу `page_no → generation` (`u32` на страницу данных;
+`page_gen`). Генерация — часть ключа: `PageCacheV2` использует
+`(page_no, generation)`, node-cache — `(page_no, generation, snapshot_version)`.
+
+Протокол:
+
+1. **Выдача** страницы (bump-аллокатор, per-zone пул, donation) инкрементирует
+   генерацию до того, как writer получит номер.
+2. **Освобождение** (`free_page`, rollback `return_pages`, donation) также
+   инкрементирует генерацию: читатель другого процесса видит промах, а не
+   покинувший снапшот образ.
+3. **Запись** содержимого (`write_page_bytes`) выполняет release-инкремент
+   после `pwrite`: читатель, увидевший новую генерацию, видит и новый образ.
+4. **Чтение** берёт генерацию до и после `pread`/валидации. Несовпадение —
+   образ отбрасывается и читается заново (не более 8 повторов, затем
+   `ReaderContended`); ключ кеша всегда содержит проверенную генерацию.
+5. На переполнении `u32::MAX → 1` (0 зарезервирован за «не выдавалась»).
+   Теоретическая коллизия требует 2³² переиспользований одной страницы и на
+   практике недостижима; поведение зафиксировано тестом `coord::tests`.
+
+Генерации живут только в sidecar (не в формате данных) и сбрасываются при
+пересоздании координатора, когда живых процессов нет. Бюджет памяти:
+`4 × (page_count_max − page_data_first)` байт; для дефолтной геометрии
+(`page_count_max = 2¹⁸`) — около 1 МиБ. Single-process путь не изменился:
+генерация всегда 0, инвалидация — по `(page_no, page_txn)`/локальной записи.
+При взятии lease зоны локальный пул по-прежнему перечитывается из durable-
+головы; кэш страниц lease не требует — его защищает генерация.
 
 ### 7.5. Каталог
 
@@ -296,7 +319,7 @@ L6  shard-мьютекс пула                    # под L2/L4; не бер
 | M3-L7 | Linux (`F_OFD_SETLK`, `/proc/<pid>/stat`); на не-Linux — `F_SETLK` fallback с classic-семантикой закрытия fd (документировано) |
 | M3-L8 | `max_zones`/`reader_slots` фиксированы геометрией; sidecar растёт с ними (32+8+8 Б/зона + 128 Б/слот) |
 | M3-L9 | Single-process писатель держит `LOCK_EX` на lock-файле, multi-процессы — `LOCK_SH`; смешанный режим (`single-writer` + `multi-reader`) невозможен (`Busy`), потому что single-writer не участвует в per-zone seqlock |
-| M3-L10 | В multi отключены `PageCacheV2`/node-cache: общая генерация страницы отсутствует, номер может переиспользоваться другим процессом. Single-process кэш не затронут |
+| M3-L10 | `PageCacheV2`/node-cache в multi используют общую таблицу генераций страниц в sidecar (`COORD_VERSION = 3`); single-process генерация всегда 0, поведение не изменено. Бюджет sidecar — 4 Б/страницу данных (~1 МиБ на дефолтную геометрию) |
 | M3-L11 | `fsck --repair` и возврат `[DP, cursor)` после `kill -9` — только в quiescent-окне; живая рекламация не чинит структурные утечки |
 
 ## 11. API и совместимость
@@ -343,8 +366,11 @@ zone.commit()?;                                   // commit-lock внутри
 | C-11.9 | Каталог: 4 процесса без внешнего flock создают 1000 зон; update/delete/gc/recreate не теряют записи | `tests/v2_multiprocess.rs::four_processes_create_1000_zones_without_external_lock`, `four_processes_update_delete_recreate_catalog_consistently` |
 | C-11.10 | 4 процесса insert/delete 10k: `high_water` ограничен, нет пересечений/утечек | `tests/v2_multiprocess_reclaim.rs` (regular + `--ignored` 10k) |
 | C-11.11 | `kill -9` писателя и crash после фазы 1: рекламация и `fsck` корректны | `kill9_writer_then_reclaim_is_consistent`, `crash_after_phase1_then_reclaim_is_safe` |
-| C-11.12 | Читатель другого процесса с пином не видит переиспользованную страницу | `reader_in_other_process_does_not_see_reused_pages` |
+| C-11.12 | Читатель другого процесса с пином не видит переиспользованную страницу; кеш инвалидируется по общей генерации | `reader_in_other_process_does_not_see_reused_pages`, `reader_cache_in_other_process_does_not_serve_reused_pages`, `page_generation_advances_on_alloc_and_write` |
+| C-11.13 | 4 процесса читают/пишут/удаляют при включённом multi-кеше; `kill -9` писателя не ломает кеш и `fsck` | `four_processes_read_write_delete_with_shared_cache`, `kill9_writer_with_shared_cache_reopens_and_reads` |
 
 **Bench (2026-11-25, release, локальный tmpfs/overlay, 8 vCPU, `benches/v2_multiprocess_reclaim.rs`).** Create 100→400 зон: 1869/1267/624 зон/с (2/4/8 процессов). Commit 2 зоны/процесс: 11.7k/10.8k/13.4k zone-commit/s. Reclaim 100 000 коммитов (insert+delete): `high_water` 50→98, 56→152, 68→260 для 2/4/8 процессов; commit 0.073/0.050/0.051 мс. Числа — ориентир, не SLA: диск/планировщик влияют.
 
-**Остаточные риски.** (R1) Сериализация durable-фазы — потолок throughput (не регресс, а свойство одного inode). (R2) Append-only хвост растёт O(коммитов) между COW-компакциями; `FreeChain::load` линейна при открытии. (R3) `zone_write_seq` исключает ложную публикацию, но не даёт wait-free чтения: под непрерывной записью одной зоны читатель может получить `ReaderContended` (retryable). (R4) Каталог-мутации сериализованы глобально: throughput `create_zone` ограничен двумя fsync на зону и перечитыванием каталога под lease (O(размера каталога)); это не блокирует запись разных зон. (R5) На не-Linux fencing/lease деградируют до classic `fcntl` (задокументировано). (R6) В multi нет кэша страниц (M3-L10), поэтому чтение дороже single-process.
+**Bench read (2026-11-26, release, 4 процесса × 40k запросов, `benches/v2_multiprocess_read.rs`).** «Запрос» — новый `ZoneReader` + `lookup_ref`; warm — один прогретый снапшот. До (кеш выключен, M3-L10): req p50/p99 20.5/25.8 µs, warm(200 ключей) 13.4/14.2 µs, hot(8) 4.34/4.92 µs, ~199k qps. После (общая генерация + Page/node-кеш): req 3.56/5.97 µs, warm(200) 0.83/0.99 µs, hot(8) 0.51/0.54 µs, ~1.09M qps. Single-process не изменился: req 1.09/1.31 µs, warm(200) 0.73/0.75 µs, hot(8) 0.44/0.46 µs (до: 1.08/1.30, 0.75/0.78, 0.45/0.47 µs).
+
+**Остаточные риски.** (R1) Сериализация durable-фазы — потолок throughput (не регресс, а свойство одного inode). (R2) Append-only хвост растёт O(коммитов) между COW-компакциями; `FreeChain::load` линейна при открытии. (R3) `zone_write_seq` исключает ложную публикацию, но не даёт wait-free чтения: под непрерывной записью одной зоны читатель может получить `ReaderContended` (retryable). (R4) Каталог-мутации сериализованы глобально: throughput `create_zone` ограничен двумя fsync на зону и перечитыванием каталога под lease (O(размера каталога)); это не блокирует запись разных зон. (R5) На не-Linux fencing/lease деградируют до classic `fcntl` (задокументировано). (R6) Кеш страниц в multi защищён общей генерацией в sidecar; остаточная цена — чтение `u32` генерации до/после `pread` и одна теоретическая коллизия при 2³² переиспользованиях страницы (M3-L10).

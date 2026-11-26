@@ -6,6 +6,13 @@
 //! `fdatasync`), затем публикация головы в памяти.
 //!
 //! B+tree, per-zone пулы, group commit и межпроцессная запись — фаза B.
+//!
+//! В `multi_process`-режиме при ≥2 живых сторах фазы коммита выполняет
+//! **лидер межпроцессной группы** (§7.5): писатели кладут готовые `RootEntry`
+//! в shared-очередь sidecar, лидер делает один `ALLOC_RECORD` + один `fdatasync`
+//! фазы 1, затем все копии корней + второй `fdatasync`, публикует `D_z` и
+//! подтверждает слоты. Смерть лидера не теряет коммит: lease снимает ядро, а
+//! повтор фазы 2 идемпотентен (`head.version == request.version`).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -13,6 +20,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use rustix::fs::{FileType, Mode, OFlags, fdatasync, fstat, fsync, ftruncate, open as fs_open};
 
@@ -28,7 +36,9 @@ use crate::parallel::consts::{
     ROOT_VERSIONS,
 };
 use crate::parallel::coord::{
-    CoordInit, MaintenanceGuard, ProcessIdentity, SharedCoord, self_identity,
+    CLIENT_MAX_MEMBERS, CoordInit, MaintenanceGuard, ProcessIdentity, SharedAckCode, SharedCoord,
+    SharedGroupStats, SharedMemberResult, SharedReadyBatch, SharedRequestMember, process_alive,
+    self_identity,
 };
 use crate::parallel::error::{FatalKind, ParallelError, V2CorruptKind};
 use crate::parallel::freepool::{BucketImages, FreeChain};
@@ -465,6 +475,14 @@ const CATALOG_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// сливается в одну группу (компакция с переиспользованием страниц).
 const CATALOG_COMPACT_GROUPS: usize = 64;
 
+/// Окно «дозора» лидера межпроцессной группы: собирает одновременную волну
+/// писателей, не добавляя полный `MAX_BATCH_DELAY` к каждой группе.
+const SHARED_SETTLE: Duration = Duration::from_millis(1);
+/// Пауза ожидания ack перед повторной попыткой стать лидером.
+const SHARED_POLL: Duration = Duration::from_micros(500);
+/// Максимум зон в межпроцессной группе.
+const SHARED_MAX_GROUP_MEMBERS: usize = 256;
+
 /// Шард lease для `zone` (`0` — каталог).
 ///
 /// Каталог занимает выделенный шард `CATALOG_LEASE_SHARD`, зоны — остальные
@@ -600,10 +618,10 @@ impl ParallelStore {
         let gc = GcState::new(geometry.max_zones())?;
         let leases = allocate_leases()?;
         // В multi-режиме номер страницы может быть переиспользован другим
-        // процессом; локальный кеш образа страницы без общей генерации
-        // невалидируем. Кеш включён только в single-process.
-        let (raw_cache, node_cache) =
-            make_caches(if multi_process { 0 } else { page_cache_entries });
+        // процессом; общая генерация страницы в sidecar делает кеш-key
+        // `(page_no, generation)` и позволяет валидировать образ один раз на
+        // генерацию (ADR 0007 §7.4).
+        let (raw_cache, node_cache) = make_caches(page_cache_entries, multi_process);
         let dp = u64::from(geometry.page_data_first());
         let init = CoordInit {
             durable_pages: dp,
@@ -613,7 +631,7 @@ impl ParallelStore {
             durable_versions: Vec::new(),
         };
         let shared = if multi_process {
-            Some(SharedCoord::open(path, geometry, uuid, &init)?)
+            Some(SharedCoord::open(path, geometry, uuid, &init, true)?)
         } else {
             None
         };
@@ -748,11 +766,7 @@ impl ParallelStore {
         let pins = PinTable::new(geometry.reader_slots().min(READER_SLOTS_V2))?;
         let gc = GcState::new(geometry.max_zones())?;
         let leases = allocate_leases()?;
-        let (raw_cache, node_cache) = make_caches(if config.multi_process {
-            0
-        } else {
-            config.page_cache_entries
-        });
+        let (raw_cache, node_cache) = make_caches(config.page_cache_entries, config.multi_process);
         let durable_version_list = recovered
             .heads
             .iter()
@@ -775,6 +789,7 @@ impl ParallelStore {
                 geometry,
                 recovered.superblock.instance_uuid,
                 &init,
+                !config.read_only,
             )?)
         } else {
             None
@@ -877,6 +892,42 @@ impl ParallelStore {
     #[must_use]
     pub fn coord_path(&self) -> Option<&Path> {
         self.shared.as_ref().map(|coord| coord.path())
+    }
+
+    /// Счётчики межпроцессного group commit (из общего sidecar).
+    ///
+    /// `None` — режим single-process. Счётчики накапливаются, пока жив хотя бы
+    /// один процесс; при полном пересоздании sidecar обнуляются.
+    #[must_use]
+    pub fn shared_group_stats(&self) -> Option<SharedGroupStats> {
+        self.shared.as_ref().map(|coord| coord.group_stats())
+    }
+
+    /// Текущий лидер межпроцессной группы: `(term, pid, starttime)`.
+    #[must_use]
+    pub fn shared_leader(&self) -> Option<(u64, u64, u64)> {
+        self.shared.as_ref().map(|coord| {
+            let (term, identity) = coord.leader();
+            (term, identity.pid, identity.starttime)
+        })
+    }
+
+    /// Ожидает, пока очередь коммитов опустеет (для тестов/бенчей).
+    ///
+    /// `true` — очередь пуста; `false` — таймаут.
+    #[must_use]
+    pub fn wait_for_shared_idle(&self, timeout: Duration) -> bool {
+        let Some(coord) = self.shared.as_ref() else {
+            return true;
+        };
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if coord.ready_batches().is_empty() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        coord.ready_batches().is_empty()
     }
 
     /// Владелец lease зоны (диагностика `ZoneBusy`).
@@ -1151,6 +1202,49 @@ impl ParallelStore {
         self.node_cache.as_ref()
     }
 
+    /// Идёт ли учёт общих генераций страниц (multi-process).
+    ///
+    /// В single-process генерации не нужны: перезапись страницы инвалидирует
+    /// локальный кеш напрямую, а номер не переиспользуется другим процессом.
+    #[must_use]
+    pub const fn generation_tracking(&self) -> bool {
+        self.shared.is_some()
+    }
+
+    /// Текущая общая генерация страницы (0 — нет учёта/страница не выдавалась).
+    ///
+    /// Ключ кеша в multi — `(page_no, generation)`: после освобождения и
+    /// повторной выдачи номер получает новую генерацию, поэтому старый образ
+    /// не может быть отдан читателю.
+    #[must_use]
+    pub fn page_generation(&self, page: u32) -> u32 {
+        self.shared
+            .as_ref()
+            .map_or(0, |coord| coord.page_generation(page))
+    }
+
+    /// Размер таблицы генераций в sidecar (memory budget; 0 в single-process).
+    #[must_use]
+    pub fn page_generation_bytes(&self) -> usize {
+        self.shared
+            .as_ref()
+            .map_or(0, |coord| coord.page_generation_bytes())
+    }
+
+    pub(crate) fn bump_page_generation(&self, page: u32) {
+        if let Some(coord) = &self.shared {
+            coord.bump_page_generation(page);
+        }
+    }
+
+    fn bump_page_generations(&self, pages: &[u32]) {
+        if let Some(coord) = &self.shared {
+            for page in pages {
+                coord.bump_page_generation(*page);
+            }
+        }
+    }
+
     /// Оценка памяти обоих кешей чтения (образы страниц + метаданные узлов).
     ///
     /// Не учитывает заголовки аллокатора и `Arc`; лимит задаётся
@@ -1265,6 +1359,7 @@ impl ParallelStore {
                 entry.loaded = true;
             }
             if let Some(page) = entry.immediate.pop() {
+                self.bump_page_generation(page);
                 self.stats.reclaimed_pages.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(page));
             }
@@ -1273,6 +1368,7 @@ impl ParallelStore {
             // `D_z`, общие пины всех процессов (`MP`) и freeze.
             if let Some(page) = entry.chain.take_eligible(durable, rv, current_version) {
                 entry.dirty = true;
+                self.bump_page_generation(page);
                 self.stats.reclaimed_pages.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(page));
             }
@@ -1317,6 +1413,7 @@ impl ParallelStore {
         if pages.is_empty() {
             return;
         }
+        self.bump_page_generations(pages);
         let mut shard = lock_unpoison(self.pool_shard(zone));
         let entry = shard.zones.entry(zone).or_default();
         entry.immediate.extend_from_slice(pages);
@@ -1327,6 +1424,7 @@ impl ParallelStore {
         if pages.is_empty() {
             return;
         }
+        self.bump_page_generations(pages);
         let mut donation = lock_unpoison(&self.donation);
         donation.extend(pages.iter().map(|page| DonationEntry {
             page: *page,
@@ -1345,6 +1443,7 @@ impl ParallelStore {
             .iter()
             .position(|entry| entry.donated_at < durable_txn)?;
         let entry = donation.swap_remove(index);
+        self.bump_page_generation(entry.page);
         self.stats.reclaimed_pages.fetch_add(1, Ordering::Relaxed);
         Some(entry.page)
     }
@@ -1878,6 +1977,19 @@ impl ParallelStore {
                 })
                 .collect();
         }
+        // Межпроцессный group commit: несколько процессов кладут готовые
+        // записи корней в общую очередь sidecar, а лидер выполняет одну пару
+        // `fdatasync` на всех. `Memory` не выигрывает от группировки (fsync нет)
+        // и остаётся на локальном пути.
+        if self
+            .shared
+            .as_ref()
+            .is_some_and(|coord| coord.has_client() && coord.alive_count() > 1)
+            && mode != SyncModeV2::Memory
+            && !shared_commit_disabled()
+        {
+            return self.execute_group_shared(members, mode);
+        }
         self.stats.group_commits.fetch_add(1, Ordering::Relaxed);
         self.stats
             .group_members
@@ -1944,6 +2056,464 @@ impl ParallelStore {
                 }))
             })
             .collect()
+    }
+
+    /// Межпроцессный group commit (§7.1, M3): готовые записи корней уходят в
+    /// общую очередь sidecar, лидер выполняет одну пару `fdatasync` на группу.
+    #[allow(clippy::too_many_lines)]
+    fn execute_group_shared(
+        &self,
+        members: Vec<PreparedPublish>,
+        mode: SyncModeV2,
+    ) -> Vec<Result<PublishOutcome, ParallelError>> {
+        let count = members.len();
+        let Some(coord) = self.shared.as_ref() else {
+            return (0..count)
+                .map(|_| Err(ParallelError::GroupClosed))
+                .collect();
+        };
+        let Some(slot) = coord.client_slot() else {
+            return (0..count)
+                .map(|_| Err(ParallelError::GroupClosed))
+                .collect();
+        };
+        let _gate = lock_unpoison(&self.commit_gate);
+        // Данные/bucket/chain — обычные pwrite; их durable-барьер сделает
+        // лидер группы (fsync inode общий для всех процессов).
+        self.fire(CrashPoint::BeforeAllocRecord);
+        if let Err(error) = self.write_group_metadata(&members) {
+            let message = error.to_string();
+            return (0..count)
+                .map(|_| Err(ParallelError::Io(std::io::Error::other(message.clone()))))
+                .collect();
+        }
+        self.fire(CrashPoint::AfterPhase1Writes);
+
+        let mut results: Vec<Option<Result<PublishOutcome, ParallelError>>> =
+            (0..count).map(|_| None).collect();
+        let mut pending: Vec<usize> = Vec::new();
+        let mut page_limit = self.durable_page_limit();
+        let mut index = 0;
+        while index < count {
+            let end = (index + CLIENT_MAX_MEMBERS).min(count);
+            let Some(chunk) = members.get(index..end) else {
+                return (0..count)
+                    .map(|_| Err(ParallelError::InvalidArgument { field: "group" }))
+                    .collect();
+            };
+            let requests: Vec<SharedRequestMember> = chunk
+                .iter()
+                .map(|member| SharedRequestMember {
+                    zone: member.zone,
+                    version: member.record.version,
+                    base_version: member.base_version,
+                    fence: member.fence,
+                    chain_page: member.chain_write.map_or(0, |(page, _, _)| page),
+                    record: member.record.encode(),
+                })
+                .collect();
+            let Some(ticket) = coord.client_publish(slot, &requests, mode) else {
+                for target in results.iter_mut().skip(index) {
+                    *target = Some(Err(ParallelError::GroupClosed));
+                }
+                break;
+            };
+            let (chunk_limit, acks) = match self.wait_shared_ack(coord, slot, ticket) {
+                Ok(value) => value,
+                Err(error) => {
+                    let message = error.to_string();
+                    for target in results.iter_mut().skip(index) {
+                        *target = Some(Err(ParallelError::Io(std::io::Error::other(
+                            message.clone(),
+                        ))));
+                    }
+                    break;
+                }
+            };
+            page_limit = page_limit.max(chunk_limit);
+            let mut uncertain = false;
+            for (offset, ack) in acks.iter().enumerate() {
+                let member_index = index + offset;
+                match ack.code {
+                    SharedAckCode::Ok => pending.push(member_index),
+                    SharedAckCode::ReaderContended => {
+                        if let Some(target) = results.get_mut(member_index) {
+                            *target = Some(Err(ParallelError::ReaderContended));
+                        }
+                    }
+                    SharedAckCode::ZoneBusy => {
+                        let zone = members.get(member_index).map_or(0, |member| member.zone);
+                        if let Some(target) = results.get_mut(member_index) {
+                            *target = Some(Err(ParallelError::ZoneBusy { zone }));
+                        }
+                    }
+                    SharedAckCode::Io => uncertain = true,
+                }
+            }
+            if uncertain {
+                self.mark_fatal(FatalKind::CommitUncertain);
+                // Предыдущие чанки уже durable и подтверждены: их `Ok` нельзя
+                // превращать в ошибку (иначе вызывающий переиспользует страницы
+                // опубликованных голов). Ошибка — только текущий и следующие.
+                pending.retain(|member| *member < index);
+                for offset in 0..(end.saturating_sub(index)) {
+                    if let Some(target) = results.get_mut(index + offset) {
+                        *target = Some(Err(ParallelError::ReadOnly {
+                            reason: FatalKind::CommitUncertain,
+                        }));
+                    }
+                }
+                break;
+            }
+            index = end;
+        }
+
+        // Фаза 1 durable: фиксируем append-группы пулов только опубликованных
+        // зон (неуспешные не должны отдавать страницы в рекламацию). Ошибка
+        // локального пула не отменяет уже подтверждённый durable-коммит — она
+        // лишь замораживает файл (пул перечитается при следующем lease).
+        if !pending.is_empty() {
+            if self.install_appends_selected(&members, &pending).is_err() {
+                self.mark_fatal(FatalKind::CommitUncertain);
+            }
+            self.publish_group(members, mode, page_limit, &pending, &mut results);
+        }
+        results
+            .into_iter()
+            .map(|slot| {
+                slot.unwrap_or(Err(ParallelError::ReadOnly {
+                    reason: FatalKind::CommitUncertain,
+                }))
+            })
+            .collect()
+    }
+
+    /// Ждёт ack своего запроса, попутно становясь лидером, если lease свободен.
+    fn wait_shared_ack(
+        &self,
+        coord: &SharedCoord,
+        slot: usize,
+        ticket: u64,
+    ) -> Result<(u64, Vec<SharedMemberResult>), ParallelError> {
+        loop {
+            if let Some(ack) = coord.client_ack(slot, ticket) {
+                return Ok(ack);
+            }
+            if let Some(lock) = coord.try_lock_commit()? {
+                let processed = self.run_shared_group(coord);
+                drop(lock);
+                if processed > 0 {
+                    continue;
+                }
+            }
+            coord.client_wait(slot, ticket, SHARED_POLL);
+        }
+    }
+
+    /// Одна межпроцессная группа под уже взятым commit-lock.
+    ///
+    /// Возвращает число обработанных зон (0 — очередь пуста). Лидер может
+    /// принадлежать любому процессу: записи корней берутся из sidecar, lease
+    /// зон проверяется по `(pid, starttime, generation)`.
+    #[allow(clippy::too_many_lines)]
+    fn run_shared_group(&self, coord: &SharedCoord) -> usize {
+        // `pending_seq` читается до снимка: публикация между этими двумя
+        // операциями не потеряется в settle-окне (sequence окажется старее и
+        // цикл перечитает очередь).
+        let mut sequence = coord.pending_sequence();
+        let mut batches = coord.ready_batches();
+        if batches.is_empty() {
+            return 0;
+        }
+        // Короткое settle-окно: собираем одновременную волну писателей.
+        let deadline = Instant::now() + SHARED_SETTLE;
+        loop {
+            let total: usize = batches.iter().map(|batch| batch.members.len()).sum();
+            if total >= SHARED_MAX_GROUP_MEMBERS || Instant::now() >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            coord.wait_pending(sequence, remaining);
+            let next = coord.pending_sequence();
+            if next == sequence {
+                break;
+            }
+            sequence = next;
+            batches = coord.ready_batches();
+            if batches.is_empty() {
+                return 0;
+            }
+        }
+        let mut taken: Vec<SharedReadyBatch> = Vec::new();
+        let mut total = 0;
+        for batch in batches {
+            let size = batch.members.len();
+            if total + size > SHARED_MAX_GROUP_MEMBERS && !taken.is_empty() {
+                break;
+            }
+            total += size;
+            taken.push(batch);
+            if total >= SHARED_MAX_GROUP_MEMBERS {
+                break;
+            }
+        }
+        if taken.is_empty() {
+            return 0;
+        }
+        coord.leader_begin(self.identity);
+        let mode = taken
+            .iter()
+            .map(|batch| batch.mode)
+            .max_by_key(|mode| mode.durability_rank())
+            .unwrap_or(SyncModeV2::Sync);
+        let mut codes: Vec<Vec<SharedAckCode>> = taken
+            .iter()
+            .map(|batch| batch.members.iter().map(|_| SharedAckCode::Io).collect())
+            .collect();
+        let mut accepted: Vec<(usize, usize, RootEntry)> = Vec::new();
+        let mut page_limit = self.durable_page_limit().max(self.allocator.cursor());
+        let mut txn_limit = self.durable_txn_limit();
+        let mut hard_io = false;
+        for (batch_index, batch) in taken.iter().enumerate() {
+            for (member_index, member) in batch.members.iter().enumerate() {
+                match self.validate_shared_member(coord, batch, member) {
+                    Ok(record) => {
+                        page_limit = page_limit.max(u64::from(record.page_limit_at_commit));
+                        if mode == SyncModeV2::Sync {
+                            txn_limit = txn_limit.max(record.version);
+                        }
+                        accepted.push((batch_index, member_index, record));
+                    }
+                    Err(code) => {
+                        if code == SharedAckCode::Io {
+                            hard_io = true;
+                        }
+                        if let Some(cell) = codes
+                            .get_mut(batch_index)
+                            .and_then(|target| target.get_mut(member_index))
+                        {
+                            *cell = code;
+                        }
+                    }
+                }
+            }
+        }
+        if hard_io {
+            self.mark_fatal(FatalKind::CommitUncertain);
+            ack_shared_batches(coord, &taken, &codes, page_limit);
+            return total;
+        }
+        if accepted.is_empty() {
+            ack_shared_batches(coord, &taken, &codes, page_limit);
+            return total;
+        }
+
+        if let Err(error) = self.reload_durable() {
+            let _ = error;
+            self.mark_fatal(FatalKind::CommitUncertain);
+            return total;
+        }
+        let fsyncs = match mode {
+            SyncModeV2::Sync => 2,
+            SyncModeV2::Flush => 1,
+            SyncModeV2::Memory => 0,
+        };
+        self.fire(CrashPoint::BeforeAllocRecord);
+        let mut candidate = page_limit;
+        {
+            let mut durable = lock_unpoison(&self.alloc_durable);
+            candidate = candidate
+                .max(durable.page_limit)
+                .max(self.allocator.cursor());
+            if candidate > u64::from(self.geometry.page_count_max()) {
+                drop(durable);
+                self.mark_fatal(FatalKind::CommitUncertain);
+                ack_shared_batches(
+                    coord,
+                    &taken,
+                    &vec![vec![SharedAckCode::Io; total]; taken.len()],
+                    page_limit,
+                );
+                return total;
+            }
+            let seq = durable.seq.saturating_add(1);
+            let written = if mode == SyncModeV2::Sync {
+                self.write_alloc_record(seq, candidate, txn_limit)
+            } else {
+                Ok(())
+            };
+            if written.and_then(|()| self.fsync_data()).is_err() {
+                drop(durable);
+                self.mark_fatal(FatalKind::CommitUncertain);
+                ack_shared_batches(
+                    coord,
+                    &taken,
+                    &vec![vec![SharedAckCode::Io; total]; taken.len()],
+                    page_limit,
+                );
+                return total;
+            }
+            durable.seq = seq;
+            durable.page_limit = candidate;
+            if mode == SyncModeV2::Sync {
+                durable.txn_limit = txn_limit;
+                self.durable_page_limit.store(candidate, Ordering::Release);
+                self.durable_txn_limit.store(txn_limit, Ordering::Release);
+                coord
+                    .durable_pages()
+                    .fetch_max(candidate, Ordering::Release);
+                coord.durable_txn().fetch_max(txn_limit, Ordering::Release);
+            }
+        }
+        self.fire(CrashPoint::AfterPhase1Fsync);
+
+        let ring = Ring::new(&self.file, &self.geometry);
+        for (_, _, record) in &accepted {
+            let zone = record.owner_zone;
+            let Ok(slot) = self.ring_slot(zone) else {
+                self.mark_fatal(FatalKind::CommitUncertain);
+                ack_shared_batches(
+                    coord,
+                    &taken,
+                    &vec![vec![SharedAckCode::Io; total]; taken.len()],
+                    candidate,
+                );
+                return total;
+            };
+            let Some(guard_ref) = self.zone_guard.get(zone as usize) else {
+                continue;
+            };
+            let guard = EpochGuard::enter(guard_ref);
+            coord.zone_write_begin(zone);
+            self.fire(CrashPoint::BeforeRootWrite);
+            let offset = slot.cell_offset(record.version);
+            let first = ring.write_cell(slot.page_a, offset, record);
+            self.fire(CrashPoint::AfterRootCopyA);
+            let second = first.and_then(|()| ring.write_cell(slot.page_b, offset, record));
+            coord.zone_write_end(zone);
+            drop(guard);
+            self.fire(CrashPoint::AfterRootCopyB);
+            if second.is_err() {
+                self.mark_fatal(FatalKind::CommitUncertain);
+                ack_shared_batches(
+                    coord,
+                    &taken,
+                    &vec![vec![SharedAckCode::Io; total]; taken.len()],
+                    candidate,
+                );
+                return total;
+            }
+        }
+        if mode == SyncModeV2::Sync && self.fsync_data().is_err() {
+            self.mark_fatal(FatalKind::CommitUncertain);
+            ack_shared_batches(
+                coord,
+                &taken,
+                &vec![vec![SharedAckCode::Io; total]; taken.len()],
+                candidate,
+            );
+            return total;
+        }
+        self.fire(CrashPoint::AfterPhase2Fsync);
+
+        if mode == SyncModeV2::Sync {
+            for (_, _, record) in &accepted {
+                coord.set_durable_version(record.owner_zone, record.version);
+            }
+        }
+        let published = accepted
+            .iter()
+            .map(|(_, _, record)| record.version)
+            .max()
+            .unwrap_or(0);
+        if published != 0 {
+            coord.published().fetch_max(published, Ordering::Release);
+        }
+        coord.note_group(u64::try_from(total).unwrap_or(u64::MAX), fsyncs);
+        self.stats.group_commits.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .group_members
+            .fetch_add(u64::try_from(total).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.stats.group_fsyncs.fetch_add(fsyncs, Ordering::Relaxed);
+        self.stats
+            .group_max_members
+            .fetch_max(u64::try_from(total).unwrap_or(u64::MAX), Ordering::Relaxed);
+
+        for (batch_index, member_index, _) in &accepted {
+            if let Some(cell) = codes
+                .get_mut(*batch_index)
+                .and_then(|target| target.get_mut(*member_index))
+            {
+                *cell = SharedAckCode::Ok;
+            }
+        }
+        ack_shared_batches(coord, &taken, &codes, candidate);
+        total
+    }
+
+    fn ring_slot(&self, zone: u32) -> Result<crate::parallel::geometry::ZoneSlot, ParallelError> {
+        if zone == 0 {
+            Ok(self.geometry.catalog_slot())
+        } else {
+            self.geometry.head_slot(zone)
+        }
+    }
+
+    fn validate_shared_member(
+        &self,
+        coord: &SharedCoord,
+        batch: &SharedReadyBatch,
+        member: &SharedRequestMember,
+    ) -> Result<RootEntry, SharedAckCode> {
+        let Some(record) = RootEntry::decode(&member.record) else {
+            return Err(SharedAckCode::ZoneBusy);
+        };
+        if record.owner_zone != member.zone
+            || record.version != member.version
+            || record.check_fields(self.geometry.page_count_max()).is_err()
+        {
+            return Err(SharedAckCode::ZoneBusy);
+        }
+        if !process_alive(batch.identity.pid, batch.identity.starttime) {
+            return Err(SharedAckCode::ZoneBusy);
+        }
+        if member.zone != 0
+            && member.fence != 0
+            && (!coord.lease_owned_by(member.zone, batch.identity)
+                || coord.lease_generation(member.zone) != member.fence)
+        {
+            return Err(SharedAckCode::ZoneBusy);
+        }
+        let Ok(head) = self.read_head_disk(member.zone) else {
+            return Err(SharedAckCode::Io);
+        };
+        let head_version = head.map_or(0, |entry| entry.version);
+        // `head.version == member.version` — предыдущий координатор успел
+        // записать корень, но погиб до ack. Повтор идемпотентен: те же байты
+        // пишутся снова и fsync'атся, писатель получает ack (потери нет).
+        if head_version != member.base_version && head_version != member.version {
+            return Err(SharedAckCode::ZoneBusy);
+        }
+        if head_version == member.version {
+            return Ok(record);
+        }
+        if member.chain_page == 0 {
+            let mp = coord.oldest_pin(member.zone).unwrap_or(NO_VERSION);
+            let Ok(slot) = self.ring_slot(member.zone) else {
+                return Err(SharedAckCode::ZoneBusy);
+            };
+            let Ok(view) = Ring::new(&self.file, &self.geometry).read_slot_at(slot, member.zone)
+            else {
+                return Err(SharedAckCode::Io);
+            };
+            let group = usize::try_from(member.version % u64::from(ROOT_VERSIONS)).unwrap_or(0);
+            if let Some(previous) = view.cell(group)
+                && previous.version >= mp
+            {
+                return Err(SharedAckCode::ReaderContended);
+            }
+        }
+        Ok(record)
     }
 
     /// Окно глобального коммита: сериализует фазы 1–2 между процессами.
@@ -2068,7 +2638,24 @@ impl ParallelStore {
     /// потерян до фазы 1, пул не содержит «половины» группы, а выделенные
     /// страницы — обычная утечка `[DP, cursor)`.
     fn install_appends(&self, members: &[PreparedPublish]) -> Result<(), ParallelError> {
-        for member in members {
+        let all: Vec<usize> = (0..members.len()).collect();
+        self.install_appends_selected(members, &all)
+    }
+
+    /// Устанавливает append-группы только перечисленных участников.
+    ///
+    /// В межпроцессной группе зона могла получить `ZoneBusy`/`ReaderContended`:
+    /// её bucket-образ записан, но голова не опубликована, поэтому страницы
+    /// нельзя отдавать в пул (иначе `drop_txn < D_z` освободит живые страницы).
+    fn install_appends_selected(
+        &self,
+        members: &[PreparedPublish],
+        selected: &[usize],
+    ) -> Result<(), ParallelError> {
+        for &index in selected {
+            let Some(member) = members.get(index) else {
+                continue;
+            };
             let Some(append) = &member.reclaim.append else {
                 continue;
             };
@@ -2654,6 +3241,7 @@ impl ParallelStore {
         // будет пересобрана, поэтому страница удаляется из старой группы. Bump
         // сохраняет инвариант «страница выдана один раз».
         if reuse && let Some(page) = chain.take_eligible(durable, rv, version) {
+            self.bump_page_generation(page);
             return Ok(page);
         }
         let ticket = self.allocator.reserve_exact(1)?;
@@ -2695,6 +3283,9 @@ impl ParallelStore {
         }
         let offset = self.geometry.page_offset(page)?;
         self.file.write_all_at(data, offset)?;
+        // Генерация — release после записи содержимого: читатель, увидевший
+        // новую генерацию, увидит и новый образ (ADR 0007 §7.4).
+        self.bump_page_generation(page);
         if let Some(cache) = self.raw_cache.as_ref() {
             cache.invalidate(page);
         }
@@ -3969,14 +4560,54 @@ fn allocate_pools() -> Result<Box<[Mutex<FreePoolShard>]>, ParallelError> {
     Ok(pools.into_boxed_slice())
 }
 
-fn make_caches(entries: usize) -> (Option<PageCacheV2>, Option<PageCache>) {
+fn make_caches(entries: usize, multi_process: bool) -> (Option<PageCacheV2>, Option<PageCache>) {
     if entries == 0 {
         return (None, None);
     }
     (
         Some(PageCacheV2::with_capacity(entries)),
-        Some(PageCache::with_capacity(PAGE_SIZE_V2, entries)),
+        Some(PageCache::with_capacity_generation_aware(
+            PAGE_SIZE_V2,
+            entries,
+            multi_process,
+        )),
     )
+}
+
+/// Аварийный выключатель межпроцессной очереди (`PULSE_MP_DIRECT_COMMIT`).
+///
+/// Нужен для сравнительных бенчей/диагностики: возвращает поведение до M3
+/// (каждый процесс берёт глобальный commit-lock и делает свои два `fdatasync`).
+/// В production переменная не выставляется.
+fn shared_commit_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("PULSE_MP_DIRECT_COMMIT").is_some())
+}
+
+/// Подтверждает группу в sidecar: `codes[bi][mi]` — результат зоны.
+fn ack_shared_batches(
+    coord: &SharedCoord,
+    batches: &[SharedReadyBatch],
+    codes: &[Vec<SharedAckCode>],
+    page_limit: u64,
+) {
+    for (batch_index, batch) in batches.iter().enumerate() {
+        let row = codes.get(batch_index);
+        let results: Vec<SharedMemberResult> = batch
+            .members
+            .iter()
+            .enumerate()
+            .map(|(member_index, member)| SharedMemberResult {
+                code: row
+                    .and_then(|values| values.get(member_index))
+                    .copied()
+                    .unwrap_or(SharedAckCode::Io),
+                prev_record: 0,
+                evicted_page: member.chain_page,
+            })
+            .collect();
+        coord.client_complete(batch, page_limit, &results);
+    }
 }
 
 fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

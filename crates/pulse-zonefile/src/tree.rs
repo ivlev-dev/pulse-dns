@@ -67,6 +67,15 @@ pub trait PageIo {
     /// Ошибки реализации; текущая in-memory реализация не ошибается.
     fn free_page(&mut self, page_no: u32) -> Result<(), ZoneFileError>;
 
+    /// Общая генерация страницы (multi-process; single — всегда `0`).
+    ///
+    /// Кеш узлов в multi использует ключ `(page_no, generation, snapshot)`:
+    /// номер, переиспользованный другим процессом, получает новую генерацию,
+    /// поэтому старые метаданные не могут быть выданы под новым образом.
+    fn page_generation(&self, _page_no: u32) -> u32 {
+        0
+    }
+
     /// COW-копия страницы: выделяет новую страницу и копирует содержимое.
     ///
     /// # Errors
@@ -900,7 +909,7 @@ fn write_leaf_page<P: PageIo + ?Sized>(
     node::encode_leaf_trusted(&mut page, ctx, items)?;
     io.write_page(page_no, &page)?;
     if let Some(cache) = cache {
-        cache.put_encoded_leaf(page_no, txn, &page, items);
+        cache.put_encoded_leaf(page_no, txn, io.page_generation(page_no), &page, items);
     }
     Ok((page_no, first))
 }
@@ -928,7 +937,7 @@ fn write_branch_page<P: PageIo + ?Sized>(
     node::encode_branch_trusted(&mut page, ctx, level, items)?;
     io.write_page(page_no, &page)?;
     if let Some(cache) = cache {
-        cache.put_encoded_branch(page_no, txn, &page, items);
+        cache.put_encoded_branch(page_no, txn, io.page_generation(page_no), &page, items);
     }
     Ok((page_no, first))
 }

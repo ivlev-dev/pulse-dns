@@ -27,6 +27,9 @@ const READY: &str = "PULSE_MP_READY";
 const RESULT: &str = "PULSE_MP_RESULT";
 const GO: &str = "PULSE_MP_GO";
 const CREATE_LOCK: &str = "PULSE_MP_CREATE_LOCK";
+const VALUE: &str = "PULSE_MP_VALUE";
+const VALUE2: &str = "PULSE_MP_VALUE2";
+const KEYS: &str = "PULSE_MP_KEYS";
 
 fn config() -> StoreConfig {
     StoreConfig {
@@ -83,6 +86,35 @@ fn rr(zone: u32, iteration: u32) -> RrsetData {
         ]],
     )
     .expect("rrset")
+}
+
+fn key(zone: u32, index: u32) -> NameRle {
+    NameRle::from_ascii(&format!("k{index}.z{zone}.mp.example")).expect("key")
+}
+
+/// `RRset` с последним байтом `value` (для проверки, что читатель видит новую
+/// версию после переиспользования страницы).
+fn value_rr(value: u8) -> RrsetData {
+    RrsetData::from_slices(60, 0, &[&[192, 0, 2, value]]).expect("value rrset")
+}
+
+fn read_value(
+    catalog: &ParallelZones<'_>,
+    reader: &pulse_zonefile::parallel::Reader<'_>,
+    zone: u32,
+    index: u32,
+) -> u8 {
+    let origin = origin(zone);
+    let view = catalog.read(reader, &origin).expect("read view");
+    let record = view
+        .lookup(&key(zone, index), 1, 0)
+        .expect("lookup")
+        .expect("record");
+    *record
+        .rdata
+        .first()
+        .and_then(|rdata| rdata.last())
+        .unwrap_or(&0)
 }
 
 fn setup(path: &Path, zones: u32, cfg: StoreConfig) -> ParallelStore {
@@ -301,6 +333,121 @@ fn child_body() -> Result<(), String> {
                 }
             }
             assert!(seen.len() >= 2, "reader did not observe two versions");
+            Ok(())
+        }
+        "cache_reader" => {
+            let store = open_multi_read(&path).map_err(|error| error.to_string())?;
+            let catalog = ParallelZones::open(&store).map_err(|error| error.to_string())?;
+            let zone = parse_u32(ZONE);
+            let keys = parse_u32(KEYS).max(1);
+            let first_value = u8::try_from(parse_u32(VALUE).max(1)).unwrap_or(u8::MAX);
+            let second_value = u8::try_from(parse_u32(VALUE2).max(2)).unwrap_or(u8::MAX);
+            let reader = store.reader().map_err(|error| error.to_string())?;
+            for index in 0..keys {
+                let value = read_value(&catalog, &reader, zone, index);
+                assert_eq!(value, first_value, "warm value key {index}");
+            }
+            let ready = PathBuf::from(std::env::var(READY).map_err(|_| "no ready".to_string())?);
+            std::fs::write(&ready, b"ready").map_err(|error| error.to_string())?;
+            let go = PathBuf::from(std::env::var(GO).map_err(|_| "no go".to_string())?);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !go.exists() {
+                if Instant::now() >= deadline {
+                    return Err("cache reader: no go signal".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // Кеш уже прогрет старыми образами; writer переиспользовал номера
+            // страниц под lease. Новый снапшот обязан вернуть новые значения.
+            for index in 0..keys {
+                let value = read_value(&catalog, &reader, zone, index);
+                assert_eq!(value, second_value, "stale page returned for key {index}");
+            }
+            let stats = store.page_cache_stats();
+            assert!(stats.hits > 0, "shared raw cache did not hit: {stats:?}");
+            assert!(store.node_cache_stats().hits > 0, "node cache did not hit");
+            if let Ok(result) = std::env::var(RESULT) {
+                std::fs::write(
+                    result,
+                    format!(
+                        "ok,{},{},{}",
+                        stats.hits,
+                        stats.misses,
+                        store.node_cache_stats().hits
+                    ),
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+        "delete_reinsert" => {
+            let store = open_multi(&path).map_err(|error| error.to_string())?;
+            let catalog = ParallelZones::open(&store).map_err(|error| error.to_string())?;
+            let zone = parse_u32(ZONE);
+            let keys = parse_u32(KEYS).max(1);
+            let value = u8::try_from(parse_u32(VALUE2).max(2)).unwrap_or(u8::MAX);
+            let origin = catalog
+                .origin(zone)
+                .ok_or_else(|| format!("no zone {zone}"))?;
+            let root_page = {
+                let reader = store.reader().map_err(|error| error.to_string())?;
+                let view = catalog.read(&reader, &origin).map_err(|e| e.to_string())?;
+                view.root().root_page
+            };
+            let root_generation = store.page_generation(root_page);
+            let mut writer = open_writer(&store, origin, zone).map_err(|e| e.to_string())?;
+            for index in 0..keys {
+                let _ = writer
+                    .delete_rrset(&key(zone, index), 1, 0)
+                    .map_err(|error| error.to_string())?;
+            }
+            commit_retry(&mut writer).map_err(|e| e.to_string())?;
+            // D_z догоняет удаление; после этого пул может отдавать страницы.
+            store.sync().map_err(|error| error.to_string())?;
+            for index in 0..keys {
+                writer
+                    .upsert_rrset(&key(zone, index), 1, 0, &value_rr(value))
+                    .map_err(|error| error.to_string())?;
+            }
+            commit_retry(&mut writer).map_err(|e| e.to_string())?;
+            assert!(
+                store.page_generation(root_page) > root_generation,
+                "генерация освобождённой/переиспользованной страницы не выросла: \
+                 {} → {}",
+                root_generation,
+                store.page_generation(root_page)
+            );
+            Ok(())
+        }
+        "read_write_delete" => {
+            let store = open_multi(&path).map_err(|error| error.to_string())?;
+            let catalog = ParallelZones::open(&store).map_err(|error| error.to_string())?;
+            let zone = parse_u32(ZONE);
+            let keys = parse_u32(KEYS).max(1);
+            let iterations = parse_u32(ITERS).max(1);
+            let reader = store.reader().map_err(|error| error.to_string())?;
+            let origin = catalog
+                .origin(zone)
+                .ok_or_else(|| format!("no zone {zone}"))?;
+            let mut writer = open_writer(&store, origin, zone).map_err(|e| e.to_string())?;
+            for iteration in 0..iterations {
+                // Читатель в этом же процессе видит консистентный снапшот.
+                // Ключ `keys-1` не участвует в upsert/delete этой нагрузки.
+                let value = read_value(&catalog, &reader, zone, keys - 1);
+                assert_eq!(value, 1, "initial read zone {zone}");
+                // Пишем и удаляем разные ключи: каждая транзакция освобождает
+                // страницы, которые пул затем переиспользует.
+                writer
+                    .upsert_rrset(&key(zone, iteration % keys), 1, 0, &value_rr(2))
+                    .map_err(|error| error.to_string())?;
+                commit_retry(&mut writer).map_err(|e| e.to_string())?;
+                let _ = writer
+                    .delete_rrset(&key(zone, (iteration + 1) % keys), 1, 0)
+                    .map_err(|error| error.to_string())?;
+                commit_retry(&mut writer).map_err(|e| e.to_string())?;
+            }
+            let stats = store.page_cache_stats();
+            assert!(stats.hits > 0, "zone {zone}: shared cache did not hit");
             Ok(())
         }
         "crash_commit" => {
@@ -590,6 +737,214 @@ fn verify_zones(path: &Path, zones: u32, expected: u32) {
     }
     assert!(store.fsck_lite().expect("fsck").fatal.is_none());
     assert!(store.fsck_graph().expect("graph").fatal.is_none());
+}
+
+/// 4 процесса читают/пишут/удаляют свои зоны одновременно; multi-кеш
+/// (страницы + узлы) включён, после прогона `fsck_lite`/`fsck_graph` чисты.
+#[test]
+fn four_processes_read_write_delete_with_shared_cache() {
+    const ZONES: u32 = 4;
+    const KEYS_COUNT: u32 = 50;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mp-rwd.v2");
+    let store = setup(&path, ZONES, config());
+    for zone in 1..=ZONES {
+        let mut writer = open_writer(&store, origin(zone), zone).expect("writer");
+        for index in 0..KEYS_COUNT {
+            writer
+                .upsert_rrset(&key(zone, index), 1, 0, &value_rr(1))
+                .expect("insert");
+        }
+        writer.commit().expect("commit");
+    }
+    drop(store);
+
+    let children: Vec<Child> = (1..=ZONES)
+        .map(|zone| {
+            spawn_child(
+                "read_write_delete",
+                &path,
+                &[
+                    (ZONE, zone.to_string()),
+                    (KEYS, KEYS_COUNT.to_string()),
+                    (ITERS, "8".to_string()),
+                ],
+            )
+        })
+        .collect();
+    for child in children {
+        assert_success(child);
+    }
+
+    let store = open_multi(&path).expect("reopen");
+    let catalog = ParallelZones::open(&store).expect("catalog");
+    let reader = store.reader().expect("reader");
+    for zone in 1..=ZONES {
+        let view = catalog.read(&reader, &origin(zone)).expect("view");
+        let value = view
+            .lookup(&key(zone, 0), 1, 0)
+            .expect("lookup")
+            .expect("record");
+        assert!(!value.rdata.is_empty(), "zone {zone}: потерян RRset");
+        let _ = view.records().expect("records");
+    }
+    assert!(store.fsck_lite().expect("fsck").fatal.is_none());
+    let graph = store.fsck_graph().expect("graph");
+    assert!(graph.fatal.is_none(), "{graph:?}");
+    assert!(graph.leaked_pages < graph.durable_pages / 2, "{graph:?}");
+}
+
+/// Читатель в другом процессе прогревает общий кеш старыми образами; writer
+/// освобождает и переиспользует номера страниц. Новый снапшот обязан вернуть
+/// новые значения: ключ кеша — `(page_no, generation)`, generation возрастает
+/// при освобождении/выдаче. `high_water` при этом не растёт неограниченно.
+#[test]
+fn reader_cache_in_other_process_does_not_serve_reused_pages() {
+    const KEYS_COUNT: u32 = 120;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mp-gen.v2");
+    let store = setup(&path, 1, config());
+    {
+        let mut writer = open_writer(&store, origin(1), 1).expect("writer");
+        for index in 0..KEYS_COUNT {
+            writer
+                .upsert_rrset(&key(1, index), 1, 0, &value_rr(1))
+                .expect("insert");
+        }
+        writer.commit().expect("commit");
+    }
+    let before_high_water = store.high_water();
+    drop(store);
+
+    let ready = dir.path().join("cache-reader-ready");
+    let go = dir.path().join("cache-reader-go");
+    let result = dir.path().join("cache-reader-result");
+    let reader = spawn_child(
+        "cache_reader",
+        &path,
+        &[
+            (ZONE, "1".to_string()),
+            (KEYS, KEYS_COUNT.to_string()),
+            (VALUE, "1".to_string()),
+            (VALUE2, "2".to_string()),
+            (READY, ready.display().to_string()),
+            (GO, go.display().to_string()),
+            (RESULT, result.display().to_string()),
+        ],
+    );
+    wait_ready(&ready);
+    assert_success(spawn_child(
+        "delete_reinsert",
+        &path,
+        &[
+            (ZONE, "1".to_string()),
+            (KEYS, KEYS_COUNT.to_string()),
+            (VALUE2, "2".to_string()),
+        ],
+    ));
+    std::fs::write(&go, b"go").expect("go signal");
+    assert_success(reader);
+
+    let report = std::fs::read_to_string(&result).expect("reader result");
+    assert!(report.starts_with("ok,"), "reader result: {report:?}");
+    let store = open_multi(&path).expect("reopen");
+    let after_high_water = store.high_water();
+    assert!(
+        after_high_water <= before_high_water.saturating_add(u64::from(KEYS_COUNT) * 16 + 2048),
+        "страницы не переиспользованы: high_water {before_high_water} → {after_high_water}"
+    );
+    assert!(store.fsck_lite().expect("fsck").fatal.is_none());
+    let graph = store.fsck_graph().expect("graph");
+    assert!(graph.fatal.is_none(), "{graph:?}");
+}
+
+/// Выдача и перезапись страницы в multi инкрементируют общую генерацию;
+/// таблица генераций живёт в sidecar и не меняет формат данных.
+#[test]
+fn page_generation_advances_on_alloc_and_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mp-generation.v2");
+    let store = open_multi_after_create(&path);
+    let ticket = store.reserve_pages(4).expect("reserve");
+    let page = ticket.first_page;
+    let allocated = store.page_generation(page);
+    assert!(allocated > 0, "генерация не выставлена при выдаче");
+    for page in ticket.first_page..=ticket.last_page() {
+        assert!(store.page_generation(page) > 0);
+    }
+    store.write_raw_page(page, b"first").expect("write");
+    let written = store.page_generation(page);
+    assert!(written > allocated, "генерация не выросла после записи");
+    store.write_raw_page(page, b"second").expect("rewrite");
+    assert!(
+        store.page_generation(page) > written,
+        "генерация не выросла после перезаписи"
+    );
+    assert!(
+        store.page_generation_bytes() >= 4 * usize::try_from(ticket.pages).unwrap_or(1),
+        "таблица генераций пуста"
+    );
+    // Single-process: учёта нет, ключ кеша остаётся generation = 0.
+    let single_path = dir.path().join("single-generation.v2");
+    let single =
+        ParallelStore::create(&single_path, StoreConfig::small(4, 1 << 12)).expect("create single");
+    let single_page = single.reserve_pages(1).expect("reserve single").first_page;
+    assert_eq!(single.page_generation(single_page), 0);
+    assert_eq!(single.page_generation_bytes(), 0);
+}
+
+/// `kill -9` писателя при включённом multi-кеше: lease/reader очищаются,
+/// читатель другого процесса открывает файл, кеш работает, `fsck` чист.
+#[test]
+fn kill9_writer_with_shared_cache_reopens_and_reads() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mp-kill-cache.v2");
+    let store = setup(&path, 1, config());
+    {
+        let mut writer = open_writer(&store, origin(1), 1).expect("writer");
+        for index in 0..32 {
+            writer
+                .upsert_rrset(&key(1, index), 1, 0, &value_rr(1))
+                .expect("insert");
+        }
+        writer.commit().expect("commit");
+    }
+    drop(store);
+    let mut victim = spawn_child("kill_writer", &path, &[(ZONE, "1".to_string())]);
+    std::thread::sleep(Duration::from_millis(400));
+    victim.kill().expect("kill writer");
+    let _ = victim.wait();
+
+    let store = open_multi_read(&path).expect("reopen read-only");
+    let catalog = ParallelZones::open(&store).expect("catalog");
+    let reader = store.reader().expect("reader");
+    for _ in 0..3 {
+        let view = catalog.read(&reader, &origin(1)).expect("view");
+        assert!(view.lookup(&key(1, 0), 1, 0).expect("lookup").is_some());
+        let _ = view.records().expect("records");
+    }
+    assert!(
+        store.page_cache_stats().hits > 0,
+        "multi read cache did not hit"
+    );
+    assert!(store.node_cache_stats().hits > 0, "node cache did not hit");
+    drop(reader);
+    drop(catalog);
+    drop(store);
+
+    let store = open_multi(&path).expect("reopen writer");
+    assert!(store.fsck_lite().expect("fsck").fatal.is_none());
+    assert!(store.fsck_graph().expect("graph").fatal.is_none());
+}
+
+fn open_multi_after_create(path: &Path) -> ParallelStore {
+    let cfg = StoreConfig {
+        multi_process: true,
+        sync_mode: SyncModeV2::Memory,
+        ..StoreConfig::small(32, 1 << 14)
+    };
+    drop(ParallelStore::create(path, cfg).expect("create"));
+    open_multi(path).expect("open multi")
 }
 
 fn fsck_multi(path: &Path) -> FsckLiteReport {

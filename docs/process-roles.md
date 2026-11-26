@@ -61,8 +61,9 @@ CLI-эквиваленты: `--role dns|api|all`, `--dns-workers N`, `--api-work
 * Рекламация страниц в multi идёт под lease зоны с гейтом
   `drop_txn < min(D_z, MP всех процессов, freeze)`; `fsck --repair` и возврат
   `[DP, cursor)` после `kill -9` — только в quiescent-окне.
-* В multi отключён page/node-кеш (общей генерации страницы нет):
-  single-process путь не затронут.
+* Page/node-кеш в multi включён: ключ содержит общую генерацию страницы из
+  sidecar (`COORD_VERSION = 3`, ADR 0007 §7.4); single-process путь не
+  изменился (генерация всегда 0).
 * `dns_workers` задаёт число UDP/DNSCrypt worker'ов. `api_workers` — лимит
   одновременных REST-соединений (на соединение — один поток),
   `api_rate_limit_per_sec` — token bucket на токен (по умолчанию 100).

@@ -457,6 +457,13 @@ fn reader_loop(
                     return;
                 }
             },
+            // `ReaderContended` — документированный retryable-исход гонки с
+            // публикацией (пин не успел за 8 попыток); под нагрузкой он
+            // ожидаем и не является ошибкой читателя.
+            Err(ParallelError::ReaderContended) => {
+                thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
             Err(error) => {
                 eprintln!("reader view: {error:?}");
                 failed.store(true, Ordering::Release);

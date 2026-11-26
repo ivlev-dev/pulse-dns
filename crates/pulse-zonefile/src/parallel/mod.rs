@@ -7,14 +7,17 @@
 //! recovery и `fsck`-lite). Фаза B1: B+tree поверх стора (`pageio`), per-zone
 //! writer/commit (`zone`), каталог зон в слоте 0 и read snapshots.
 //!
-//! Фаза B2a: [`PageCacheV2`] (валидация страницы один раз на `(page_no, txn)`,
-//! zero-copy warm lookup) и рекламация — per-zone bucket'ы с `drop_txn`,
-//! `free_head` в `RootEntry`, `is_reclaimable`, chain-GC, освобождение
-//! overflow/tombstone и donation.
+//! Фаза B2a: [`PageCacheV2`] (валидация страницы один раз на
+//! `(page_no, generation)`, zero-copy warm lookup; в multi генерация общая из
+//! sidecar) и рекламация — per-zone bucket'ы с `drop_txn`, `free_head` в
+//! `RootEntry`, `is_reclaimable`, chain-GC, освобождение overflow/tombstone и
+//! donation.
 //!
 //! Фаза B2b: group commit ([`GroupCommitter`], [`ParallelStore::commit_group`]):
 //! батчинг зон, ровно два `fdatasync` на группу, backpressure и ack после
-//! публикации; `Flush`/`Memory` и липкий `Sync`; tombstone-GC каталога
+//! публикации; в multi-режиме та же пара `fdatasync` делится **между
+//! процессами** через общую очередь sidecar (`§7.5`, [`SharedGroupStats`]);
+//! `Flush`/`Memory` и липкий `Sync`; tombstone-GC каталога
 //! ([`ParallelZones::gc_catalog`]); sweep утечек ([`ParallelStore::leak_report`],
 //! [`ParallelStore::repair_leaks`], [`fsck_repair`]). M3 (ADR 0007):
 //! `multi_process` — общий sidecar-координатор (`coord`), per-zone
@@ -70,6 +73,7 @@ pub mod verify;
 pub mod zone;
 
 pub use alloc::{AllocHandle, AllocTicket, Allocator};
+pub use coord::SharedGroupStats;
 pub use error::{CopySource, FatalKind, ParallelError, V2CorruptKind};
 pub use freepool::is_reclaimable;
 pub use geometry::{Geometry, ZoneSlot};

@@ -23,6 +23,7 @@ v1-модули, их публичный API и поведение не изме
 | §5.6/§6.5 tombstone-GC | `delete_zone` пишет tombstone; `ParallelZones::gc_catalog` удаляет каталог-запись **после** durable `deleted_txn`, после чего `zone_seq` переиспользуется `create_zone` (origin можно создать заново). Крах на любой стадии не оставляет каталог-запись на удалённую зону. |
 | §6.5/R4 утечки | `ParallelStore::leak_report` (leaked `[data_first, DP)`, aborted `[DP, cursor)`, `MAX_LEAK_RATIO = 1 %`); `repair_leaks` возвращает утёкшие страницы durable-free в bucket каталога, проверяет дизъюнктность и идемпотентность; `fsck_repair(path)` — offline `LOCK_EX`. Пересечение множеств (`PageOverlap`) — отказ, не «починка». |
 | §7.3 метрики | `StoreStats::{group_commits, group_members, group_fsyncs, group_max_members, group_aborted, aborted_pages_estimate}`, `GroupStats`, `LeakReport::{leaked_pages, ratio, max_ratio, exceeds_max_ratio}`. |
+| §7.1/§7.5 межпроцессная группа (M3) | Очередь клиентов в sidecar (v4): писатель кладёт 64-Б `RootEntry` в свой слот, координатор (любой процесс, взявший `fcntl`-lease `COMMIT`) собирает пачку ≤256 зон за `SHARED_SETTLE = 1 мс`, пишет `ALLOC_RECORD` + один `fdatasync`, затем все копии корней + второй `fdatasync`, публикует `D_z`/`published` и подтверждает слоты (CAS `READY→DONE` + futex wake). `ParallelStore::shared_group_stats()` — `groups/fsyncs/members/max_members` по всей очереди; `shared_leader()` — `(term, pid, starttime)`. |
 
 ### B2b API
 
@@ -130,7 +131,7 @@ writer.commit()?;                       // одна публикация; ста
 
 | Раздел спеки | Реализация |
 |---|---|
-| §5.7/§8.1 `PageCache` | `PageCacheV2` (лимит `page_cache_entries`, 16 шардов × 4 way, метка recency при вставке): страница валидируется один раз на `page_no` (CRC, `owner_zone`, `page.txn ≤ snapshot.version`, структура) и отдаётся `Arc<[u8]>`; warm lookup — без syscall/CRC/аллокаций. Второй уровень — v1 `PageCache` узлов (`store.node_cache()`), поэтому `ZoneReader::lookup/lookup_ref` не декодирует страницу повторно: кеш хранит только метаданные (`NodeMeta` с точными `Box<[T]>`, без фиксированных массивов на 1024 item'а) и байтово-сравнимые 16-Б префиксы ключей. Роли разделены: `PageCacheV2` — образы страниц, `PageCache` — разобранные узлы; hit не пишет в разделяемые атомики. Метрики: `store.page_cache_stats()`, `store.node_cache_stats()`, `store.cache_memory_bytes()`, `PageCache::evictions()`, `StoreStats::{page_cache_hits, page_cache_misses}` |
+| §5.7/§8.1 `PageCache` | `PageCacheV2` (лимит `page_cache_entries`, 16 шардов × 4 way, метка recency при вставке): страница валидируется один раз на `(page_no, generation)` (CRC, `owner_zone`, `page.txn ≤ snapshot.version`, структура) и отдаётся `Arc<[u8]>`; warm lookup — без syscall/CRC/аллокаций. В multi `generation` читается из sidecar (`page_gen`, ADR 0007 §7.4) и возрастает при выдаче/освобождении/записи; в single — всегда 0. Второй уровень — v1 `PageCache` узлов (`store.node_cache()`), ключ в multi `(page_no, generation, snapshot_version)`, поэтому `ZoneReader::lookup/lookup_ref` не декодирует страницу повторно: кеш хранит только метаданные (`NodeMeta` с точными `Box<[T]>`, без фиксированных массивов на 1024 item'а) и байтово-сравнимые 16-Б префиксы ключей. Роли разделены: `PageCacheV2` — образы страниц, `PageCache` — разобранные узлы; hit не пишет в разделяемые атомики. Метрики: `store.page_cache_stats()`, `store.node_cache_stats()`, `store.cache_memory_bytes()`, `store.page_generation_bytes()`, `PageCache::evictions()`, `StoreStats::{page_cache_hits, page_cache_misses}` |
 | §6.1 bucket | `PAGE_TYPE_FREELIST = 5`: `next_bucket`, `owner_zone`, `drop_txn`, `count`, `flags`, `page_ids[]` (1008 @ 4096); цепочка отсортирована по `drop_txn`, COW-пересборка в коммите; `RootEntry.free_head` |
 | §6.2 `is_reclaimable` | `parallel::is_reclaimable(drop_txn, D_z, RV_z, current_version)`; `RV_z = min(D_z−1, MP, freeze)`; выдача только после durable `D_z > drop_txn` |
 | §6.3 порядок | bucket `dropped(V)` + старые bucket-образы пишутся в фазе 1; `free_head` — в `RootEntry V`; коммит фиксирует пул в памяти только после fsync фазы 2 (retry `ReaderContended` не удваивает `dropped(V)`) |
@@ -373,8 +374,13 @@ let _snap = store.zone_snapshot(&reader, 1)?; // seqlock + пин
 - В multi рекламация durable-пулов идёт под lease зоны с гейтом
   `drop_txn < min(D_z, MP всех процессов, freeze)`; append-only + COW-компакция.
   Каталог могут менять все процессы (catalog lease + commit-lock), readers
-  обновляются `refresh()`. Page/node-кеш в multi отключён (M3-L10);
+  обновляются `refresh()`. Page/node-кеш в multi включён: ключ содержит общую
+  генерацию страницы из sidecar (`COORD_VERSION = 4`, ADR 0007 §7.4); в v4
+  добавлена очередь group commit (`clients` + счётчики групп/fsync/лидера).
   `fsck --repair` и `[DP, cursor)` после `kill -9` — офлайн (M3-L11).
+  При единственном живом сторе (`alive_hint == 1`) коммит идёт прежним
+  локальным путём — single-process поведение и latency не меняются;
+  `PULSE_MP_DIRECT_COMMIT` принудительно включает старый путь для бенчей.
 - `publish_root` (низкоуровневый API фазы A) всегда выполняет два `fdatasync`;
   группировка — `commit_group`/`GroupCommitter` (B2b).
 - `publish_root` принимает `version` от вызывающего и проверяет монотонность

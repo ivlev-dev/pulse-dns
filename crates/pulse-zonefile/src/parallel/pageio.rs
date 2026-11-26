@@ -46,8 +46,13 @@ pub const V2_PAGE_BYTES: u32 = PAGE_SIZE_V2;
 /// арене; overflow уходит в хеш-карту для широких/глубоких обходов.
 const INLINE_PAGE_SLOTS: usize = 16;
 
-/// Слоты inline-арены: `(page_no, образ)`.
-type InlinePages = [Option<(u32, Arc<[u8]>)>; INLINE_PAGE_SLOTS];
+/// Сколько раз чтение повторяется, если генерация страницы сменилась во время
+/// `pread` (страницу освободили и выдали другому процессу). На практике пин
+/// снапшота исключает это для достижимых страниц.
+const GENERATION_RETRIES: u32 = 8;
+
+/// Слоты inline-арены: `(page_no, generation, образ)`.
+type InlinePages = [Option<(u32, u32, Arc<[u8]>)>; INLINE_PAGE_SLOTS];
 
 /// Арена прочитанных страниц: append-only, слоты не переиспользуются.
 ///
@@ -86,9 +91,18 @@ impl Hasher for PageHasher {
     fn write_u32(&mut self, value: u32) {
         self.0 = u64::from(value);
     }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
 }
 
-type PageMap = HashMap<u32, Arc<[u8]>, BuildHasherDefault<PageHasher>>;
+/// Ключ арены: `(generation, page_no)`.
+const fn page_key(page: u32, generation: u32) -> u64 {
+    (generation as u64) << 32 | page as u64
+}
+
+type PageMap = HashMap<u64, Arc<[u8]>, BuildHasherDefault<PageHasher>>;
 
 #[allow(unsafe_code)]
 fn page_parts(buffer: &Arc<[u8]>) -> (*const u8, usize) {
@@ -104,14 +118,16 @@ unsafe fn slice_at(pointer: *const u8, length: usize) -> &'static [u8] {
 
 impl PageArena {
     #[allow(unsafe_code)]
-    fn lookup(&self, page: u32) -> Option<&[u8]> {
+    fn lookup(&self, page: u32, generation: u32) -> Option<&[u8]> {
         {
             let inline = self.inline.borrow();
             if let Some(buffer) = inline
                 .iter()
                 .flatten()
-                .find(|(candidate, _)| *candidate == page)
-                .map(|(_, buffer)| buffer)
+                .find(|(candidate, candidate_gen, _)| {
+                    *candidate == page && *candidate_gen == generation
+                })
+                .map(|(_, _, buffer)| buffer)
             {
                 let (pointer, length) = page_parts(buffer);
                 drop(inline);
@@ -120,7 +136,7 @@ impl PageArena {
             }
         }
         let pages = self.overflow.borrow();
-        let buffer = pages.get(&page)?;
+        let buffer = pages.get(&page_key(page, generation))?;
         let (pointer, length) = page_parts(buffer);
         drop(pages);
         // SAFETY: см. выше; overflow очищается только через `&mut self`.
@@ -128,12 +144,13 @@ impl PageArena {
     }
 
     #[allow(unsafe_code)]
-    fn store(&self, page: u32, buffer: Arc<[u8]>) -> &[u8] {
+    fn store(&self, page: u32, generation: u32, buffer: Arc<[u8]>) -> &[u8] {
         {
             let mut inline = self.inline.borrow_mut();
             for slot in inline.iter() {
-                if let Some((candidate, existing)) = slot
+                if let Some((candidate, candidate_gen, existing)) = slot
                     && *candidate == page
+                    && *candidate_gen == generation
                 {
                     let (pointer, length) = page_parts(existing);
                     drop(inline);
@@ -144,7 +161,7 @@ impl PageArena {
             for slot in inline.iter_mut() {
                 if slot.is_none() {
                     let (pointer, length) = page_parts(&buffer);
-                    *slot = Some((page, buffer));
+                    *slot = Some((page, generation, buffer));
                     drop(inline);
                     // SAFETY: данные `Arc<[u8]>` не перемещаются; клон не нужен,
                     // потому что владение перешло в арену.
@@ -155,7 +172,7 @@ impl PageArena {
         let mut pages = self.overflow.borrow_mut();
         // Повторная вставка не подменяет образ: на него могут ссылаться
         // выданные ранее срезы.
-        let stored = pages.entry(page).or_insert(buffer);
+        let stored = pages.entry(page_key(page, generation)).or_insert(buffer);
         let (pointer, length) = page_parts(stored);
         drop(pages);
         // SAFETY: см. `lookup`; overflow очищается только через `&mut self`.
@@ -268,52 +285,66 @@ impl<'a> ReaderIo<'a> {
     }
 
     fn read(&self, page_no: u32) -> Result<&[u8], ZoneFileError> {
-        if let Some(page) = self.arena.lookup(page_no) {
-            return Ok(page);
-        }
-        if let Some(cache) = self.cache
-            && let Some(data) = cache.get(page_no, self.zone)
-        {
-            let Some(txn) = wire::read_u64(&data, PAGE_OFF_TXN) else {
-                return Err(self.stash(
+        for _attempt in 0..GENERATION_RETRIES {
+            let generation = self.store.page_generation(page_no);
+            if let Some(page) = self.arena.lookup(page_no, generation) {
+                return Ok(page);
+            }
+            if let Some(cache) = self.cache
+                && let Some(data) = cache.get(page_no, generation, self.zone)
+            {
+                let Some(txn) = wire::read_u64(&data, PAGE_OFF_TXN) else {
+                    return Err(self.stash(
+                        page_no,
+                        ParallelError::Corrupt {
+                            kind: V2CorruptKind::Bounds,
+                            page: Some(page_no),
+                        },
+                    ));
+                };
+                if txn > self.version {
+                    return Err(self.stash(
+                        page_no,
+                        ParallelError::Corrupt {
+                            kind: V2CorruptKind::PageTxn,
+                            page: Some(page_no),
+                        },
+                    ));
+                }
+                // Между lookup и возвратом страницу могли освободить и выдать
+                // заново: образ под старой генерацией невалиден.
+                if self.store.page_generation(page_no) == generation {
+                    return Ok(self.arena.store(page_no, generation, data));
+                }
+                continue;
+            }
+            let mut buffer = vec![0_u8; V2_PAGE_BYTES as usize];
+            self.store
+                .read_page_into(page_no, &mut buffer)
+                .map_err(|error| self.stash(page_no, error))?;
+            let txn = wire::read_u64(&buffer, PAGE_OFF_TXN).ok_or_else(|| {
+                self.stash(
                     page_no,
                     ParallelError::Corrupt {
                         kind: V2CorruptKind::Bounds,
                         page: Some(page_no),
                     },
-                ));
-            };
-            if txn > self.version {
-                return Err(self.stash(
-                    page_no,
-                    ParallelError::Corrupt {
-                        kind: V2CorruptKind::PageTxn,
-                        page: Some(page_no),
-                    },
-                ));
+                )
+            })?;
+            prepare_page(&mut buffer, page_no, self.version, self.zone)
+                .map_err(|error| self.stash(page_no, error))?;
+            // Поколение проверяется после чтения: `pread` мог пересечься с
+            // переиспользованием. Тогда образ отбрасывается и читается заново.
+            if self.store.page_generation(page_no) != generation {
+                continue;
             }
-            return Ok(self.arena.store(page_no, data));
+            let data: Arc<[u8]> = buffer.into_boxed_slice().into();
+            if let Some(cache) = self.cache {
+                cache.insert(page_no, txn, generation, self.zone, Arc::clone(&data));
+            }
+            return Ok(self.arena.store(page_no, generation, data));
         }
-        let mut buffer = vec![0_u8; V2_PAGE_BYTES as usize];
-        self.store
-            .read_page_into(page_no, &mut buffer)
-            .map_err(|error| self.stash(page_no, error))?;
-        let txn = wire::read_u64(&buffer, PAGE_OFF_TXN).ok_or_else(|| {
-            self.stash(
-                page_no,
-                ParallelError::Corrupt {
-                    kind: V2CorruptKind::Bounds,
-                    page: Some(page_no),
-                },
-            )
-        })?;
-        prepare_page(&mut buffer, page_no, self.version, self.zone)
-            .map_err(|error| self.stash(page_no, error))?;
-        let data: Arc<[u8]> = buffer.into_boxed_slice().into();
-        if let Some(cache) = self.cache {
-            cache.insert(page_no, txn, self.zone, Arc::clone(&data));
-        }
-        Ok(self.arena.store(page_no, data))
+        Err(self.stash(page_no, ParallelError::ReaderContended))
     }
 }
 
@@ -344,6 +375,10 @@ impl PageIo for ReaderIo<'_> {
 
     fn free_page(&mut self, _page_no: u32) -> Result<(), ZoneFileError> {
         Ok(())
+    }
+
+    fn page_generation(&self, page_no: u32) -> u32 {
+        self.store.page_generation(page_no)
     }
 }
 
@@ -466,59 +501,69 @@ impl<'a> WriteIo<'a> {
     }
 
     fn read(&self, page_no: u32) -> Result<&[u8], ZoneFileError> {
-        if let Some(page) = self.arena.lookup(page_no) {
-            return Ok(page);
-        }
-        let dirty = self.dirty.borrow().get(&page_no).map(|page| page.to_vec());
-        if let Some(mut buffer) = dirty {
-            prepare_page(&mut buffer, page_no, self.version.get(), self.zone)
+        for _attempt in 0..GENERATION_RETRIES {
+            let generation = self.store.page_generation(page_no);
+            if let Some(page) = self.arena.lookup(page_no, generation) {
+                return Ok(page);
+            }
+            let dirty = self.dirty.borrow().get(&page_no).map(|page| page.to_vec());
+            if let Some(mut buffer) = dirty {
+                prepare_page(&mut buffer, page_no, self.version.get(), self.zone)
+                    .map_err(|error| self.stash(page_no, error))?;
+                let data: Arc<[u8]> = buffer.into_boxed_slice().into();
+                return Ok(self.arena.store(page_no, generation, data));
+            }
+            if let Some(cache) = self.store.raw_page_cache()
+                && let Some(data) = cache.get(page_no, generation, self.zone)
+            {
+                let Some(txn) = wire::read_u64(&data, PAGE_OFF_TXN) else {
+                    return Err(self.stash(
+                        page_no,
+                        ParallelError::Corrupt {
+                            kind: V2CorruptKind::Bounds,
+                            page: Some(page_no),
+                        },
+                    ));
+                };
+                if txn > self.version.get() {
+                    return Err(self.stash(
+                        page_no,
+                        ParallelError::Corrupt {
+                            kind: V2CorruptKind::PageTxn,
+                            page: Some(page_no),
+                        },
+                    ));
+                }
+                if self.store.page_generation(page_no) == generation {
+                    return Ok(self.arena.store(page_no, generation, data));
+                }
+                continue;
+            }
+            let mut buffer = vec![0_u8; V2_PAGE_BYTES as usize];
+            self.store
+                .read_page_into(page_no, &mut buffer)
                 .map_err(|error| self.stash(page_no, error))?;
-            let data: Arc<[u8]> = buffer.into_boxed_slice().into();
-            return Ok(self.arena.store(page_no, data));
-        }
-        if let Some(cache) = self.store.raw_page_cache()
-            && let Some(data) = cache.get(page_no, self.zone)
-        {
-            let Some(txn) = wire::read_u64(&data, PAGE_OFF_TXN) else {
-                return Err(self.stash(
+            let txn = wire::read_u64(&buffer, PAGE_OFF_TXN).ok_or_else(|| {
+                self.stash(
                     page_no,
                     ParallelError::Corrupt {
                         kind: V2CorruptKind::Bounds,
                         page: Some(page_no),
                     },
-                ));
-            };
-            if txn > self.version.get() {
-                return Err(self.stash(
-                    page_no,
-                    ParallelError::Corrupt {
-                        kind: V2CorruptKind::PageTxn,
-                        page: Some(page_no),
-                    },
-                ));
+                )
+            })?;
+            prepare_page(&mut buffer, page_no, self.version.get(), self.zone)
+                .map_err(|error| self.stash(page_no, error))?;
+            if self.store.page_generation(page_no) != generation {
+                continue;
             }
-            return Ok(self.arena.store(page_no, data));
+            let data: Arc<[u8]> = buffer.into_boxed_slice().into();
+            if let Some(cache) = self.store.raw_page_cache() {
+                cache.insert(page_no, txn, generation, self.zone, Arc::clone(&data));
+            }
+            return Ok(self.arena.store(page_no, generation, data));
         }
-        let mut buffer = vec![0_u8; V2_PAGE_BYTES as usize];
-        self.store
-            .read_page_into(page_no, &mut buffer)
-            .map_err(|error| self.stash(page_no, error))?;
-        let txn = wire::read_u64(&buffer, PAGE_OFF_TXN).ok_or_else(|| {
-            self.stash(
-                page_no,
-                ParallelError::Corrupt {
-                    kind: V2CorruptKind::Bounds,
-                    page: Some(page_no),
-                },
-            )
-        })?;
-        prepare_page(&mut buffer, page_no, self.version.get(), self.zone)
-            .map_err(|error| self.stash(page_no, error))?;
-        let data: Arc<[u8]> = buffer.into_boxed_slice().into();
-        if let Some(cache) = self.store.raw_page_cache() {
-            cache.insert(page_no, txn, self.zone, Arc::clone(&data));
-        }
-        Ok(self.arena.store(page_no, data))
+        Err(self.stash(page_no, ParallelError::ReaderContended))
     }
 }
 
@@ -587,6 +632,13 @@ impl PageIo for WriteIo<'_> {
                 InvariantId::DuplicatePage,
             ));
         }
+        // Освобождение меняет жизненный цикл номера: читатель другого
+        // процесса должен увидеть промах по генерации, а не старый образ.
+        self.store.bump_page_generation(page_no);
         Ok(())
+    }
+
+    fn page_generation(&self, page_no: u32) -> u32 {
+        self.store.page_generation(page_no)
     }
 }

@@ -63,10 +63,14 @@ pub(crate) const COORD_MAGIC: [u8; 8] = *b"PULSCD01";
 /// Версия раскладки sidecar.
 ///
 /// v2 добавила очередь свободных `zone_seq` (`free_seqs`), которой
-/// пользуется каталог при повторном создании зон (ADR 0007 §7.1). Это не
-/// формат данных: sidecar пересоздаётся при старте, а live-процессы старой
-/// версии получают `Busy`, а не читают чужую раскладку.
-pub(crate) const COORD_VERSION: u16 = 2;
+/// пользуется каталог при повторном создании зон (ADR 0007 §7.1). v3 добавила
+/// общую таблицу `page_no → generation` (`page_gen`), по которой
+/// `PageCacheV2`/node-cache инвалидируют переиспользованную страницу (ADR 0007
+/// §7.4). v4 добавила межпроцессную очередь group commit: слоты клиентов с
+/// готовыми `RootEntry`, счётчики групп/`fsync` и lease координирующего
+/// процесса. Это не формат данных: sidecar пересоздаётся при старте, а
+/// live-процессы старой версии получают `Busy`, а не читают чужую раскладку.
+pub(crate) const COORD_VERSION: u16 = 4;
 /// Суффикс sidecar-файла.
 pub(crate) const COORD_FILE_SUFFIX: &str = ".pulsecoord";
 
@@ -91,7 +95,63 @@ const SC_OFF_ALIVE_HINT: usize = PAGE + 384;
 const SC_OFF_FREE_ZONE_HEAD: usize = PAGE + 448;
 const SC_OFF_FREE_ZONE_TAIL: usize = PAGE + 512;
 const SC_OFF_FREE_ZONE_READY: usize = PAGE + 576;
+/// Счётчик постановок в общую очередь group commit (futex-слово лидера).
+const SC_OFF_PENDING_SEQ: usize = PAGE + 640;
+/// Выполненные межпроцессные группы.
+const SC_OFF_GROUPS: usize = PAGE + 704;
+/// `fdatasync` межпроцессных групп.
+const SC_OFF_FSYNCS: usize = PAGE + 768;
+/// Зона-коммиты межпроцессных групп.
+const SC_OFF_GROUP_MEMBERS: usize = PAGE + 832;
+/// Максимальный размер межпроцессной группы.
+const SC_OFF_GROUP_MAX: usize = PAGE + 896;
+/// Fencing-терм/идентичность координирующего процесса.
+const SC_OFF_LEADER_TERM: usize = PAGE + 960;
+const SC_OFF_LEADER_PID: usize = PAGE + 1024;
+const SC_OFF_LEADER_STARTTIME: usize = PAGE + 1088;
+/// Сколько групп отработал текущий лидер (диагностика/тесты).
+const SC_OFF_LEADER_GROUPS: usize = PAGE + 1152;
 const ARRAYS_OFF: usize = 2 * PAGE;
+
+/// Слотов клиентов общей очереди group commit.
+pub(crate) const CLIENT_SLOTS: usize = 256;
+/// Максимум зон в одном запросе клиента (локальная группа больше — чанками).
+pub(crate) const CLIENT_MAX_MEMBERS: usize = 32;
+/// Размер слота клиента: заголовок 64 Б + члены 32×96 Б + результаты 32×16 Б.
+pub(crate) const CLIENT_SLOT_SIZE: usize = 64 + CLIENT_MAX_MEMBERS * 96 + CLIENT_MAX_MEMBERS * 16;
+
+/// `state = (ticket << 8) | phase`; CAS перехода `READY → DONE` — точка
+/// линейности ack (старый координатор не может «подтвердить» новый запрос).
+const CLIENT_OFF_STATE: usize = 0;
+const CLIENT_OFF_OWNER: usize = 8;
+const CLIENT_OFF_PID: usize = 16;
+const CLIENT_OFF_STARTTIME: usize = 24;
+const CLIENT_OFF_TICKET: usize = 32;
+const CLIENT_OFF_NMEMBERS: usize = 40;
+const CLIENT_OFF_MODE: usize = 44;
+const CLIENT_OFF_PAGE_LIMIT: usize = 48;
+
+const MEMBER_OFF_ZONE: usize = 0;
+/// Страница chain-вытеснения (`0` — нет).
+const MEMBER_OFF_CHAIN_PAGE: usize = 4;
+const MEMBER_OFF_VERSION: usize = 8;
+const MEMBER_OFF_BASE_VERSION: usize = 16;
+const MEMBER_OFF_FENCE: usize = 24;
+const MEMBER_OFF_RECORD: usize = 32;
+const MEMBER_SIZE: usize = 96;
+
+const RESULT_OFF_CODE: usize = 0;
+const RESULT_OFF_PREV: usize = 4;
+const RESULT_OFF_EVICTED: usize = 8;
+const RESULT_SIZE: usize = 16;
+
+const CLIENT_PHASE_IDLE: u64 = 0;
+const CLIENT_PHASE_READY: u64 = 1;
+const CLIENT_PHASE_DONE: u64 = 2;
+const CLIENT_TICKET_SHIFT: u32 = 8;
+
+/// Размер элемента таблицы генераций страниц (u32).
+const PAGE_GEN_SIZE: usize = 4;
 
 /// Размер слота lease: `generation | state | pid | starttime`.
 const LEASE_SLOT_SIZE: usize = 32;
@@ -155,6 +215,100 @@ pub(crate) struct ProcessIdentity {
     pub pid: u64,
     /// Время старта процесса (`/proc/<pid>/stat`, поле 22), в тиках.
     pub starttime: u64,
+}
+
+/// Участник межпроцессной группы: готовый `RootEntry` и его координаты.
+///
+/// Данные/bucket/chain к моменту публикации уже записаны процессом-писателем;
+/// координатору остаётся `ALLOC_RECORD` + копии корня + два `fdatasync`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SharedRequestMember {
+    /// Зона (`0` — каталог).
+    pub zone: u32,
+    /// Итоговая версия (`RootEntry.version`).
+    pub version: u64,
+    /// Версия головы на момент плана (защита от устаревшего плана).
+    pub base_version: u64,
+    /// Поколение lease на момент плана (`0` — без проверки владельца).
+    pub fence: u64,
+    /// Страница chain-вытеснения (`0` — вытеснения нет).
+    pub chain_page: u32,
+    /// 64-байтовая запись корня (CRC уже посчитан).
+    pub record: [u8; 64],
+}
+
+/// Код результата зоны в ack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedAckCode {
+    /// Публикация durable.
+    Ok,
+    /// Гонка с пином: план устарел (retryable).
+    ReaderContended,
+    /// План устарел/зона под чужим lease.
+    ZoneBusy,
+    /// Ошибка ввода-вывода: исход группы не определён.
+    Io,
+}
+
+impl SharedAckCode {
+    const fn to_disk(self) -> u32 {
+        match self {
+            Self::Ok => 0,
+            Self::ReaderContended => 1,
+            Self::ZoneBusy => 2,
+            Self::Io => 3,
+        }
+    }
+
+    const fn from_disk(value: u32) -> Self {
+        match value {
+            0 => Self::Ok,
+            1 => Self::ReaderContended,
+            2 => Self::ZoneBusy,
+            _ => Self::Io,
+        }
+    }
+}
+
+/// Результат одной зоны из ack координатора.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SharedMemberResult {
+    /// Код.
+    pub code: SharedAckCode,
+    /// `prev_record` опубликованной записи.
+    pub prev_record: u32,
+    /// Вытесненная в chain страница (0 — нет).
+    pub evicted_page: u32,
+}
+
+/// Готовый к обработке запрос клиента (снимок для координатора).
+#[derive(Debug, Clone)]
+pub(crate) struct SharedReadyBatch {
+    /// Слот клиента.
+    pub slot: usize,
+    /// Билет запроса (ack обязан вернуть его же).
+    pub ticket: u64,
+    /// Токен владельца слота (защита от переиспользования).
+    pub owner: u64,
+    /// Идентичность владельца.
+    pub identity: ProcessIdentity,
+    /// Режим durability запроса.
+    pub mode: crate::parallel::layout::SyncModeV2,
+    /// Члены запроса.
+    pub members: Vec<SharedRequestMember>,
+}
+
+/// Снимок счётчиков межпроцессного group commit (из sidecar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SharedGroupStats {
+    /// Выполненных групп.
+    pub groups: u64,
+    /// `fdatasync` групп.
+    pub fsyncs: u64,
+    /// Зона-коммитов в группах.
+    pub members: u64,
+    /// Максимальный размер группы.
+    pub max_members: u64,
 }
 
 /// Идентичность текущего процесса (кэшируется: `/proc/self/stat` стабилен).
@@ -253,6 +407,15 @@ pub(crate) struct SharedCoord {
     readers_off: usize,
     /// Массив переиспользуемых `zone_seq` (`max_zones` × `u32`).
     free_seqs_off: usize,
+    /// Таблица `(page_no − page_data_first) → generation` (`u32`).
+    page_gen_off: usize,
+    page_gen_count: usize,
+    /// Слоты общей очереди group commit (`CLIENT_SLOTS × CLIENT_SLOT_SIZE`).
+    clients_off: usize,
+    /// Слот этого процесса в очереди (только writable-стор).
+    client: Option<usize>,
+    page_data_first: u32,
+    page_count_max: u32,
     /// Держим `LOCK_SH` на `LOCK_OFF_ALIVE` всё время жизни.
     alive_lock: Option<RangeLock>,
 }
@@ -289,6 +452,7 @@ impl SharedCoord {
         geometry: Geometry,
         instance_uuid: [u8; 16],
         init: &CoordInit,
+        writable: bool,
     ) -> Result<Arc<Self>, ParallelError> {
         let coord_path = Self::path_for(path);
         let fd = match fs_open(
@@ -339,6 +503,12 @@ impl SharedCoord {
             durable_off: layout.durable_off,
             readers_off: layout.readers_off,
             free_seqs_off: layout.free_seqs_off,
+            page_gen_off: layout.page_gen_off,
+            page_gen_count: layout.page_gen_count,
+            clients_off: layout.clients_off,
+            client: None,
+            page_data_first: geometry.page_data_first(),
+            page_count_max: geometry.page_count_max(),
             alive_lock: None,
         };
 
@@ -362,7 +532,22 @@ impl SharedCoord {
             coord.alive_hint().fetch_add(1, Ordering::AcqRel);
             coord.raise_watermarks(init);
         }
+        if writable {
+            coord.client = coord.client_register(self_identity());
+        }
         Ok(Arc::new(coord))
+    }
+
+    /// Слот этого процесса в общей очереди group commit.
+    #[must_use]
+    pub(crate) const fn client_slot(&self) -> Option<usize> {
+        self.client
+    }
+
+    /// Есть ли у процесса слот очереди (иначе — локальный путь коммита).
+    #[must_use]
+    pub(crate) const fn has_client(&self) -> bool {
+        self.client.is_some()
     }
 
     /// Путь sidecar.
@@ -409,10 +594,19 @@ impl SharedCoord {
         self.atomic_u64(SC_OFF_GENERATION)
     }
 
-    /// Подсказка «сколько процессов держат `LOCk_SH`» (диагностика).
+    /// Подсказка «сколько процессов держат `LOCK_SH`» (диагностика).
     #[must_use]
     pub(crate) fn alive_hint(&self) -> &AtomicU64 {
         self.atomic_u64(SC_OFF_ALIVE_HINT)
+    }
+
+    /// Сколько открытых writable/read-only сторов держат sidecar.
+    ///
+    /// Используется как дешёвый гейт: при единственном процессе общая очередь
+    /// не нужна, и коммит идёт прежним локальным путём.
+    #[must_use]
+    pub(crate) fn alive_count(&self) -> u64 {
+        self.alive_hint().load(Ordering::Acquire)
     }
 
     // --- очередь переиспользуемых zone_seq (каталог, ADR 0007 §7.1) ---
@@ -486,6 +680,503 @@ impl SharedCoord {
         for index in 0..u64::from(self.max_zones) {
             self.free_zone_slot(index).store(0, Ordering::SeqCst);
         }
+    }
+
+    // --- генерации страниц (ADR 0007 §7.4) ---
+
+    fn page_gen_slot(&self, page: u32) -> Option<&AtomicU32> {
+        if page < self.page_data_first || page >= self.page_count_max {
+            return None;
+        }
+        let index = usize::try_from(page - self.page_data_first).ok()?;
+        if index >= self.page_gen_count {
+            return None;
+        }
+        Some(
+            self.atomic_u32(
+                self.page_gen_off
+                    .checked_add(index.checked_mul(PAGE_GEN_SIZE)?)?,
+            ),
+        )
+    }
+
+    /// Текущая генерация страницы (0 — страница ещё не выдавалась).
+    ///
+    /// Пара `(page_no, generation)` — ключ кеша: при переиспользовании номера
+    /// генерация возрастает, старый образ становится недостижим.
+    #[must_use]
+    pub(crate) fn page_generation(&self, page: u32) -> u32 {
+        self.page_gen_slot(page)
+            .map_or(0, |slot| slot.load(Ordering::Acquire))
+    }
+
+    /// Инкрементирует генерацию страницы (выдача/освобождение/перезапись).
+    ///
+    /// Монотонна до `u32::MAX`; на переполнении переходит в 1, а не в 0:
+    /// 0 зарезервирован за «страница ещё не выдавалась». Теоретическая
+    /// коллизия требует 2³² повторных переиспользований одной страницы и
+    /// поэтому не влияет на практическую корректность (документировано в
+    /// ADR 0007 §7.4).
+    pub(crate) fn bump_page_generation(&self, page: u32) -> u32 {
+        let Some(slot) = self.page_gen_slot(page) else {
+            return 0;
+        };
+        let mut current = slot.load(Ordering::Acquire);
+        loop {
+            let next = next_page_generation(current);
+            match slot.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return next,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Инкрементирует генерации диапазона `[first, first + pages)`.
+    pub(crate) fn bump_page_generations(&self, first: u32, pages: u32) {
+        let last = first.saturating_add(pages);
+        for page in first..last {
+            self.bump_page_generation(page);
+        }
+    }
+
+    /// Сколько байт sidecar занимает таблица генераций (memory budget).
+    #[must_use]
+    pub(crate) fn page_generation_bytes(&self) -> usize {
+        self.page_gen_count.saturating_mul(PAGE_GEN_SIZE)
+    }
+
+    fn reset_page_generations(&self) {
+        // SAFETY: `page_gen_off`/`page_gen_count` вычислены из геометрии и
+        // лежат в границах отображения. Сброс выполняется только при
+        // эксклюзивном `LOCK_OFF_ALIVE` (живых процессов нет), поэтому гонок
+        // с читателями/писателями нет. Область не пересекается с заголовком
+        // и другими массивами.
+        unsafe {
+            std::ptr::write_bytes(
+                self.map.as_ptr().add(self.page_gen_off).cast_mut(),
+                0,
+                self.page_gen_count.saturating_mul(PAGE_GEN_SIZE),
+            );
+        }
+    }
+
+    // --- общая очередь group commit (v4) ---
+
+    fn client_base(&self, slot: usize) -> usize {
+        self.clients_off + slot * CLIENT_SLOT_SIZE
+    }
+
+    fn client_word(&self, slot: usize, offset: usize) -> &AtomicU64 {
+        self.atomic_u64(self.client_base(slot) + offset)
+    }
+
+    fn client_u32(&self, slot: usize, offset: usize) -> &AtomicU32 {
+        self.atomic_u32(self.client_base(slot) + offset)
+    }
+
+    fn member_off(&self, slot: usize, index: usize) -> usize {
+        self.client_base(slot) + 64 + index * MEMBER_SIZE
+    }
+
+    fn result_off(&self, slot: usize, index: usize) -> usize {
+        self.client_base(slot) + 64 + CLIENT_MAX_MEMBERS * MEMBER_SIZE + index * RESULT_SIZE
+    }
+
+    fn reset_client_slot(&self, slot: usize, identity: ProcessIdentity) {
+        self.client_word(slot, CLIENT_OFF_STATE)
+            .store(CLIENT_PHASE_IDLE, Ordering::SeqCst);
+        self.client_word(slot, CLIENT_OFF_TICKET)
+            .store(0, Ordering::SeqCst);
+        self.client_u32(slot, CLIENT_OFF_NMEMBERS)
+            .store(0, Ordering::SeqCst);
+        self.client_u32(slot, CLIENT_OFF_MODE)
+            .store(0, Ordering::SeqCst);
+        self.client_word(slot, CLIENT_OFF_PAGE_LIMIT)
+            .store(0, Ordering::SeqCst);
+        self.client_word(slot, CLIENT_OFF_PID)
+            .store(identity.pid, Ordering::SeqCst);
+        self.client_word(slot, CLIENT_OFF_STARTTIME)
+            .store(identity.starttime, Ordering::SeqCst);
+    }
+
+    /// Регистрирует слот клиента очереди; `None` — таблица полна.
+    fn client_register(&self, identity: ProcessIdentity) -> Option<usize> {
+        let token = Self::owner_token(identity);
+        for slot in 0..CLIENT_SLOTS {
+            let owner = self.client_word(slot, CLIENT_OFF_OWNER);
+            let current = owner.load(Ordering::Acquire);
+            if current == token {
+                return Some(slot);
+            }
+            let reclaimable = current == 0 || {
+                let dead = Self::token_identity(current);
+                !process_alive(
+                    dead.pid,
+                    self.client_word(slot, CLIENT_OFF_STARTTIME)
+                        .load(Ordering::Acquire),
+                )
+            };
+            if !reclaimable {
+                continue;
+            }
+            if owner
+                .compare_exchange(current, token, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.reset_client_slot(slot, identity);
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    /// Публикует готовый запрос в свой слот. `None` — слота нет/таблица сброшена.
+    pub(crate) fn client_publish(
+        &self,
+        slot: usize,
+        members: &[SharedRequestMember],
+        mode: crate::parallel::layout::SyncModeV2,
+    ) -> Option<u64> {
+        if slot >= CLIENT_SLOTS || members.is_empty() || members.len() > CLIENT_MAX_MEMBERS {
+            return None;
+        }
+        let owner = self
+            .client_word(slot, CLIENT_OFF_OWNER)
+            .load(Ordering::Acquire);
+        let identity = Self::token_identity(owner);
+        if owner == 0 || identity.pid != self_identity().pid {
+            return None;
+        }
+        for (index, member) in members.iter().enumerate() {
+            let base = self.member_off(slot, index);
+            self.atomic_u32(base + MEMBER_OFF_ZONE)
+                .store(member.zone, Ordering::Relaxed);
+            self.atomic_u32(base + MEMBER_OFF_CHAIN_PAGE)
+                .store(member.chain_page, Ordering::Relaxed);
+            self.atomic_u64(base + MEMBER_OFF_VERSION)
+                .store(member.version, Ordering::Relaxed);
+            self.atomic_u64(base + MEMBER_OFF_BASE_VERSION)
+                .store(member.base_version, Ordering::Relaxed);
+            self.atomic_u64(base + MEMBER_OFF_FENCE)
+                .store(member.fence, Ordering::Relaxed);
+            for (chunk, bytes) in member.record.as_chunks::<8>().0.iter().enumerate() {
+                self.atomic_u64(base + MEMBER_OFF_RECORD + chunk * 8)
+                    .store(u64::from_le_bytes(*bytes), Ordering::Relaxed);
+            }
+            // Результат по умолчанию — «не обработан».
+            let result = self.result_off(slot, index);
+            self.atomic_u32(result + RESULT_OFF_CODE)
+                .store(SharedAckCode::Io.to_disk(), Ordering::Relaxed);
+            self.atomic_u32(result + RESULT_OFF_PREV)
+                .store(0, Ordering::Relaxed);
+            self.atomic_u32(result + RESULT_OFF_EVICTED)
+                .store(0, Ordering::Relaxed);
+        }
+        self.client_u32(slot, CLIENT_OFF_NMEMBERS).store(
+            u32::try_from(members.len()).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+        self.client_u32(slot, CLIENT_OFF_MODE)
+            .store(u32::from(mode.to_disk()), Ordering::Relaxed);
+        self.client_word(slot, CLIENT_OFF_PAGE_LIMIT)
+            .store(0, Ordering::Relaxed);
+        let ticket = self
+            .client_word(slot, CLIENT_OFF_TICKET)
+            .load(Ordering::Relaxed)
+            .saturating_add(1);
+        self.client_word(slot, CLIENT_OFF_TICKET)
+            .store(ticket, Ordering::Relaxed);
+        // Публикация запроса: Release после записи payload.
+        self.client_word(slot, CLIENT_OFF_STATE).store(
+            (ticket << CLIENT_TICKET_SHIFT) | CLIENT_PHASE_READY,
+            Ordering::Release,
+        );
+        self.pending_seq().fetch_add(1, Ordering::Release);
+        futex_wake(self.pending_seq(), i32::MAX);
+        Some(ticket)
+    }
+
+    /// Ждёт ack запроса `ticket`; `None` — таймаут.
+    pub(crate) fn client_wait(&self, slot: usize, ticket: u64, timeout: std::time::Duration) {
+        if slot >= CLIENT_SLOTS {
+            return;
+        }
+        let state = self.client_word(slot, CLIENT_OFF_STATE);
+        let current = state.load(Ordering::Acquire);
+        if (current >> CLIENT_TICKET_SHIFT) != ticket {
+            return;
+        }
+        // Ровно одно ожидание: по таймауту управление возвращается в
+        // `wait_shared_ack`, и участник пробует сам стать лидером (иначе смерть
+        // координатора оставила бы всех в вечном futex-ожидании).
+        futex_wait_u64(state, current, timeout);
+    }
+
+    /// Результат запроса, если координатор уже подтвердил его.
+    pub(crate) fn client_ack(
+        &self,
+        slot: usize,
+        ticket: u64,
+    ) -> Option<(u64, Vec<SharedMemberResult>)> {
+        if slot >= CLIENT_SLOTS {
+            return None;
+        }
+        let expected = (ticket << CLIENT_TICKET_SHIFT) | CLIENT_PHASE_DONE;
+        if self
+            .client_word(slot, CLIENT_OFF_STATE)
+            .load(Ordering::Acquire)
+            != expected
+        {
+            return None;
+        }
+        // Acquire уже выполнен загрузкой state; результаты записаны до CAS.
+        let count = self
+            .client_u32(slot, CLIENT_OFF_NMEMBERS)
+            .load(Ordering::Acquire) as usize;
+        let page_limit = self
+            .client_word(slot, CLIENT_OFF_PAGE_LIMIT)
+            .load(Ordering::Acquire);
+        let mut results = Vec::with_capacity(count.min(CLIENT_MAX_MEMBERS));
+        for index in 0..count.min(CLIENT_MAX_MEMBERS) {
+            let base = self.result_off(slot, index);
+            results.push(SharedMemberResult {
+                code: SharedAckCode::from_disk(
+                    self.atomic_u32(base + RESULT_OFF_CODE)
+                        .load(Ordering::Acquire),
+                ),
+                prev_record: self
+                    .atomic_u32(base + RESULT_OFF_PREV)
+                    .load(Ordering::Acquire),
+                evicted_page: self
+                    .atomic_u32(base + RESULT_OFF_EVICTED)
+                    .load(Ordering::Acquire),
+            });
+        }
+        Some((page_limit, results))
+    }
+
+    /// Снимок готовых запросов (без `READY` — пусто).
+    pub(crate) fn ready_batches(&self) -> Vec<SharedReadyBatch> {
+        let mut batches = Vec::new();
+        for slot in 0..CLIENT_SLOTS {
+            let state = self
+                .client_word(slot, CLIENT_OFF_STATE)
+                .load(Ordering::Acquire);
+            if state & 0xFF != CLIENT_PHASE_READY {
+                continue;
+            }
+            let ticket = state >> CLIENT_TICKET_SHIFT;
+            let owner = self
+                .client_word(slot, CLIENT_OFF_OWNER)
+                .load(Ordering::Acquire);
+            if owner == 0 {
+                continue;
+            }
+            // Полная идентичность: токен упаковывает лишь младшие 32 бита
+            // `starttime`, а `process_alive` сравнивает полное значение.
+            let identity = ProcessIdentity {
+                pid: self
+                    .client_word(slot, CLIENT_OFF_PID)
+                    .load(Ordering::Acquire),
+                starttime: self
+                    .client_word(slot, CLIENT_OFF_STARTTIME)
+                    .load(Ordering::Acquire),
+            };
+            let count = self
+                .client_u32(slot, CLIENT_OFF_NMEMBERS)
+                .load(Ordering::Acquire) as usize;
+            let mode = crate::parallel::layout::SyncModeV2::from_disk(
+                u8::try_from(
+                    self.client_u32(slot, CLIENT_OFF_MODE)
+                        .load(Ordering::Acquire),
+                )
+                .unwrap_or(0),
+            )
+            .unwrap_or(crate::parallel::layout::SyncModeV2::Sync);
+            let mut members = Vec::with_capacity(count.min(CLIENT_MAX_MEMBERS));
+            for index in 0..count.min(CLIENT_MAX_MEMBERS) {
+                let base = self.member_off(slot, index);
+                let mut record = [0_u8; 64];
+                for (chunk, bytes) in record.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                    let word = self
+                        .atomic_u64(base + MEMBER_OFF_RECORD + chunk * 8)
+                        .load(Ordering::Acquire);
+                    *bytes = word.to_le_bytes();
+                }
+                members.push(SharedRequestMember {
+                    zone: self
+                        .atomic_u32(base + MEMBER_OFF_ZONE)
+                        .load(Ordering::Acquire),
+                    version: self
+                        .atomic_u64(base + MEMBER_OFF_VERSION)
+                        .load(Ordering::Acquire),
+                    base_version: self
+                        .atomic_u64(base + MEMBER_OFF_BASE_VERSION)
+                        .load(Ordering::Acquire),
+                    fence: self
+                        .atomic_u64(base + MEMBER_OFF_FENCE)
+                        .load(Ordering::Acquire),
+                    chain_page: self
+                        .atomic_u32(base + MEMBER_OFF_CHAIN_PAGE)
+                        .load(Ordering::Acquire),
+                    record,
+                });
+            }
+            batches.push(SharedReadyBatch {
+                slot,
+                ticket,
+                owner,
+                identity,
+                mode,
+                members,
+            });
+        }
+        batches
+    }
+
+    /// Подтверждает запрос: пишет результаты и переводит `READY → DONE`.
+    ///
+    /// `false` — слот переиспользован/состояние изменилось (ack не доставлен;
+    /// новый владелец обработает свой запрос сам).
+    pub(crate) fn client_complete(
+        &self,
+        batch: &SharedReadyBatch,
+        page_limit: u64,
+        results: &[SharedMemberResult],
+    ) -> bool {
+        if batch.slot >= CLIENT_SLOTS {
+            return false;
+        }
+        if self
+            .client_word(batch.slot, CLIENT_OFF_OWNER)
+            .load(Ordering::Acquire)
+            != batch.owner
+        {
+            return false;
+        }
+        for (index, result) in results.iter().enumerate() {
+            let base = self.result_off(batch.slot, index);
+            self.atomic_u32(base + RESULT_OFF_PREV)
+                .store(result.prev_record, Ordering::Relaxed);
+            self.atomic_u32(base + RESULT_OFF_EVICTED)
+                .store(result.evicted_page, Ordering::Relaxed);
+            self.atomic_u32(base + RESULT_OFF_CODE)
+                .store(result.code.to_disk(), Ordering::Relaxed);
+        }
+        self.client_word(batch.slot, CLIENT_OFF_PAGE_LIMIT)
+            .store(page_limit, Ordering::Relaxed);
+        let expected = (batch.ticket << CLIENT_TICKET_SHIFT) | CLIENT_PHASE_READY;
+        let done = (batch.ticket << CLIENT_TICKET_SHIFT) | CLIENT_PHASE_DONE;
+        let state = self.client_word(batch.slot, CLIENT_OFF_STATE);
+        if state
+            .compare_exchange(expected, done, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        futex_wake(state, i32::MAX);
+        true
+    }
+
+    fn pending_seq(&self) -> &AtomicU64 {
+        self.atomic_u64(SC_OFF_PENDING_SEQ)
+    }
+
+    /// Счётчик постановок в очередь (для settle-окна лидера).
+    #[must_use]
+    pub(crate) fn pending_sequence(&self) -> u64 {
+        self.pending_seq().load(Ordering::Acquire)
+    }
+
+    /// Ждёт появления новых запросов до `timeout`.
+    pub(crate) fn wait_pending(&self, expected: u64, timeout: std::time::Duration) {
+        futex_wait_u64(self.pending_seq(), expected, timeout);
+    }
+
+    fn group_counter(&self, offset: usize) -> &AtomicU64 {
+        self.atomic_u64(offset)
+    }
+
+    /// Учитывает выполненную группу.
+    pub(crate) fn note_group(&self, members: u64, fsyncs: u64) {
+        self.group_counter(SC_OFF_GROUPS)
+            .fetch_add(1, Ordering::Relaxed);
+        self.group_counter(SC_OFF_FSYNCS)
+            .fetch_add(fsyncs, Ordering::Relaxed);
+        self.group_counter(SC_OFF_GROUP_MEMBERS)
+            .fetch_add(members, Ordering::Relaxed);
+        self.group_counter(SC_OFF_GROUP_MAX)
+            .fetch_max(members, Ordering::Relaxed);
+    }
+
+    /// Счётчики межпроцессного group commit.
+    #[must_use]
+    pub(crate) fn group_stats(&self) -> SharedGroupStats {
+        SharedGroupStats {
+            groups: self.group_counter(SC_OFF_GROUPS).load(Ordering::Acquire),
+            fsyncs: self.group_counter(SC_OFF_FSYNCS).load(Ordering::Acquire),
+            members: self
+                .group_counter(SC_OFF_GROUP_MEMBERS)
+                .load(Ordering::Acquire),
+            max_members: self.group_counter(SC_OFF_GROUP_MAX).load(Ordering::Acquire),
+        }
+    }
+
+    /// Отмечает начало группы под lease: терм + идентичность лидера.
+    pub(crate) fn leader_begin(&self, identity: ProcessIdentity) -> u64 {
+        let term = self
+            .group_counter(SC_OFF_LEADER_TERM)
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        self.group_counter(SC_OFF_LEADER_PID)
+            .store(identity.pid, Ordering::Release);
+        self.group_counter(SC_OFF_LEADER_STARTTIME)
+            .store(identity.starttime, Ordering::Release);
+        self.group_counter(SC_OFF_LEADER_GROUPS)
+            .fetch_add(1, Ordering::Relaxed);
+        term
+    }
+
+    /// Текущий лидер (для диагностики/тестов).
+    #[must_use]
+    pub(crate) fn leader(&self) -> (u64, ProcessIdentity) {
+        (
+            self.group_counter(SC_OFF_LEADER_TERM)
+                .load(Ordering::Acquire),
+            ProcessIdentity {
+                pid: self
+                    .group_counter(SC_OFF_LEADER_PID)
+                    .load(Ordering::Acquire),
+                starttime: self
+                    .group_counter(SC_OFF_LEADER_STARTTIME)
+                    .load(Ordering::Acquire),
+            },
+        )
+    }
+
+    /// Пробует стать координатором группы (non-blocking lease).
+    ///
+    /// # Errors
+    ///
+    /// `Io` — ошибка `fcntl` (не `EAGAIN`).
+    pub(crate) fn try_lock_commit(&self) -> Result<Option<RangeLock>, ParallelError> {
+        match set_lock(&self.file, FCNTL_SETLK, LOCK_EX, LOCK_OFF_COMMIT, 1) {
+            Ok(()) => {}
+            Err(error) if is_busy(&error) => return Ok(None),
+            Err(error) => return Err(ParallelError::Io(error)),
+        }
+        let file = match self.file.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = set_lock(&self.file, FCNTL_SETLK, LOCK_UN, LOCK_OFF_COMMIT, 1);
+                return Err(ParallelError::Io(error));
+            }
+        };
+        Ok(Some(RangeLock {
+            file,
+            start: LOCK_OFF_COMMIT,
+            len: 1,
+        }))
     }
 
     /// `D_z` зоны (durable version), 0 — неизвестно.
@@ -1026,6 +1717,38 @@ impl SharedCoord {
             }
         }
         self.reset_free_zone_queue();
+        self.reset_page_generations();
+        for offset in [
+            SC_OFF_PENDING_SEQ,
+            SC_OFF_GROUPS,
+            SC_OFF_FSYNCS,
+            SC_OFF_GROUP_MEMBERS,
+            SC_OFF_GROUP_MAX,
+            SC_OFF_LEADER_TERM,
+            SC_OFF_LEADER_PID,
+            SC_OFF_LEADER_STARTTIME,
+            SC_OFF_LEADER_GROUPS,
+        ] {
+            self.atomic_u64(offset).store(0, Ordering::SeqCst);
+        }
+        for slot in 0..CLIENT_SLOTS {
+            self.client_word(slot, CLIENT_OFF_STATE)
+                .store(0, Ordering::SeqCst);
+            self.client_word(slot, CLIENT_OFF_OWNER)
+                .store(0, Ordering::SeqCst);
+            self.client_word(slot, CLIENT_OFF_TICKET)
+                .store(0, Ordering::SeqCst);
+            self.client_u32(slot, CLIENT_OFF_NMEMBERS)
+                .store(0, Ordering::SeqCst);
+            self.client_u32(slot, CLIENT_OFF_MODE)
+                .store(0, Ordering::SeqCst);
+            self.client_word(slot, CLIENT_OFF_PAGE_LIMIT)
+                .store(0, Ordering::SeqCst);
+            self.client_word(slot, CLIENT_OFF_PID)
+                .store(0, Ordering::SeqCst);
+            self.client_word(slot, CLIENT_OFF_STARTTIME)
+                .store(0, Ordering::SeqCst);
+        }
     }
 
     fn raise_watermarks(&self, init: &CoordInit) {
@@ -1095,6 +1818,15 @@ impl SharedCoord {
 
 impl Drop for SharedCoord {
     fn drop(&mut self) {
+        if let Some(slot) = self.client {
+            let token = Self::owner_token(self_identity());
+            let owner = self.client_word(slot, CLIENT_OFF_OWNER);
+            if owner.load(Ordering::Acquire) == token {
+                self.client_word(slot, CLIENT_OFF_STATE)
+                    .store(0, Ordering::SeqCst);
+                let _ = owner.compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
         let hint = self.alive_hint();
         let mut current = hint.load(Ordering::Acquire);
         loop {
@@ -1115,6 +1847,9 @@ struct Layout {
     durable_off: usize,
     readers_off: usize,
     free_seqs_off: usize,
+    page_gen_off: usize,
+    page_gen_count: usize,
+    clients_off: usize,
     len: u64,
 }
 
@@ -1148,9 +1883,38 @@ impl Layout {
                 field: "reader_slots",
             },
         )?);
-        let len = free_seqs_off
-            .checked_add(max_zones * 4)
-            .ok_or(ParallelError::InvalidArgument { field: "max_zones" })?;
+        let page_gen_off = align64(
+            free_seqs_off
+                .checked_add(max_zones * 4)
+                .ok_or(ParallelError::InvalidArgument { field: "max_zones" })?,
+        );
+        let data_first = usize::try_from(geometry.page_data_first()).map_err(|_| {
+            ParallelError::InvalidArgument {
+                field: "page_data_first",
+            }
+        })?;
+        let page_count = usize::try_from(geometry.page_count_max()).map_err(|_| {
+            ParallelError::InvalidArgument {
+                field: "page_count_max",
+            }
+        })?;
+        let page_gen_count = page_count.saturating_sub(data_first);
+        let page_gen_bytes =
+            page_gen_count
+                .checked_mul(PAGE_GEN_SIZE)
+                .ok_or(ParallelError::InvalidArgument {
+                    field: "page_count_max",
+                })?;
+        let clients_off = align64(page_gen_off.checked_add(page_gen_bytes).ok_or(
+            ParallelError::InvalidArgument {
+                field: "page_count_max",
+            },
+        )?);
+        let len = clients_off
+            .checked_add(CLIENT_SLOTS * CLIENT_SLOT_SIZE)
+            .ok_or(ParallelError::InvalidArgument {
+                field: "coord_size",
+            })?;
         let len = align64(len);
         Ok(Self {
             leases_off,
@@ -1158,6 +1922,9 @@ impl Layout {
             durable_off,
             readers_off,
             free_seqs_off,
+            page_gen_off,
+            page_gen_count,
+            clients_off,
             len: u64::try_from(len).map_err(|_| ParallelError::InvalidArgument {
                 field: "coord_size",
             })?,
@@ -1167,6 +1934,15 @@ impl Layout {
 
 fn align64(value: usize) -> usize {
     value.saturating_add(63) & !63
+}
+
+/// Следующая генерация страницы: 0 и `u32::MAX` переходят в 1.
+///
+/// 0 означает «страница ещё не выдавалась», поэтому переполнение не должно
+/// возвращать 0 (иначе свежая страница совпала бы с legacy-ключом).
+pub(crate) const fn next_page_generation(current: u32) -> u32 {
+    let next = current.wrapping_add(1);
+    if next == 0 { 1 } else { next }
 }
 
 struct ReaderSlotView {
@@ -1179,6 +1955,50 @@ fn is_busy(error: &io::Error) -> bool {
         error.raw_os_error(),
         Some(code) if code == libc::EACCES || code == libc::EAGAIN
     )
+}
+
+/// `FUTEX_WAIT` по младшему 32-битному слову `AtomicU64` (межпроцессный).
+///
+/// Ожидание ограничено `timeout`: участник периодически пробует сам стать
+/// лидером (если координатор умер, его `fcntl`-lease уже снят ядром).
+fn futex_wait_u64(word: &AtomicU64, expected: u64, timeout: std::time::Duration) {
+    let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+    let timespec = libc::timespec {
+        tv_sec: libc::time_t::try_from(nanos / 1_000_000_000).unwrap_or(libc::time_t::MAX),
+        tv_nsec: libc::c_long::try_from(nanos % 1_000_000_000).unwrap_or(999_999_999),
+    };
+    // SAFETY: `word` — выровненный `AtomicU64` в `MAP_SHARED`; futex читает
+    // только младшее 32-битное слово по валидному адресу, `timespec` живёт на
+    // стеке до возврата syscall. Указатели на uaddr2/mask нулевые — как
+    // требует `FUTEX_WAIT`.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr().cast::<u32>(),
+            libc::FUTEX_WAIT,
+            u32::try_from(expected & 0xFFFF_FFFF).unwrap_or(u32::MAX),
+            &timespec,
+            std::ptr::null::<u32>(),
+            0,
+        );
+    }
+}
+
+/// `FUTEX_WAKE` по младшему 32-битному слову `AtomicU64`.
+fn futex_wake(word: &AtomicU64, count: i32) {
+    // SAFETY: тот же выровненный адрес; `FUTEX_WAKE` не разыменовывает
+    // остальные аргументы (нулевые).
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr().cast::<u32>(),
+            libc::FUTEX_WAKE,
+            count,
+            std::ptr::null::<u32>(),
+            std::ptr::null::<u32>(),
+            0,
+        );
+    }
 }
 
 /// `fcntl(F_SETLK/F_SETLKW)` c байтовым диапазоном.
@@ -1203,5 +2023,67 @@ fn set_lock(file: &File, cmd: i32, typ: i16, start: u64, len: u64) -> io::Result
             continue;
         }
         return Err(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parallel::geometry::Geometry;
+
+    #[test]
+    fn generation_wraps_to_one_not_zero() {
+        assert_eq!(next_page_generation(0), 1);
+        assert_eq!(next_page_generation(1), 2);
+        assert_eq!(next_page_generation(u32::MAX - 1), u32::MAX);
+        // Переполнение не возвращает 0: 0 — «страница ещё не выдавалась».
+        assert_eq!(next_page_generation(u32::MAX), 1);
+    }
+
+    fn test_geometry() -> Geometry {
+        Geometry::new(8, 1 << 12, 64, 8).expect("geometry")
+    }
+
+    fn init_for(geometry: Geometry) -> CoordInit {
+        CoordInit {
+            durable_pages: u64::from(geometry.page_data_first()),
+            durable_txn: 1,
+            next_txn: 2,
+            published: 0,
+            durable_versions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sidecar_v3_has_page_generation_table_and_migrates_v2() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("coord.v2");
+        let geometry = test_geometry();
+        let init = init_for(geometry);
+        let coord = SharedCoord::open(&path, geometry, [7; 16], &init, true).expect("open");
+        let coord_path = coord.path().to_path_buf();
+        let page = geometry.page_data_first();
+        assert!(coord.page_generation_bytes() > 0);
+        assert_eq!(coord.page_generation(page), 0);
+        assert_eq!(coord.bump_page_generation(page), 1);
+        assert_eq!(coord.page_generation(page), 1);
+        drop(coord);
+
+        // Эмулируем sidecar предыдущей версии: при отсутствии живых процессов
+        // координатор обязан пересоздать раскладку, а не читать чужую.
+        {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&coord_path)
+                .expect("open sidecar");
+            file.write_at(&2_u16.to_le_bytes(), HDR_OFF_VERSION as u64)
+                .expect("downgrade version");
+        }
+        let coord = SharedCoord::open(&path, geometry, [7; 16], &init, true).expect("reopen");
+        assert_eq!(coord.page_generation(page), 0, "таблица не сброшена");
+        assert_eq!(coord.bump_page_generation(page), 1);
+        drop(coord);
     }
 }

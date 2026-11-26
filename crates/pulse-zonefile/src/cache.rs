@@ -6,9 +6,10 @@
 //! ведёт метрики hit/miss. Reader table, meta и superblock не кешируются —
 //! сюда попадают только страницы `LEAF`/`BRANCH`.
 //!
-//! Инвалидация — по паре `(page_no, txn)`: COW всегда пишет новую страницу,
-//! поэтому версия страницы неизменяема. При переполнении вытесняется запись
-//! с наименьшим счётчиком использования (приближённый LRU).
+//! Инвалидация — по паре `(page_no, txn)` в single-process и по
+//! `(page_no, generation, snapshot)` в multi-process: COW всегда пишет новую
+//! страницу, поэтому версия/генерация страницы неизменяемы. При переполнении
+//! вытесняется запись с наименьшим счётчиком использования (приближённый LRU).
 //!
 //! ```
 //! # use pulse_zonefile::tree::{MemoryStore, PageIo};
@@ -69,10 +70,18 @@ impl CacheStats {
 
 struct CacheEntry {
     meta: Arc<NodeMeta>,
+    /// Общая генерация страницы (multi); в single — `0`.
+    generation: u32,
+    /// Версия снапшота, под которым валидированы метаданные (multi).
+    snapshot: u64,
     used: AtomicU64,
 }
 
 const WAYS: usize = 4;
+
+/// Повторы, если генерация страницы сменилась между чтением образа и ключом
+/// (переиспользование номера другим процессом).
+const GENERATION_RETRIES: u32 = 8;
 
 #[derive(Default, Clone)]
 struct CacheSet {
@@ -90,6 +99,9 @@ pub struct PageCache {
     page_size: u32,
     capacity: usize,
     ways: usize,
+    /// Ключ в multi: `(page_no, generation, snapshot)`; в single —
+    /// `(page_no, page_txn)` (прежняя семантика без регрессий).
+    generation_aware: bool,
     entries: RwLock<Vec<CacheSet>>,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -107,6 +119,14 @@ impl std::fmt::Debug for PageCache {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CacheKey {
+    page_no: u32,
+    txn: u64,
+    generation: u32,
+    snapshot: u64,
+}
+
 impl PageCache {
     /// Кеш с ёмкостью по умолчанию ([`DEFAULT_PAGE_CACHE_ENTRIES`]).
     #[must_use]
@@ -117,12 +137,27 @@ impl PageCache {
     /// Кеш с заданной ёмкостью (0 трактуется как 1).
     #[must_use]
     pub fn with_capacity(page_size: u32, capacity: usize) -> Self {
+        Self::with_capacity_generation_aware(page_size, capacity, false)
+    }
+
+    /// Кеш с ключом `(page_no, generation, snapshot)` (multi-process).
+    ///
+    /// `generation_aware = false` сохраняет прежний ключ `(page_no, page_txn)`
+    /// для single-process пути. `true` включает инвалидацию по общей
+    /// генерации страницы (ADR 0007 §7.4).
+    #[must_use]
+    pub fn with_capacity_generation_aware(
+        page_size: u32,
+        capacity: usize,
+        generation_aware: bool,
+    ) -> Self {
         let capacity = capacity.max(1);
         let ways = capacity.min(WAYS);
         Self {
             page_size,
             capacity,
             ways,
+            generation_aware,
             entries: RwLock::new(vec![CacheSet::default(); capacity.div_ceil(ways)]),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -226,10 +261,32 @@ impl PageCache {
         kind: NodeKind,
         expected_level: u16,
     ) -> Result<NodeRef<'a>, ZoneFileError> {
-        let page = io.read_page(page_no)?;
-        let page_txn = wire::read_u64(page, 16)
-            .ok_or_else(|| corrupt(Some(page_no), CorruptKind::Bounds, CorruptDetail::Truncated))?;
-        let key = (page_no, page_txn);
+        // В multi страницу могли переиспользовать между `read_page` и
+        // вычислением ключа. Читаем генерацию до и после: если она изменилась,
+        // образ и номер уже не соответствуют друг другу — повторяем.
+        let mut attempts = 0_u32;
+        let (page, page_txn, generation) = loop {
+            let generation = if self.generation_aware {
+                io.page_generation(page_no)
+            } else {
+                0
+            };
+            let page = io.read_page(page_no)?;
+            let page_txn = wire::read_u64(page, 16).ok_or_else(|| {
+                corrupt(Some(page_no), CorruptKind::Bounds, CorruptDetail::Truncated)
+            })?;
+            if !self.generation_aware || io.page_generation(page_no) == generation {
+                break (page, page_txn, generation);
+            }
+            attempts = attempts.saturating_add(1);
+            if attempts >= GENERATION_RETRIES {
+                return Err(corrupt(
+                    Some(page_no),
+                    CorruptKind::Bounds,
+                    CorruptDetail::OffsetOutOfRange,
+                ));
+            }
+        };
         if page_txn > snapshot_txn {
             return Err(corrupt(
                 Some(page_no),
@@ -237,6 +294,16 @@ impl PageCache {
                 CorruptDetail::OffsetOutOfRange,
             ));
         }
+        let key = CacheKey {
+            page_no,
+            txn: page_txn,
+            generation,
+            snapshot: if self.generation_aware {
+                snapshot_txn
+            } else {
+                0
+            },
+        };
         if let Some(entry) = self.lookup_entry(key) {
             verify_kind(&entry.meta, kind, expected_level, page_no)?;
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -256,9 +323,24 @@ impl PageCache {
     }
 
     /// Кладёт в кеш только что закодированный лист (доверенный путь записи).
-    pub(crate) fn put_encoded_leaf(&self, page_no: u32, txn: u64, page: &[u8], items: &[LeafItem]) {
+    pub(crate) fn put_encoded_leaf(
+        &self,
+        page_no: u32,
+        txn: u64,
+        generation: u32,
+        page: &[u8],
+        items: &[LeafItem],
+    ) {
         if let Ok(meta) = NodeMeta::from_encoded_leaf(page, page_no, txn, self.page_size, items) {
-            self.insert((page_no, txn), Arc::new(meta));
+            self.insert(
+                CacheKey {
+                    page_no,
+                    txn,
+                    generation: if self.generation_aware { generation } else { 0 },
+                    snapshot: if self.generation_aware { txn } else { 0 },
+                },
+                Arc::new(meta),
+            );
         }
     }
 
@@ -267,22 +349,32 @@ impl PageCache {
         &self,
         page_no: u32,
         txn: u64,
+        generation: u32,
         page: &[u8],
         items: &[BranchItem],
     ) {
         if let Ok(meta) = NodeMeta::from_encoded_branch(page, page_no, txn, self.page_size, items) {
-            self.insert((page_no, txn), Arc::new(meta));
+            self.insert(
+                CacheKey {
+                    page_no,
+                    txn,
+                    generation: if self.generation_aware { generation } else { 0 },
+                    snapshot: if self.generation_aware { txn } else { 0 },
+                },
+                Arc::new(meta),
+            );
         }
     }
 
-    fn lookup_entry(&self, key: (u32, u64)) -> Option<Arc<CacheEntry>> {
+    fn lookup_entry(&self, key: CacheKey) -> Option<Arc<CacheEntry>> {
         let sets = self.entries.read().ok()?;
-        let set = sets.get(Self::set_index_for(key.0, sets.len()))?;
-        let entry = set
-            .ways
-            .iter()
-            .flatten()
-            .find(|entry| entry.meta.page_no == key.0 && entry.meta.txn == key.1)?;
+        let set = sets.get(Self::set_index_for(key.page_no, sets.len()))?;
+        let entry = set.ways.iter().flatten().find(|entry| {
+            entry.meta.page_no == key.page_no
+                && entry.meta.txn == key.txn
+                && (!self.generation_aware
+                    || (entry.generation == key.generation && entry.snapshot == key.snapshot))
+        })?;
         // Hit не пишет в разделяемые атомики (см. doc-комментарий типа).
         Some(Arc::clone(entry))
     }
@@ -291,23 +383,31 @@ impl PageCache {
         ((page_no.wrapping_mul(0x9E37_79B1) >> 8) as usize) % set_count.max(1)
     }
 
-    fn insert(&self, key: (u32, u64), meta: Arc<NodeMeta>) {
+    fn insert(&self, key: CacheKey, meta: Arc<NodeMeta>) {
         let Ok(mut sets) = self.entries.write() else {
             return;
         };
         let set_count = sets.len().max(1);
-        let index = Self::set_index_for(key.0, set_count);
+        let index = Self::set_index_for(key.page_no, set_count);
         let Some(set) = sets.get_mut(index) else {
             return;
         };
         let used = self.clock.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(CacheEntry {
             meta,
+            generation: key.generation,
+            snapshot: key.snapshot,
             used: AtomicU64::new(used),
         });
+        let matches = |existing: &CacheEntry| {
+            existing.meta.page_no == key.page_no
+                && existing.meta.txn == key.txn
+                && (!self.generation_aware
+                    || (existing.generation == key.generation && existing.snapshot == key.snapshot))
+        };
         for way in set.ways.iter_mut().take(self.ways) {
             match way {
-                Some(existing) if existing.meta.page_no == key.0 && existing.meta.txn == key.1 => {
+                Some(existing) if matches(existing) => {
                     return;
                 }
                 None => {

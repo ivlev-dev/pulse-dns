@@ -53,11 +53,19 @@ name = "v2_group"
 harness = false
 
 [[bench]]
+name = "v2_shared_group"
+harness = false
+
+[[bench]]
 name = "v2_multiprocess"
 harness = false
 
 [[bench]]
 name = "v2_multiprocess_reclaim"
+harness = false
+
+[[bench]]
+name = "v2_multiprocess_read"
 harness = false
 
 [[bench]]

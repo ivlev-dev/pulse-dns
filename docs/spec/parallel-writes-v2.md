@@ -560,6 +560,65 @@ throughput = MAX_BATCH_ZONES / (T_fsync1 + T_fsync2)
 
 Потолок — `fdatasync` одного inode (2 на группу): 20–80k зона-коммитов/с на NVMe при пачке 8–256.
 
+### 7.5. Межпроцессная группа (M3, sidecar v4)
+
+Глобальный commit-lock остаётся, но теперь сериализует **группы**, а не
+отдельные коммиты. Очередь — в sidecar `<file>.pulsecoord` (`COORD_VERSION = 4`,
+`CLIENT_SLOTS = 256`, `CLIENT_SLOT_SIZE = 3648`, `CLIENT_MAX_MEMBERS = 32`):
+
+| Поле слота | Смысл |
+|---|---|
+| `state = (ticket << 8) | phase` | `phase`: 0 idle, 1 ready, 2 done; CAS `READY→DONE` — точка линейности ack |
+| `owner`, `pid`, `starttime` | владелец слота (рекламация мёртвых) |
+| `ticket` | монотонный билет запроса (ABA/повтор) |
+| `n_members`, `mode` | размер пачки зон и durability |
+| `page_limit` | результат: `DP` группы |
+| member × 32 | `zone`, `chain_page`, `version`, `base_version`, `fence`, 64-Б `record` |
+| result × 32 | `code` (ok/contended/busy/io), `prev_record`, `evicted` |
+
+Протокол:
+
+```
+writer:  данные + bucket(V) + chain → pwrite (без fsync)
+         state := (ticket<<8)|READY (Release);  pending_seq++ + futex wake
+         loop: ack? → выполнить публикацию головы в памяти
+               try_lock(COMMIT)? → coordinator_pass()
+               futex_wait(state, ticket, 500 мкс)
+coordinator (любой процесс под F_SETLK lease COMMIT):
+  settle ≤ 1 мс / ≤ 256 зон; mode = max(durability участников)
+  валидация: record CRC/поля, lease=(pid,starttime,generation), head==base_version
+             (head==version ⇒ повтор после краха лидера, идемпотентно),
+             chain_page==0 ∧ old.version ≥ oldest_pin ⇒ ReaderContended
+  фаза 1: ALLOC_RECORD(max page_limit, txn_limit) + fdatasync
+  фаза 2: 2 копии RootEntry под zone_write_seq + fdatasync
+  D_z/published (Release); ack: results + CAS READY→DONE + futex wake
+```
+
+- **Ровно два `fdatasync` на межпроцессную группу.** `fsync` любого fd
+  инода сбрасывает dirty-страницы этого inode, поэтому один координатор
+  покрывает записи всех писателей.
+- **Отказоустойчивость.** `fcntl`-lease снимается ядром при смерти процесса;
+  ожидающий участник по таймауту futex сам берёт lease и дочитывает очередь.
+  `head==version` превращает повтор фазы 2 в идемпотентную операцию: уже
+  durable/видимый корень переписывается теми же байтами и fsync'ается, ack
+  доставляется. Мёртвый владелец слота получает `ZoneBusy` (никто не ждёт) и
+  рекламируется при следующей регистрации.
+- **Нет двойной публикации/потери ack.** `ticket` + CAS состояния: старый
+  координатор не может подтвердить новый запрос; «подтверждён» = ровно один
+  `READY→DONE`. Участник не выходит из коммита до `DONE`, поэтому lease зоны
+  не отпускается и более новая версия той же зоны не может обогнать повтор.
+- **Ошибки.** I/O фазы 1/2 → `CommitUncertain` (`write_locked`), ack `Io` всем
+  участникам, головы не публикуются; `ReaderContended`/`ZoneBusy` — per-zone,
+  остальные зоны группы публикуются.
+- **Backpressure.** Слот писателя один (in-process `commit_gate`); локальная
+  группа >32 зон уходит несколькими запросами, координатор сливает их в одну
+  пачку. При `alive_hint == 1` очередь не используется (single-process путь без
+  изменений); `PULSE_MP_DIRECT_COMMIT` — аварийный/бенч-выключатель.
+
+Метрики: `shared_group_stats() = {groups, fsyncs, members, max_members}`,
+`shared_leader() = (term, pid, starttime)`; `/proc/<pid>/stat` (pid, starttime)
+используются и как fencing, и как liveness.
+
 ---
 
 ## 8. Производительность
